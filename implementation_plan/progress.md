@@ -1,0 +1,20 @@
+# Phase 1 Implementation Progress
+
+This document tracks the execution status of the Agent Tasks defined in the Implementation Plan.
+
+| Task | Component | Status | Assignee |
+|------|-----------|--------|----------|
+| [Task 1](./agent_tasks/task-1-database-schema.md) | Database Schema | Todo | Unassigned |
+| [Task 2](./agent_tasks/task-2-api-service.md) | API Service | Todo | Unassigned |
+| [Task 3](./agent_tasks/task-3-worker-service-core.md) | Worker Service Core | Todo | Unassigned |
+| [Task 4](./agent_tasks/task-4-langgraph-checkpointer.md) | LangGraph Checkpointer | Todo | Unassigned |
+| [Task 5](./agent_tasks/task-5-mcp-server.md) | Co-located MCP Server | Todo | Unassigned |
+| [Task 6](./agent_tasks/task-6-graph-executor.md) | Graph Executor | Todo | Unassigned |
+| [Task 7](./agent_tasks/task-7-aws-infrastructure.md) | AWS Cloud Infrastructure | Todo | Unassigned |
+
+## Notes
+- Task 1 must be completed before downstream components that rely on the schema can be fully tested.
+- Tasks 2, 3, 4 can be worked on in parallel after Task 1 is defined.
+- Tasks 5 and 7 have no dependencies and can start immediately alongside Task 1.
+- Task 6 depends on 3, 4, and 5.
+- Task 7 can be worked on in parallel with all other tasks but is required for cloud deployment.

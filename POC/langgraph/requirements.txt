@@ -1,0 +1,6 @@
+langgraph==1.0.5
+langgraph-checkpoint>=2.1.0,<4.0.0
+langchain-core>=1.0.0,<2.0.0
+typing_extensions>=4.0.0
+openai>=1.0.0,<2.0.0
+python-dotenv>=1.0.0,<2.0.0

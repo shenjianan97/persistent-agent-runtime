@@ -34,6 +34,10 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
 | design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
 | design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
+| implementation_plan/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
+| implementation_plan/progress.md | Live tracking board for agent execution of Phase 1 |
+| implementation_plan/agent_tasks/*.md | 7 parallelizable, single-responsibility execution templates for agents |
+| POC/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
 ## Project Stages
 
@@ -41,19 +45,23 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - PROJECT.md — vision, differentiation, user stories, phases
 - Core concepts and tradeoff positions documented
 
-### Stage 2 — Technical Design [IN PROGRESS]
+### Stage 2 — Technical Design [DONE]
 - PHASE1_DURABLE_EXECUTION.md — Phase 1 architectural context, entity model, API contract, DB schema, sequence diagrams (done)
 - PHASE2_MULTI_AGENT.md — consolidated Phase 2 design doc (done)
 - DESIGN_NOTES_PHASE3_PLUS.md — Phase 3+ reference material extracted from former Phase 2+ notes (done)
-- Review and refine Phase 1 design before implementation (not started)
+- Review and refine Phase 1 design before implementation (done)
 
-### Stage 3 — Implementation Plan [NOT STARTED]
-- Task breakdown with dependencies and ordering
-- Milestones — what's demoable at each checkpoint
-- Test strategy — integration tests for crash recovery, idempotency
+### Stage 3 — Implementation Plan [DONE]
+- Hand-off: Translate Phase 1 design into `implementation_plan/plan.md` Orchestrator Plan
+- Splitting Prompts: Generate and split explicit constraints into 7 parallelizable agent task spec files (`task-1` through `task-7`) 
+- Tracking: Created `implementation_plan/progress.md` for orchestrator execution tracking
+- POC logic: Created LangGraph POC validation tasks in `POC/langgraph/` to test assumptions
 
 ### Stage 4 — Implementation [NOT STARTED]
-- Write code iteratively against the API contract and DB schema
+- Hand off agent tasks to execution engine
+- Stage 4.1: DB Schema, AWS Infrastructure
+- Stage 4.2: Worker Core, API Service, MCP server, LangGraph checkpointer
+- Stage 4.3: Graph Executor Assembly
 
 ### Stage 5 — Validation [NOT STARTED]
 - End-to-end crash-recovery demo
