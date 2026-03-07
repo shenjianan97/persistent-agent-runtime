@@ -6,7 +6,7 @@
 
 **Out of scope:** Agent as first-class entity (config is inline on Task), multi-agent scheduling, memory compaction, approval workflows, UI (except minimal demo dashboard), multi-tenancy, Custom Tool Runtime (BYOT — customer-provided MCP servers).
 
-For Phase 2+ concepts (full Agent entity, long-term memory, scaling analysis, DynamoDB design), see [DESIGN_NOTES_PHASE2.md](./DESIGN_NOTES_PHASE2.md).
+For later-phase concepts beyond Phase 1, see [PHASE2_MULTI_AGENT.md](./PHASE2_MULTI_AGENT.md) for the consolidated Phase 2 design and [DESIGN_NOTES_PHASE3_PLUS.md](./DESIGN_NOTES_PHASE3_PLUS.md) for Phase 3+ reference material.
 
 ---
 
@@ -111,8 +111,9 @@ updated_at:             timestamp
 - No `waiting_for_approval` status (approval workflows are Phase 2+)
 - `agent_config_snapshot` carries everything the Worker Service needs — no Agent table lookup
 - `worker_pool_id` is always `"shared"` but stored for forward compatibility (Phase 2: used as tool runtime routing key for Custom Tool Runtime)
-- `tenant_id` is always `"default"` but stored for forward auth compatibility — all queries include `tenant_id` in WHERE clauses
+- In Phase 1, the server always resolves `tenant_id = "default"` internally for every API request. The column exists for forward auth compatibility, and all DB queries still include `tenant_id` in WHERE clauses.
 - No `retrying` status — tasks go directly from `running` to `queued` (with `retry_count` incremented and `retry_after` set)
+- `last_error_code` and `last_error_message` represent the task's current/latest failure context. They are cleared on successful completion and on redrive. Full retry/error event history is deferred to Phase 2+.
 
 ### Checkpoint
 
@@ -135,12 +136,12 @@ created_at:             timestamp
 
 ### Checkpoint Writes
 
-**Description:** Represents LangGraph's pending, intermediate state updates. During a node's execution, individual updates to specific state channels are recorded here before the final checkpoint is committed. LangGraph uses this table internally to track in-flight writes and resolve state correctly during crash recovery.
+**Description:** Represents LangGraph's pending, intermediate state updates associated with a checkpoint context. During execution, individual updates to specific state channels are recorded here against either the current checkpoint or the newly created checkpoint returned by `put()`. LangGraph uses this table internally to track in-flight writes and resolve state correctly during crash recovery.
 
 ```
 task_id:                UUID (FK -> tasks, maps to LangGraph thread_id)
 checkpoint_ns:          TEXT (default "")
-checkpoint_id:          TEXT (FK -> checkpoints)
+checkpoint_id:          TEXT (part of composite FK -> checkpoints(task_id, checkpoint_ns, checkpoint_id))
 task_path:              TEXT (LangGraph task path identifier)
 idx:                    INT (write index within the checkpoint)
 channel:                TEXT (LangGraph channel name)
@@ -172,6 +173,8 @@ The Worker Service is a long-running Python process deployed on ECS Fargate. Eac
 
 Base path: `/v1`
 
+**Tenant resolution in Phase 1:** Clients do not supply `tenant_id` on read, cancel, or redrive APIs. The API Service resolves `tenant_id = "default"` internally for all Phase 1 requests and still applies tenant-scoped queries in the database so auth can be added later without reshaping the schema.
+
 ### Task Submission
 
 ```
@@ -200,7 +203,7 @@ POST /v1/tasks
 
 | Field | Constraint |
 |-------|-----------|
-| `tenant_id` | Optional, string, max 64 characters (ignored/defaulted to `"default"` in Phase 1) |
+| `tenant_id` | Optional, string, max 64 characters (server resolves to `"default"` in Phase 1) |
 | `agent_id` | Required, string, max 64 characters |
 | `input` | Required, max 100KB |
 | `agent_config.system_prompt` | Required, max 50KB |
@@ -321,6 +324,26 @@ Returns the ordered list of root-namespace LangGraph checkpoints for a task. Eac
 
 ```
 GET /v1/tasks/dead-letter?agent_id=support_agent_v1&limit=50
+```
+
+Returns up to `limit` dead-lettered tasks for the internally resolved Phase 1 tenant (`"default"`), ordered by `dead_lettered_at DESC, task_id DESC`. Pagination is deferred from Phase 1.
+
+**Response: `200 OK`**
+```json
+{
+  "items": [
+    {
+      "task_id": "550e8400-e29b-41d4-a716-446655440000",
+      "agent_id": "support_agent_v1",
+      "dead_letter_reason": "non_retryable_error",
+      "last_error_code": "tool_args_invalid",
+      "last_error_message": "calculator.args.expression failed validation",
+      "retry_count": 1,
+      "last_worker_id": "worker-a-123",
+      "dead_lettered_at": "2026-03-05T10:00:20Z"
+    }
+  ]
+}
 ```
 
 ```
@@ -991,8 +1014,8 @@ The following diagram illustrates how the Worker Service integrates LangGraph wi
  │  tasks table                    checkpoints table                 │
  │  ┌─────────────────────┐        ┌──────────────────────────┐      │
  │  │ agent_config_snapshot│        │ completed checkpoints    │      │
- │  │  ├─ system_prompt    │        │  (ordered by thread_ts)  │      │
- │  │  ├─ model            │        │                          │      │
+ │  │  ├─ system_prompt    │        │  (ordered by created_at  │      │
+ │  │  ├─ model            │        │   / insertion order)     │      │
  │  │  ├─ allowed_tools    │        │  ├─ checkpoint_payload   │      │
  │  │  └─ temperature      │        │  └─ metadata             │      │
  │  └──────────┬──────────┘        └────────────┬─────────────┘      │
@@ -1131,13 +1154,15 @@ Max steps:     Circuit breaker for infinite node loops (LangGraph recursion_limi
 
 **Redrive:** `POST /v1/tasks/{task_id}/redrive` resets `retry_count = 0` and sets `status = queued`. The task resumes from the last checkpoint — completed super-steps are not re-executed. Checkpoint rollback is deferred to Phase 2 (see Section 3).
 
+**Phase 1 error field semantics:** A task that eventually succeeds should not continue to surface stale retry errors as if it were unhealthy. `last_error_code` and `last_error_message` are therefore cleared on successful completion. Rich append-only retry/error audit history is deferred to Phase 2+.
+
 ### 5.6 Security Overview
 
 > **Covers:** S5, S6
 
 Tool execution security is enforced at graph execution time, not just at submission:
 
-- **Secret isolation:** API keys for LLM providers and tool backends are loaded from environment variables or AWS Secrets Manager at execution time via a `SecretProvider` interface. Secrets must never be inserted into LangGraph state, checkpoint payloads, metadata, or logs. The checkpointer does not mutate persisted state; log redaction happens in the logging layer, and code review/tests enforce that secrets never enter checkpointed state.
+- **Secret isolation:** In Phase 1, API keys for LLM providers and tool backends are loaded from environment variables at execution time. Integrating AWS Secrets Manager is deferred to Phase 2+ as deployment hardening. Secrets must never be inserted into LangGraph state, checkpoint payloads, metadata, or logs. The checkpointer does not mutate persisted state; log redaction happens in the logging layer, and code review/tests enforce that secrets never enter checkpointed state.
 - **Prompt injection mitigation:** Tool call outputs are treated as untrusted data. They are placed in clearly delineated content blocks in the prompt and are never injected into system prompts. This prevents a malicious tool response from hijacking the agent's instructions.
 
 See LLD §6.3 for enforcement details (allowed_tools checks, argument schema validation, tenant scoping).
@@ -1186,7 +1211,9 @@ CREATE TABLE tasks (
     last_error_code     TEXT,
     last_error_message  TEXT,
     last_worker_id      TEXT,
-    dead_letter_reason  TEXT,
+    dead_letter_reason  TEXT
+                        CHECK (dead_letter_reason IS NULL OR dead_letter_reason IN
+                            ('cancelled_by_user','retries_exhausted','task_timeout','non_retryable_error','max_steps_exceeded')),
     dead_lettered_at    TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -1206,6 +1233,10 @@ CREATE INDEX idx_tasks_timeout ON tasks (created_at)
 
 -- Lookup by agent (scoped by tenant)
 CREATE INDEX idx_tasks_tenant_agent ON tasks (tenant_id, agent_id, created_at);
+
+-- Dead-letter API: newest failures first, optionally filtered by agent
+CREATE INDEX idx_tasks_dead_letter ON tasks (tenant_id, agent_id, dead_lettered_at DESC, task_id DESC)
+    WHERE status = 'dead_letter';
 
 -- Checkpoints table (acts as LangGraph BaseCheckpointSaver)
 -- LangGraph metadata columns are stored as returned by the pinned library version
@@ -1232,7 +1263,9 @@ CREATE INDEX idx_checkpoints_task_created ON checkpoints(task_id, checkpoint_ns,
 
 -- Checkpoint writes table (stores pending writes within a super-step)
 -- Required by LangGraph's BaseCheckpointSaver.put_writes() contract and persisted
--- alongside checkpoints for library-managed recovery behavior.
+-- alongside checkpoints for library-managed recovery behavior. With the pinned
+-- Phase 1 LangGraph versions, writes are associated with an existing checkpoint
+-- id, so a composite FK to checkpoints is safe and keeps the schema honest.
 CREATE TABLE checkpoint_writes (
     task_id             UUID NOT NULL REFERENCES tasks(task_id),
     checkpoint_ns       TEXT NOT NULL DEFAULT '',
@@ -1243,7 +1276,9 @@ CREATE TABLE checkpoint_writes (
     type                TEXT,
     blob                BYTEA NOT NULL,
 
-    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
+    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx),
+    FOREIGN KEY (task_id, checkpoint_ns, checkpoint_id)
+        REFERENCES checkpoints(task_id, checkpoint_ns, checkpoint_id)
 );
 ```
 
@@ -1336,6 +1371,10 @@ WHERE task_id = :task_id
 UPDATE tasks
 SET status = 'completed',
     output = :final_output,
+    lease_owner = NULL,
+    lease_expiry = NULL,
+    last_error_code = NULL,
+    last_error_message = NULL,
     version = version + 1,
     updated_at = NOW()
 WHERE task_id = :task_id
@@ -1345,6 +1384,55 @@ WHERE task_id = :task_id
 ```
 
 **Completion check on resume:** When LangGraph is initialized with an existing `thread_id`, it loads the last checkpoint and evaluates whether the graph has reached an end state. If so, `astream()` yields nothing and returns immediately. The Worker Service detects this (zero super-steps yielded) and marks the task `completed`. This handles the crash-between-last-checkpoint-and-task-completion edge case.
+
+**Retryable node failure (worker-classified, re-queue with backoff):**
+```sql
+WITH requeued AS (
+    UPDATE tasks
+    SET status = 'queued',
+        lease_owner = NULL,
+        lease_expiry = NULL,
+        retry_count = retry_count + 1,
+        retry_after = NOW() + (POWER(2, retry_count) * INTERVAL '1 second'),
+        retry_history = retry_history || jsonb_build_array(NOW()),
+        last_error_code = :error_code,
+        last_error_message = :error_message,
+        version = version + 1,
+        updated_at = NOW()
+    WHERE task_id = :task_id
+      AND tenant_id = :tenant_id
+      AND status = 'running'
+      AND lease_owner = :worker_id
+      AND retry_count < max_retries
+    RETURNING task_id, worker_pool_id
+)
+, notified AS (
+    SELECT pg_notify('new_task', worker_pool_id)
+    FROM requeued
+)
+SELECT task_id
+FROM requeued;
+```
+
+**Retryable node failure with retries exhausted (worker-classified terminal failure):**
+```sql
+UPDATE tasks
+SET status = 'dead_letter',
+    last_worker_id = :worker_id,
+    lease_owner = NULL,
+    lease_expiry = NULL,
+    last_error_code = :error_code,
+    last_error_message = :error_message,
+    dead_letter_reason = 'retries_exhausted',
+    dead_lettered_at = NOW(),
+    version = version + 1,
+    updated_at = NOW()
+WHERE task_id = :task_id
+  AND tenant_id = :tenant_id
+  AND status = 'running'
+  AND lease_owner = :worker_id
+  AND retry_count >= max_retries;
+```
 
 **Reaper — lease expiry scan:**
 ```sql
@@ -1428,6 +1516,25 @@ RETURNING task_id, status;
 
 The worker detects cancellation on the next heartbeat (lease_owner cleared) and stops execution.
 
+**Worker-classified terminal failures (non-retryable error or max steps exceeded):**
+```sql
+UPDATE tasks
+SET status = 'dead_letter',
+    last_worker_id = :worker_id,
+    lease_owner = NULL,
+    lease_expiry = NULL,
+    last_error_code = :error_code,
+    last_error_message = :error_message,
+    dead_letter_reason = :dead_letter_reason, -- 'non_retryable_error' or 'max_steps_exceeded'
+    dead_lettered_at = NOW(),
+    version = version + 1,
+    updated_at = NOW()
+WHERE task_id = :task_id
+  AND tenant_id = :tenant_id
+  AND status = 'running'
+  AND lease_owner = :worker_id;
+```
+
 **Redrive a dead-lettered task:**
 ```sql
 -- Checkpoint rollback (DELETE latest checkpoint + writes) deferred to Phase 2.
@@ -1440,6 +1547,7 @@ WITH redriven AS (
         lease_expiry = NULL,
         last_error_code = NULL,
         last_error_message = NULL,
+        last_worker_id = NULL,
         dead_letter_reason = NULL,
         dead_lettered_at = NULL,
         version = version + 1,
@@ -1509,8 +1617,8 @@ To guarantee correct crash recovery and minimize duplicate side-effects, the sys
 - **Tool idempotency (Phase 1 simplification):** All Phase 1 tools are idempotent and read-only by design. The `allowed_tools` list is validated against the co-located MCP server's `listTools` at submission time, so non-idempotent tools cannot enter the system. Non-idempotent tool guards are deferred to Phase 2 (see Section 6.2).
 
 #### Secret Handling
-- API keys for LLM providers stored in environment variables or AWS Secrets Manager. Never in checkpoint payloads or agent config.
-- Tool handlers receive secrets via a `SecretProvider` interface that loads from Secrets Manager at execution time. Secrets are never stored in LangGraph state or checkpoint data.
+- In Phase 1, API keys for LLM providers and tool backends are stored in environment variables only. Never in checkpoint payloads or agent config.
+- Tool handlers receive secrets from process environment at execution time. AWS Secrets Manager integration is deferred to Phase 2+.
 - The `PostgresDurableCheckpointer` must preserve exact state fidelity; it does not scrub or rewrite payloads before persistence.
 
 #### Input Validation

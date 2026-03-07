@@ -32,8 +32,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 |------|---------|
 | PROJECT.md | High-level project overview: vision, user stories, phases, tradeoffs, tech stack |
 | design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
-| design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, memory compaction, Custom Tool Runtime / BYOT (placeholder) |
-| design/DESIGN_NOTES_PHASE2.md | Phase 2+ reference material: full Agent entity, long-term memory model, scaling analysis, DynamoDB design |
+| design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
+| design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
 
 ## Project Stages
 
@@ -43,8 +43,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ### Stage 2 — Technical Design [IN PROGRESS]
 - PHASE1_DURABLE_EXECUTION.md — Phase 1 architectural context, entity model, API contract, DB schema, sequence diagrams (done)
-- DESIGN_NOTES_PHASE2.md — Phase 2+ reference material extracted from former DESIGN.md (done)
-- PHASE2_MULTI_AGENT.md — Phase 2 scope placeholder (done)
+- PHASE2_MULTI_AGENT.md — consolidated Phase 2 design doc (done)
+- DESIGN_NOTES_PHASE3_PLUS.md — Phase 3+ reference material extracted from former Phase 2+ notes (done)
 - Review and refine Phase 1 design before implementation (not started)
 
 ### Stage 3 — Implementation Plan [NOT STARTED]
