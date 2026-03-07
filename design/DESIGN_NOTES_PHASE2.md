@@ -14,7 +14,7 @@ config:               JSON
   ├── system_prompt:  string ("you are a research assistant that...")
   ├── model:          string ("claude-sonnet-4-6")
   ├── temperature:    float (0.7)
-  └── allowed_tools:  []string (["web_search", "read_file"])
+  └── allowed_tools:  []string (["web_search", "read_url", "calculator"])
 memory_ref:           string (S3 prefix for long-term memory, e.g., s3://bucket/memory/agent123/)
 max_concurrent_tasks: int (default 5)
 task_ttl_seconds:     int (default 86400)
@@ -27,13 +27,22 @@ An agent is a database record that defines identity. It stores WHAT the agent is
 
 ---
 
-## 2. Worker Pools & Private Workers (BYOW)
+## 2. Custom Tool Runtime (BYOT — Bring Your Own Tools)
 
-Tasks specify a `worker_pool_id`. By default, tasks run on the "shared" pool (elastic Fargate containers with public internet access only). Customers can also deploy a Private Worker binary inside their own VPC, associated with a custom `worker_pool_id`. Because workers *pull* tasks from the queue, this allows agents to securely access customer internal databases or Model Context Protocol (MCP) servers without requiring the customer to open inbound firewall ports.
+Replaces the former "Private Workers (BYOW)" concept. The key insight: customers don't need to deploy a full Worker Service — they only need to provide their tool code.
 
-### VPC & MCP Security via Private Workers
+Tasks specify a `worker_pool_id` which doubles as a tool runtime routing key. By default, tasks use the `"shared"` pool with built-in tools served by the co-located MCP server. Customers can register custom MCP server containers via a tool registration API, and the platform runs them in isolated ECS tasks within the platform's VPC.
 
-Exposing Model Context Protocol (MCP) servers or internal APIs directly to the internet is a severe security risk. The runtime uses a "Bring Your Own Worker" (BYOW) model where the worker runs inside the customer's secure perimeter. The worker connects to local MCP servers via `stdio` or internal networking, and only makes outbound requests to the central runtime to poll for tasks and post results.
+### Security Model
+
+Exposing MCP servers to the public internet is a severe security risk — MCP has no built-in auth, encryption, or request signing. The Custom Tool Runtime avoids this entirely:
+
+- Customer MCP servers run as isolated containers **within the platform's VPC** — no public internet exposure
+- VPC security groups restrict traffic: only the Worker Service can reach customer MCP servers
+- Each customer's MCP server runs in its own container with resource limits and no access to the database or other customers' containers
+- The Worker Service (control plane) handles all durable execution concerns — the MCP server is purely a tool executor
+
+This is architecturally similar to how AWS Bedrock AgentCore Gateway runs customer-provided tools, but with the added benefit of durable execution guarantees (checkpointing around tool calls, crash recovery, non-idempotent tool guards) that AgentCore does not provide.
 
 ---
 

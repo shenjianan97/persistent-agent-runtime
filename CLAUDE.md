@@ -10,7 +10,10 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - **Task belongs to one agent** (immutable). Worker is the stateless process that executes tasks.
 - **Checkpoint-resume, not event-sourced replay.** LLM calls are non-deterministic — Temporal-style replay doesn't work.
 - **Database-as-queue (Phase 1).** PostgreSQL `FOR UPDATE SKIP LOCKED`. Eliminates dual-write problem.
-- **Strong consistency on the execution path.** Optimistic concurrency control via version field.
+- **Strong consistency on the execution path.** Lease ownership plus database locks protect execution; the task `version` field is for lifecycle transitions and auditing, not per-checkpoint optimistic concurrency.
+- **Phase 1 recovery model is conservative.** Previously checkpointed nodes are not re-executed, but an interrupted in-flight node may be re-executed in full after crash recovery. Phase 1 enforces idempotent-only tools at submission time (all pre-registered tools served via co-located MCP server are read-only); non-idempotent tool guards are deferred to Phase 2.
+- **Tools via MCP protocol.** Phase 1 uses a co-located MCP server for built-in tools. Phase 2 introduces the Custom Tool Runtime (BYOT): customers upload MCP server containers, the platform runs them in isolated compute within the same VPC. Replaces the former BYOW (Bring Your Own Worker) concept — customers provide tools, not workers.
+- **Phase 1 scope excludes subgraphs and budget enforcement.** Phase 1 uses a single top-level LangGraph only; budget enforcement is deferred to Phase 2.
 - **LLMs are stateless.** Memory is simulated by assembling prompts from stored data (agent config + long-term memory from S3 + step history from PostgreSQL).
 - **Two-level memory:** step checkpoints in PostgreSQL double as conversation history within a task. Long-term memory is distilled knowledge across tasks, stored as append-only entries in S3 with compaction.
 
@@ -29,7 +32,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 |------|---------|
 | PROJECT.md | High-level project overview: vision, user stories, phases, tradeoffs, tech stack |
 | design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
-| design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, memory compaction, private workers (placeholder) |
+| design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, memory compaction, Custom Tool Runtime / BYOT (placeholder) |
 | design/DESIGN_NOTES_PHASE2.md | Phase 2+ reference material: full Agent entity, long-term memory model, scaling analysis, DynamoDB design |
 
 ## Project Stages

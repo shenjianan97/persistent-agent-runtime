@@ -2,9 +2,9 @@
 
 **Goal:** Prove that tasks survive worker crashes and resume correctly from the last checkpoint.
 
-**Scope:** Task submission API, LangGraph-based execution engine with lease-based ownership, custom `PostgresDurableCheckpointer` for durable graph state, distributed reaper for expired leases, dead letter handling, per-node cost tracking via LangGraph event streaming, structured logging with task/worker correlation.
+**Scope:** Task submission API, LangGraph-based execution engine with lease-based ownership, custom `PostgresDurableCheckpointer` for durable graph state, distributed reaper for expired leases, dead letter handling, per-node cost tracking via LangGraph event streaming, structured logging with task/worker correlation. Phase 1 supports a single top-level graph only; subgraphs are explicitly out of scope.
 
-**Out of scope:** Agent as first-class entity (config is inline on Task), multi-agent scheduling, memory compaction, approval workflows, UI (except minimal demo dashboard), multi-tenancy, private workers (BYOW).
+**Out of scope:** Agent as first-class entity (config is inline on Task), multi-agent scheduling, memory compaction, approval workflows, UI (except minimal demo dashboard), multi-tenancy, Custom Tool Runtime (BYOT — customer-provided MCP servers).
 
 For Phase 2+ concepts (full Agent entity, long-term memory, scaling analysis, DynamoDB design), see [DESIGN_NOTES_PHASE2.md](./DESIGN_NOTES_PHASE2.md).
 
@@ -45,13 +45,13 @@ For Phase 2+ concepts (full Agent entity, long-term memory, scaling analysis, Dy
 
 | ID | Requirement |
 |----|-------------|
-| S1 | On crash recovery, LangGraph re-executes the entire interrupted node (which may contain multiple tool calls). All tools registered with the agent must either be idempotent or wrapped with idempotency keys. Tools that cannot be made safe for re-execution must be isolated in their own graph node and annotated `idempotent: false` in the tool registry; the runtime wraps these in a pre-check that dead-letters the task if the node is being re-executed after a crash. |
+| S1 | On crash recovery, Phase 1 assumes LangGraph may re-execute the entire interrupted node (which may contain multiple tool calls). All Phase 1 tools are pre-registered, idempotent, read-only operations (`web_search`, `read_url`, `calculator`) served via a co-located MCP server, and are safe for re-execution. The `allowed_tools` whitelist is enforced at task submission — only registered idempotent tools are accepted. Non-idempotent tool guards are deferred to Phase 2 when customer-provided mutable tools are introduced via the Custom Tool Runtime. |
 | S2 | Tool execution is restricted to the agent's `allowed_tools` list. |
 | S3 | Tool arguments are validated against a per-tool JSON schema before execution. |
 | S4 | API inputs are validated against size limits and allowed values. |
 | S5 | Secrets never appear in checkpoint payloads or logs. |
 | S6 | Tool outputs are treated as untrusted data and never injected into system prompts. |
-| S7 | All queries are scoped by `tenant_id` to support future auth without schema changes. |
+| S7 | All API-facing queries are scoped by `tenant_id` to support future auth without schema changes. Internal reaper queries scan across tenants for simplicity. |
 
 **Observability:**
 
@@ -86,17 +86,23 @@ tenant_id:              string (default "default", reserved for auth in Phase 2)
 agent_id:               string (logical identifier, not a FK in Phase 1)
 agent_config_snapshot:  JSON (copy of agent config at task creation time)
 status:                 enum (queued | running | completed | dead_letter)
+dead_letter_reason:     enum (nullable, cancelled_by_user | retries_exhausted | task_timeout | non_retryable_error | max_steps_exceeded)
 worker_pool_id:         string (default "shared", reserved for Phase 2 routing)
 version:                int (updated on every transition, used for auditing/ETags)
 input:                  text (the task's input prompt)
-output:                 text (final result, populated on completion)
+output:                 JSON (final result, populated on completion)
 lease_owner:            string (worker ID, null when unowned)
 lease_expiry:           timestamp (null when unowned)
 retry_count:            int (default 0)
 max_retries:            int (default 3)
 retry_after:            timestamp (null; set on retry to enforce backoff delay)
+retry_history:          JSON array (default [], append-only timestamps of each retry attempt)
 task_timeout_seconds:   int (default 3600)
 max_steps:              int (default 100, circuit breaker)
+last_error_code:        string (nullable, error classification code)
+last_error_message:     string (nullable, human-readable error detail)
+last_worker_id:         string (nullable, worker that last held the task before dead-lettering)
+dead_lettered_at:       timestamp (nullable, when the task entered dead_letter)
 created_at:             timestamp
 updated_at:             timestamp
 ```
@@ -104,15 +110,20 @@ updated_at:             timestamp
 **Phase 1 simplifications:**
 - No `waiting_for_approval` status (approval workflows are Phase 2+)
 - `agent_config_snapshot` carries everything the Worker Service needs — no Agent table lookup
-- `worker_pool_id` is always `"shared"` but stored for forward compatibility
+- `worker_pool_id` is always `"shared"` but stored for forward compatibility (Phase 2: used as tool runtime routing key for Custom Tool Runtime)
 - `tenant_id` is always `"default"` but stored for forward auth compatibility — all queries include `tenant_id` in WHERE clauses
 - No `retrying` status — tasks go directly from `running` to `queued` (with `retry_count` incremented and `retry_after` set)
 
 ### Checkpoint
+
+**Description:** Represents LangGraph's preserved execution state. At the end of every successful node execution (super-step), LangGraph serializes the agent's current memory, messages, and state variables into this table. It serves as the definitive snapshot from which a task resumes after a worker crash or retryable failure.
+
 ```
-checkpoint_id:          TEXT (PK, LangGraph checkpoint_id — UUID string)
-task_id:                UUID (FK -> tasks, maps to LangGraph thread_id)
-checkpoint_ns:          TEXT (default "", LangGraph namespace for subgraphs)
+task_id:                UUID (FK -> tasks, maps to LangGraph thread_id)  ─┐
+checkpoint_ns:          TEXT (default "", always root namespace in Phase 1) ├─ composite PK
+checkpoint_id:          TEXT (LangGraph checkpoint_id — UUID string)       ─┘
+worker_id:              TEXT (worker instance that wrote this checkpoint)
+parent_checkpoint_id:   TEXT (nullable, previous checkpoint_id in the chain)
 thread_ts:              TEXT (LangGraph version string, e.g. "2026-03-05T10:00:01.123456+00:00")
 parent_ts:              TEXT (previous checkpoint version, nullable)
 checkpoint_payload:     JSONB (serialized LangGraph Checkpoint: channel_values, channel_versions, versions_seen, pending_sends)
@@ -123,6 +134,9 @@ created_at:             timestamp
 ```
 
 ### Checkpoint Writes
+
+**Description:** Represents LangGraph's pending, intermediate state updates. During a node's execution, individual updates to specific state channels are recorded here before the final checkpoint is committed. LangGraph uses this table internally to track in-flight writes and resolve state correctly during crash recovery.
+
 ```
 task_id:                UUID (FK -> tasks, maps to LangGraph thread_id)
 checkpoint_ns:          TEXT (default "")
@@ -134,17 +148,18 @@ type:                   TEXT (write type)
 blob:                   BYTEA (serialized channel value)
 ```
 
-LangGraph's `BaseCheckpointSaver` requires both tables. The `checkpoints` table stores the full graph state after each super-step. The `checkpoint_writes` table stores pending writes — intermediate channel updates within a super-step. Without `checkpoint_writes`, LangGraph cannot correctly resume a node that was interrupted mid-execution (e.g., a `ToolNode` that completed 2 of 3 tool calls before a crash).
+LangGraph's `BaseCheckpointSaver` requires both tables. The `checkpoints` table stores the durable graph state after each completed super-step. The `checkpoint_writes` table stores pending writes used by LangGraph's checkpoint machinery during execution. In Phase 1, the runtime's safety model is conservative: if a worker crashes during a node, that node may be re-executed in full on recovery.
 
 The database acts as a custom LangGraph `PostgresDurableCheckpointer` implementing `BaseCheckpointSaver`.
-LangGraph's native checkpointer handles the sequencing (`thread_ts` and `parent_ts`) to ensure deterministic crash recovery. Instead of a custom idempotency key, LangGraph's checkpoint mechanism ensures nodes are not re-executed unless the graph crashed *during* the node execution.
+LangGraph's checkpoint metadata (`checkpoint_id`, `thread_ts`, `parent_ts`) is treated as an opaque library contract pinned to a tested version for Phase 1. Instead of a custom idempotency key, the runtime relies on the combination of durable checkpoints, lease ownership, and conservative whole-node re-execution after crash.
 
 ### Worker Service (running service — not persisted in DB)
 
 The Worker Service is a long-running Python process deployed on ECS Fargate. Each instance generates a unique `worker_id` (e.g., `worker-{hostname}-{pid}-{uuid}`) used for lease ownership. Multiple instances run concurrently for horizontal scaling. The service is built on `asyncio` to ensure network I/O (like long LLM calls) yields execution cleanly to background tasks.
 
 - **Task Poller:** Claims queued tasks from PostgreSQL via `FOR UPDATE SKIP LOCKED`. Uses PostgreSQL `LISTEN/NOTIFY` on the `new_task` channel to block efficiently until work is available, dropping idle DB load to near zero. Falls back to jittered polling if the connection drops.
-- **Graph Executor:** An asyncio task that loads the agent's LangGraph `StateGraph`, initializes the custom `PostgresDurableCheckpointer` (constructed with the current `worker_id` and `task_id` for lease-aware writes), and executes `graph.astream(input, config={"configurable": {"thread_id": task_id}, "recursion_limit": max_steps})`. Using `astream()` instead of `ainvoke()` gives the runtime control between super-steps — enabling mid-execution cancellation checks, cost accumulation, and circuit-breaker enforcement.
+- **Graph Executor:** An asyncio task that loads the agent's LangGraph `StateGraph`, initializes the custom `PostgresDurableCheckpointer` (constructed with the current `worker_id` and `task_id` for lease-aware writes), and executes `graph.astream(input, config={"configurable": {"thread_id": task_id}, "recursion_limit": max_steps})`. The execution is wrapped in an `asyncio.timeout(task_timeout_seconds)` block. Using `astream()` instead of `ainvoke()` gives the runtime control between super-steps — enabling mid-execution cancellation checks, cost accumulation, and circuit-breaker enforcement.
+- **Co-located MCP Server:** An in-process (or sidecar) MCP server that exposes pre-registered tools (`web_search`, `read_url`, `calculator`). LangGraph tool nodes call tools via the MCP protocol. No network exposure — communication is local. See Section 5.0.3 for details.
 - **Heartbeat Task:** An asyncio background task that extends the lease every 15s per active task. Running in the asyncio event loop ensures it won't be starved by long network calls in the graph executor.
 - **Distributed Reaper:** Scans for expired leases and timed-out tasks on a jittered interval (30s +/-10s). Not a singleton — every Worker Service instance runs reaper logic.
 - **Concurrency:** Bounded by `asyncio.Semaphore` (`MAX_CONCURRENT_TASKS`, default 10 per instance).
@@ -166,12 +181,13 @@ POST /v1/tasks
 **Request:**
 ```json
 {
+  "tenant_id": "default",
   "agent_id": "support_agent_v1",
   "agent_config": {
     "system_prompt": "You are a research assistant...",
     "model": "claude-sonnet-4-6",
     "temperature": 0.7,
-    "allowed_tools": ["web_search", "read_file"]
+    "allowed_tools": ["web_search", "read_url", "calculator"]
   },
   "input": "Refund user 123 for their last order",
   "max_retries": 3,
@@ -184,10 +200,12 @@ POST /v1/tasks
 
 | Field | Constraint |
 |-------|-----------|
+| `tenant_id` | Optional, string, max 64 characters (ignored/defaulted to `"default"` in Phase 1) |
+| `agent_id` | Required, string, max 64 characters |
 | `input` | Required, max 100KB |
 | `agent_config.system_prompt` | Required, max 50KB |
 | `agent_config.model` | Required, must be in supported models list |
-| `agent_config.allowed_tools` | Each tool must exist in the registered tool whitelist |
+| `agent_config.allowed_tools` | Each tool must exist in the co-located MCP server's `listTools` response |
 | `agent_config.temperature` | 0.0 - 2.0 |
 | `max_retries` | 0 - 10 (default 3) |
 | `max_steps` | 1 - 1000 (default 100) |
@@ -202,6 +220,8 @@ POST /v1/tasks
   "created_at": "2026-03-05T10:00:00Z"
 }
 ```
+
+*(Note: The API purposely avoids LangGraph-specific constructs like `thread_id` or `messages` in the payload. See **[5.0.2 LangGraph Translation Layer](#502-langgraph-translation-layer)** for exactly how the Worker Service maps this generic API input into LangGraph's internal graph definitions.)*
 
 ### Task Status
 
@@ -218,9 +238,15 @@ GET /v1/tasks/{task_id}
   "input": "Refund user 123 for their last order",
   "output": null,
   "retry_count": 0,
+  "retry_history": [],
   "checkpoint_count": 5,
   "total_cost_microdollars": 12500,
   "lease_owner": "worker-abc-123",
+  "last_error_code": null,
+  "last_error_message": null,
+  "last_worker_id": null,
+  "dead_letter_reason": null,
+  "dead_lettered_at": null,
   "created_at": "2026-03-05T10:00:00Z",
   "updated_at": "2026-03-05T10:00:15Z"
 }
@@ -237,11 +263,15 @@ POST /v1/tasks/{task_id}/cancel
 {
   "task_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "dead_letter",
-  "reason": "cancelled_by_user"
+  "dead_letter_reason": "cancelled_by_user"
 }
 ```
 
-Worker Service detects cancellation on the next heartbeat (lease_owner cleared or status changed). Because the runtime uses `graph.astream()`, the heartbeat coroutine sets a cancellation flag that the streaming loop checks between super-steps. If cancellation is detected between nodes, the loop exits cleanly after the last checkpoint — no partial state. If cancellation is detected *during* a node (e.g., mid-LLM-call), the heartbeat coroutine cancels the `astream()` asyncio task. The in-flight node's result is discarded (not checkpointed), and LangGraph will re-execute that node on redrive. This is safe because the last committed checkpoint is always consistent.
+Worker Service detects cancellation on the next heartbeat (lease_owner cleared or status changed). Because the runtime uses `graph.astream()`, the heartbeat coroutine sets a cancellation flag that the streaming loop checks between super-steps. If cancellation is detected between nodes, the loop exits cleanly after the last checkpoint — no partial state. 
+
+If a long-running node (e.g., an LLM call or a slow tool execution) is in-flight:
+1. Standard user cancellation takes effect after that node completes (typically < 120s for LLM calls). 
+2. If the node hangs indefinitely, it will eventually hit the `asyncio.timeout(task_timeout_seconds)` wrapper dynamically configured on the Graph Executor, which will forcefully terminate the execution and send the task to the dead letter queue.
 
 ### Step History (Checkpoints)
 
@@ -249,7 +279,7 @@ Worker Service detects cancellation on the next heartbeat (lease_owner cleared o
 GET /v1/tasks/{task_id}/checkpoints
 ```
 
-Returns the ordered list of LangGraph checkpoints for a task. Each checkpoint corresponds to a completed graph super-step (node execution). The `node_name` and `step_number` fields are derived from checkpoint metadata.
+Returns the ordered list of root-namespace LangGraph checkpoints for a task. Each checkpoint corresponds to a completed graph super-step (node execution). The `node_name` and `step_number` fields are derived from checkpoint metadata and insertion order.
 
 **Response: `200 OK`**
 ```json
@@ -259,6 +289,7 @@ Returns the ordered list of LangGraph checkpoints for a task. Each checkpoint co
       "checkpoint_id": "...",
       "step_number": 1,
       "node_name": "agent",
+      "worker_id": "worker-a-123",
       "cost_microdollars": 5200,
       "execution_metadata": {
         "latency_ms": 2340,
@@ -272,6 +303,7 @@ Returns the ordered list of LangGraph checkpoints for a task. Each checkpoint co
       "checkpoint_id": "...",
       "step_number": 2,
       "node_name": "tools",
+      "worker_id": "worker-a-123",
       "cost_microdollars": 0,
       "execution_metadata": {
         "latency_ms": 450,
@@ -283,7 +315,7 @@ Returns the ordered list of LangGraph checkpoints for a task. Each checkpoint co
 }
 ```
 
-`step_number` is derived from the checkpoint ordering (`thread_ts`), not stored as a column. `node_name` is extracted from `metadata_payload.source` (the LangGraph node that produced this checkpoint).
+`step_number` is derived from checkpoint insertion order in the root namespace (`checkpoint_ns = ''`), not stored as a column. `node_name` is extracted from `metadata_payload.source` (the LangGraph node that produced this checkpoint). `worker_id` comes from the checkpoint row and lets the API show the crash boundary directly.
 
 ### Dead Letter
 
@@ -294,7 +326,7 @@ GET /v1/tasks/dead-letter?agent_id=support_agent_v1&limit=50
 ```
 POST /v1/tasks/{task_id}/redrive
 ```
-Re-queues the task: resets `retry_count = 0`, sets `status = queued`. Accepts an optional request body `{"rollback_last_checkpoint": true}` to delete the last checkpoint and its associated writes, forcing LangGraph to resume from the previous checkpoint. This is useful when the last checkpoint captured a state that will deterministically fail on resume (e.g., a non-idempotent tool node that partially executed). The task resumes from the last checkpoint — completed super-steps are not re-executed.
+Re-queues the task: resets `retry_count = 0`, sets `status = queued`. The task resumes from the last checkpoint — completed super-steps are not re-executed. Checkpoint rollback (`rollback_last_checkpoint`) is deferred to Phase 2 when mutable tools may produce checkpoints that deterministically fail on resume; Phase 1's idempotent read-only tools make this scenario unlikely.
 
 ### Health Check
 
@@ -320,12 +352,18 @@ GET /v1/health
 
 ```
 queued ──────► running ──────► completed
-  ^              │
-  │              ├──────► queued (if retry_count < max_retries, with retry_after set)
-  │              │
-  │              └──────► dead_letter (non-retryable error OR retry_count >= max_retries)
+  ^  │           │
+  │  │           ├──────► queued (if retry_count < max_retries, with retry_after set)
+  │  │           │
+  │  │           ├──────► dead_letter (non-retryable error OR retry_count >= max_retries)
+  │  │           │
+  │  │           └──────► dead_letter (timeout OR cancelled_by_user)
+  │  │
+  │  └──────────────────► dead_letter (timeout OR cancelled_by_user while queued)
   │
-  └──── (lease expired, reclaimed by reaper)
+  ├──── (lease expired, reclaimed by reaper)
+  │
+  └──── (redriven from dead_letter via POST /redrive) ◄───── dead_letter
 ```
 
 Every state transition is a conditional write relying on lease ownership (`WHERE task_id = ? AND lease_owner = ?`) or row-level locks (`FOR UPDATE SKIP LOCKED`). If two workers race, exactly one succeeds.
@@ -337,13 +375,12 @@ Every state transition is a conditional write relying on lease ownership (`WHERE
 | queued | running | Worker Service claims task | `FOR UPDATE SKIP LOCKED`, `retry_after IS NULL OR retry_after < NOW()` |
 | running | completed | Graph execution completes | Worker Service sets final output |
 | running | queued | Node fails with retryable error | `retry_count < max_retries`; sets `retry_after` for backoff |
-| running | dead_letter | Node fails with non-retryable error | 4xx from LLM, invalid tool, budget exceeded |
+| running | dead_letter | Node fails with non-retryable error | 4xx from LLM, invalid tool, invalid tool args |
 | running | dead_letter | Retryable error but exhausted | `retry_count >= max_retries` |
-| running | queued | Lease expires | Reaper reclaims, increments retry_count, sets retry_after |
-| running/queued | dead_letter | Task timeout exceeded | Reaper detects `created_at + task_timeout_seconds < NOW()` |
-
-**Simplification vs original design:** The `retrying` and `failed` intermediate states have been removed. `retrying` added a state with no clear query benefit — the `retry_after` timestamp on `queued` tasks achieves the same backoff behavior. `failed` was always an automatic transition to `dead_letter`, making it a transient state that was never queryable.
-
+| `running` | `queued` | Lease expires | Reaper reclaims, increments retry_count, sets retry_after |
+| `running` / `queued` | `dead_letter` | Task timeout exceeded | Reaper detects `created_at + task_timeout_seconds < NOW()` |
+| `running` / `queued` | `dead_letter` | Task canceled by user | API receives `POST /cancel` |
+| `dead_letter` | `queued` | Task redrive | API receives `POST /redrive`; resets `retry_count` and `retry_after` |
 ### Sequence Diagrams
 
 #### Task Submission
@@ -359,37 +396,51 @@ Client                    API Service             PostgreSQL
   |<-- 201 {task_id} --------+                        |
 ```
 
+*(LISTEN/NOTIFY omitted for clarity — see Section 5.3)*
+
 #### Task Claim + Graph Execution (Happy Path)
 
 ```
-Worker Service                PostgreSQL              LLM API
-  |                              |                      |
-  +-- Poll: CTE claim query ---->|                      |
-  |  (FOR UPDATE SKIP LOCKED)    |                      |
-  |<-- task row (status=running) +                      |
-  |                              |                      |
-  |  [Start heartbeat asyncio task]                     |
-  |                              |                      |
-  +-- graph.astream(thread_id) --+
-  |  (LangGraph execution)       |                      |
-  |                              |                      |
-  |-- Node Execution ------------+                      |
-  |  (e.g., llm_call node)       |                      |
-  +-- LLM call ------------------------------------------->|
-  |<-- LLM response ----------------------------------------+
-  |                              |                      |
-  |-- Custom Checkpointer Saves -+                      |
-  +-- INSERT checkpoint -------->|                      |
-  |  + checkpoint_payload        |                      |
-  |                              |                      |
-  |  [LangGraph auto-loops to next node (tools)]        |
-  |                              |                      |
+Worker Service                PostgreSQL              LLM API       MCP Server
+  |                              |                      |                |
+  +-- Poll: CTE claim query ---->|                      |                |
+  |  (FOR UPDATE SKIP LOCKED)    |                      |                |
+  |<-- task row (status=running) +                      |                |
+  |                              |                      |                |
+  |  [Start heartbeat asyncio task]                     |                |
+  |                              |                      |                |
+  +-- graph.astream(thread_id) --+                      |                |
+  |  (LangGraph execution)       |                      |                |
+  |                              |                      |                |
+  |-- Node Execution ------------+                      |                |
+  |  (e.g., llm_call node)       |                      |                |
+  +-- LLM call ---------------------------------------->|                |
+  |<-- LLM response (tool_calls) -----------------------+                |
+  |                              |                      |                |
+  |-- Custom Checkpointer Saves -+                      |                |
+  +-- INSERT checkpoint -------->|                      |                |
+  |  + checkpoint_payload        |                      |                |
+  |                              |                      |                |
+  |  [LangGraph routes to tools] |                      |                |
+  |                              |                      |                |
+  |-- Node Execution ------------+                      |                |
+  |  (e.g., tool_execution node) |                      |                |
+  +-- MCP tool call (e.g. web_search) ----------------------------------->|
+  |<-- Tool result (via MCP protocol) -----------------------------------+
+  |                              |                      |                |
+  |-- Custom Checkpointer Saves -+                      |                |
+  +-- INSERT checkpoint -------->|                      |                |
+  |  + checkpoint_payload        |                      |                |
+  |                              |                      |                |
+  |  [LangGraph auto-loops to next node]                |                |
   |  ... repeat until done ...   |                      |
   |                              |                      |
   +-- graph.astream exhausted ---+                      |
   +-- UPDATE task (completed) -->|                      |
   |  [Stop heartbeat task]       |                      |
 ```
+
+*(LISTEN/NOTIFY omitted for clarity — see Section 5.3)*
 
 #### Heartbeat (runs concurrently with graph execution)
 
@@ -407,64 +458,149 @@ Worker Service                PostgreSQL
   |  -> Lease revoked, STOP      |
 ```
 
-#### Crash Recovery
+#### Failure Scenario 1: Worker Crash & Lease Expiry Recovery
+
+This diagram illustrates what happens when a worker claims a task, connects to the LLM, and then abruptly crashes before the checkpointer can save the state.
+
+This also illustrates an **"Idempotency Hit"**. The LLM performed work (and billed for tokens!) but the checkpoint was never saved. When the new worker resumes the graph, it must execute that exact same LLM API call again.
 
 ```
-Worker Service A  Reaper (any Worker     PostgreSQL          Worker Service B
-  |                Service instance)       |                   |
-  +-- Executing ----+----------------------+                   |
-  |                 |                      |                   |
-  X (crash)         |                      |                   |
-  |                 |                      |                   |
-  |           [Lease expires after 60s]    |                   |
-  |                 |                      |                   |
-  |                 +-- UPDATE tasks ------>|                   |
-  |                 |  SET status=queued    |                   |
-  |                 |  retry_count++        |                   |
-  |                 |  clear lease          |                   |
-  |                 |  RETURNING task_id    |                   |
-  |                 |                      |                   |
-  |                 |                      |<-- Poll -----------+
-  |                 |                      +-- task row ------->|
-  |                 |                      |                   |
-  |                 |                      |   [graph.astream  |
-  |                 |                      |    with thread_id] |
-  |                 |                      |                   |
-  |                 |                      |   [Checkpointer   |
-  |                 |                      |    loads last      |
-  |                 |                      |    checkpoint;     |
-  |                 |                      |    LangGraph       |
-  |                 |                      |    resumes from    |
-  |                 |                      |    saved state]    |
+Worker 1              LLM API       PostgreSQL              Worker 2 (Reaper)
+  |                      |              |                      |
+  +-- Claims Task ------>|              |                      |
+  |  (status=running)    |              |                      |
+  |                      |              |                      |
+  +-- LLM call --------->|              |                      |
+  |                      |              |                      |
+[CRASH]                  |              |                      |
+  x                      |              |                      |
+                         |              |                      |
+                       (Time passes, lease_expiry is explicitly missed)
+                         |              |                      |
+                         |              |<-- Reaper Poll ------+
+                         |              |    (Finds lease_expiry < NOW())
+                         |              |                      |
+                         |              |<-- UPDATE task ------+
+                         |              |  (status=queued,     |
+                         |              |   retry_count++,     |
+                         |              |   retry_after=NOW+X) |
 ```
 
-#### Idempotency Hit (Crash After LLM Response, Before Checkpoint)
+*Note: When a completely fresh worker eventually claims this queued task, LangGraph's `astream` will load the last successfully saved checkpoint from the DB and transparently repeat the LLM call that Worker 1 initiated before crashing.*
+
+#### Failure Scenario 2: Non-Retryable Node Error
+
+This diagram illustrates what happens when LangGraph attempts to execute a tool, but the tool execution throws a fatal error (e.g., the LLM hallucinated arguments that fail Pydantic validation) that should not be retried.
 
 ```
-Worker Service A            PostgreSQL              LLM API
-  |                            |                      |
-  |-- LangGraph executes node -+                      |
-  +-- LLM call ----------------------------------------->|
-  |<-- LLM response ----------------------------------------+
-  |                            |                      |
-  |  [Worker crashes HERE -- response received but NOT checkpointed]
-  X                            |                      |
-  
-  ... reaper reclaims, Worker Service B picks up ...
+Worker Service                MCP Server              PostgreSQL
+  |                                |                        |
+  +-- MCP tool call (calculator) ->|                        |
+  |                                |                        |
+  |<-- ValidationException --------+                        |
+  |  (e.g., division by zero)      |                        |
+  |                                |                        |
+  |  [Worker catches Exception]    |                        |
+  |  [Determines non-retryable]    |                        |
+  |                                |                        |
+  +-- UPDATE task ----------------------------------------->|
+  |  (status=dead_letter,                                   |
+  |   dead_letter_reason=non_retryable_error)               |
+  |                                |                        |
+  |  [Stop graph.astream]          |                        |
+  |  [Stop heartbeat]              |                        |
+```
 
-Worker Service B            PostgreSQL              LLM API
-  |                            |                      |
-  +-- graph.astream(thread_id) +                      |
-  +-- Checkpointer lists checkpoints ------------------->|
-  |<-- Last saved checkpoint --+                      |
-  |                            |                      |
-  |  [LangGraph sees last checkpoint was BEFORE the crash]
-  |  [LangGraph natively decides to re-execute the node]
-  |                            |                      |
-  +-- LLM call (re-execute) ---------------------------->|
-  |                            |                      |
-  +-- INSERT checkpoint -------->|                      |
-  |  [LOG: "Node re-executed. New output checkpointed."]
+#### Failure Scenario 3: Retryable Error with Backoff Requeue
+
+This diagram illustrates what happens when an LLM call returns a transient error (e.g., 5xx or 429 rate limit). The worker catches the error, classifies it as retryable, and requeues the task with an exponential backoff delay. The task remains invisible to workers until `retry_after` expires.
+
+```
+Worker Service                LLM API               PostgreSQL
+  |                              |                      |
+  +-- LLM call ----------------->|                      |
+  |                              |                      |
+  |<-- 503 Service Unavailable --+                      |
+  |                              |                      |
+  |  [Catches retryable error]   |                      |
+  |  [retry_count < max_retries] |                      |
+  |                              |                      |
+  +-- UPDATE task -------------------------------------->|
+  |  (status=queued,                                    |
+  |   retry_count++,                                    |
+  |   retry_after=NOW + 2^retry_count seconds,          |
+  |   lease_owner=NULL)                                 |
+  |                              |                      |
+  |  [Stop graph.astream]        |                      |
+  |  [Stop heartbeat]            |                      |
+  |                              |                      |
+  |                          (Time passes, retry_after expires)
+  |                              |                      |
+  |                              |      Another Worker  |
+  |                              |           |          |
+  |                              |           +-- Claim ->|
+  |                              |           |  (retry_after < NOW())
+  |                              |           |<- task ---+
+  |                              |           |          |
+  |                              |  [Resumes from last checkpoint]
+```
+
+#### Failure Scenario 4: Task Cancellation During Execution
+
+This diagram illustrates the between-node cancellation path. The API sets the task to `dead_letter` and clears the lease. The worker detects this on its next heartbeat and exits cleanly after the current node finishes. If a long-running node (e.g., an LLM call or slow tool execution) is in-flight, cancellation takes effect after that node completes. If the node hangs indefinitely, it will eventually be caught by the Graph Executor's hard `asyncio.timeout` wrapper. The checkpoint is always clean.
+
+```
+Client              API Service          PostgreSQL              Worker Service
+  |                    |                      |                      |
+  +-- POST /cancel --->|                      |                      |
+  |                    +-- UPDATE task ------->|                      |
+  |                    |  (status=dead_letter, |                      |
+  |                    |   lease_owner=NULL,   |                      |
+  |                    |   dead_letter_reason= |                      |
+  |                    |   cancelled_by_user)  |                      |
+  |<-- 200 OK ---------+                      |                      |
+  |                    |                      |                      |
+  |                    |                      |   [Node in-flight     |
+  |                    |                      |    e.g., LLM call]    |
+  |                    |                      |                      |
+  |                    |                      |   [Heartbeat fires]   |
+  |                    |                      |<-- UPDATE lease_expiry+
+  |                    |                      |    WHERE lease_owner=me
+  |                    |                      |    AND status='running'
+  |                    |                      +-- rows_affected=0 --->|
+  |                    |                      |                      |
+  |                    |                      |   [Lease revoked]     |
+  |                    |                      |   Sets cancellation   |
+  |                    |                      |   flag. Current node  |
+  |                    |                      |   finishes. Streaming |
+  |                    |                      |   loop checks flag,   |
+  |                    |                      |   exits cleanly.      |
+  |                    |                      |   [Stop heartbeat]    |
+```
+
+#### Failure Scenario 5: Redrive from Dead Letter
+
+This diagram illustrates redriving a dead-lettered task. The API resets the task to `queued` and clears dead-letter fields. The next worker that claims it resumes from the last checkpoint. Checkpoint rollback is deferred to Phase 2.
+
+```
+Client              API Service          PostgreSQL              Worker Service
+  |                    |                      |                      |
+  +-- POST /redrive -->|                      |                      |
+  |                    +-- UPDATE task ------->|                      |
+  |                    |  (status=queued,      |                      |
+  |                    |   retry_count=0,      |                      |
+  |                    |   clear dead_letter   |                      |
+  |                    |   fields)             |                      |
+  |<-- 200 OK ---------+                      |                      |
+  |                    |                      |                      |
+  |                    |                      |      [Worker claims]  |
+  |                    |                      |<-- FOR UPDATE --------+
+  |                    |                      |    SKIP LOCKED        |
+  |                    |                      +-- task row ---------->|
+  |                    |                      |                      |
+  |                    |                      |  [graph.astream loads |
+  |                    |                      |   last checkpoint,    |
+  |                    |                      |   resumes from there] |
 ```
 
 ---
@@ -480,7 +616,7 @@ Phase 1 has three deployable components. Understanding their boundaries is essen
 | Service | Runtime | Responsibility | Stateful? |
 |---------|---------|---------------|-----------|
 | **API Service** | Java (Spring Boot) on ECS Fargate | REST API — accepts task submissions, serves status/history queries, handles cancellation and redrive | No (all state in PostgreSQL) |
-| **Worker Service** | Python on ECS Fargate | Polls for queued tasks, executes LangGraph (LLM calls + tool calls), heartbeats, runs distributed reaper | No (all state in PostgreSQL) |
+| **Worker Service** | Python on ECS Fargate | Polls for queued tasks, executes LangGraph (LLM calls + tool calls via co-located MCP server), heartbeats, runs distributed reaper | No (all state in PostgreSQL) |
 | **PostgreSQL** | Aurora Serverless v2 | State store, task queue, LangGraph checkpoints, conversation history | Yes (source of truth) |
 
 The **API Service** and **Worker Service** are independent processes that share nothing except the database. Multiple instances of each can run concurrently. Neither holds in-memory state that would be lost on crash — all durable state lives in PostgreSQL.
@@ -491,6 +627,11 @@ A single **Worker Service** instance contains several concurrent subsystems:
 - **Graph Executor** — initializes the LangGraph agent, injects the `PostgresDurableCheckpointer`, and calls `astream()` with `recursion_limit`
 - **Heartbeat Task** — extends lease every 15s per active task (independent of graph execution)
 - **Distributed Reaper** — scans for expired leases and timed-out tasks on a jittered interval
+
+Phase 1 is validated against these pinned package versions:
+- `langgraph==1.0.5`
+- `langgraph-checkpoint==4.0.0`
+- `langgraph-checkpoint-postgres==3.0.4`
 
 #### 5.0.1 Architectural Decision: PostgreSQL vs SQS for Queueing
 
@@ -512,21 +653,21 @@ Shows the three services, external actors, and how they connect.
                          │           External Systems               │
                          │                                          │
                          │  ┌─────────────┐    ┌────────────────┐  │
-                         │  │  LLM APIs   │    │  Tool Backends  │  │
-                         │  │  (Bedrock,  │    │  (web search,   │  │
-                         │  │  Anthropic)  │    │   file ops)    │  │
+                         │  │  LLM APIs   │    │  External APIs  │  │
+                         │  │  (Bedrock,  │    │  (Tavily, etc.) │  │
+                         │  │  Anthropic)  │    │                │  │
                          │  └──────▲──────┘    └──────▲─────────┘  │
                          └─────────┼──────────────────┼────────────┘
                                    │                  │
-                                   │ HTTPS            │ HTTPS/gRPC
+                                   │ HTTPS            │ HTTPS
                                    │                  │
-┌──────────┐  REST    ┌───────────┴──────────────────┴───────────┐
-│          │  (HTTPS) │                                           │
-│  Client  │ ────────>│              API Service                  │
-│          │ <────────│         (Java / Spring Boot)              │
-│          │          │                                           │
+┌──────────┐  REST    ┌───────────┴──────────────────┼───────────┐
+│          │  (HTTPS) │                              │            │
+│  Client  │ ────────>│              API Service     │            │
+│          │ <────────│         (Java / Spring Boot) │            │
+│          │          │                              │            │
 └──────────┘          │  POST /v1/tasks      GET /v1/tasks/{id}  │
-                      │  POST /cancel        GET /steps           │
+                      │  POST /cancel        GET /checkpoints     │
                       │  POST /redrive       GET /dead-letter     │
                       └──────────────┬────────────────────────────┘
                                      │
@@ -558,10 +699,12 @@ Shows the three services, external actors, and how they connect.
 │  │  ┌────────────┐ │     │                      │                │
 │  │  │  LangGraph │ │─────┼── LLM API calls ──────────────────>  │
 │  │  │  astream() │ │     │                                       │
-│  │  │  (agent +  │ │─────┼── Tool backend calls ──────────────>  │
-│  │  │   tools)   │ │     │                                       │
-│  │  └────────────┘ │     │                                       │
-│  └─────────────────┘     │                                       │
+│  │  │  (agent +  │ │     │  ┌──────────────────────────────┐    │
+│  │  │   tools)   │ │─────┼─>│  Co-located MCP Server       │    │
+│  │  └────────────┘ │     │  │  (in-process / sidecar)      │    │
+│  └─────────────────┘     │  │  web_search, read_url,       │────┼── External API calls ──>
+│                          │  │  calculator                   │    │
+│                          │  └──────────────────────────────┘    │
 │                          │                                       │
 └──────────────────────────┴───────────────────────────────────────┘
 ```
@@ -589,17 +732,26 @@ A single Worker Service instance runs these subsystems concurrently. Each subsys
 │  │                                                           │    │
 │  │  1. Init Custom PostgresDurableCheckpointer               │    │
 │  │  2. Load LangGraph StateGraph (agent_config)              │    │
-│  │  3. Execute: graph.astream(.., thread_id=task_id)         │    │
+│  │  3. Wrap with asyncio.timeout(task_timeout_seconds)       │    │
+│  │  4. Execute: graph.astream(.., thread_id=task_id)         │    │
 │  │                                                           │    │
 │  │     ┌─────────────┐    ┌─────────────────┐                │    │
 │  │     │ LangGraph   │    │ Checkpointer    │                │    │
 │  │     │ Node        │    │                 │                │    │
 │  │     │ Execution   │    │ Saves state to  │                │    │
 │  │     │ (LLM/Tools) │────│ PostgreSQL      │                │    │
-│  │     │             │    │ after nodes     │                │    │
-│  │     └─────────────┘    └─────────────────┘                │    │
-│  │  4. Catch errors -> propagate to Dead Letter logic        │    │
-│  │  5. Return final output -> Complete task                  │    │
+│  │     │      │      │    │ after nodes     │                │    │
+│  │     └──────┼──────┘    └─────────────────┘                │    │
+│  │            │ MCP protocol (local)                         │    │
+│  │            ▼                                              │    │
+│  │     ┌─────────────────────┐                               │    │
+│  │     │ Co-located MCP      │── HTTPS ──> External APIs     │    │
+│  │     │ Server (in-process) │            (Tavily, etc.)     │    │
+│  │     │ web_search, read_url│                               │    │
+│  │     │ calculator          │                               │    │
+│  │     └─────────────────────┘                               │    │
+│  │  5. Catch errors/timeouts -> propagate to Dead Letter     │    │
+│  │  6. Return final output -> Complete task                  │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                   │
 │  ┌─────────────────────────┐  ┌──────────────────────────────┐   │
@@ -617,6 +769,31 @@ A single Worker Service instance runs these subsystems concurrently. Each subsys
 │  └─────────────────────────┘  └──────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
+
+#### 5.0.2 LangGraph Translation Layer
+
+The REST API request deliberately hides LangGraph-specific constructs (like `thread_id` or `messages`) to provide a clean, agnostic boundary for the client. When the Worker Service claims a task in the **Task Poller**, it passes the generic API payload to the **Graph Executor**, which translates it into the specific objects required by LangGraph before calling `astream()`:
+
+1. **`agent_config` $\rightarrow$ Graph Definition:** The worker uses the config to instantiate the graph components dynamically. It configures the LLM backend (e.g., `ChatAnthropic` with `model` and `temperature`), binds the `allowed_tools`, and defines the exact `SystemMessage` node based on the `system_prompt`.
+2. **`input` $\rightarrow$ Initial State:** The generic `input` text is converted into the strongly-typed starting state for the graph, typically wrapping it in a `HumanMessage` object and pushing it into the graph's `messages` channel.
+3. **`task_id` $\rightarrow$ `thread_id`:** The UUID generated by the API (`task_id`) is passed to LangGraph inside the `RunnableConfig` object as the `thread_id`. This is exactly how the `PostgresDurableCheckpointer` links the graph state back to the task record in the database.
+4. **`max_steps` $\rightarrow$ `recursion_limit`:** The API parameter `max_steps` overrides LangGraph's default `recursion_limit` to prevent infinite tool-calling loops.
+5. **Worker Config $\rightarrow$ Checkpoint Namespace:** While Phase 1 always uses the root namespace (`""`), the translation layer ensures the `PostgresDurableCheckpointer` is initialized with the current `worker_id` so that inserted checkpoints accurately record the crash boundary.
+
+#### 5.0.3 Pre-Registered Tools via Internal MCP Server (Phase 1)
+
+In Phase 1, the Custom Tool Runtime (BYOT) is not yet supported — customers cannot provide their own tools. The Worker Service ships with a **co-located MCP server** that exposes a standard library of pre-registered tools. The MCP server runs in-process (or as a sidecar) within the Worker Service container — no network exposure.
+
+Using MCP as the tool interface even in Phase 1 establishes the abstraction boundary early. In Phase 2, the same MCP protocol is used to call customer-provided MCP servers running in isolated containers within the platform's VPC — no Worker Service changes needed.
+
+When a task is submitted, the `allowed_tools` array in the `agent_config` is validated against the tools advertised by the internal MCP server's `listTools` response. If an unknown tool is requested, the task immediately fails validation.
+
+The initial MVP toolkit includes:
+1. **`web_search`:** Executes a search engine query (e.g., via Tavily or Serper API) and returns top results.
+2. **`read_url`:** Fetches the raw HTML of a given URL, strips markup, and returns clean markdown content.
+3. **`calculator`:** Evaluates safe mathematical expressions to prevent the LLM from hallucinating arithmetic.
+
+Because the runtime treats tool execution conservatively (re-executing the entire node on crash recovery, see Requirement **S1**), these built-in tools are designed strictly as **idempotent, read-only** operations. Tools with mutable side-effects (like writing to a database or sending an email) are deferred to Phase 2, where the Custom Tool Runtime runs customer-provided MCP servers in isolated compute and the control plane enforces non-idempotent tool guards (checkpoint-before-call, dead-letter on re-execution after crash).
 
 #### Deployment View
 
@@ -636,16 +813,23 @@ A single Worker Service instance runs these subsystems concurrently. Each subsys
 │  │  │ Worker Service (Fargate) │──┼────>│  (PostgreSQL) │    │
 │  │  │  x N tasks (scale on     │  │     │              │    │
 │  │  │   queue depth)           │  │     └──────────────┘    │
-│  │  └──────────┬───────────────┘  │                          │
-│  │             │                  │                          │
-│  └─────────────┼──────────────────┘                          │
-│                │                                             │
-│                │ HTTPS                                        │
-│                ▼                                             │
+│  │  │                          │  │                          │
+│  │  │  ┌────────────────────┐  │  │                          │
+│  │  │  │ Co-located MCP     │  │  │                          │
+│  │  │  │ Server (in-process)│  │  │                          │
+│  │  │  └──────────┬─────────┘  │  │                          │
+│  │  └─────────────┼────────────┘  │                          │
+│  │                │               │                          │
+│  └────────────────┼───────────────┘                          │
+│                   │ HTTPS                                    │
+│                   ▼                                          │
 │  ┌─────────────────────────┐  ┌──────────────────────────┐  │
 │  │  Bedrock (LLM calls)    │  │  CloudWatch (logs +      │  │
 │  │                          │  │  metrics via OTel)       │  │
-│  └─────────────────────────┘  └──────────────────────────┘  │
+│  ├─────────────────────────┤  └──────────────────────────┘  │
+│  │  External APIs (Tavily,  │                                │
+│  │  web search backends)    │                                │
+│  └─────────────────────────┘                                │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -764,7 +948,7 @@ One system, one write, no dual-write risk. PostgreSQL handles this pattern up to
 - If heartbeat update returns 0 rows, the lease was revoked — Worker Service stops execution immediately
 - LLM calls taking 5-120s: heartbeat task runs independently, keeps extending the lease
 
-**Important:** The heartbeat checks `lease_owner` and `status` only — **not** `version`. Checkpoint saves bump the task version, so checking version in heartbeats would cause false lease-revocation signals.
+**Important:** The heartbeat checks `lease_owner` and `status` only — **not** `version`. `tasks.version` changes on task lifecycle transitions, not checkpoint persistence, so heartbeats should not couple lease ownership to a version snapshot.
 
 **Worker Service Claiming (LISTEN/NOTIFY):** To avoid spin-polling and high CPU/DB load when the queue is empty, the system uses PostgreSQL's pub/sub capabilities:
 - **Queue-entry transitions:** Any transition that makes a task claimable (`status='queued'`) emits `NOTIFY new_task, '<pool_id>'` in the same transaction (`POST /tasks`, retry requeue, reaper reclaim, redrive).
@@ -832,7 +1016,7 @@ The following diagram illustrates how the Worker Service integrates LangGraph wi
  │ │   LLM Node (Agent)   │      │   Tool Node (Action) │            │
  │ │                      │      │                      │            │
  │ │  Graph State ────►   │      │  Tool Call ────────► │            │
- │ │  LLM API (Bedrock /  │      │  Python tool logic   │            │
+ │ │  LLM API (Bedrock /  │      │  MCP Server (local)  │            │
  │ │  Anthropic / OpenAI) │      │                      │            │
  │ │                      │      │  ◄── Tool Result     │            │
  │ │  ◄── Response        │      │                      │            │
@@ -856,6 +1040,7 @@ The following diagram illustrates how the Worker Service integrates LangGraph wi
  │                                                                   │
  │  checkpoints table (INSERT)         tasks table (UPDATE)          │
  │  ┌───────────────────────┐          ┌──────────────────────┐      │
+ │  │ worker_id             │          │ status transitions   │      │
  │  │ checkpoint_payload    │          │ version++            │      │
  │  │ metadata_payload      │          │ updated_at = NOW()   │      │
  │  │ cost_microdollars     │          │                      │      │
@@ -879,6 +1064,8 @@ Cost tracking and execution metadata are collected via **LangGraph callback hand
 1. A custom `CostTrackingCallback` is registered with the LangGraph invocation. It subscribes to `on_llm_end` events to capture token usage (`input_tokens`, `output_tokens`, `model`), calculates `cost_microdollars` from a static price-per-model config map, and records `latency_ms`.
 2. After each super-step completes (detected via the `astream()` loop), the Worker Service writes the accumulated cost and metadata to the checkpoint row for that super-step via a separate `UPDATE checkpoints SET cost_microdollars = ..., execution_metadata = ... WHERE checkpoint_id = ...` statement.
 3. The checkpointer's `put()` method itself only writes the LangGraph state — it does not handle cost or metadata. This keeps the checkpointer implementation clean and compatible with the `BaseCheckpointSaver` interface.
+
+This metadata write is intentionally decoupled from checkpoint persistence. Recovery correctness depends only on the checkpoint row itself; cost and execution metadata are observability fields. If a worker crashes after the checkpoint commit but before the metadata update, the task still resumes correctly, but the most recent completed step may show missing or undercounted cost in Phase 1.
 
 #### Zombie Worker Protection in the Checkpointer
 
@@ -913,7 +1100,6 @@ The Worker Service wraps `graph.astream()` in a try/except block. LangGraph surf
 | `GraphRecursionError` (max steps) | No | Dead letter |
 | Task timeout exceeded | No | Dead letter |
 | `LeaseRevokedException` | — | Worker stops; reaper handles re-queue or dead letter |
-| Non-idempotent node re-execution on recovery | No | Dead letter (pre-check detects crash recovery + `idempotent: false` annotation) |
 
 #### Timeout Hierarchy
 
@@ -940,11 +1126,10 @@ Max steps:     Circuit breaker for infinite node loops (LangGraph recursion_limi
 - `GraphRecursionError` — LangGraph hit `recursion_limit` (maps to `max_steps`)
 - Manual cancellation via `POST /v1/tasks/{task_id}/cancel`
 - Non-retryable error (4xx from LLM API, invalid tool definition)
-- Non-idempotent node re-execution detected on crash recovery
 
 **Dead letter record preserves:** Full checkpoint history (graph states and metadata), final error code/message, last worker ID, dead-letter reason/time, retry-attempt timestamps, agent config snapshot.
 
-**Redrive:** `POST /v1/tasks/{task_id}/redrive` resets `retry_count = 0` and sets `status = queued`. If `rollback_last_checkpoint=true`, the API deletes the latest checkpoint and its associated writes, forcing LangGraph to resume from the previous checkpoint on the next claim. This is useful for recovering from a stuck node (e.g., a non-idempotent tool that partially executed). The task resumes from the last checkpoint — completed super-steps are not re-executed.
+**Redrive:** `POST /v1/tasks/{task_id}/redrive` resets `retry_count = 0` and sets `status = queued`. The task resumes from the last checkpoint — completed super-steps are not re-executed. Checkpoint rollback is deferred to Phase 2 (see Section 3).
 
 ### 5.6 Security Overview
 
@@ -952,7 +1137,7 @@ Max steps:     Circuit breaker for infinite node loops (LangGraph recursion_limi
 
 Tool execution security is enforced at graph execution time, not just at submission:
 
-- **Secret isolation:** API keys for LLM providers and tool backends are loaded from environment variables or AWS Secrets Manager at execution time via a `SecretProvider` interface. Secrets never flow through checkpoint payloads, metadata, or logs. The `PostgresDurableCheckpointer` scrubs checkpoint payloads for known secret patterns (API key formats, Bearer tokens) before persistence as a defense-in-depth measure.
+- **Secret isolation:** API keys for LLM providers and tool backends are loaded from environment variables or AWS Secrets Manager at execution time via a `SecretProvider` interface. Secrets must never be inserted into LangGraph state, checkpoint payloads, metadata, or logs. The checkpointer does not mutate persisted state; log redaction happens in the logging layer, and code review/tests enforce that secrets never enter checkpointed state.
 - **Prompt injection mitigation:** Tool call outputs are treated as untrusted data. They are placed in clearly delineated content blocks in the prompt and are never injected into system prompts. This prevents a malicious tool response from hijacking the agent's instructions.
 
 See LLD §6.3 for enforcement details (allowed_tools checks, argument schema validation, tenant scoping).
@@ -989,7 +1174,7 @@ CREATE TABLE tasks (
     worker_pool_id      TEXT NOT NULL DEFAULT 'shared',
     version             INT NOT NULL DEFAULT 1,
     input               TEXT NOT NULL,
-    output              TEXT,
+    output              JSONB,
     lease_owner         TEXT,
     lease_expiry        TIMESTAMPTZ,
     retry_count         INT NOT NULL DEFAULT 0,
@@ -1023,11 +1208,13 @@ CREATE INDEX idx_tasks_timeout ON tasks (created_at)
 CREATE INDEX idx_tasks_tenant_agent ON tasks (tenant_id, agent_id, created_at);
 
 -- Checkpoints table (acts as LangGraph BaseCheckpointSaver)
--- Column types match LangGraph's checkpoint interface exactly (thread_ts is TEXT, not TIMESTAMPTZ).
+-- LangGraph metadata columns are stored as returned by the pinned library version
+-- (thread_ts is TEXT, not TIMESTAMPTZ). Phase 1 supports only the root namespace.
 CREATE TABLE checkpoints (
     task_id             UUID NOT NULL REFERENCES tasks(task_id),
     checkpoint_ns       TEXT NOT NULL DEFAULT '',
     checkpoint_id       TEXT NOT NULL,
+    worker_id           TEXT NOT NULL,
     parent_checkpoint_id TEXT,
     thread_ts           TEXT NOT NULL,  -- LangGraph version string, NOT a native timestamp
     parent_ts           TEXT,           -- Previous checkpoint version string
@@ -1041,9 +1228,11 @@ CREATE TABLE checkpoints (
 );
 
 CREATE INDEX idx_checkpoints_task_ts ON checkpoints(task_id, thread_ts);
+CREATE INDEX idx_checkpoints_task_created ON checkpoints(task_id, checkpoint_ns, created_at);
 
 -- Checkpoint writes table (stores pending writes within a super-step)
--- Required by LangGraph's BaseCheckpointSaver.put_writes() for correct mid-node crash recovery.
+-- Required by LangGraph's BaseCheckpointSaver.put_writes() contract and persisted
+-- alongside checkpoints for library-managed recovery behavior.
 CREATE TABLE checkpoint_writes (
     task_id             UUID NOT NULL REFERENCES tasks(task_id),
     checkpoint_ns       TEXT NOT NULL DEFAULT '',
@@ -1054,9 +1243,7 @@ CREATE TABLE checkpoint_writes (
     type                TEXT,
     blob                BYTEA NOT NULL,
 
-    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx),
-    FOREIGN KEY (task_id, checkpoint_ns, checkpoint_id)
-        REFERENCES checkpoints(task_id, checkpoint_ns, checkpoint_id) ON DELETE CASCADE
+    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
 );
 ```
 
@@ -1099,16 +1286,18 @@ WHERE task_id = :task_id
   AND status = 'running';
 ```
 
-Note: The heartbeat checks `lease_owner` and `status` only — **not** `version`. Checkpoint saves bump the task version, so checking version here would cause false lease-revocation signals.
+Note: The heartbeat checks `lease_owner` and `status` only — **not** `version`. `tasks.version` changes on task lifecycle transitions, so checking version here would cause false lease-revocation signals after claim/retry/cancel/reaper transitions while adding no extra safety over lease ownership.
 
 **Checkpointer `put()` — lease-aware checkpoint write:**
 ```sql
 -- The PostgresDurableCheckpointer.put() implementation.
 -- Joins against tasks to prevent a zombie worker from writing after lease revocation.
+-- Checkpoint writes do not mutate the task row; `tasks.version` changes only on task
+-- lifecycle transitions (claim, retry, completion, dead-letter, cancel, redrive).
 -- If 0 rows are inserted, the checkpointer raises LeaseRevokedException.
-INSERT INTO checkpoints (task_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id,
+INSERT INTO checkpoints (task_id, checkpoint_ns, checkpoint_id, worker_id, parent_checkpoint_id,
                          thread_ts, parent_ts, checkpoint_payload, metadata_payload)
-SELECT :task_id, :checkpoint_ns, :checkpoint_id, :parent_checkpoint_id,
+SELECT :task_id, :checkpoint_ns, :checkpoint_id, :worker_id, :parent_checkpoint_id,
        :thread_ts, :parent_ts, :checkpoint_payload, :metadata_payload
 FROM tasks t
 WHERE t.task_id = :task_id
@@ -1118,6 +1307,7 @@ WHERE t.task_id = :task_id
 ON CONFLICT (task_id, checkpoint_ns, checkpoint_id) DO UPDATE
 SET checkpoint_payload = EXCLUDED.checkpoint_payload,
     metadata_payload = EXCLUDED.metadata_payload,
+    worker_id = EXCLUDED.worker_id,
     parent_checkpoint_id = EXCLUDED.parent_checkpoint_id,
     thread_ts = EXCLUDED.thread_ts,
     parent_ts = EXCLUDED.parent_ts;
@@ -1168,8 +1358,7 @@ WITH requeued AS (
         retry_history = retry_history || jsonb_build_array(NOW()),
         version = version + 1,
         updated_at = NOW()
-    WHERE tenant_id = :tenant_id
-      AND status = 'running'
+    WHERE status = 'running'
       AND lease_expiry < NOW()
       AND retry_count < max_retries
     RETURNING task_id, worker_pool_id
@@ -1194,8 +1383,7 @@ SET status = 'dead_letter',
     dead_lettered_at = NOW(),
     version = version + 1,
     updated_at = NOW()
-WHERE tenant_id = :tenant_id
-  AND status = 'running'
+WHERE status = 'running'
   AND lease_expiry < NOW()
   AND retry_count >= max_retries
 RETURNING task_id;
@@ -1214,8 +1402,7 @@ SET status = 'dead_letter',
     dead_lettered_at = NOW(),
     version = version + 1,
     updated_at = NOW()
-WHERE tenant_id = :tenant_id
-  AND status IN ('running', 'queued')
+WHERE status IN ('running', 'queued')
   AND created_at + (task_timeout_seconds * INTERVAL '1 second') < NOW()
 RETURNING task_id;
 ```
@@ -1243,39 +1430,7 @@ The worker detects cancellation on the next heartbeat (lease_owner cleared) and 
 
 **Redrive a dead-lettered task:**
 ```sql
-BEGIN;
-
--- If rollback_last_checkpoint is requested, delete the latest checkpoint and its writes.
--- This forces LangGraph to resume from the previous checkpoint, skipping the stuck node.
-DELETE FROM checkpoint_writes cw
-USING checkpoints c, tasks t
-WHERE :rollback_last_checkpoint = TRUE
-  AND cw.task_id = c.task_id
-  AND cw.checkpoint_ns = c.checkpoint_ns
-  AND cw.checkpoint_id = c.checkpoint_id
-  AND c.task_id = t.task_id
-  AND t.task_id = :task_id
-  AND t.tenant_id = :tenant_id
-  AND t.status = 'dead_letter'
-  AND c.checkpoint_id = (
-      SELECT checkpoint_id FROM checkpoints
-      WHERE task_id = :task_id
-      ORDER BY thread_ts DESC LIMIT 1
-  );
-
-DELETE FROM checkpoints c
-USING tasks t
-WHERE :rollback_last_checkpoint = TRUE
-  AND c.task_id = t.task_id
-  AND t.task_id = :task_id
-  AND t.tenant_id = :tenant_id
-  AND t.status = 'dead_letter'
-  AND c.checkpoint_id = (
-      SELECT checkpoint_id FROM checkpoints
-      WHERE task_id = :task_id
-      ORDER BY thread_ts DESC LIMIT 1
-  );
-
+-- Checkpoint rollback (DELETE latest checkpoint + writes) deferred to Phase 2.
 WITH redriven AS (
     UPDATE tasks
     SET status = 'queued',
@@ -1300,8 +1455,6 @@ WITH redriven AS (
 )
 SELECT task_id
 FROM redriven;
-
-COMMIT;
 ```
 
 The redriven task resumes from the last checkpoint — LangGraph loads the saved state and continues from there.
@@ -1330,17 +1483,17 @@ To guarantee correct crash recovery and minimize duplicate side-effects, the sys
 **The Checkpointer Contract:**
 1. After each super-step (node execution), LangGraph calls `checkpointer.put()` with the new graph state.
 2. The `PostgresDurableCheckpointer` writes the checkpoint to the `checkpoints` table.
-3. During node execution, LangGraph calls `checkpointer.put_writes()` to record intermediate channel writes to the `checkpoint_writes` table.
-4. If the worker crashes mid-node, the `checkpoint_writes` table records which channels were already written, enabling LangGraph to skip completed writes on resume.
+3. During node execution, LangGraph calls `checkpointer.put_writes()` to record pending writes required by the checkpoint saver contract.
+4. In Phase 1, these writes are treated as library-internal recovery data. Application-level safety still assumes that an interrupted node may be re-executed in full after crash.
 
 **Crash Recovery:**
 1. A new Worker Service instance reclaims the task and calls `graph.astream(thread_id=task_id)`.
 2. The `PostgresDurableCheckpointer.get_tuple()` loads the latest checkpoint.
-3. LangGraph evaluates the checkpoint state, checks `checkpoint_writes` for any pending writes from an interrupted node, and resumes from the correct position.
+3. LangGraph evaluates the checkpoint state and uses the persisted checkpoint data required by the pinned saver implementation to resume from the correct position.
 
 **Split-brain protection:** The `PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id)` constraint on the checkpoints table, combined with the lease-owner check in `put()`, ensures that if two Worker Services somehow both attempt to write (e.g., a split-brain scenario), only the lease holder succeeds. The other's `INSERT ... SELECT FROM tasks WHERE lease_owner = :worker_id` returns 0 rows, triggering `LeaseRevokedException`.
 
-**Tool idempotency:** Tools registered in the tool registry declare `idempotent: true|false`. For `idempotent: false` tools, the runtime wraps them in a guard that checks (via checkpoint metadata) whether the current node is being re-executed after a crash. If so, the guard raises a non-retryable error, dead-lettering the task for manual review rather than risking duplicate side-effects. Idempotent tools (or tools with their own idempotency keys) are safe to re-execute.
+**Tool idempotency:** In Phase 1, all pre-registered tools (`web_search`, `read_url`, `calculator`) are idempotent, read-only operations served via the co-located MCP server and are safe to re-execute after a crash. The `allowed_tools` whitelist is enforced at task submission — only registered tools are accepted, eliminating the possibility of non-idempotent tool execution. Non-idempotent tool guards (checkpoint-before-call, dead-letter on re-execution) are deferred to Phase 2 when customer-provided mutable tools are introduced via the Custom Tool Runtime.
 
 ### 6.3 Security
 
@@ -1351,18 +1504,18 @@ To guarantee correct crash recovery and minimize duplicate side-effects, the sys
 - **Agent-level data isolation:** API endpoints filter by `agent_id` within tenant. No cross-agent data access.
 
 #### Tool Execution Security
-- **Scoped tool permissions:** `agent_config_snapshot.allowed_tools` is enforced by a custom `ToolNode` wrapper that checks the allow list before dispatching any tool call. Tools not in the list raise a non-retryable error.
-- **Argument validation:** Tool call arguments are validated against a per-tool JSON schema by the `ToolNode` wrapper before execution. Unknown or malformed arguments are rejected. This prevents a malicious/confused LLM response from passing dangerous arguments to tools.
-- **Tool idempotency annotation:** Each tool in the registry declares `idempotent: true|false`. This annotation controls crash-recovery behavior — non-idempotent tools trigger a dead-letter guard on re-execution (see Section 6.2).
+- **Scoped tool permissions:** `agent_config_snapshot.allowed_tools` is enforced by a custom `ToolNode` wrapper that checks the allow list before dispatching any tool call to the co-located MCP server. Tools not in the list raise a non-retryable error.
+- **Argument validation:** Tool call arguments are validated against the per-tool JSON schema (sourced from the MCP server's tool definitions) by the `ToolNode` wrapper before execution. Unknown or malformed arguments are rejected. This prevents a malicious/confused LLM response from passing dangerous arguments to tools.
+- **Tool idempotency (Phase 1 simplification):** All Phase 1 tools are idempotent and read-only by design. The `allowed_tools` list is validated against the co-located MCP server's `listTools` at submission time, so non-idempotent tools cannot enter the system. Non-idempotent tool guards are deferred to Phase 2 (see Section 6.2).
 
 #### Secret Handling
 - API keys for LLM providers stored in environment variables or AWS Secrets Manager. Never in checkpoint payloads or agent config.
 - Tool handlers receive secrets via a `SecretProvider` interface that loads from Secrets Manager at execution time. Secrets are never stored in LangGraph state or checkpoint data.
-- The `PostgresDurableCheckpointer` scrubs checkpoint payloads for known secret patterns (API key formats, Bearer tokens) before persistence as a defense-in-depth measure.
+- The `PostgresDurableCheckpointer` must preserve exact state fidelity; it does not scrub or rewrite payloads before persistence.
 
 #### Input Validation
 - All API inputs are validated against constraints (see Section 3). Reject requests that exceed size limits or contain invalid values.
-- `agent_config.allowed_tools` is validated against the registered tool whitelist — arbitrary tool names are rejected.
+- `agent_config.allowed_tools` is validated against the co-located MCP server's `listTools` response — arbitrary tool names are rejected.
 - `agent_config.model` is validated against supported models — arbitrary model strings are rejected.
 
 #### Prompt Injection Mitigation
@@ -1406,6 +1559,8 @@ Structured logs with `task_id`, `worker_id`, and `node_name` correlation on ever
 - `TASK_COMPLETED`: task finished, includes total checkpoints and total cost
 - `TASK_DEAD_LETTERED`: task moved to dead letter, includes reason
 
+Checkpoint provenance is also queryable directly because each checkpoint row stores `worker_id`.
+
 #### Alerts
 
 | Alert | Condition | Severity |
@@ -1429,7 +1584,7 @@ Structured logs with `task_id`, `worker_id`, and `node_name` correlation on ever
 6. Instance B initializes LangGraph with the same `thread_id` — the `PostgresDurableCheckpointer` loads the last checkpoint, and LangGraph resumes from exactly where it left off
 7. Logs: `GRAPH_RESUMED: Loaded checkpoint cp-abc at super-step 5. Skipping 5 completed nodes.`
 8. Task completes successfully
-9. Query `GET /v1/tasks/{task_id}/checkpoints` (via API Service) — full checkpoint history with timing and cost breakdown; checkpoint metadata shows which Worker Service instance produced each checkpoint
+9. Query `GET /v1/tasks/{task_id}/checkpoints` (via API Service) — full checkpoint history with timing and cost breakdown; each checkpoint row shows which Worker Service instance produced it via `worker_id`
 10. Display cost comparison: "Cost without checkpointing: $0.045 (10 LLM calls). Cost with checkpointing: $0.023 (5 re-used after crash). Savings: 49%."
 
 ### Demo Dashboard (stretch goal)

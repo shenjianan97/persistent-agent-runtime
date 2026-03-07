@@ -18,7 +18,7 @@ This project delivers a **cloud-native, serverless durable execution runtime des
 |---------|----------|--------------------|---------|-------------------------|--------------|
 | Execution model | Event-sourced deterministic replay | Graph execution with checkpointing | Journal-based replay | Checkpoint-resume with orchestrator constraints | **LangGraph graphs + durable lease-based execution (database-as-queue, distributed reaper, crash recovery)** |
 | Memory model | Bounded workflow state | Conversation history | Key-value per virtual object | Orchestrator state (serializable) | **LangGraph state checkpoints (per-task) + append-only long-term memory with compaction (Phase 2)** |
-| Cost awareness | None | None | None | Consumption-based billing (infra only) | **Per-node cost tracking with budget enforcement** |
+| Cost awareness | None | None | None | Consumption-based billing (infra only) | **Per-node cost tracking (Phase 1) + budget enforcement (Phase 2)** |
 | Infrastructure model | Self-hosted or Cloud | Managed platform (opinionated) | Self-hosted or Cloud | Azure-only managed | **Self-hosted, cloud-agnostic runtime you own — uses LangGraph for agent logic, owns the infra layer (queuing, leases, retries, dead letter, cost tracking)** |
 
 **Why not just use Temporal?** 
@@ -61,37 +61,41 @@ Temporal requires deterministic orchestration logic. AI agents violate this beca
 
 - **Agent:** Identity and configuration stored in the database. An agent is data, not a process—it never "goes down." It defines persona, models, tools, memory, and budgets.
 - **Task:** A unit of work belonging to one specific agent. The agent's config dictates how the task is executed.
-- **Step:** A checkpoint within a task (e.g., `llm_call`, `tool_call`). Steps enable resume-from-checkpoint after crashes.
+- **Step:** A logical pausing point within a task (e.g., waiting for an LLM response or external tool execution). The runtime saves the state after every step, enabling resume-from-checkpoint after crashes.
 - **Worker:** A stateless process that claims tasks and executes steps. It loads the agent's config to "become" that agent. If a worker crashes, another loading the same config continues seamlessly.
 
-In Phase 1, `agent_id` is a string field on Task with agent config stored inline. In Phase 2, Agent becomes a first-class entity in the database.
+In Phase 1, `agent_id` is a string field on Task with agent config stored inline. Phase 1 supports a single top-level graph only; subgraphs are out of scope. In Phase 2, Agent becomes a first-class entity in the database.
 
 ### Key Mechanisms
 
 - **Lease-based ownership** — Workers hold time-bounded leases on tasks. Heartbeats extend leases. Expired leases are reclaimed by a reaper. Prevents both orphaned tasks and dual execution.
 - **Checkpoint-resume** (not event-sourced replay) — On crash recovery, find the last completed step and continue from there. No determinism constraints. Chosen because LLM non-determinism makes Temporal-style replay unsuitable.
-- **Idempotency via LangGraph checkpointing** — In Phase 1, LangGraph's `BaseCheckpointSaver` backed by PostgreSQL ensures each super-step is checkpointed before the next begins. On crash recovery, LangGraph resumes from the last checkpoint — no duplicate node execution. Transactional outbox is reserved for queue migration in Phase 2 (PostgreSQL -> SQS FIFO).
+- **Idempotency via LangGraph checkpointing** — In Phase 1, LangGraph's `BaseCheckpointSaver` backed by PostgreSQL ensures each super-step is checkpointed before the next begins. On crash recovery, previously checkpointed nodes are not re-executed, but an interrupted node may be re-executed in full, so side-effecting tools must be idempotent or explicitly guarded. Transactional outbox is reserved for queue migration in Phase 2 (PostgreSQL -> SQS FIFO).
 - **Database-as-queue** (Phase 1) — Tasks are stored and claimed from the same database atomically, eliminating the dual-write problem between a separate queue and state store.
 - **Two-level memory** — LangGraph graph-state checkpoints in PostgreSQL natively include conversation history within a task. Long-term memory is distilled knowledge across tasks, stored as append-only entries in S3 with periodic compaction.
-- **Error and retry model** — Steps that fail are retried with exponential backoff (1s, 2s, 4s). Non-retryable errors (4xx from LLM API, invalid tool definition) skip retries and fail immediately. Retry is per-task (default max 3 retries), resuming from the last completed step. Tasks exceeding max retries are moved to dead letter. Budget exceeded → task pauses (not fails), allowing manual intervention or budget increase.
+- **Error and retry model** — Steps that fail are retried with exponential backoff (1s, 2s, 4s). Non-retryable errors (4xx from LLM API, invalid tool definition) skip retries and fail immediately. Retry is per-task (default max 3 retries), resuming from the last completed checkpoint. Tasks exceeding max retries are moved to dead letter. Budget enforcement is deferred to Phase 2, where budget-exceeded tasks pause rather than fail.
 
 ---
 
 ## 5. Developer Experience & Integration
 
-**The Integration Story:** This project leverages **LangGraph** as the underlying execution framework but replaces the infrastructure deployment burden. You don't write custom `while` loops or manual checkpointing logic; developers write standard LangGraph `StateGraph` definitions (nodes and edges). The Worker Service loads your graph and calls `graph.astream()`, while a custom `PostgresDurableCheckpointer` durably syncs the state to your database. The runtime owns the durable execution loop (queuing, leases, retries, budgeting) securely wrapping the LangGraph execution.
+**The Integration Story:** This project leverages **LangGraph** as the underlying execution framework but replaces the infrastructure deployment burden. You don't write custom `while` loops or manual checkpointing logic; developers write standard LangGraph `StateGraph` definitions (nodes and edges). The Worker Service loads your graph and calls `graph.astream()`, while a custom `PostgresDurableCheckpointer` durably syncs the state to your database. The runtime owns the durable execution loop (queuing, leases, retries, and later budgeting) securely wrapping the LangGraph execution.
 
 **Submitting a Task:**
 ```json
 // POST /v1/tasks
 {
   "agent_id": "support_agent_v1",
-  "worker_pool_id": "cust_vpc_pool_99", // Routes to customer's private worker
+  "agent_config": {
+    "system_prompt": "You are a research assistant...",
+    "model": "claude-sonnet-4-6",
+    "temperature": 0.7,
+    "allowed_tools": ["web_search", "read_url", "calculator"]
+  },
   "input": "Refund user 123 for their last order",
-  "budget": { 
-    "max_usd": 0.50,
-    "max_steps": 15
-  }
+  "max_retries": 3,
+  "max_steps": 15,
+  "task_timeout_seconds": 3600
 }
 ```
 
@@ -105,7 +109,7 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 | Strong vs eventual consistency | **Strong consistency on the execution path** | Prevents dual execution after worker crashes. Eventual consistency only for observability reads. |
 | Database-as-queue vs separate queue | **Database-as-queue for Phase 1** | Eliminates dual-write problem. PostgreSQL handles 5K-10K claims/sec. |
 | Standalone runtime vs Temporal application | **Standalone runtime** | AI-specific problems need control over the execution loop. Better portfolio signal. |
-| Tool side-effect containment vs flexibility | **Step-level idempotency + downstream idempotency keys** | Full sandboxing too restrictive for MVP. Idempotent tools can retry safely; non-idempotent recovery routes to dead letter for manual review. |
+| Tool side-effect containment vs flexibility | **Phase 1: idempotent-only built-in tools via internal MCP. Phase 2: customer-provided tools via Custom Tool Runtime (managed MCP servers).** | Phase 1 pre-registers only read-only idempotent tools (`web_search`, `read_url`, `calculator`) served via a co-located MCP server, enforced at submission via `allowed_tools` whitelist. Phase 2 lets customers upload custom MCP server containers (including mutable tools) that run in isolated compute within the platform's VPC. Non-idempotent tool guards enforced by the control plane. |
 
 ---
 
@@ -117,7 +121,7 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 | State store (Phase 1) | **PostgreSQL (Aurora Serverless v2)** | `FOR UPDATE SKIP LOCKED` eliminates need for separate queue. |
 | Queue (Phase 2) | **SQS FIFO** | Per-agent ordering via message group ID. Transactional outbox from PostgreSQL. |
 | Compute | **ECS Fargate** | Horizontally scalable, no cluster management. |
-| LLM integration | **Bedrock + OpenAI/Anthropic APIs** | Bedrock for AWS-native signal; direct APIs for practical coverage. |
+| Agent Execution | **LangGraph + Bedrock/Anthropic/OpenAI** | LangGraph provides the orchestration primitives; native APIs handle generation. |
 | Observability | **OpenTelemetry → CloudWatch** | Vendor-neutral instrumentation, low-ops backend. |
 | IaC | **CDK (TypeScript)** | Entire stack defined in one repo. |
 
@@ -136,6 +140,7 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 - Reaper for expired leases and dead letter handling
 - Per-node cost tracking via LangGraph event streaming
 - OpenTelemetry traces and key metrics
+- Single top-level graph only (no subgraphs in Phase 1)
 
 **Demo scenario:**
 1. Submit a multi-step research task
@@ -143,10 +148,10 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 3. Kill the worker mid-execution
 4. Lease expires, reaper reclaims the task
 5. New worker picks up the task; LangGraph resumes from last checkpoint
-6. Task completes successfully — previously checkpointed nodes are not re-executed
-7. Query full checkpoint history with timing and cost breakdown
+6. Task completes successfully — previously checkpointed nodes are not re-executed; only the interrupted in-flight node may be re-executed on recovery
+7. Query full checkpoint history with timing, cost breakdown, and worker provenance
 
-**Out of scope:** Multi-agent scheduling, memory compaction, approval workflows, UI, multi-tenancy.
+**Out of scope:** Multi-agent scheduling, memory compaction, approval workflows, UI, multi-tenancy, subgraphs, budget enforcement.
 
 ### Phase 2 — Multi-Agent & Cost-Aware Scheduling (4-6 weeks)
 
@@ -158,7 +163,7 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 - Fair scheduling: weighted fair queuing to prevent agent monopolization
 - Worker backpressure: pull-based concurrency semaphore
 - Memory compaction: LLM-based summarization of long-term agent memory
-- Private Workers (BYOW - Bring Your Own Worker): Bridging the gap between a fully hosted SaaS and enterprise security. Tasks route to customer-deployed workers in their VPC for secure access to internal APIs and MCP servers, while the runtime still manages orchestration and billing.
+- Custom Tool Runtime (BYOT - Bring Your Own Tools): Customers upload custom MCP server containers with their own tools (including mutable tools like `db_query`, `send_email`). The platform runs these in isolated ECS tasks within the same VPC as the Worker Service — no public internet exposure. The Worker Service calls customer MCP servers over private networking. The control plane handles checkpointing, crash recovery, and non-idempotent tool guards.
 - SQS FIFO migration via transactional outbox (if needed)
 
 ### Future Directions (Post Phase 2)
@@ -198,7 +203,7 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 ## 11. Related Documents
 
 - [design/PHASE1_DURABLE_EXECUTION.md](./design/PHASE1_DURABLE_EXECUTION.md) — Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency
-- [design/PHASE2_MULTI_AGENT.md](./design/PHASE2_MULTI_AGENT.md) — Phase 2 design: Agent entity, cost-aware scheduling, memory compaction, private workers
+- [design/PHASE2_MULTI_AGENT.md](./design/PHASE2_MULTI_AGENT.md) — Phase 2 design: Agent entity, cost-aware scheduling, memory compaction, Custom Tool Runtime (BYOT)
 - [design/DESIGN_NOTES_PHASE2.md](./design/DESIGN_NOTES_PHASE2.md) — Phase 2+ reference material: full Agent entity, long-term memory model, scaling analysis, DynamoDB design
 
 ---
