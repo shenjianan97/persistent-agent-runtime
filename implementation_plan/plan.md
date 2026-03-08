@@ -49,8 +49,8 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
 
   Component: AWS Cloud Infrastructure
   Change type: new code
-  Path: `infrastructure/cdk/`
-  Description: Provision foundational AWS resources using AWS CDK in TypeScript. This includes a VPC, Aurora Serverless v2 PostgreSQL cluster, ECS Fargate services for API and Worker services, IAM execution/task roles, and OpenTelemetry/CloudWatch integration.
+  Path: `infrastructure/cdk/`, `src/api-service/`, and `src/worker-service/`
+  Description: Provision foundational AWS resources using AWS CDK in TypeScript and implement application containerization assets required for deployment. This includes Docker build contexts for the API and Worker services, image packaging/publication strategy, a VPC, Aurora Serverless v2 PostgreSQL cluster, ECS Fargate services, IAM execution/task roles, and OpenTelemetry/CloudWatch integration.
 
 #### A3. Dependency Graph
 All tasks are mostly independent except where schema or runtime contracts are shared:
@@ -60,7 +60,7 @@ All tasks are mostly independent except where schema or runtime contracts are sh
   Task 4 (LangGraph Checkpointer) → depends on → Task 1
   Task 5 (Co-located MCP Server) → depends on no prior tasks
   Task 6 (Worker Service Graph Executor) → depends on → Task 3, Task 4, Task 5
-  Task 7 (AWS Infrastructure) → can run in parallel with all other tasks, but blocks final integration testing and deployment.
+  Task 7 (AWS Infrastructure and Containerization) → can run in parallel with all other tasks, but blocks final integration testing and deployment.
 
 #### A4. Data / API / Schema Changes
   Change: Foundation PostgreSQL Schema setup
@@ -90,7 +90,7 @@ Each task should leave explicit artifacts for downstream consumers:
   A task execution entrypoint that accepts a claimed task record and performs graph execution, retry/dead-letter classification, and checkpoint cost updates.
 
   Task 7 output
-  Deployable CDK stacks plus clear instructions for schema bootstrap ordering relative to service rollout.
+  Deployable CDK stacks, API/Worker container build assets (for example Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, and clear instructions for schema bootstrap ordering relative to service rollout.
 
 #### A5. Integration Points
   Caller: API Service
@@ -128,9 +128,13 @@ Before implementation begins in earnest, the repo should pin or explicitly docum
   Infrastructure runtime
   Node.js/CDK versions and AWS CDK v2 package set for TypeScript
 
+  Container build/runtime
+  Base images, build tooling entrypoints, and image publication mechanism (for example CDK Docker assets or ECR push workflow) for the API and Worker services
+
 #### A6. Deployment and Rollout Plan
   Infrastructure as Code: AWS CDK must be used to deploy all components. Manual AWS Console configuration or Terraform are prohibited.
   IaC language: TypeScript, matching the project-level stack decision.
+  Containerization: API Service and Worker Service must each have a reproducible container build definition suitable for local verification and ECS deployment; container packaging must not be left implicit.
   Compute: ECS Fargate for API Service (Java) and Worker Service (Python).
   Database: Amazon Aurora Serverless v2 (PostgreSQL).
   Networking: Services must run in private subnets with NAT Gateways for external LLM API access.

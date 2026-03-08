@@ -1,8 +1,8 @@
-# Worker Service Core
+# Worker Service
 
-The worker service core provides the foundational asyncio primitives for claiming, leasing, and recycling tasks in the Persistent Agent Runtime. It implements the database-as-queue pattern from the Phase 1 design using PostgreSQL `FOR UPDATE SKIP LOCKED`, with lease-based ownership to guarantee that no two workers execute the same task simultaneously.
+The worker service now includes the foundational asyncio primitives for claiming, leasing, and recycling tasks in the Persistent Agent Runtime plus the Phase 1 co-located MCP server. It implements the database-as-queue pattern from the Phase 1 design using PostgreSQL `FOR UPDATE SKIP LOCKED`, with lease-based ownership to guarantee that no two workers execute the same task simultaneously.
 
-This module is intentionally free of LangGraph or graph execution logic. It exports reusable primitives that Task 6 (Graph Executor) consumes.
+The worker core remains intentionally free of LangGraph orchestration logic. It exports reusable primitives that Task 6 (Graph Executor) consumes, while `tools/` exposes the read-only FastMCP server contract that Task 6 will dispatch through.
 
 ## Architecture
 
@@ -45,6 +45,21 @@ core/
   reaper.py         ReaperTask: distributed expired-lease and timeout scanner
   logging.py        Structured logging (structlog JSON), lifecycle event constants, MetricsCollector
   worker.py         WorkerService: top-level orchestrator, signal-based graceful shutdown
+checkpointer/
+  __init__.py       Public API: PostgresDurableCheckpointer, LeaseRevokedException
+  postgres.py       Lease-aware LangGraph checkpoint saver backed by PostgreSQL
+tools/
+  __init__.py       Public API: create_mcp_server, create_tool_server_app, tool definitions, schema helpers
+  app.py            Extractable FastMCP application assembly
+  server.py         Worker-owned runtime shim and stdio/HTTP entrypoint
+  definitions.py    Canonical tool names, schemas, models, and registration helpers
+  env.py            `.env` loading for tool configuration
+  runtime_logging.py stderr logging for MCP startup and tool calls
+  sample_client.py  Manual HTTP client for local MCP testing
+  calculator.py     Safe AST-based arithmetic evaluator
+  read_url.py       Bounded URL fetch + HTML/text extraction with SSRF guards
+  providers/
+    search.py       SearchProvider protocol and Tavily-backed implementation
 ```
 
 ## Configuration
@@ -109,9 +124,63 @@ An `asyncio.Event` that the heartbeat manager sets when the heartbeat UPDATE ret
 
 The handle also exposes `handle.lease_revoked` (bool) for a simple flag check.
 
+## Co-located MCP Server (Task 5)
+
+The worker service now ships with an in-process FastMCP server for the Phase 1 read-only tool set:
+
+- `web_search(query: str, max_results: int = 5)`
+- `read_url(url: str, max_chars: int = 5000)`
+- `calculator(expression: str)`
+
+Create the server from Python:
+
+```python
+from tools.server import create_mcp_server
+
+server = create_mcp_server()
+```
+
+Run it locally over attachable HTTP:
+
+```bash
+cd services/worker-service
+.venv/bin/python -m tools.server --transport http --host 127.0.0.1 --port 8000
+```
+
+Connect with the sample client:
+
+```bash
+cd services/worker-service
+.venv/bin/python -m tools.sample_client --url http://127.0.0.1:8000/mcp
+```
+
+### Tool Contract
+
+- `list_tools()` advertises exactly `web_search`, `read_url`, and `calculator`.
+- `web_search` uses a provider abstraction with a Tavily-backed default implementation.
+- `read_url` only fetches public `http`/`https` URLs, rejects private or loopback targets, limits redirects and response size, and returns sanitized readable text.
+- `calculator` evaluates bounded arithmetic expressions without using `eval()`.
+- local HTTP transport is available for manual MCP client attachment at `/mcp`.
+
+### Runtime Configuration
+
+The default search backend uses these environment variables:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TAVILY_API_KEY` | Yes for live `web_search` calls | Tavily API key used by the default search provider |
+
+The tools package will auto-load local `.env` files from the current working directory, `src/worker-service/tools/.env`, and `src/worker-service/.env` without overriding an already-set process environment variable.
+
+Unit tests do not require external API keys because they inject fake providers and mocked HTTP transports.
+
+### Logging
+
+The tools package logs startup and tool-call events to `stderr`. In stdio mode, `stdout` remains reserved for MCP protocol traffic.
+
 ## Running Tests
 
-**Unit Tests (Mocked DB):**
+**Pytest Suite (No DB Required):**
 
 Install dev dependencies and run pytest:
 
@@ -121,7 +190,7 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-All tests are pure unit tests using mocked asyncpg connections. No running PostgreSQL instance is required. The test suite covers:
+The pytest suite mixes unit tests with local MCP transport integration tests. No running PostgreSQL instance is required. The test suite covers:
 
 - Backoff schedule progression and cap (`test_backoff.py`)
 - Semaphore bounding of concurrent tasks (`test_semaphore.py`)
@@ -131,6 +200,13 @@ All tests are pure unit tests using mocked asyncpg connections. No running Postg
 - SQL query contract tests against the design doc (`test_queries.py`)
 - Metrics collector counters/gauges and event constants (`test_metrics.py`)
 - WorkerConfig defaults, uniqueness, immutability (`test_config.py`)
+- FastMCP server registration and stable tool schemas (`test_mcp_server.py`)
+- HTTP transport subprocess integration (`test_mcp_http_integration.py`)
+- stdio transport subprocess integration (`test_mcp_stdio_integration.py`)
+- local `.env` loading precedence for tool configuration (`test_env_loading.py`)
+- Safe arithmetic parsing and rejection of unsafe expressions (`test_calculator_tool.py`)
+- Search-tool provider normalization and transport error propagation (`test_web_search_tool.py`)
+- URL reader bounds, SSRF-style rejection, and extraction behavior (`test_read_url_tool.py`)
 
 **Integration Tests (Real DB):**
 

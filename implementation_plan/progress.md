@@ -7,8 +7,8 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 | [Task 1](./agent_tasks/task-1-database-schema.md) | Database Schema | Done | Added the Phase 1 Postgres schema, schema README, and Docker-backed verification harness for queue and checkpoint query flows. | Unassigned |
 | [Task 2](./agent_tasks/task-2-api-service.md) | API Service | Done | Spring Boot REST API with 7 endpoints (submit, status, checkpoints, cancel, dead-letter, redrive, health), full validation, pg_notify, 36 tests. | Engineer A |
 | [Task 3](./agent_tasks/task-3-worker-service-core.md) | Worker Service Core | Done | Task poller (FOR UPDATE SKIP LOCKED + LISTEN/NOTIFY), heartbeat manager, distributed reaper, structured logging, 95 tests. | Engineer B |
-| [Task 4](./agent_tasks/task-4-langgraph-checkpointer.md) | LangGraph Checkpointer | Todo | Not started. | Unassigned |
-| [Task 5](./agent_tasks/task-5-mcp-server.md) | Co-located MCP Server | Todo | Not started. | Unassigned |
+| [Task 4](./agent_tasks/task-4-langgraph-checkpointer.md) | LangGraph Checkpointer | Done | Added a lease-aware `PostgresDurableCheckpointer`, public package exports, and unit/integration coverage for checkpoint writes, reads, and lease revocation behavior. | Unassigned |
+| [Task 5](./agent_tasks/task-5-mcp-server.md) | Co-located MCP Server | Done | Added a FastMCP-based in-process tool server exposing `web_search`, `read_url`, and `calculator`, plus worker-service documentation and test coverage. | Unassigned |
 | [Task 6](./agent_tasks/task-6-graph-executor.md) | Graph Executor | Todo | Not started. | Unassigned |
 | [Task 7](./agent_tasks/task-7-aws-infrastructure.md) | AWS Cloud Infrastructure | Todo | Not started. | Unassigned |
 

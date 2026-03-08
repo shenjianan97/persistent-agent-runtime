@@ -9,6 +9,14 @@ description = "Cloud-Native Persistent Agent Runtime - Worker Service Core"
 requires-python = ">=3.11"
 dependencies = [
     "asyncpg>=0.29.0",
+    "beautifulsoup4>=4.13.0",
+    "httpx>=0.28.0",
+    "langgraph==1.0.5",
+    "langgraph-checkpoint==3.0.1",
+    "langgraph-checkpoint-postgres==3.0.4",
+    "mcp==1.26.0",
+    "pydantic>=2.11.0",
+    "python-dotenv>=1.0.0",
     "structlog>=24.1.0",
 ]
 
@@ -25,4 +33,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["core*"]
+include = ["core*", "checkpointer*", "tools*"]
