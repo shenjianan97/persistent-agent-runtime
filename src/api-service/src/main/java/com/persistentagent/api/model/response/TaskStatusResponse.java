@@ -1,0 +1,28 @@
+package com.persistentagent.api.model.response;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.UUID;
+
+public record TaskStatusResponse(
+        @JsonProperty("task_id") UUID taskId,
+        @JsonProperty("agent_id") String agentId,
+        String status,
+        String input,
+        Object output,
+        @JsonProperty("retry_count") int retryCount,
+        @JsonProperty("retry_history") List<Object> retryHistory,
+        @JsonProperty("checkpoint_count") int checkpointCount,
+        @JsonProperty("total_cost_microdollars") long totalCostMicrodollars,
+        @JsonProperty("lease_owner") String leaseOwner,
+        @JsonProperty("last_error_code") String lastErrorCode,
+        @JsonProperty("last_error_message") String lastErrorMessage,
+        @JsonProperty("last_worker_id") String lastWorkerId,
+        @JsonProperty("dead_letter_reason") String deadLetterReason,
+        @JsonProperty("dead_lettered_at") OffsetDateTime deadLetteredAt,
+        @JsonProperty("created_at") OffsetDateTime createdAt,
+        @JsonProperty("updated_at") OffsetDateTime updatedAt
+) {
+}

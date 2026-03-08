@@ -1,0 +1,6 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:55432/persistent_agent_runtime
+    username: postgres
+    password: postgres
+    driver-class-name: org.postgresql.Driver
