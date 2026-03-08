@@ -32,6 +32,8 @@ venv.bak/
 ENV/
 env.bak/
 .idea/
+.pytest_cache/
+.tmp/
 
 # Java
 *.class

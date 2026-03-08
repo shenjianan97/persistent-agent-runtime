@@ -10,7 +10,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 
 ## Contract Boundaries
 
-- The schema contract is defined by `design/PHASE1_DURABLE_EXECUTION.md`, Section 6.1.
+- The schema contract is defined by `docs/design/PHASE1_DURABLE_EXECUTION.md`, Section 6.1.
 - `tasks.status` values are exactly `queued`, `running`, `completed`, `dead_letter`.
 - `dead_letter_reason` values are exactly `cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`.
 - `updated_at` uses `DEFAULT NOW()` for inserts only. Application update queries must set `updated_at = NOW()` explicitly. There are no triggers or database functions that maintain `updated_at`.
@@ -29,6 +29,8 @@ Application code must call `pg_notify('new_task', worker_pool_id)` inline in the
 Those SQL patterns are part of the downstream contract for the API Service and Worker Service.
 
 ## Verification
+
+Warning: `verify_schema.sh` is destructive. It resets the `public` schema with `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;` before applying the migration and running verification. Do not point it at a database whose contents you want to keep.
 
 Run:
 

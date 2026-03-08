@@ -1,0 +1,313 @@
+import os
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import asyncpg
+import pytest
+import pytest_asyncio
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKER_SRC = REPO_ROOT / "services" / "worker-service"
+E2E_ROOT = REPO_ROOT / "tests" / "e2e"
+if str(WORKER_SRC) not in sys.path:
+    sys.path.insert(0, str(WORKER_SRC))
+if str(E2E_ROOT) not in sys.path:
+    sys.path.insert(0, str(E2E_ROOT))
+
+from helpers.api_client import ApiClient
+from helpers.db import DbHelper
+from helpers.e2e_context import E2EContext
+from helpers.mock_llm import DynamicChatProvider, simple_response
+from helpers.worker_launcher import create_worker, stop_worker
+
+MIGRATION_FILE = REPO_ROOT / "infrastructure" / "database" / "migrations" / "0001_phase1_durable_execution.sql"
+
+DB_HOST = os.getenv("E2E_DB_HOST", "localhost")
+DB_PORT = int(os.getenv("E2E_DB_PORT", "55432"))
+DB_NAME = os.getenv("E2E_DB_NAME", "persistent_agent_runtime")
+DB_USER = os.getenv("E2E_DB_USER", "postgres")
+DB_PASSWORD = os.getenv("E2E_DB_PASSWORD", "postgres")
+DB_DSN = os.getenv(
+    "E2E_DB_DSN",
+    f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+)
+
+API_PORT = int(os.getenv("E2E_API_PORT", "8080"))
+API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
+
+PG_CONTAINER = os.getenv("E2E_PG_CONTAINER", "par-e2e-postgres")
+PG_IMAGE = os.getenv("E2E_PG_IMAGE", "postgres:16")
+
+
+def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        check=check,
+        text=True,
+        capture_output=True,
+    )
+
+
+def _is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _is_api_healthy(base_url: str) -> bool:
+    try:
+        client = ApiClient(base_url)
+        payload = client.health(raise_for_status=False)
+        return payload["status_code"] == 200 and payload["body"].get("status") == "healthy"
+    except Exception:
+        return False
+
+
+def _docker_container_exists(name: str) -> bool:
+    proc = _run(["docker", "ps", "-a", "--format", "{{.Names}}"], check=True)
+    names = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return name in names
+
+
+def _docker_container_running(name: str) -> bool:
+    proc = _run(["docker", "ps", "--format", "{{.Names}}"], check=True)
+    names = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    return name in names
+
+
+def _wait_for_postgres(container_name: str, timeout_sec: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        proc = _run(["docker", "exec", container_name, "pg_isready", "-U", DB_USER], check=False)
+        if proc.returncode == 0:
+            return
+        time.sleep(0.5)
+    raise TimeoutError("PostgreSQL did not become ready in time")
+
+
+async def _schema_exists() -> bool:
+    conn = await asyncpg.connect(DB_DSN)
+    try:
+        regclass = await conn.fetchval("SELECT to_regclass('public.tasks')")
+        return regclass is not None
+    finally:
+        await conn.close()
+
+
+def _apply_migration() -> None:
+    _run(["psql", DB_DSN, "-f", str(MIGRATION_FILE)], check=True)
+
+
+def _start_api_process() -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "DB_HOST": DB_HOST,
+            "DB_PORT": str(DB_PORT),
+            "DB_NAME": DB_NAME,
+            "DB_USER": DB_USER,
+            "DB_PASSWORD": DB_PASSWORD,
+            "SERVER_PORT": str(API_PORT),
+        }
+    )
+    log_file = REPO_ROOT / ".tmp" / "e2e-api-service.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(log_file, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        ["./gradlew", "bootRun"],
+        cwd=str(REPO_ROOT / "services" / "api-service"),
+        env=env,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    process._codex_log_handle = log_handle  # type: ignore[attr-defined]
+    return process
+
+
+def _wait_for_api(base_url: str, timeout_sec: float = 120.0) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if _is_api_healthy(base_url):
+            return
+        time.sleep(1.0)
+    raise TimeoutError("API service did not become healthy in time")
+
+
+def pytest_configure() -> None:
+    worker_path = str(WORKER_SRC)
+    helpers_path = str(E2E_ROOT)
+    if worker_path not in sys.path:
+        sys.path.insert(0, worker_path)
+    if helpers_path not in sys.path:
+        sys.path.insert(0, helpers_path)
+
+
+@dataclass
+class RuntimeHandles:
+    started_postgres: bool = False
+    started_api: bool = False
+    postgres_was_running: bool = False
+    api_process: subprocess.Popen[str] | None = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def runtime_environment() -> RuntimeHandles:
+    if os.getenv("E2E_SKIP_AUTO_INFRA", "0") == "1":
+        return RuntimeHandles()
+
+    handles = RuntimeHandles()
+
+    postgres_reachable = _is_port_open(DB_HOST, DB_PORT)
+    if not postgres_reachable:
+        if not _docker_container_exists(PG_CONTAINER):
+            _run(
+                [
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    PG_CONTAINER,
+                    "-e",
+                    f"POSTGRES_USER={DB_USER}",
+                    "-e",
+                    f"POSTGRES_PASSWORD={DB_PASSWORD}",
+                    "-e",
+                    f"POSTGRES_DB={DB_NAME}",
+                    "-p",
+                    f"{DB_PORT}:5432",
+                    PG_IMAGE,
+                ],
+                check=True,
+            )
+            handles.started_postgres = True
+        else:
+            handles.postgres_was_running = _docker_container_running(PG_CONTAINER)
+            if not handles.postgres_was_running:
+                _run(["docker", "start", PG_CONTAINER], check=True)
+                handles.started_postgres = True
+
+        _wait_for_postgres(PG_CONTAINER)
+
+    try:
+        if not asyncio_run(_schema_exists()):
+            _apply_migration()
+    except Exception as exc:  # pragma: no cover - startup failure path
+        pytest.skip(f"Failed to verify/apply schema: {exc}")
+
+    if not _is_api_healthy(API_BASE):
+        try:
+            handles.api_process = _start_api_process()
+            handles.started_api = True
+            _wait_for_api(API_BASE)
+        except Exception as exc:  # pragma: no cover - startup failure path
+            _cleanup_runtime(handles)
+            pytest.skip(f"Failed to start API service: {exc}")
+
+    yield handles
+    _cleanup_runtime(handles)
+
+
+def _cleanup_runtime(handles: RuntimeHandles) -> None:
+    if handles.api_process and handles.started_api:
+        process = handles.api_process
+        process.terminate()
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        log_handle = getattr(process, "_codex_log_handle", None)
+        if log_handle:
+            log_handle.close()
+
+    if handles.started_postgres and not handles.postgres_was_running:
+        _run(["docker", "stop", PG_CONTAINER], check=False)
+
+
+def asyncio_run(coro: Any) -> Any:
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+@pytest_asyncio.fixture
+async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
+    del runtime_environment
+    pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM checkpoint_writes")
+        await conn.execute("DELETE FROM checkpoints")
+        await conn.execute("DELETE FROM tasks")
+    yield pool
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM checkpoint_writes")
+        await conn.execute("DELETE FROM checkpoints")
+        await conn.execute("DELETE FROM tasks")
+    await pool.close()
+
+
+@pytest.fixture
+def api_client(runtime_environment: RuntimeHandles) -> ApiClient:
+    del runtime_environment
+    return ApiClient(API_BASE)
+
+
+@pytest_asyncio.fixture
+async def db(db_pool: asyncpg.Pool) -> DbHelper:
+    return DbHelper(db_pool)
+
+
+@pytest.fixture
+def llm_provider() -> DynamicChatProvider:
+    provider = DynamicChatProvider(default_factory=lambda: simple_response("ok"))
+    patcher = patch("executor.graph.ChatAnthropic", side_effect=provider.build)
+    patcher.start()
+    try:
+        yield provider
+    finally:
+        patcher.stop()
+
+
+class WorkerManager:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+        self._workers: list[Any] = []
+
+    async def start(self, **kwargs: Any) -> Any:
+        worker = await create_worker(self._pool, **kwargs)
+        await worker.start()
+        self._workers.append(worker)
+        return worker
+
+    async def stop_all(self) -> None:
+        while self._workers:
+            worker = self._workers.pop()
+            await stop_worker(worker)
+
+
+@pytest_asyncio.fixture
+async def worker_manager(db_pool: asyncpg.Pool) -> WorkerManager:
+    manager = WorkerManager(db_pool)
+    try:
+        yield manager
+    finally:
+        await manager.stop_all()
+
+
+@pytest_asyncio.fixture
+async def e2e(
+    api_client: ApiClient,
+    db: DbHelper,
+    llm_provider: DynamicChatProvider,
+    worker_manager: WorkerManager,
+) -> E2EContext:
+    """Unified context fixture used by all scenario tests."""
+    return E2EContext(api=api_client, db=db, llm=llm_provider, workers=worker_manager)

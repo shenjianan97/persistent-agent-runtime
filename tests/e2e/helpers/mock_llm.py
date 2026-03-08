@@ -1,0 +1,125 @@
+import asyncio
+from collections.abc import Callable
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+from langchain_core.messages import AIMessage, ToolCall
+
+
+class DynamicChatProvider:
+    """Builds mock LLM instances for patched ChatAnthropic calls."""
+
+    def __init__(self, default_factory: Callable[[], MagicMock]):
+        self._default_factory = default_factory
+        self._factory: Callable[[], MagicMock] = default_factory
+        self._queue: list[MagicMock] = []
+
+    def set_factory(self, factory: Callable[[], MagicMock]) -> None:
+        self._factory = factory
+        self._queue = []
+
+    def set_llm(self, llm: MagicMock) -> None:
+        self._factory = lambda: llm
+        self._queue = []
+
+    def set_queue(self, llms: list[MagicMock]) -> None:
+        self._queue = list(llms)
+
+    def reset(self) -> None:
+        self._factory = self._default_factory
+        self._queue = []
+
+    def build(self, *args: Any, **kwargs: Any) -> MagicMock:
+        del args, kwargs
+        if self._queue:
+            return self._queue.pop(0)
+        return self._factory()
+
+
+def _new_mock() -> MagicMock:
+    mock = MagicMock()
+    mock.bind_tools.return_value = mock
+    return mock
+
+
+def simple_response(content: str = "Hello!") -> MagicMock:
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(return_value=AIMessage(content=content))
+    return mock
+
+
+def calculator_tool_call(expression: str = "2 + 2", final_answer: str = "The answer is 4.") -> MagicMock:
+    call_msg = AIMessage(
+        content="",
+        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_1")],
+    )
+    final_msg = AIMessage(content=final_answer)
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[call_msg, final_msg])
+    return mock
+
+
+def retryable_then_success(error_msg: str = "503 Service Unavailable", final: str = "recovered") -> MagicMock:
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[Exception(error_msg), AIMessage(content=final)])
+    return mock
+
+
+def always_fails(error_msg: str = "400 Bad Request: invalid") -> MagicMock:
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=Exception(error_msg))
+    return mock
+
+
+def slow_response(delay: float = 999.0, content: str = "too late") -> MagicMock:
+    async def _slow(*args: Any, **kwargs: Any) -> AIMessage:
+        del args, kwargs
+        await asyncio.sleep(delay)
+        return AIMessage(content=content)
+
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=_slow)
+    return mock
+
+
+def infinite_tool_loop(expression: str = "1+1") -> MagicMock:
+    def _next(*args: Any, **kwargs: Any) -> AIMessage:
+        del args, kwargs
+        return AIMessage(
+            content="",
+            tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id=f"call_{id(object())}")],
+        )
+
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=_next)
+    return mock
+
+
+def tool_then_retryable_then_success(
+    expression: str = "5*5",
+    retryable_error: str = "503 Service Unavailable",
+    final_answer: str = "done",
+) -> MagicMock:
+    call_msg = AIMessage(
+        content="",
+        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_resume")],
+    )
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[call_msg, Exception(retryable_error), AIMessage(content=final_answer)])
+    return mock
+
+
+def tool_then_slow_final(expression: str = "5*5", delay: float = 30.0) -> MagicMock:
+    call_msg = AIMessage(
+        content="",
+        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_lease")],
+    )
+
+    async def _slow(*args: Any, **kwargs: Any) -> AIMessage:
+        del args, kwargs
+        await asyncio.sleep(delay)
+        return AIMessage(content="final")
+
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[call_msg, _slow])
+    return mock

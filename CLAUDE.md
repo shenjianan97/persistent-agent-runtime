@@ -30,19 +30,19 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 | File | Purpose |
 |------|---------|
-| PROJECT.md | High-level project overview: vision, user stories, phases, tradeoffs, tech stack |
-| design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
-| design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
-| design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
-| implementation_plan/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
-| implementation_plan/progress.md | Live tracking board for agent execution of Phase 1 |
-| implementation_plan/agent_tasks/*.md | 7 parallelizable, single-responsibility execution templates for agents |
-| POC/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
+| docs/PROJECT.md | High-level project overview: vision, user stories, phases, tradeoffs, tech stack |
+| docs/design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
+| docs/design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
+| docs/design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
+| docs/implementation_plan/phase-1/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
+| docs/implementation_plan/phase-1/progress.md | Live tracking board for agent execution of Phase 1 |
+| docs/implementation_plan/phase-1/agent_tasks/*.md | 7 parallelizable, single-responsibility execution templates for agents |
+| experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
 ## Project Stages
 
 ### Stage 1 — Problem & Scope [DONE]
-- PROJECT.md — vision, differentiation, user stories, phases
+- docs/PROJECT.md — vision, differentiation, user stories, phases
 - Core concepts and tradeoff positions documented
 
 ### Stage 2 — Technical Design [DONE]
@@ -52,16 +52,15 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - Review and refine Phase 1 design before implementation (done)
 
 ### Stage 3 — Implementation Plan [DONE]
-- Hand-off: Translate Phase 1 design into `implementation_plan/plan.md` Orchestrator Plan
+- Hand-off: Translate Phase 1 design into `docs/implementation_plan/phase-1/plan.md` Orchestrator Plan
 - Splitting Prompts: Generate and split explicit constraints into 7 parallelizable agent task spec files (`task-1` through `task-7`) 
-- Tracking: Created `implementation_plan/progress.md` for orchestrator execution tracking
-- POC logic: Created LangGraph POC validation tasks in `POC/langgraph/` to test assumptions
+- Tracking: Created `docs/implementation_plan/phase-1/progress.md` for orchestrator execution tracking
+- POC logic: Created LangGraph POC validation tasks in `experiments/langgraph/` to test assumptions
 
-### Stage 4 — Implementation [NOT STARTED]
-- Hand off agent tasks to execution engine
-- Stage 4.1: DB Schema, AWS Infrastructure
-- Stage 4.2: Worker Core, API Service, MCP server, LangGraph checkpointer
-- Stage 4.3: Graph Executor Assembly
+### Stage 4 — Implementation [IN PROGRESS]
+- Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, and graph executor (Tasks 1-6)
+- Remaining: AWS infrastructure and containerization work (Task 7)
+- Source of truth: `docs/implementation_plan/phase-1/progress.md`
 
 ### Stage 5 — Validation [NOT STARTED]
 - End-to-end crash-recovery demo
