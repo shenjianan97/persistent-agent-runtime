@@ -2,7 +2,7 @@
 
 The worker service now includes the foundational asyncio primitives for claiming, leasing, and recycling tasks in the Persistent Agent Runtime plus the Phase 1 co-located MCP server. It implements the database-as-queue pattern from the Phase 1 design using PostgreSQL `FOR UPDATE SKIP LOCKED`, with lease-based ownership to guarantee that no two workers execute the same task simultaneously.
 
-The worker core remains intentionally free of LangGraph orchestration logic. It exports reusable primitives that Task 6 (Graph Executor) consumes, while `tools/` exposes the read-only FastMCP server contract that Task 6 will dispatch through.
+The worker core remains intentionally free of LangGraph orchestration logic. It exports reusable primitives that are consumed by the `GraphExecutor` (implemented in the `executor/` module as part of Task 6), while `tools/` exposes the read-only FastMCP server contract that `GraphExecutor` dispatches through.
 
 ## Architecture
 
@@ -48,6 +48,9 @@ core/
 checkpointer/
   __init__.py       Public API: PostgresDurableCheckpointer, LeaseRevokedException
   postgres.py       Lease-aware LangGraph checkpoint saver backed by PostgreSQL
+executor/
+  __init__.py       Public API: GraphExecutor
+  graph.py          LangGraph assembly, integration with tools/checkpointer, and error classification
 tools/
   __init__.py       Public API: create_mcp_server, create_tool_server_app, tool definitions, schema helpers
   app.py            Extractable FastMCP application assembly
@@ -81,46 +84,32 @@ tools/
 | `reaper_interval_seconds` | `30` | Base reaper scan interval |
 | `reaper_jitter_seconds` | `10` | +/- jitter on reaper interval |
 
-## Integration Point (Task 6 -- Graph Executor)
+## Integration Point (Graph Executor)
 
-The Graph Executor plugs in through two mechanisms:
+The Graph Executor (`executor/graph.py`) plugs in through the `on_task_claimed` callback mechanism. It handles the entire LangGraph orchestration layer:
 
-### 1. `on_task_claimed` callback
+- **Graph Assembly**: Dynamically constructs a `StateGraph`, binds the specified LLM (Anthropic or Bedrock based on model name), and injects Phase 1 tools.
+- **Durable Checkpointing**: Initialises the `PostgresDurableCheckpointer` to persist and resume graphs from the PostgreSQL `checkpoints` table.
+- **Safety**: Wraps the graph execution in an `asyncio.timeout(task_timeout_seconds)` and limits steps using LangGraph's `max_steps`.
+- **Failure Classification**: Distinguishes transient, retryable faults (e.g., rate limits, HTTP 5xx errors) from fatal faults and updates task status and exponential backoff timers dynamically.
+- **Cancellation**: Halts the LangChain iteration if it detects the heartbeat `cancel_event` flag has been set on lease revocation.
 
-Pass an async callback to `WorkerService` (or directly to `TaskPoller`). It receives the full claimed task row as a `dict[str, Any]` and is responsible for the entire execution lifecycle:
-
+Example Usage:
 ```python
-async def execute_task(task_data: dict[str, Any]) -> None:
-    task_id = str(task_data["task_id"])
-    tenant_id = task_data["tenant_id"]
+from core.worker import WorkerService
+from executor.graph import GraphExecutor
 
-    # 1. Start heartbeat
-    handle = worker.heartbeat.start_heartbeat(task_id, tenant_id)
+worker = WorkerService(config)
+executor = GraphExecutor(worker)
 
-    try:
-        # 2. Build and run the LangGraph graph
-        #    Check handle.cancel_event between super-steps
-        async for event in graph.astream(...):
-            if handle.cancel_event.is_set():
-                break  # Lease was revoked
-            # process event...
-
-        # 3. Mark task completed (if not revoked)
-        if not handle.lease_revoked:
-            # UPDATE tasks SET status = 'completed' ...
-            pass
-    finally:
-        # 4. Stop heartbeat
-        await worker.heartbeat.stop_heartbeat(task_id)
-
-worker = WorkerService(config, on_task_claimed=execute_task)
+worker = WorkerService(config, on_task_claimed=executor.execute_task)
 ```
 
 The poller manages the semaphore around this callback -- it acquires a slot before invoking the callback and releases it when the callback returns (or raises).
 
-### 2. `HeartbeatHandle.cancel_event`
+### `HeartbeatHandle.cancel_event`
 
-An `asyncio.Event` that the heartbeat manager sets when the heartbeat UPDATE returns 0 rows (meaning the lease was revoked -- e.g., by the reaper after expiry, or by a cancel API call). The executor should check this event between LangGraph super-steps and stop execution if set.
+An `asyncio.Event` that the heartbeat manager sets when the heartbeat UPDATE returns 0 rows (meaning the lease was revoked -- e.g., by the reaper after expiry, or by a cancel API call). The executor checks this event between LangGraph super-steps and stops execution if set.
 
 The handle also exposes `handle.lease_revoked` (bool) for a simple flag check.
 

@@ -20,6 +20,8 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
     get_serializable_checkpoint_metadata,
 )
+from langchain_core.load.dump import dumps as langchain_dumps
+from langchain_core.load.load import loads as langchain_loads
 from langgraph.checkpoint.serde.base import SerializerProtocol
 
 
@@ -168,10 +170,8 @@ class PostgresDurableCheckpointer(BaseCheckpointSaver[str]):
         thread_id, checkpoint_ns, parent_checkpoint_id = self._extract_checkpoint_target(
             config
         )
-        checkpoint_payload = json.dumps(checkpoint)
-        metadata_payload = json.dumps(
-            get_serializable_checkpoint_metadata(config, metadata)
-        )
+        checkpoint_payload = langchain_dumps(checkpoint)
+        metadata_payload = langchain_dumps(get_serializable_checkpoint_metadata(config, metadata))
 
         async with self._connection() as conn:
             async with conn.transaction():
@@ -460,7 +460,9 @@ LIMIT 1
         if value is None:
             return {}
         if isinstance(value, str):
-            return json.loads(value)
+            return langchain_loads(value)
+        elif isinstance(value, dict):
+            return langchain_loads(json.dumps(value))
         return dict(value)
 
     @asynccontextmanager

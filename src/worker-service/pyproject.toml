@@ -11,6 +11,9 @@ dependencies = [
     "asyncpg>=0.29.0",
     "beautifulsoup4>=4.13.0",
     "httpx>=0.28.0",
+    "langchain-core>=0.3.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-aws>=0.2.0",
     "langgraph==1.0.5",
     "langgraph-checkpoint==3.0.1",
     "langgraph-checkpoint-postgres==3.0.4",
@@ -30,6 +33,11 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore:Core Pydantic V1 functionality isn't compatible with Python 3.14:UserWarning",
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",
+    "ignore:The function `loads` is in beta:Warning"
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
