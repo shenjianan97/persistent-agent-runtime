@@ -174,6 +174,11 @@ Health check with database connectivity and queue/worker counts.
 **Build:**
 ```bash
 cd src/api-service
+
+# Note: If you encounter an error like "Unable to access jarfile gradle-wrapper.jar",
+# you may need to regenerate the wrapper using a local gradle installation first:
+# gradle wrapper
+
 ./gradlew build
 ```
 
@@ -204,9 +209,21 @@ Configuration via environment variables or `application.yml`:
 ./gradlew test
 ```
 
-**Including integration tests** (requires local PostgreSQL container):
+**Java Integration tests** (requires local PostgreSQL container):
 ```bash
 INTEGRATION_TESTS_ENABLED=true ./gradlew test
 ```
 
-The integration tests expect the `persistent-agent-runtime-postgres` Docker container running on `localhost:55432`.
+The Java integration tests expect the `persistent-agent-runtime-postgres` Docker container running on `localhost:55432`.
+
+**Python API Integration End-to-End Tests:**
+A python script `api_integration_test.py` is included to run end-to-end failure scenarios against the running API application and a real database.
+
+```bash
+# Ensure API service is running:
+./gradlew bootRun
+
+# Then, run the tests:
+pip install urllib3 psycopg2-binary
+python api_integration_test.py
+```

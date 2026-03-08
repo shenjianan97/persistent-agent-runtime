@@ -111,6 +111,8 @@ The handle also exposes `handle.lease_revoked` (bool) for a simple flag check.
 
 ## Running Tests
 
+**Unit Tests (Mocked DB):**
+
 Install dev dependencies and run pytest:
 
 ```bash
@@ -129,3 +131,15 @@ All tests are pure unit tests using mocked asyncpg connections. No running Postg
 - SQL query contract tests against the design doc (`test_queries.py`)
 - Metrics collector counters/gauges and event constants (`test_metrics.py`)
 - WorkerConfig defaults, uniqueness, immutability (`test_config.py`)
+
+**Integration Tests (Real DB):**
+
+A script `worker_integration_test.py` is included to test worker core primitives (Poller, Reaper, Heartbeat) using a real PostgreSQL database.
+
+```bash
+# Wait for the DB to be initialized, then run:
+cd src/worker-service
+# install dependencies using uv:
+uv pip install psycopg2-binary
+python worker_integration_test.py
+```
