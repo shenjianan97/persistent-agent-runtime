@@ -14,7 +14,6 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError
 
-from core.worker import WorkerService
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 
 from tools.definitions import (
@@ -65,8 +64,9 @@ class CostTrackingCallback(AsyncCallbackHandler):
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
     
-    def __init__(self, worker: WorkerService):
-        self.worker = worker
+    def __init__(self, config: WorkerConfig, pool: asyncpg.Pool):
+        self.config = config
+        self.pool = pool
         self.deps = create_default_dependencies()
 
     def _get_tools(self, allowed_tools: list[str]) -> list[StructuredTool]:
@@ -106,6 +106,7 @@ class GraphExecutor:
         return tools
 
     def _build_graph(self, agent_config: dict[str, Any]) -> StateGraph:
+        """Assembles the LangGraph state machine and binds MCP tools."""
         model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
         temperature = agent_config.get("temperature", 0.7)
         allowed_tools = agent_config.get("allowed_tools", [])
@@ -118,6 +119,7 @@ class GraphExecutor:
         else:
             llm = ChatBedrock(model_id=model_name, model_kwargs={"temperature": temperature})
             
+        # Register the local MCP tools with the LLM 
         tools = self._get_tools(allowed_tools)
         if tools:
             llm_with_tools = llm.bind_tools(tools)
@@ -132,10 +134,12 @@ class GraphExecutor:
             response = await llm_with_tools.ainvoke(messages, config)
             return {"messages": [response]}
 
+        # Define the Graph layout
         workflow = StateGraph(MessagesState)
         workflow.add_node("agent", agent_node)
         
         if tools:
+            # LangGraph handles routing the LLM's ToolCall directly to our python functions
             tool_node = ToolNode(tools)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
@@ -146,20 +150,17 @@ class GraphExecutor:
         workflow.add_edge(START, "agent")
         return workflow
 
-    async def execute_task(self, task_data: dict[str, Any]) -> None:
-        """Main entrypoint from WorkerService on_task_claimed."""
+    async def execute_task(self, task_data: dict[str, Any], cancel_event: asyncio.Event) -> None:
+        """Main entrypoint from the executor router."""
         task_id = str(task_data["task_id"])
         tenant_id = task_data["tenant_id"]
         agent_config = json.loads(task_data["agent_config_snapshot"])
         task_input = task_data["input"]
         max_steps = task_data.get("max_steps", 100)
         task_timeout_seconds = task_data.get("task_timeout_seconds", 3600)
-        worker_id = self.worker.config.worker_id
+        worker_id = self.config.worker_id
         
-        # 1. Start heartbeat
-        heartbeat_handle = self.worker.heartbeat.start_heartbeat(task_id, tenant_id)
-        
-        pool = self.worker.pool
+        pool = self.pool
         try:
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(
@@ -191,7 +192,7 @@ class GraphExecutor:
                 # Executing super-steps via astream
                 async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates"):
                     # Step 6: Cancellation Awareness
-                    if heartbeat_handle.cancel_event.is_set():
+                    if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
                         return
 
@@ -201,20 +202,20 @@ class GraphExecutor:
                         # Append the cost directly to the recently written checkpoint
                         # (LangGraph astream('updates') emits after nodes commit their checkpoint)
                         await pool.execute('''
-                            UPDATE checkpoints 
+                            UPDATE checkpoints
                             SET metadata_payload = jsonb_set(
-                                metadata_payload, 
-                                '{cost_microdollars}', 
-                                COALESCE(metadata_payload->>'cost_microdollars', '0')::bigint::jsonb + $1::bigint::jsonb
+                                metadata_payload,
+                                '{cost_microdollars}',
+                                to_jsonb(COALESCE((metadata_payload->>'cost_microdollars')::bigint, 0) + $1::bigint)
                             )
                             WHERE task_id = $2::uuid AND checkpoint_id = (
-                                SELECT checkpoint_id FROM checkpoints 
-                                WHERE task_id = $2::uuid 
+                                SELECT checkpoint_id FROM checkpoints
+                                WHERE task_id = $2::uuid
                                 ORDER BY thread_ts DESC LIMIT 1
                             )
                         ''', pending_cost, task_id)
 
-                if heartbeat_handle.cancel_event.is_set():
+                if cancel_event.is_set():
                     return
 
                 # Execution Finished successfully. Compute final output.
@@ -253,8 +254,6 @@ class GraphExecutor:
                 await self._handle_retryable_error(task_data, e)
             else:
                 await self._handle_dead_letter(task_id, "non_retryable_error", str(e))
-        finally:
-            await self.worker.heartbeat.stop_heartbeat(task_id)
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
@@ -267,7 +266,9 @@ class GraphExecutor:
             return False
 
         # 429 and 5xx are retryable
-        if "429" in error_str or "5" in error_str or "rate limit" in error_str:
+        if "429" in error_str or "rate limit" in error_str:
+            return True
+        if any(code in error_str for code in ("500", "502", "503", "504")):
             return True
             
         if isinstance(e, (ConnectionError, TimeoutError)):
@@ -280,7 +281,7 @@ class GraphExecutor:
         task_id = str(task_data["task_id"])
         retry_count = task_data.get("retry_count", 0)
         max_retries = task_data.get("max_retries", 3)
-        worker_pool_id = self.worker.config.worker_pool_id
+        worker_pool_id = self.config.worker_pool_id
         
         if retry_count >= max_retries:
             await self._handle_dead_letter(task_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
@@ -291,7 +292,7 @@ class GraphExecutor:
         retry_after = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
         
         error_msg = str(e)[:1024]
-        async with self.worker.pool.acquire() as conn:
+        async with self.pool.acquire() as conn:
             await conn.execute(
                 '''UPDATE tasks 
                    SET status='queued', 
@@ -314,10 +315,10 @@ class GraphExecutor:
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
     async def _handle_dead_letter(self, task_id: str, reason: str, error_msg: str):
-        worker_id = self.worker.config.worker_id
+        worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
         
-        async with self.worker.pool.acquire() as conn:
+        async with self.pool.acquire() as conn:
             await conn.execute(
                 '''UPDATE tasks 
                    SET status='dead_letter', 

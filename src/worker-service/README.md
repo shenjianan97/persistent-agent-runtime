@@ -9,13 +9,14 @@ The worker core remains intentionally free of LangGraph orchestration logic. It 
 Three subsystems run concurrently inside a single asyncio event loop:
 
 ```
-WorkerService
+ WorkerService
  |
  |-- TaskPoller
  |     - LISTEN new_task (primary wake)
  |     - FOR UPDATE SKIP LOCKED claim query
  |     - Exponential backoff on empty polls (100ms -> 5s cap)
  |     - asyncio.Semaphore bounds concurrency to MAX_CONCURRENT_TASKS
+ |     - Coordinates `TaskRouter` and `HeartbeatManager` per task
  |
  |-- HeartbeatManager
  |     - One asyncio task per active task, every 15s
@@ -24,12 +25,29 @@ WorkerService
  |     - Sets HeartbeatHandle.cancel_event so the executor can stop
  |
  |-- ReaperTask
-       - Runs on every worker instance (not a singleton)
-       - Jittered interval: 30s +/- 10s
-       - Expired leases: requeue (retry_count < max_retries) or dead-letter
-       - Task timeouts: dead-letter with reason 'task_timeout'
-       - Emits pg_notify('new_task', pool_id) in the same transaction
+ |     - Runs on every worker instance (not a singleton)
+ |     - Jittered interval: 30s +/- 10s
+ |     - Expired leases: requeue (retry_count < max_retries) or dead-letter
+ |     - Task timeouts: dead-letter with reason 'task_timeout'
+ |     - Emits pg_notify('new_task', pool_id) in the same transaction
+ |
+ |-- TaskRouter (Injected)
+ |     - Inspects `task_data` to decide which TaskExecutor to use
+ |
+ |-- TaskExecutor (Injected, e.g. GraphExecutor)
+       - Runs LangGraph compilation and LLM generation
+       - Boots in-memory MCP Server to expose tools (calculator, web_search, etc.)
 ```
+
+### How a Task flows through the Subsystems
+
+1. **Revervation:** `ReaperTask` runs in the background. If another worker crashes, it finds tasks where `lease_expiry` is in the past and resets them to `queued`.
+2. **Claiming:** `TaskPoller` waits for Postgres `LISTEN/NOTIFY` events. When a new task appears, it runs a `FOR UPDATE SKIP LOCKED` query to claim it, giving the worker a 60-second lease.
+3. **Coordination:** Inside the Poller, it immediately asks the `HeartbeatManager` to start pinging Postgres every 15s in the background to keep the lease alive. 
+4. **Routing:** The Poller hands the task to the `TaskRouter`, which decides that the `GraphExecutor` should handle it.
+5. **Execution:** The `GraphExecutor` boots the local MCP server to register available tools (`calculator`, `web_search`), compiles the LangGraph state machine, and streams events from Anthropic.
+6. **Cancellation:** If the `HeartbeatManager` fails to renew the lease (e.g. DB goes down), it sets a `cancel_event` flag. The `GraphExecutor` checks this flag between LLM steps and gracefully aborts if the lease is lost.
+7. **Completion:** When the graph finishes, the executor writes the final `completed` status to the DB, and the Poller tells the `HeartbeatManager` to stop pinging.
 
 All SQL queries are taken verbatim from `design/PHASE1_DURABLE_EXECUTION.md` Section 6.1. All reaper operations use `UPDATE ... RETURNING` to avoid TOCTOU races between multiple reaper instances.
 
@@ -49,7 +67,8 @@ checkpointer/
   __init__.py       Public API: PostgresDurableCheckpointer, LeaseRevokedException
   postgres.py       Lease-aware LangGraph checkpoint saver backed by PostgreSQL
 executor/
-  __init__.py       Public API: GraphExecutor
+  __init__.py       Public API: GraphExecutor, DefaultTaskRouter, TaskRouter, TaskExecutor
+  router.py         TaskExecutor / TaskRouter protocols, DefaultTaskRouter (Phase 1 always→GraphExecutor)
   graph.py          LangGraph assembly, integration with tools/checkpointer, and error classification
 tools/
   __init__.py       Public API: create_mcp_server, create_tool_server_app, tool definitions, schema helpers
@@ -96,16 +115,17 @@ The Graph Executor (`executor/graph.py`) plugs in through the `on_task_claimed` 
 
 Example Usage:
 ```python
+from core.db import create_pool
 from core.worker import WorkerService
-from executor.graph import GraphExecutor
+from executor.router import DefaultTaskRouter
 
-worker = WorkerService(config)
-executor = GraphExecutor(worker)
-
-worker = WorkerService(config, on_task_claimed=executor.execute_task)
+pool = await create_pool(config.db_dsn)
+router = DefaultTaskRouter(config, pool)
+worker = WorkerService(config, pool, router)
+await worker.start()
 ```
 
-The poller manages the semaphore around this callback -- it acquires a slot before invoking the callback and releases it when the callback returns (or raises).
+The poller manages the semaphore around this callback -- it acquires a slot before invoking the callback and releases it when the callback returns (or raises). The `TaskRouter` decides which `TaskExecutor` handles each claimed task; `DefaultTaskRouter` always routes to `GraphExecutor`.
 
 ### `HeartbeatHandle.cancel_event`
 
@@ -196,6 +216,8 @@ The pytest suite mixes unit tests with local MCP transport integration tests. No
 - Safe arithmetic parsing and rejection of unsafe expressions (`test_calculator_tool.py`)
 - Search-tool provider normalization and transport error propagation (`test_web_search_tool.py`)
 - URL reader bounds, SSRF-style rejection, and extraction behavior (`test_read_url_tool.py`)
+- GraphExecutor completion, timeout, retry, dead-letter, and cancellation paths (`test_executor.py`)
+- Lease-aware checkpointer lease validation, writes, and tuple reconstruction (`test_checkpointer.py`)
 
 **Integration Tests (Real DB):**
 

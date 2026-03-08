@@ -16,6 +16,15 @@ import pytest_asyncio
 
 DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
 
+
+async def cleanup_test_db(pool: asyncpg.Pool) -> None:
+    """Remove all test data to ensure isolation between integration tests."""
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM checkpoint_writes")
+        await conn.execute("DELETE FROM checkpoints")
+        await conn.execute("DELETE FROM tasks")
+
+
 async def setup_test_task(pool: asyncpg.Pool) -> str:
     task_id = str(uuid.uuid4())
     async with pool.acquire() as conn:
@@ -42,6 +51,8 @@ async def test_worker_end_to_end_integration():
         pytest.skip(f"Skipping integration test due to DB connection failure: {e}")
         return
         
+    await cleanup_test_db(pool)
+
     config = WorkerConfig(
         worker_id="test-graph-integration-worker",
         db_dsn=DB_DSN,
@@ -51,9 +62,9 @@ async def test_worker_end_to_end_integration():
         reaper_jitter_seconds=0
     )
     
-    worker = WorkerService(config)
-    executor = GraphExecutor(worker)
-    worker._on_task_claimed = executor.execute_task  # Attach executor
+    from executor.router import DefaultTaskRouter
+    router = DefaultTaskRouter(config, pool)
+    worker = WorkerService(config, pool, router)
     
     # We patch ChatAnthropic to return a deterministic message avoiding network calls
     with patch("executor.graph.ChatAnthropic") as MockChat:
@@ -99,6 +110,8 @@ async def test_worker_core_primitives_integration():
         pytest.skip(f"Skipping integration test due to DB connection failure: {e}")
         return
         
+    await cleanup_test_db(pool)
+
     config = WorkerConfig(
         worker_id="test-core-integration-worker",
         db_dsn=DB_DSN,
@@ -110,21 +123,20 @@ async def test_worker_core_primitives_integration():
     
     executed_tasks = []
     
-    async def mock_executor(task_data: dict):
-        task_id = str(task_data["task_id"])
-        tenant_id = task_data["tenant_id"]
-        executed_tasks.append(task_id)
-        
-        handle = worker.heartbeat.start_heartbeat(task_id, tenant_id)
-        try:
-            await asyncio.sleep(2.5)  # Wait for a heartbeat to fire
-            if not handle.cancel_event.is_set():
-                async with pool.acquire() as conn:
-                    await conn.execute("UPDATE tasks SET status='completed' WHERE task_id=$1", task_id)
-        finally:
-            await worker.heartbeat.stop_heartbeat(task_id)
+    class MockRouter:
+        def get_executor(self, task_data: dict):
+            class MockExecutor:
+                async def execute_task(self, task_data: dict, cancel_event: asyncio.Event) -> None:
+                    task_id = str(task_data["task_id"])
+                    executed_tasks.append(task_id)
+                    
+                    await asyncio.sleep(2.5)  # Wait for a heartbeat to fire
+                    if not cancel_event.is_set():
+                        async with pool.acquire() as conn:
+                            await conn.execute("UPDATE tasks SET status='completed' WHERE task_id=$1", task_id)
+            return MockExecutor()
             
-    worker = WorkerService(config, on_task_claimed=mock_executor)
+    worker = WorkerService(config, pool, MockRouter())
     await worker.start()
     
     try:
@@ -152,8 +164,10 @@ async def test_worker_core_primitives_integration():
         await asyncio.sleep(3) # Wait for Reaper
         async with pool.acquire() as conn:
             row = await conn.fetchrow("SELECT status, retry_count FROM tasks WHERE task_id=$1", t3)
-            assert str(row["status"]) == "queued"
-            assert row["retry_count"] == 1
+            # The reaper requeues the task (retry_count incremented).
+            # The poller may re-claim it before we check, so status could be 'queued' or 'running'.
+            assert row["retry_count"] >= 1, f"Reaper should have incremented retry_count, got {row['retry_count']}"
+            assert str(row["status"]) in ("queued", "running"), f"Unexpected status: {row['status']}"
             
         # Scenario 4: Reaper dead-letters on task timeout
         t4 = str(uuid.uuid4())
@@ -185,6 +199,8 @@ async def test_worker_mcp_tool_execution_integration():
         pytest.skip(f"Skipping integration test due to DB connection failure: {e}")
         return
         
+    await cleanup_test_db(pool)
+
     config = WorkerConfig(
         worker_id="test-tool-integration-worker",
         db_dsn=DB_DSN,
@@ -194,9 +210,9 @@ async def test_worker_mcp_tool_execution_integration():
         reaper_jitter_seconds=0
     )
     
-    worker = WorkerService(config)
-    executor = GraphExecutor(worker)
-    worker._on_task_claimed = executor.execute_task
+    from executor.router import DefaultTaskRouter
+    router = DefaultTaskRouter(config, pool)
+    worker = WorkerService(config, pool, router)
     
     # We patch ChatAnthropic to simulate an LLM deciding to call the calculator tool
     with patch("executor.graph.ChatAnthropic") as MockChat:

@@ -24,27 +24,30 @@ class WorkerService:
     """Top-level worker service that ties together poller, heartbeat, and reaper.
 
     Usage:
-        config = WorkerConfig(db_dsn="postgresql://...")
-        worker = WorkerService(config, on_task_claimed=my_executor)
+        pool = await create_pool(DB_DSN)
+        router = DefaultTaskRouter(config, pool)
+        worker = WorkerService(config, pool, router)
         await worker.start()
         # ... runs until shutdown signal ...
         await worker.stop()
 
-    The on_task_claimed callback receives a dict of the claimed task row and
-    is responsible for:
-      1. Starting a heartbeat via worker.heartbeat.start_heartbeat(task_id, tenant_id)
-      2. Executing the graph
-      3. Stopping the heartbeat via worker.heartbeat.stop_heartbeat(task_id)
+    Architecture:
+      - WorkerService is the "Engine Block" that holds the subsystems.
+      - TaskPoller: Pulls queued tasks and assigns them coordinates.
+      - HeartbeatManager: Pings the DB to maintain leases for active tasks.
+      - ReaperTask: Recycles expired tasks from crashed workers.
+      - TaskRouter: Routes claimed tasks to the correct executor.
     """
 
     def __init__(
         self,
-        config: WorkerConfig | None = None,
-        on_task_claimed: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        config: WorkerConfig,
+        pool: asyncpg.Pool,
+        router: Any,
     ) -> None:
-        self._config = config or WorkerConfig()
-        self._on_task_claimed = on_task_claimed
-        self._pool: asyncpg.Pool | None = None
+        self._config = config
+        self._pool = pool
+        self._router = router
         self._metrics = MetricsCollector()
         self._log = get_logger(self._config.worker_id, component="worker")
 
@@ -78,13 +81,6 @@ class WorkerService:
             max_concurrent=self._config.max_concurrent_tasks,
         )
 
-        # Create connection pool
-        self._pool = await create_pool(
-            self._config.db_dsn,
-            min_size=2,
-            max_size=self._config.max_concurrent_tasks + 5,
-        )
-
         # Initialize subsystems
         self.heartbeat = HeartbeatManager(
             self._config, self._pool, self._metrics
@@ -94,7 +90,8 @@ class WorkerService:
             self._config,
             self._pool,
             self._metrics,
-            on_task_claimed=self._on_task_claimed,
+            self.heartbeat,
+            self._router,
         )
 
         self.reaper = ReaperTask(
@@ -123,8 +120,6 @@ class WorkerService:
             await self.heartbeat.stop_all()
         if self.reaper:
             await self.reaper.stop()
-        if self._pool:
-            await self._pool.close()
 
         await self._log.ainfo("worker_stopped")
 

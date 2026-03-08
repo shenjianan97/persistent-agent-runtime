@@ -50,7 +50,7 @@ class TestPollerBackoff:
         config = config or WorkerConfig(worker_id="test-poller")
         pool = MagicMock()
         metrics = MetricsCollector()
-        return TaskPoller(config, pool, metrics)
+        return TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
     def test_initial_backoff(self):
         poller = self._make_poller()
@@ -80,7 +80,7 @@ class TestPollerNotify:
         config = WorkerConfig(worker_id="test-poller", worker_pool_id="shared")
         pool = MagicMock()
         metrics = MetricsCollector()
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
         poller._on_notify(MagicMock(), 0, "new_task", "shared")
         assert poller._notify_event.is_set()
@@ -89,7 +89,7 @@ class TestPollerNotify:
         config = WorkerConfig(worker_id="test-poller", worker_pool_id="shared")
         pool = MagicMock()
         metrics = MetricsCollector()
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
         poller._on_notify(MagicMock(), 0, "new_task", "other_pool")
         assert not poller._notify_event.is_set()
@@ -98,7 +98,7 @@ class TestPollerNotify:
         config = WorkerConfig(worker_id="test-poller", worker_pool_id="shared")
         pool = MagicMock()
         metrics = MetricsCollector()
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
         poller._on_notify(MagicMock(), 0, "new_task", "")
         assert poller._notify_event.is_set()
@@ -109,7 +109,7 @@ class TestPollerSemaphore:
         config = WorkerConfig(worker_id="test-poller", max_concurrent_tasks=7)
         pool = MagicMock()
         metrics = MetricsCollector()
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
         assert isinstance(poller.semaphore, asyncio.Semaphore)
 
@@ -127,7 +127,7 @@ class TestPollerTryClaim:
         ctx.__aexit__ = AsyncMock(return_value=False)
         pool.acquire = MagicMock(return_value=ctx)
         metrics = MetricsCollector()
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
 
         result = await poller._try_claim()
         assert result is False
@@ -153,7 +153,7 @@ class TestPollerTryClaim:
         metrics = MetricsCollector()
 
         # No callback — semaphore released immediately
-        poller = TaskPoller(config, pool, metrics)
+        poller = TaskPoller(config, pool, metrics, MagicMock(), None)
 
         result = await poller._try_claim()
         assert result is True
@@ -181,10 +181,18 @@ class TestPollerTryClaim:
 
         callback_received = []
 
-        async def on_claimed(task_data):
-            callback_received.append(task_data)
+        class MockRouter:
+            def get_executor(self, task_data: dict):
+                class MockExecutor:
+                    async def execute_task(self, td: dict, cancel_event):
+                        callback_received.append(td)
+                return MockExecutor()
 
-        poller = TaskPoller(config, pool, metrics, on_task_claimed=on_claimed)
+        heartbeat = MagicMock()
+        handle = MagicMock()
+        handle.cancel_event = asyncio.Event()
+        heartbeat.start_heartbeat.return_value = handle
+        poller = TaskPoller(config, pool, metrics, heartbeat, MockRouter())
 
         result = await poller._try_claim()
         assert result is True

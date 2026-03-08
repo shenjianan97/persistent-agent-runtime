@@ -53,7 +53,7 @@ def task_data():
 
 @pytest.mark.asyncio
 async def test_completion_path(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     
     # Mock compile and building
     with patch.object(executor, "_build_graph") as mock_build:
@@ -78,7 +78,7 @@ async def test_completion_path(mock_worker, task_data):
             mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
             mock_compiled.aget_state.return_value = mock_state
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify completed path
             assert mock_worker.pool.execute.call_count == 1
@@ -91,7 +91,7 @@ async def test_completion_path(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_timeout_dead_letter(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     task_data["task_timeout_seconds"] = 1
     
     with patch.object(executor, "_build_graph") as mock_build:
@@ -109,7 +109,7 @@ async def test_timeout_dead_letter(mock_worker, task_data):
                 yield {}
             mock_compiled.astream = slow_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify dead letter logic
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_called_with(
@@ -132,7 +132,7 @@ async def test_timeout_dead_letter(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_retryable_error(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -149,7 +149,7 @@ async def test_retryable_error(mock_worker, task_data):
                 yield {}
             mock_compiled.astream = failing_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify retry logic
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_any_call(
@@ -160,7 +160,7 @@ async def test_retryable_error(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_non_retryable_error(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -177,7 +177,7 @@ async def test_non_retryable_error(mock_worker, task_data):
                 yield {}
             mock_compiled.astream = failing_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify dead letter logic
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_called_with(
@@ -200,7 +200,7 @@ async def test_non_retryable_error(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_graph_recursion_error(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -217,7 +217,7 @@ async def test_graph_recursion_error(mock_worker, task_data):
                 yield {}
             mock_compiled.astream = failing_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify dead letter logic
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_called_with(
@@ -240,7 +240,7 @@ async def test_graph_recursion_error(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_retries_exhausted(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     task_data["retry_count"] = 3
     task_data["max_retries"] = 3
     
@@ -259,7 +259,7 @@ async def test_retries_exhausted(mock_worker, task_data):
                 yield {}
             mock_compiled.astream = failing_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify dead letter logic with retries_exhausted
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_called_with(
@@ -282,7 +282,7 @@ async def test_retries_exhausted(mock_worker, task_data):
 
 @pytest.mark.asyncio
 async def test_cancellation_awareness(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker)
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -305,7 +305,7 @@ async def test_cancellation_awareness(mock_worker, task_data):
                 
             mock_compiled.astream = cancelling_astream
             
-            await executor.execute_task(task_data)
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
             
             # Verify that pool.execute and acquire.execute were NOT called (no status updates)
             # No completed and no dead letter should be written by the executor.

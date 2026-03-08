@@ -63,12 +63,14 @@ class TaskPoller:
         config: WorkerConfig,
         pool: asyncpg.Pool,
         metrics: MetricsCollector,
-        on_task_claimed: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        heartbeat: Any,
+        router: Any,
     ) -> None:
         self._config = config
         self._pool = pool
         self._metrics = metrics
-        self._on_task_claimed = on_task_claimed
+        self._heartbeat = heartbeat
+        self._router = router
         self._semaphore = asyncio.Semaphore(config.max_concurrent_tasks)
         self._log = get_logger(config.worker_id, component="poller")
         self._running = False
@@ -220,7 +222,7 @@ class TaskPoller:
                 retry_count=task_data.get("retry_count", 0),
             )
 
-            if self._on_task_claimed:
+            if self._router:
                 # Launch task execution without blocking the poller.
                 # The semaphore is released by the executor when the task finishes.
                 asyncio.create_task(
@@ -237,18 +239,29 @@ class TaskPoller:
             raise
 
     async def _execute_and_release(self, task_data: dict[str, Any]) -> None:
-        """Run the task callback and release the semaphore when done."""
+        """Route the task, wrap it in a heartbeat lease, execute, and release the semaphore."""
+        task_id = str(task_data["task_id"])
+        tenant_id = task_data["tenant_id"]
+        
+        # 1. Coordination: Ask HeartbeatManager to maintain lease in the background
+        handle = self._heartbeat.start_heartbeat(task_id, tenant_id)
         try:
-            if self._on_task_claimed:
-                await self._on_task_claimed(task_data)
+            if self._router:
+                # 2. Routing: Ask TaskRouter to pick an executor based on task_data
+                executor = self._router.get_executor(task_data)
+                
+                # 3. Execution: Run the graph, passing the cancellation event so it can abort
+                await executor.execute_task(task_data, handle.cancel_event)
         except Exception as exc:
             await self._log.aerror(
                 "task_execution_error",
-                task_id=str(task_data["task_id"]),
+                task_id=task_id,
                 error=str(exc),
                 exc_info=True,
             )
         finally:
+            # 4. Cleanup: Tell HeartbeatManager to stop pinging, and release semaphore
+            await self._heartbeat.stop_heartbeat(task_id)
             self._semaphore.release()
             active = self._config.max_concurrent_tasks - self._semaphore._value  # type: ignore[attr-defined]
             self._metrics.set_gauge(
