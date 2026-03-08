@@ -33,6 +33,15 @@ The API Service acts as the ingest and query interface between external clients 
 - **Provides output to:** None
 - **Shared interfaces/contracts:** Exposes JSON REST constructs compatible natively with the `tasks` schema representation.
 
+## Local Test Environment
+- Reuse the existing local PostgreSQL container created by Task 1 verification for integration testing instead of provisioning a separate database.
+- Expected local container: `persistent-agent-runtime-postgres`
+- Expected local port mapping: `55432 -> 5432`
+- Before running integration tests, use Docker to confirm the actual host port for the retained container rather than assuming it blindly. Preferred check: `docker ps --filter name=persistent-agent-runtime-postgres` or `docker port persistent-agent-runtime-postgres`.
+- Expected default database settings: database `persistent_agent_runtime`, user `postgres`, password `postgres`
+- Assume the Task 1 schema has already been applied in that container. If a clean reset is needed, rerun `KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh`.
+- Prefer targeting this local PostgreSQL instance for API integration tests and manual endpoint validation.
+
 ## Implementation Specification
 Step 1: Implement `POST /v1/tasks` against the exact request/response contract in `design/PHASE1_DURABLE_EXECUTION.md`, inserting a `queued` task row with `tenant_id` resolved internally to `"default"` and `agent_config` persisted as `agent_config_snapshot`. The INSERT transaction must also execute `SELECT pg_notify('new_task', :worker_pool_id)` before commit, as specified in Section 5.3 of the design doc — every transition to `status='queued'` must emit NOTIFY.
 Step 2: Enforce the documented API validation rules at submission time: payload size limits, supported model list, temperature range, retry/step/timeout bounds, and `allowed_tools` validation. Since the Phase 1 tool set is fixed, hardcode the allowed tool names (`web_search`, `read_url`, `calculator`) as a compile-time constant for validation — this avoids a runtime dependency on the MCP server at submission time while remaining consistent with the Task 5 `listTools` contract.
@@ -49,7 +58,7 @@ The implementation is complete when:
 
 ## Testing Requirements
 - **Unit tests:** Extensive Controller/Service mocks validating HTTP interactions.
-- **Integration tests:** REST-assured or MockMvc tests hitting an integrated test DB environment.
+- **Integration tests:** REST-assured or MockMvc tests hitting the retained local PostgreSQL container (`persistent-agent-runtime-postgres` on `localhost:55432`) as the default integrated test DB environment.
 - **Failure scenarios:** Test invalid DB insertions enforcing HTTP bad request status codes correctly alongside concurrency overrides.
 - **Failure scenarios:** Test unsupported tools, unsupported models, out-of-range numeric limits, tenant-scoped not-found behavior, and invalid cancel/redrive transitions.
 
