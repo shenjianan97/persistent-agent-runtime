@@ -1,7 +1,6 @@
 package com.persistentagent.api.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
@@ -24,10 +23,15 @@ public class TaskService {
 
     private final TaskRepository taskRepository;
     private final ObjectMapper objectMapper;
+    private final CheckpointEventParser checkpointEventParser;
 
-    public TaskService(TaskRepository taskRepository, ObjectMapper objectMapper) {
+    public TaskService(
+            TaskRepository taskRepository,
+            ObjectMapper objectMapper,
+            CheckpointEventParser checkpointEventParser) {
         this.taskRepository = taskRepository;
         this.objectMapper = objectMapper;
+        this.checkpointEventParser = checkpointEventParser;
     }
 
     public TaskSubmissionResponse submitTask(TaskSubmissionRequest request) {
@@ -122,15 +126,22 @@ public class TaskService {
         List<CheckpointResponse> checkpoints = IntStream.range(0, rows.size())
                 .mapToObj(i -> {
                     Map<String, Object> row = rows.get(i);
-                    String nodeName = extractNodeName(row.get("metadata_payload"));
+                    String checkpointId = (String) row.get("checkpoint_id");
+                    String nodeName = checkpointEventParser.extractNodeName(row.get("metadata_payload"), checkpointId);
                     Object executionMetadata = parseJson(row.get("execution_metadata"));
+                    CheckpointEventResponse event = checkpointEventParser.parseEvent(
+                            row.get("checkpoint_payload"),
+                            row.get("metadata_payload"),
+                            nodeName,
+                            checkpointId);
                     return new CheckpointResponse(
-                            (String) row.get("checkpoint_id"),
+                            checkpointId,
                             i + 1, // step_number derived from insertion order
                             nodeName,
                             (String) row.get("worker_id"),
                             ((Number) row.get("cost_microdollars")).intValue(),
                             executionMetadata,
+                            event,
                             toOffsetDateTime(row.get("created_at")));
                 })
                 .toList();
@@ -262,27 +273,6 @@ public class TaskService {
         return null;
     }
 
-    private List<Object> parseJsonList(Object value) {
-        if (value == null)
-            return List.of();
-        try {
-            if (value instanceof String s) {
-                return objectMapper.readValue(s, new TypeReference<List<Object>>() {
-                });
-            }
-            if (value instanceof org.postgresql.util.PGobject pgObj) {
-                return objectMapper.readValue(pgObj.getValue(), new TypeReference<List<Object>>() {
-                });
-            }
-            if (value instanceof List<?> list) {
-                return new ArrayList<>(list);
-            }
-        } catch (Exception e) {
-            // fall through
-        }
-        return List.of();
-    }
-
     private Object parseJson(Object value) {
         if (value == null)
             return null;
@@ -302,17 +292,11 @@ public class TaskService {
         return value;
     }
 
-    private String extractNodeName(Object metadataPayload) {
-        try {
-            Object parsed = parseJson(metadataPayload);
-            if (parsed instanceof Map<?, ?> map) {
-                Object source = map.get("source");
-                if (source instanceof String s)
-                    return s;
-            }
-        } catch (Exception e) {
-            // fall through
+    private List<Object> parseJsonList(Object value) {
+        Object parsed = parseJson(value);
+        if (parsed instanceof List<?> list) {
+            return new ArrayList<>(list);
         }
-        return "unknown";
+        return List.of();
     }
 }

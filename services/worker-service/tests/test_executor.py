@@ -1,6 +1,7 @@
 import asyncio
 import json
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from core.worker import WorkerService
@@ -23,6 +24,8 @@ def mock_worker():
     worker.pool = MagicMock()
     worker.pool.acquire.return_value = mock_ctx
     worker.pool.execute = AsyncMock()
+    worker.pool.fetchrow = AsyncMock(return_value=None)
+    worker.pool.fetch = AsyncMock(return_value=[])
     
     worker.heartbeat = MagicMock()
     worker.heartbeat.stop_heartbeat = AsyncMock()
@@ -87,6 +90,125 @@ async def test_completion_path(mock_worker, task_data):
             assert "status='completed'" in args[0]
             assert args[1] == json.dumps({"result": "Final Answer: 4"})
             assert args[2] == task_data["task_id"]
+
+
+def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    event = {
+        "agent": {
+            "messages": [
+                SimpleNamespace(
+                    usage_metadata={
+                        "input_tokens": 428,
+                        "output_tokens": 53,
+                    }
+                )
+            ]
+        }
+    }
+
+    cost = executor._extract_cost_from_stream_event(event, "claude-sonnet-4-20250514")
+
+    assert cost == 2079
+
+
+def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    checkpoint_payload = {
+        "channel_values": {
+            "messages": [
+                {"kwargs": {"type": "human", "content": "What is 2+2?"}},
+                {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}},
+            ]
+        }
+    }
+
+    cost = executor._extract_cost_from_checkpoint_payload(checkpoint_payload, "claude-sonnet-4-20250514")
+
+    assert cost == 2079
+
+
+def test_extract_cost_from_checkpoint_payload_ignores_prior_ai_usage_when_latest_message_is_tool(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    checkpoint_payload = {
+        "channel_values": {
+            "messages": [
+                {"kwargs": {"type": "human", "content": "What is 2+2?"}},
+                {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}},
+                {"kwargs": {"type": "tool", "content": '{"result": 4}'}},
+            ]
+        }
+    }
+
+    cost = executor._extract_cost_from_checkpoint_payload(checkpoint_payload, "claude-sonnet-4-20250514")
+
+    assert cost == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    task_data["agent_config_snapshot"] = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "temperature": 0.5,
+        "allowed_tools": ["calculator"]
+    })
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def mock_astream(*args, **kwargs):
+                yield {
+                    "agent": {
+                        "messages": [
+                            SimpleNamespace(
+                                usage_metadata={
+                                    "input_tokens": 428,
+                                    "output_tokens": 53,
+                                }
+                            )
+                        ]
+                    }
+                }
+            mock_compiled.astream = mock_astream
+
+            mock_state = MagicMock()
+            mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
+            mock_compiled.aget_state.return_value = mock_state
+            mock_worker.pool.fetch.side_effect = [
+                [
+                    {
+                        "checkpoint_id": "checkpoint-003",
+                        "checkpoint_payload": {
+                            "channel_values": {
+                                "messages": [
+                                    {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}}
+                                ]
+                            }
+                        },
+                        "cost_microdollars": 0,
+                    }
+                ],
+                [],
+            ]
+
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+            assert mock_worker.pool.execute.call_count == 2
+            cost_args, _ = mock_worker.pool.execute.call_args_list[0]
+            assert "UPDATE checkpoints" in cost_args[0]
+            assert "cost_microdollars = cost_microdollars + $1::int" in cost_args[0]
+            assert cost_args[1] == 2079
+            assert cost_args[2] == task_data["task_id"]
+            assert cost_args[3] == "checkpoint-003"
 
 
 @pytest.mark.asyncio

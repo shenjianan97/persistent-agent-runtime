@@ -38,7 +38,7 @@ class TaskServiceTest {
         objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        taskService = new TaskService(taskRepository, objectMapper);
+        taskService = new TaskService(taskRepository, objectMapper, new CheckpointEventParser(objectMapper));
     }
 
     // --- submitTask tests ---
@@ -259,6 +259,9 @@ class TaskServiceTest {
                         "cost_microdollars", 5200,
                         "execution_metadata", "{\"latency_ms\": 2340}",
                         "metadata_payload", "{\"source\": \"agent\"}",
+                        "checkpoint_payload", """
+                                {"channel_values":{"messages":[{"kwargs":{"type":"human","content":"what is 2+2?"}}]}}
+                                """,
                         "created_at", now));
         when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
 
@@ -268,6 +271,146 @@ class TaskServiceTest {
         assertEquals("cp-1", response.checkpoints().get(0).checkpointId());
         assertEquals(1, response.checkpoints().get(0).stepNumber());
         assertEquals("agent", response.checkpoints().get(0).nodeName());
+        assertEquals("input", response.checkpoints().get(0).event().type());
+        assertEquals("what is 2+2?", response.checkpoints().get(0).event().summary());
+    }
+
+    @Test
+    void getCheckpoints_aiToolCall_returnsParsedToolEvent() {
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow(
+                        "cp-tool-call",
+                        "worker-a",
+                        0,
+                        null,
+                        "{\"source\": \"loop\"}",
+                        """
+                                {
+                                  "channel_values": {
+                                    "messages": [
+                                      {
+                                        "kwargs": {
+                                          "type": "ai",
+                                          "content": [{"type":"tool_use","name":"calculator","input":{"expression":"2+2"}}],
+                                          "tool_calls": [{"name":"calculator","args":{"expression":"2+2"}}],
+                                          "usage_metadata": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                                """,
+                        now));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+
+        CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
+
+        assertEquals("tool_call", event.type());
+        assertEquals("Tool Call: calculator", event.title());
+        assertEquals("calculator", event.toolName());
+        assertTrue(event.toolArgs() instanceof Map<?, ?>);
+        assertTrue(event.usage() instanceof Map<?, ?>);
+    }
+
+    @Test
+    void getCheckpoints_toolResult_returnsParsedToolResultEvent() {
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow(
+                        "cp-tool-result",
+                        "worker-a",
+                        0,
+                        null,
+                        "{\"source\": \"loop\"}",
+                        """
+                                {
+                                  "channel_values": {
+                                    "messages": [
+                                      {
+                                        "kwargs": {
+                                          "type": "tool",
+                                          "name": "calculator",
+                                          "content": "{\\"expression\\": \\"2+2\\", \\"result\\": 4}"
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                                """,
+                        now));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+
+        CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
+
+        assertEquals("tool_result", event.type());
+        assertEquals("Tool Result: calculator", event.title());
+        assertTrue(event.toolResult() instanceof Map<?, ?>);
+    }
+
+    @Test
+    void getCheckpoints_multipleToolCalls_returnsAggregatedToolEvent() {
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow(
+                        "cp-multi-tool",
+                        "worker-a",
+                        0,
+                        null,
+                        "{\"source\": \"loop\"}",
+                        """
+                                {
+                                  "channel_values": {
+                                    "messages": [
+                                      {
+                                        "kwargs": {
+                                          "type": "ai",
+                                          "tool_calls": [
+                                            {"name":"calculator","args":{"expression":"2+2"}},
+                                            {"name":"read_url","args":{"url":"https://example.com"}}
+                                          ]
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                                """,
+                        now));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+
+        CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
+
+        assertEquals("tool_call", event.type());
+        assertEquals("Tool Calls", event.title());
+        assertNull(event.toolName());
+        assertTrue(event.toolArgs() instanceof List<?>);
+        assertTrue(event.summary().contains("calculator"));
+        assertTrue(event.summary().contains("read_url"));
+    }
+
+    @Test
+    void getCheckpoints_malformedPayload_fallsBackToCheckpointEvent() {
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow(
+                        "cp-bad-json",
+                        "worker-a",
+                        0,
+                        null,
+                        "{\"source\": \"loop\", \"step\": 3}",
+                        "{not valid json",
+                        now));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+
+        CheckpointResponse checkpoint = taskService.getCheckpoints(taskId).checkpoints().get(0);
+
+        assertEquals("loop", checkpoint.nodeName());
+        assertEquals("checkpoint", checkpoint.event().type());
+        assertTrue(checkpoint.event().summary().contains("Framework step \"loop\" completed"));
     }
 
     @Test
@@ -304,5 +447,24 @@ class TaskServiceTest {
         assertEquals("disconnected", response.database());
         assertEquals(0, response.activeWorkers());
         assertEquals(0, response.queuedTasks());
+    }
+
+    private Map<String, Object> checkpointRow(
+            String checkpointId,
+            String workerId,
+            int costMicrodollars,
+            Object executionMetadata,
+            String metadataPayload,
+            String checkpointPayload,
+            Timestamp createdAt) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("checkpoint_id", checkpointId);
+        row.put("worker_id", workerId);
+        row.put("cost_microdollars", costMicrodollars);
+        row.put("execution_metadata", executionMetadata);
+        row.put("metadata_payload", metadataPayload);
+        row.put("checkpoint_payload", checkpointPayload);
+        row.put("created_at", createdAt);
+        return row;
     }
 }

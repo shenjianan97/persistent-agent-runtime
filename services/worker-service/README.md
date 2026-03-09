@@ -41,8 +41,10 @@ Create a `.env` file in `services/worker-service/` or export directly:
 | `AWS_SECRET_ACCESS_KEY` | Bedrock models | — |
 | `AWS_REGION` | Bedrock models | — |
 | `TAVILY_API_KEY` | `web_search` tool | — |
+| `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
 
 The model is selected per-agent via `agent_config.model`. Names containing `claude` use Anthropic; others use Bedrock.
+Checkpoint cost estimation uses the local pricing file, not a runtime provider lookup. Update `config/model_pricing.json` or point `MODEL_PRICING_FILE` at another JSON file to add or override model rates.
 
 ### Run the Worker (Real LLM)
 

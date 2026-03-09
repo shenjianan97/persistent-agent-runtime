@@ -11,6 +11,7 @@ public record CheckpointResponse(
         @JsonProperty("worker_id") String workerId,
         @JsonProperty("cost_microdollars") int costMicrodollars,
         @JsonProperty("execution_metadata") Object executionMetadata,
+        @JsonProperty("event") CheckpointEventResponse event,
         @JsonProperty("created_at") OffsetDateTime createdAt
 ) {
 }

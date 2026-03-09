@@ -92,7 +92,7 @@ public class TaskRepository {
 
         String sql = """
                 SELECT checkpoint_id, worker_id, cost_microdollars,
-                       execution_metadata, metadata_payload, created_at
+                       execution_metadata, metadata_payload, checkpoint_payload, created_at
                 FROM checkpoints
                 WHERE task_id = ? AND checkpoint_ns = ''
                 ORDER BY created_at ASC

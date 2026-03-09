@@ -44,8 +44,26 @@ export interface CheckpointResponse {
     node_name: string;
     worker_id: string;
     cost_microdollars: number;
+    event?: CheckpointEvent;
     state_snapshot?: any;
     created_at: string;
+}
+
+export interface CheckpointEventUsage {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+}
+
+export interface CheckpointEvent {
+    type: 'system' | 'checkpoint' | 'input' | 'tool_call' | 'tool_result' | 'output';
+    title: string;
+    summary: string;
+    content?: unknown;
+    tool_name?: string | null;
+    tool_args?: unknown;
+    tool_result?: unknown;
+    usage?: CheckpointEventUsage | null;
 }
 
 export interface CheckpointListResponse {

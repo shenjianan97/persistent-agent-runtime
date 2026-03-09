@@ -301,14 +301,23 @@ class TaskControllerTest {
                 UUID taskId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
                 CheckpointListResponse response = new CheckpointListResponse(List.of(
-                                new CheckpointResponse("cp-1", 1, "agent", "worker-a", 5200, null, now)));
+                                new CheckpointResponse(
+                                                "cp-1",
+                                                1,
+                                                "agent",
+                                                "worker-a",
+                                                5200,
+                                                null,
+                                                new CheckpointEventResponse("input", "User Input", "what is 2+2?", "what is 2+2?", null, null, null, null),
+                                                now)));
                 when(taskService.getCheckpoints(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId + "/checkpoints"))
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.checkpoints[0].checkpoint_id").value("cp-1"))
                                 .andExpect(jsonPath("$.checkpoints[0].step_number").value(1))
-                                .andExpect(jsonPath("$.checkpoints[0].node_name").value("agent"));
+                                .andExpect(jsonPath("$.checkpoints[0].node_name").value("agent"))
+                                .andExpect(jsonPath("$.checkpoints[0].event.type").value("input"));
         }
 
         // --- POST /v1/tasks/{taskId}/cancel ---

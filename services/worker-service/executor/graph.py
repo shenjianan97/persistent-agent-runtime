@@ -5,17 +5,18 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncGenerator
 
+import asyncpg
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_anthropic import ChatAnthropic
 from langchain_aws import ChatBedrock
 from langchain_core.tools import StructuredTool
-from langchain_core.callbacks import AsyncCallbackHandler
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError
 
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
+from core.config import WorkerConfig
 
 from tools.definitions import (
     create_default_dependencies, 
@@ -29,37 +30,6 @@ from tools.definitions import (
 from tools.calculator import evaluate_expression
 
 logger = logging.getLogger(__name__)
-
-
-class CostTrackingCallback(AsyncCallbackHandler):
-    """
-    Accumulates token usage and cost per LLM call.
-    We inject this into the `config["callbacks"]` of the graph execution.
-    """
-    def __init__(self):
-        super().__init__()
-        self.total_cost_microdollars = 0
-        self.total_tokens = 0
-        self.flush_pending = 0
-
-    async def on_llm_end(self, response, **kwargs):
-        # response is an LLMResult
-        if response.llm_output and "token_usage" in response.llm_output:
-            usage = response.llm_output["token_usage"]
-            in_tokens = usage.get("prompt_tokens", 0)
-            out_tokens = usage.get("completion_tokens", 0)
-            self.total_tokens += in_tokens + out_tokens
-            
-            # Rough proxy: $3.00 / 1M input, $15.00 / 1M output (Sonnet pricing rough approx)
-            cost_in = int((in_tokens / 1_000_000) * 3_000_000)
-            cost_out = int((out_tokens / 1_000_000) * 15_000_000)
-            self.total_cost_microdollars += (cost_in + cost_out)
-            self.flush_pending += (cost_in + cost_out)
-
-    def extract_and_reset_pending(self) -> int:
-        val = self.flush_pending
-        self.flush_pending = 0
-        return val
 
 
 class GraphExecutor:
@@ -180,13 +150,12 @@ class GraphExecutor:
             compiled_graph = graph.compile(checkpointer=checkpointer)
             
             # 4. Config map
-            cost_callback = CostTrackingCallback()
+            model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
             config = {
                 "configurable": {
                     "thread_id": task_id,
                 },
                 "recursion_limit": max_steps,
-                "callbacks": [cost_callback]
             }
             
             async def run_astream():
@@ -202,27 +171,12 @@ class GraphExecutor:
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
                         return
 
-                    # Update cost microdollars in standard checkpoint metadata
-                    pending_cost = cost_callback.extract_and_reset_pending()
-                    if pending_cost > 0:
-                        # Append the cost directly to the recently written checkpoint
-                        # (LangGraph astream('updates') emits after nodes commit their checkpoint)
-                        await pool.execute('''
-                            UPDATE checkpoints
-                            SET metadata_payload = jsonb_set(
-                                metadata_payload,
-                                '{cost_microdollars}',
-                                to_jsonb(COALESCE((metadata_payload->>'cost_microdollars')::bigint, 0) + $1::bigint)
-                            )
-                            WHERE task_id = $2::uuid AND checkpoint_id = (
-                                SELECT checkpoint_id FROM checkpoints
-                                WHERE task_id = $2::uuid
-                                ORDER BY thread_ts DESC LIMIT 1
-                            )
-                        ''', pending_cost, task_id)
+                    await self._backfill_checkpoint_costs(task_id, model_name)
 
                 if cancel_event.is_set():
                     return
+
+                await self._backfill_checkpoint_costs(task_id, model_name)
 
                 # Execution Finished successfully. Compute final output.
                 final_state = await compiled_graph.aget_state(config)
@@ -262,6 +216,152 @@ class GraphExecutor:
                 await self._handle_retryable_error(task_data, e)
             else:
                 await self._handle_dead_letter(task_id, "non_retryable_error", str(e))
+
+    def _extract_cost_from_stream_event(self, event: Any, model_name: str) -> int:
+        usage = self._extract_usage_from_stream_event(event)
+        if usage is None:
+            return 0
+        return self._calculate_cost_microdollars(model_name, usage)
+
+    def _extract_cost_from_checkpoint_payload(self, checkpoint_payload: Any, model_name: str) -> int:
+        if checkpoint_payload is None:
+            return 0
+
+        if isinstance(checkpoint_payload, str):
+            try:
+                checkpoint_payload = json.loads(checkpoint_payload)
+            except json.JSONDecodeError:
+                logger.warning("Unable to parse checkpoint payload while calculating cost.")
+                return 0
+
+        if not isinstance(checkpoint_payload, dict):
+            return 0
+
+        channel_values = checkpoint_payload.get("channel_values")
+        if not isinstance(channel_values, dict):
+            return 0
+
+        messages = channel_values.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return 0
+
+        usage = self._extract_usage_from_message(messages[-1])
+        if usage is None:
+            return 0
+
+        return self._calculate_cost_microdollars(model_name, usage)
+
+    def _extract_usage_from_stream_event(self, event: Any) -> dict[str, int] | None:
+        if not isinstance(event, dict):
+            return None
+
+        for update in event.values():
+            usage = self._extract_usage_from_update(update)
+            if usage is not None:
+                return usage
+
+        return None
+
+    def _extract_usage_from_update(self, update: Any) -> dict[str, int] | None:
+        if not isinstance(update, dict):
+            return None
+
+        messages = update.get("messages")
+        if not isinstance(messages, list):
+            return None
+
+        for message in reversed(messages):
+            usage = self._extract_usage_from_message(message)
+            if usage is not None:
+                return usage
+
+        return None
+
+    def _extract_usage_from_message(self, message: Any) -> dict[str, int] | None:
+        usage = getattr(message, "usage_metadata", None)
+        if usage is None and isinstance(message, dict):
+            usage = message.get("usage_metadata")
+            if usage is None:
+                kwargs = message.get("kwargs")
+                if isinstance(kwargs, dict):
+                    usage = kwargs.get("usage_metadata")
+
+        if not isinstance(usage, dict):
+            return None
+
+        input_tokens = self._coerce_usage_value(usage, "input_tokens", "prompt_tokens", "inputTokens")
+        output_tokens = self._coerce_usage_value(usage, "output_tokens", "completion_tokens", "outputTokens")
+        if input_tokens is None and output_tokens is None:
+            return None
+
+        return {
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+        }
+
+    def _coerce_usage_value(self, usage: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+        return None
+
+    def _calculate_cost_microdollars(self, model_name: str, usage: dict[str, int]) -> int:
+        pricing = self.config.model_pricing.get(model_name)
+        if pricing is None:
+            logger.warning("No pricing configured for model %s; checkpoint cost will remain zero.", model_name)
+            return 0
+
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        input_cost = self._cost_from_tokens(input_tokens, pricing.input_microdollars_per_million)
+        output_cost = self._cost_from_tokens(output_tokens, pricing.output_microdollars_per_million)
+        return input_cost + output_cost
+
+    def _cost_from_tokens(self, tokens: int, microdollars_per_million: int) -> int:
+        return (tokens * microdollars_per_million + 500_000) // 1_000_000
+
+    async def _persist_checkpoint_cost(self, task_id: str, checkpoint_id: str, pending_cost: int) -> None:
+        await self.pool.execute(
+            '''
+            UPDATE checkpoints
+            SET cost_microdollars = cost_microdollars + $1::int,
+                metadata_payload = jsonb_set(
+                    COALESCE(metadata_payload, '{}'::jsonb),
+                    '{cost_microdollars}',
+                    to_jsonb(COALESCE((metadata_payload->>'cost_microdollars')::bigint, 0) + $1::bigint),
+                    true
+                )
+            WHERE task_id = $2::uuid AND checkpoint_id = $3
+            ''',
+            pending_cost,
+            task_id,
+            checkpoint_id,
+        )
+
+    async def _backfill_checkpoint_costs(self, task_id: str, model_name: str) -> None:
+        rows = await self.pool.fetch(
+            '''
+            SELECT checkpoint_id, checkpoint_payload, cost_microdollars
+            FROM checkpoints
+            WHERE task_id = $1::uuid
+              AND checkpoint_ns = ''
+              AND cost_microdollars = 0
+            ORDER BY thread_ts ASC
+            ''',
+            task_id,
+        )
+
+        if not rows:
+            return
+
+        for row in rows:
+            pending_cost = self._extract_cost_from_checkpoint_payload(row["checkpoint_payload"], model_name)
+            if pending_cost <= 0:
+                continue
+            await self._persist_checkpoint_cost(task_id, row["checkpoint_id"], pending_cost)
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""

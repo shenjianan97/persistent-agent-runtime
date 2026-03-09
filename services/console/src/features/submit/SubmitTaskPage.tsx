@@ -53,10 +53,10 @@ export function SubmitTaskPage() {
     return (
         <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
             <div className="mb-8">
-                <h2 className="text-2xl font-display font-medium uppercase tracking-wider mb-2 flex items-center gap-2">
-                    <PlaySquare className="w-6 h-6 text-primary" />
-                    Dispatch Task
-                </h2>
+                    <h2 className="text-2xl font-display font-medium uppercase tracking-wider mb-2 flex items-center gap-2">
+                        <PlaySquare className="w-6 h-6 text-primary" />
+                        Submit Task
+                    </h2>
                 <p className="text-muted-foreground w-full md:w-2/3">
                     Initialize a new durable execution job. The task will be queued and picked up by an available worker.
                 </p>
@@ -269,7 +269,7 @@ export function SubmitTaskPage() {
                             disabled={mutation.isPending}
                             className="rounded-none font-bold uppercase tracking-widest px-8 hover:saturate-150 transition-all border border-primary text-black"
                         >
-                            {mutation.isPending ? "INITIALIZING..." : "DISPATCH TASK"}
+                            {mutation.isPending ? "INITIALIZING..." : "SUBMIT TASK"}
                         </Button>
                     </div>
                 </form>
