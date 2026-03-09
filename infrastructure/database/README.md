@@ -5,6 +5,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 ## Files
 
 - `migrations/0001_phase1_durable_execution.sql`: initial schema for `tasks`, `checkpoints`, and `checkpoint_writes`
+- `migrations/0002_worker_registry.sql`: `workers` table for worker self-registration and heartbeat tracking
 - `tests/verification.sql`: integration-style verification of the shipped schema and canonical query patterns
 - `verify_schema.sh`: launches or reuses a disposable PostgreSQL container and runs the verification suite
 
@@ -51,7 +52,7 @@ docker ps -a --filter name=persistent-agent-runtime-postgres
 docker logs persistent-agent-runtime-postgres
 ```
 
-The script starts a disposable PostgreSQL container if needed, applies the schema from scratch, and runs verification coverage for:
+The script starts a disposable PostgreSQL container if needed, applies all migrations in order from `migrations/`, and runs verification coverage for:
 
 - schema creation and required indexes
 - claim via `FOR UPDATE SKIP LOCKED`

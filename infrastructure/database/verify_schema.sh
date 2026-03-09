@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MIGRATION_FILE="$ROOT_DIR/migrations/0001_phase1_durable_execution.sql"
+MIGRATION_DIR="$ROOT_DIR/migrations"
 VERIFICATION_FILE="$ROOT_DIR/tests/verification.sql"
 CONTAINER_NAME="${DB_CONTAINER_NAME:-persistent-agent-runtime-postgres}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16}"
@@ -74,7 +74,13 @@ fi
 wait_for_postgres
 
 reset_database
-apply_sql_file "$MIGRATION_FILE"
+
+# Apply all migrations in order
+for migration in "$MIGRATION_DIR"/0*.sql; do
+  echo "Applying $(basename "$migration")..."
+  apply_sql_file "$migration"
+done
+
 apply_sql_file "$VERIFICATION_FILE"
 
 echo "Schema verification passed"

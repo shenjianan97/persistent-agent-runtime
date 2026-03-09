@@ -17,6 +17,7 @@ This repo combines:
 
 - a Java API service for task submission and querying
 - a Python worker service for lease-based execution and LangGraph orchestration
+- a React console for monitoring tasks, workers, and dead letters
 - PostgreSQL as the Phase 1 queue and durable checkpoint store
 
 ## Current Architecture
@@ -47,29 +48,35 @@ docs/
   implementation_plan/
 services/
   api-service/
+  console/
   worker-service/
 tests/
-  e2e/
+  backend-integration/
 experiments/
   langgraph/
 infrastructure/
+  database/
+  cdk/
 ```
 
 - [`docs/PROJECT.md`](./docs/PROJECT.md): project overview, phases, tradeoffs, and roadmap
 - [`docs/design/`](./docs/design/): architecture and design documents
 - [`docs/implementation_plan/`](./docs/implementation_plan/): implementation planning and progress
 - [`services/api-service/`](./services/api-service/): Spring Boot API service
+- [`services/console/`](./services/console/): React SPA for monitoring and controlling the runtime
 - [`services/worker-service/`](./services/worker-service/): Python worker, checkpointer, executor, and tools
 - [`tests/backend-integration/`](./tests/backend-integration/): cross-service integration tests (API + Worker + PostgreSQL, mocked LLMs)
 - [`experiments/langgraph/`](./experiments/langgraph/): proof-of-concept and validation work
-- [`infrastructure/`](./infrastructure/): database and deployment infrastructure
+- [`infrastructure/database/`](./infrastructure/database/): schema migrations and verification
+- [`infrastructure/cdk/`](./infrastructure/cdk/): AWS CDK infrastructure (Task 8)
 
 ## Getting Started
 
 ### Prerequisites
 
 - Java 21+
-- Python 3.11+ or newer
+- Python 3.11+
+- Node.js 18+
 - PostgreSQL
 - Docker
 
@@ -93,10 +100,11 @@ KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
 
 That gives you a local database with the required `tasks`, `checkpoints`, and `checkpoint_writes` tables already created.
 
-If you already have your own PostgreSQL instance, Docker is not strictly required. In that case, apply the schema manually from:
+If you already have your own PostgreSQL instance, Docker is not strictly required. In that case, apply the migrations manually in order:
 
 ```text
 infrastructure/database/migrations/0001_phase1_durable_execution.sql
+infrastructure/database/migrations/0002_worker_registry.sql
 ```
 
 Then point the API and worker services at that database with their normal environment variables.
@@ -104,6 +112,7 @@ Then point the API and worker services at that database with their normal enviro
 ### Useful Entry Points
 
 - API service: [`services/api-service/README.md`](./services/api-service/README.md)
+- Console: [`services/console/README.md`](./services/console/README.md)
 - Worker service: [`services/worker-service/README.md`](./services/worker-service/README.md)
 - Backend integration tests: [`tests/backend-integration/README.md`](./tests/backend-integration/README.md)
 - Database schema: [`infrastructure/database/README.md`](./infrastructure/database/README.md)
@@ -135,17 +144,18 @@ The repo is in active development.
 Implemented or substantially defined already:
 
 - Phase 1 database schema and verification flow
-- REST API for task submission, status, checkpoints, cancellation, dead-letter listing, and redrive
-- worker poller, heartbeat manager, and reaper
+- REST API for task submission, listing, status, checkpoints, cancellation, dead-letter listing, and redrive
+- Worker poller, heartbeat manager, and reaper
+- Worker registry with self-registration, heartbeat, and stale worker cleanup
 - PostgreSQL-backed LangGraph checkpointer
-- in-process MCP server for `web_search`, `read_url`, and `calculator`
-- end-to-end test coverage for crash recovery and lifecycle behavior
+- In-process MCP server for `web_search`, `read_url`, and `calculator`
+- Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
+- End-to-end test coverage for crash recovery and lifecycle behavior
 
 Still evolving:
 
-- AWS infrastructure and deployment flow
-- broader packaging and repository cleanup
-- later-phase multi-agent scheduling and budget enforcement
+- AWS infrastructure and deployment flow (Task 8)
+- Later-phase multi-agent scheduling and budget enforcement
 
 ## Design Documents
 
