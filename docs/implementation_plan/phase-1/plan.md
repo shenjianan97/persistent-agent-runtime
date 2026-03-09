@@ -47,6 +47,11 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
   Path: `services/worker-service/executor/`
   Description: Embed LangGraph `astream()` inside the Worker Service to translate API payloads into workflow states, manage tool dispatches, and calculate cycle cost.
 
+  Component: Demo Dashboard
+  Change type: new code
+  Path: `services/console/`
+  Description: Build a React 19 + TypeScript SPA with Tailwind CSS/shadcn/ui that consumes the Phase 1 API endpoints. Provides task submission, live checkpoint timeline, cost visualization, and dead letter queue management for demo purposes.
+
   Component: AWS Cloud Infrastructure
   Change type: new code
   Path: `infrastructure/cdk/`, `services/api-service/`, and `services/worker-service/`
@@ -60,7 +65,8 @@ All tasks are mostly independent except where schema or runtime contracts are sh
   Task 4 (LangGraph Checkpointer) → depends on → Task 1
   Task 5 (Co-located MCP Server) → depends on no prior tasks
   Task 6 (Worker Service Graph Executor) → depends on → Task 3, Task 4, Task 5
-  Task 7 (AWS Infrastructure and Containerization) → can run in parallel with all other tasks, but blocks final integration testing and deployment.
+  Task 7 (Demo Dashboard) → depends on → Task 2 (API Service REST endpoints for data consumption)
+  Task 8 (AWS Infrastructure and Containerization) → can run in parallel with all other tasks, but blocks final integration testing and deployment.
 
 #### A4. Data / API / Schema Changes
   Change: Foundation PostgreSQL Schema setup
@@ -90,6 +96,9 @@ Each task should leave explicit artifacts for downstream consumers:
   A task execution entrypoint that accepts a claimed task record and performs graph execution, retry/dead-letter classification, and checkpoint cost updates.
 
   Task 7 output
+  A production-ready React SPA with typed API client, live-polling checkpoint timeline, cost charts, and dead letter management, plus CORS configuration in the API Service.
+
+  Task 8 output
   Deployable CDK stacks, API/Worker container build assets (for example Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, and clear instructions for schema bootstrap ordering relative to service rollout.
 
 #### A5. Integration Points
@@ -184,6 +193,7 @@ Please refer to the following tasks in the `agent_tasks/` directory:
 - [Task 4: LangGraph Postgres Checkpointer](./agent_tasks/task-4-langgraph-checkpointer.md)
 - [Task 5: Co-located MCP Server](./agent_tasks/task-5-mcp-server.md)
 - [Task 6: Graph Executor Assembly](./agent_tasks/task-6-graph-executor.md)
-- [Task 7: AWS Cloud Infrastructure](./agent_tasks/task-7-aws-infrastructure.md)
+- [Task 7: Console](./agent_tasks/task-7-console.md)
+- [Task 8: AWS Cloud Infrastructure](./agent_tasks/task-8-aws-infrastructure.md)
 
 Tracking of these tasks can be found in [progress.md](./progress.md).

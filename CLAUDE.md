@@ -19,7 +19,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ## Tech Stack
 
-- Java (core runtime), Python (workers), TypeScript (CDK)
+- Java (core runtime), Python (workers), TypeScript (CDK, Console)
+- React 19 + Vite + Tailwind/shadcn/ui — Console frontend
 - PostgreSQL (Aurora Serverless v2) — Phase 1 state store + queue
 - SQS FIFO — Phase 2 queue (transactional outbox)
 - ECS Fargate — workers
@@ -36,7 +37,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | docs/design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
 | docs/implementation_plan/phase-1/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
 | docs/implementation_plan/phase-1/progress.md | Live tracking board for agent execution of Phase 1 |
-| docs/implementation_plan/phase-1/agent_tasks/*.md | 7 parallelizable, single-responsibility execution templates for agents |
+| docs/implementation_plan/phase-1/agent_tasks/*.md | 8 parallelizable, single-responsibility execution templates for agents |
 | experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
 ## Project Stages
@@ -53,13 +54,13 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ### Stage 3 — Implementation Plan [DONE]
 - Hand-off: Translate Phase 1 design into `docs/implementation_plan/phase-1/plan.md` Orchestrator Plan
-- Splitting Prompts: Generate and split explicit constraints into 7 parallelizable agent task spec files (`task-1` through `task-7`) 
+- Splitting Prompts: Generate and split explicit constraints into 8 parallelizable agent task spec files (`task-1` through `task-8`) 
 - Tracking: Created `docs/implementation_plan/phase-1/progress.md` for orchestrator execution tracking
 - POC logic: Created LangGraph POC validation tasks in `experiments/langgraph/` to test assumptions
 
 ### Stage 4 — Implementation [IN PROGRESS]
 - Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, and graph executor (Tasks 1-6)
-- Remaining: AWS infrastructure and containerization work (Task 7)
+- Remaining: Console frontend (Task 7), AWS infrastructure and containerization (Task 8)
 - Source of truth: `docs/implementation_plan/phase-1/progress.md`
 
 ### Stage 5 — Validation [NOT STARTED]

@@ -173,15 +173,31 @@ cd services/worker-service
 
 ### Runtime Configuration
 
-The default search backend uses these environment variables:
+The worker requires appropriate API keys to authenticate with external APIs, including the LLMs driven by the `GraphExecutor` and the tools.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TAVILY_API_KEY` | Yes for live `web_search` calls | Tavily API key used by the default search provider |
+| `ANTHROPIC_API_KEY` | Yes (for Claude models) | API key for Anthropic (Claude 3.5 Sonnet, etc.) |
+| `AWS_ACCESS_KEY_ID` | Yes (for Bedrock models) | AWS access key when using Bedrock |
+| `AWS_SECRET_ACCESS_KEY` | Yes (for Bedrock models) | AWS secret key when using Bedrock |
+| `AWS_REGION` | Yes (for Bedrock models) | AWS region for Bedrock (e.g., `us-west-2`) |
+| `TAVILY_API_KEY` | Yes (for `web_search` calls) | Tavily API key used by the default search provider |
 
-The tools package will auto-load local `.env` files from the current working directory, `services/worker-service/tools/.env`, and `services/worker-service/.env` without overriding an already-set process environment variable.
+The worker will auto-load these from a `.env` file located at `services/worker-service/.env`, `services/worker-service/tools/.env`, or the current working directory. You can also export them directly in your shell before starting the worker:
 
-Unit tests do not require external API keys because they inject fake providers and mocked HTTP transports.
+```bash
+cd services/worker-service
+source .venv/bin/activate
+
+# Set API Keys
+export ANTHROPIC_API_KEY="sk-ant-..."
+export TAVILY_API_KEY="tvly-..."
+export DB_DSN="postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
+
+python worker.py
+```
+
+*Note: Unit tests do not require external API keys because they inject fake providers and mocked execution transports.*
 
 ### Logging
 

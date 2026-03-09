@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-7-aws-infrastructure.md -->
+<!-- AGENT_TASK_START: task-8-aws-infrastructure.md -->
 
-# Task 7: AWS Cloud Infrastructure
+# Task 8: AWS Cloud Infrastructure
 
 ## Agent Instructions
 You are a software engineer or cloud architect implementing the Infrastructure as Code (IaC) for a larger system.
@@ -69,4 +69,4 @@ The implementation is complete when:
 ## Assumptions / Open Questions for This Task
 - None. Use AWS CDK with TypeScript and ECS Fargate, as already decided in `docs/PROJECT.md`.
 
-<!-- AGENT_TASK_END: task-7-aws-infrastructure.md -->
+<!-- AGENT_TASK_END: task-8-aws-infrastructure.md -->
