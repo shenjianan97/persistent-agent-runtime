@@ -5,7 +5,7 @@ export interface TaskStatusResponse {
     agent_id: string;
     status: TaskStatus;
     input: string;
-    output?: string;
+    output?: unknown;
     retry_count: number;
     retry_history: string[];
     checkpoint_count: number;
@@ -68,9 +68,25 @@ export interface DeadLetterListResponse {
     total: number;
 }
 
+export interface TaskSummaryResponse {
+    task_id: string;
+    agent_id: string;
+    status: TaskStatus;
+    retry_count: number;
+    checkpoint_count: number;
+    total_cost_microdollars: number;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface TaskListResponse {
+    items: TaskSummaryResponse[];
+    total: number;
+}
+
 export interface HealthResponse {
     status: string;
-    database_connected: boolean;
+    database: string;
     active_workers: number;
     queued_tasks: number;
 }

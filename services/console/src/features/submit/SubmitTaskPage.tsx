@@ -42,7 +42,7 @@ export function SubmitTaskPage() {
                 });
                 navigate(`/tasks/${response.task_id}`);
             },
-            onError: (error: any) => {
+            onError: (error: Error) => {
                 toast.error("Submission failed", {
                     description: error.message || "Unknown error occurred.",
                 });
@@ -75,7 +75,7 @@ export function SubmitTaskPage() {
                                     name="agent_id"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Agent ID</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Agent ID</FormLabel>
                                             <FormControl>
                                                 <Input className="rounded-none border-border bg-black/50 focus-visible:ring-primary focus-visible:ring-1" placeholder="e.g., e2e-test" {...field} />
                                             </FormControl>
@@ -88,7 +88,7 @@ export function SubmitTaskPage() {
                                     name="model"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Model</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Model</FormLabel>
                                             <FormControl>
                                                 <select
                                                     className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
@@ -111,7 +111,7 @@ export function SubmitTaskPage() {
                                 name="system_prompt"
                                 render={({ field }) => (
                                     <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">System Prompt</FormLabel>
+                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">System Prompt</FormLabel>
                                         <FormControl>
                                             <Textarea
                                                 className="min-h-[100px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary focus-visible:ring-1"
@@ -128,7 +128,7 @@ export function SubmitTaskPage() {
                                 name="input"
                                 render={({ field }) => (
                                     <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Input Directive</FormLabel>
+                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Input Directive</FormLabel>
                                         <FormControl>
                                             <Textarea
                                                 className="min-h-[150px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary border-b-[3px] focus-visible:border-b-primary focus-visible:ring-0"
@@ -155,7 +155,7 @@ export function SubmitTaskPage() {
                                     name="temperature"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Temperature</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Temperature</FormLabel>
                                             <FormControl>
                                                 <Input type="number" step="0.1" min="0" max="2" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseFloat(e.target.value))} />
                                             </FormControl>
@@ -169,7 +169,7 @@ export function SubmitTaskPage() {
                                     name="max_steps"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Max Steps</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Steps</FormLabel>
                                             <FormControl>
                                                 <Input type="number" min="1" max="1000" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
                                             </FormControl>
@@ -183,7 +183,7 @@ export function SubmitTaskPage() {
                                     name="max_retries"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Max Retries</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Retries</FormLabel>
                                             <FormControl>
                                                 <Input type="number" min="0" max="10" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
                                             </FormControl>
@@ -197,7 +197,7 @@ export function SubmitTaskPage() {
                                     name="task_timeout_seconds"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Timeout (s)</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Timeout (s)</FormLabel>
                                             <FormControl>
                                                 <Input type="number" min="60" max="86400" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
                                             </FormControl>
@@ -214,7 +214,7 @@ export function SubmitTaskPage() {
                                     render={() => (
                                         <FormItem>
                                             <div className="mb-4">
-                                                <FormLabel className="uppercase tracking-widest text-[#a1a1aa] text-xs">Allowed Tools</FormLabel>
+                                                <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Allowed Tools</FormLabel>
                                                 <FormDescription className="text-xs">
                                                     Grant capabilities to this execution
                                                 </FormDescription>

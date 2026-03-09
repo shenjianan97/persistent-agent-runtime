@@ -4,6 +4,7 @@ import { AppShell } from './layout/AppShell';
 import { DashboardPage } from './features/dashboard/DashboardPage';
 import { SubmitTaskPage } from './features/submit/SubmitTaskPage';
 import { TaskDetailPage } from './features/task-detail/TaskDetailPage';
+import { TaskListPage } from './features/task-list/TaskListPage';
 import { DeadLetterPage } from './features/dead-letter/DeadLetterPage';
 import { Toaster } from 'sonner';
 
@@ -23,6 +24,7 @@ function App() {
                 <Routes>
                     <Route element={<AppShell />}>
                         <Route path="/" element={<DashboardPage />} />
+                        <Route path="/tasks" element={<TaskListPage />} />
                         <Route path="/tasks/new" element={<SubmitTaskPage />} />
                         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                         <Route path="/dead-letter" element={<DeadLetterPage />} />

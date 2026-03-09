@@ -14,7 +14,7 @@ import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_SRC = REPO_ROOT / "services" / "worker-service"
-E2E_ROOT = REPO_ROOT / "tests" / "e2e"
+E2E_ROOT = REPO_ROOT / "tests" / "backend-integration"
 if str(WORKER_SRC) not in sys.path:
     sys.path.insert(0, str(WORKER_SRC))
 if str(E2E_ROOT) not in sys.path:

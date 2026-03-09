@@ -178,6 +178,27 @@ public class TaskService {
         return new DeadLetterListResponse(items);
     }
 
+    public TaskListResponse listTasks(String status, String agentId, Integer limit) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+        int effectiveLimit = limit != null ? Math.min(Math.max(limit, 1), 200) : 50;
+
+        List<Map<String, Object>> rows = taskRepository.listTasks(tenantId, status, agentId, effectiveLimit);
+
+        List<TaskSummaryResponse> items = rows.stream()
+                .map(row -> new TaskSummaryResponse(
+                        (UUID) row.get("task_id"),
+                        (String) row.get("agent_id"),
+                        (String) row.get("status"),
+                        ((Number) row.get("retry_count")).intValue(),
+                        ((Number) row.get("checkpoint_count")).intValue(),
+                        ((Number) row.get("total_cost_microdollars")).longValue(),
+                        toOffsetDateTime(row.get("created_at")),
+                        toOffsetDateTime(row.get("updated_at"))))
+                .toList();
+
+        return new TaskListResponse(items, items.size());
+    }
+
     public RedriveResponse redriveTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 

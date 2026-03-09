@@ -55,6 +55,7 @@ class WorkerService:
         self.poller: TaskPoller | None = None
         self.heartbeat: HeartbeatManager | None = None
         self.reaper: ReaperTask | None = None
+        self._registry_task: asyncio.Task | None = None
 
         self._shutdown_event = asyncio.Event()
 
@@ -98,9 +99,15 @@ class WorkerService:
             self._config, self._pool, self._metrics
         )
 
+        # Register this worker in the workers table
+        await self._register_worker()
+
         # Start subsystems
         await self.poller.start()
         await self.reaper.start()
+
+        # Start periodic worker heartbeat (separate from task heartbeats)
+        self._registry_task = asyncio.create_task(self._worker_heartbeat_loop())
 
         self._metrics.set_gauge(
             "workers.active_tasks",
@@ -114,6 +121,13 @@ class WorkerService:
         """Gracefully shut down all subsystems."""
         await self._log.ainfo("worker_stopping")
 
+        if self._registry_task:
+            self._registry_task.cancel()
+            try:
+                await self._registry_task
+            except asyncio.CancelledError:
+                pass
+
         if self.poller:
             await self.poller.stop()
         if self.heartbeat:
@@ -121,6 +135,7 @@ class WorkerService:
         if self.reaper:
             await self.reaper.stop()
 
+        await self._deregister_worker()
         await self._log.ainfo("worker_stopped")
 
     async def run_until_shutdown(self) -> None:
@@ -138,3 +153,50 @@ class WorkerService:
             await self._shutdown_event.wait()
         finally:
             await self.stop()
+
+    async def _register_worker(self) -> None:
+        """Register this worker in the workers table via upsert."""
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO workers (worker_id, worker_pool_id, tenant_id, status, last_heartbeat_at, started_at)
+                    VALUES ($1, $2, $3, 'online', NOW(), NOW())
+                    ON CONFLICT (worker_id) DO UPDATE
+                    SET status = 'online', last_heartbeat_at = NOW(), started_at = NOW()
+                    """,
+                    self._config.worker_id,
+                    self._config.worker_pool_id,
+                    self._config.tenant_id,
+                )
+            await self._log.ainfo("worker_registered", worker_id=self._config.worker_id)
+        except Exception as exc:
+            await self._log.aerror("worker_register_failed", error=str(exc))
+
+    async def _deregister_worker(self) -> None:
+        """Mark this worker as offline in the workers table."""
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE workers SET status = 'offline', last_heartbeat_at = NOW() WHERE worker_id = $1",
+                    self._config.worker_id,
+                )
+            await self._log.ainfo("worker_deregistered", worker_id=self._config.worker_id)
+        except Exception as exc:
+            await self._log.aerror("worker_deregister_failed", error=str(exc))
+
+    async def _worker_heartbeat_loop(self) -> None:
+        """Periodically update last_heartbeat_at so the API knows we're alive."""
+        try:
+            while True:
+                await asyncio.sleep(self._config.heartbeat_interval_seconds)
+                try:
+                    async with self._pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE workers SET last_heartbeat_at = NOW() WHERE worker_id = $1 AND status = 'online'",
+                            self._config.worker_id,
+                        )
+                except Exception as exc:
+                    await self._log.aerror("worker_heartbeat_failed", error=str(exc))
+        except asyncio.CancelledError:
+            pass

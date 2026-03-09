@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils';
 export function DashboardPage() {
     const { data: health, isLoading, isError } = useHealth();
 
-    const isUp = !isError && health?.status === 'UP';
+    const isUp = !isError && health?.status === 'healthy';
 
     return (
         <div className="space-y-8 animate-in fade-in duration-500">
@@ -35,14 +35,14 @@ export function DashboardPage() {
                 <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
                     <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                         <CardTitle className="text-sm font-medium tracking-wide text-muted-foreground uppercase">Database</CardTitle>
-                        <Database className={cn("h-4 w-4", health?.database_connected ? "text-[#ccff00]" : "text-destructive")} />
+                        <Database className={cn("h-4 w-4", health?.database === 'connected' ? "text-success" : "text-destructive")} />
                     </CardHeader>
                     <CardContent>
                         {isLoading ? (
                             <div className="h-8 bg-muted/20 animate-pulse w-24"></div>
                         ) : (
-                            <div className={cn("text-2xl font-bold uppercase tracking-widest", health?.database_connected ? "text-[#ccff00]" : "text-destructive")}>
-                                {health?.database_connected ? 'Connected' : 'Disconnected'}
+                            <div className={cn("text-2xl font-bold uppercase tracking-widest", health?.database === 'connected' ? "text-success" : "text-destructive")}>
+                                {health?.database === 'connected' ? 'Connected' : 'Disconnected'}
                             </div>
                         )}
                     </CardContent>

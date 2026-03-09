@@ -718,7 +718,7 @@ FROM tasks WHERE task_id = :id;
 ## 4. Project Structure
 
 ```
-tests/e2e/
+tests/backend-integration/
   PLAN.md                    # This file
   conftest.py                # Shared fixtures: DB setup, API client, worker launcher
   helpers/
@@ -1151,7 +1151,7 @@ cd services/api-service && ./gradlew bootRun &
 until curl -sf http://localhost:8080/v1/health; do sleep 1; done
 
 # 4. Run E2E tests (worker started in-process by test harness)
-cd tests/e2e && python -m pytest -v --timeout=120
+cd tests/backend-integration && python -m pytest -v
 ```
 
 ### CI Note

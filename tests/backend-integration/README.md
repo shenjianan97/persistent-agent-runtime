@@ -1,13 +1,8 @@
-# End-to-End Test Suite
+# Backend Integration Test Suite
 
-This directory contains the **Phase 1 durable execution** E2E test suite for the persistent agent runtime.
+Cross-service integration tests for the **Phase 1 durable execution** runtime. Tests the full backend path — API Service (Java/Spring), Worker Service (Python/asyncio + LangGraph), and PostgreSQL — with **mocked LLMs** for deterministic, fast execution.
 
-The tests validate the full runtime path:
-- API Service (Java/Spring)
-- Worker Service (Python/asyncio + LangGraph)
-- PostgreSQL (queue/state/checkpoints)
-
-All scenarios from [`end-to-end-plan.md`](docs/implementation_plan/phase-1/testing/end-to-end-plan.md) are implemented.
+No frontend is involved.
 
 ## What This Suite Covers
 
@@ -21,21 +16,16 @@ All scenarios from [`end-to-end-plan.md`](docs/implementation_plan/phase-1/testi
 
 ## Test Design
 
-The suite uses:
 - `pytest` + `pytest-asyncio`
-- Real API + DB
-- In-process worker startup
-- Deterministic LLM mocks by patching `executor.graph.ChatAnthropic`
+- **Real** API service + PostgreSQL
+- In-process worker startup (workers are created directly with tuned configs for fast test execution, not via `main.py`)
+- **Mock LLMs** — all tests patch `executor.graph.ChatAnthropic` via `helpers/mock_llm.py`. There is no real LLM mode.
 
 Common test behavior is centralized in:
-- [`helpers/e2e_context.py`](tests/e2e/helpers/e2e_context.py)
-- [`conftest.py`](tests/e2e/conftest.py)
+- [`helpers/e2e_context.py`](helpers/e2e_context.py)
+- [`conftest.py`](conftest.py)
 
-Use the `e2e` fixture in tests for:
-- setting LLM behavior
-- starting/stopping workers
-- task submission/status polling
-- DB assertions
+Use the `e2e` fixture in tests for setting LLM behavior, starting/stopping workers, task submission/status polling, and DB assertions.
 
 ## Infrastructure Behavior (Hybrid Detect-and-Reuse)
 
@@ -60,24 +50,22 @@ Specifically:
 From repository root:
 
 ```bash
-services/worker-service/.venv/bin/python -m pytest -q tests/e2e
+services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration
 ```
 
 Run a single file:
 
 ```bash
-services/worker-service/.venv/bin/python -m pytest -q tests/e2e/test_recovery.py
+services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/test_recovery.py
 ```
 
 Run a single test:
 
 ```bash
-services/worker-service/.venv/bin/python -m pytest -q tests/e2e/test_crash_resume.py::test_3_19_crash_recovery_node_resume_boundary
+services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/test_crash_resume.py::test_3_19_crash_recovery_node_resume_boundary
 ```
 
 ## Environment Variables
-
-You can override runtime defaults with:
 
 - `E2E_DB_HOST` (default: `localhost`)
 - `E2E_DB_PORT` (default: `55432`)

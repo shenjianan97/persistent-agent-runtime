@@ -59,8 +59,9 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - POC logic: Created LangGraph POC validation tasks in `experiments/langgraph/` to test assumptions
 
 ### Stage 4 — Implementation [IN PROGRESS]
-- Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, and graph executor (Tasks 1-6)
-- Remaining: Console frontend (Task 7), AWS infrastructure and containerization (Task 8)
+- Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, graph executor, and console frontend (Tasks 1-7)
+- Post-Task 7 additions: worker registry table (`0002_worker_registry.sql`), worker self-registration/heartbeat/deregistration, reaper stale-worker cleanup, `GET /v1/tasks` list endpoint, task list UI
+- Remaining: AWS infrastructure and containerization (Task 8)
 - Source of truth: `docs/implementation_plan/phase-1/progress.md`
 
 ### Stage 5 — Validation [NOT STARTED]

@@ -98,6 +98,15 @@ FROM tasks
 WHERE status = 'queued';
 """
 
+# Mark workers as offline if no heartbeat for 90 seconds (3 missed heartbeats at 15s interval + buffer)
+STALE_WORKER_QUERY = """
+UPDATE workers
+SET status = 'offline'
+WHERE status = 'online'
+  AND last_heartbeat_at < NOW() - INTERVAL '90 seconds'
+RETURNING worker_id;
+"""
+
 
 class ReaperTask:
     """Distributed reaper that scans for expired leases and timed-out tasks.
@@ -217,6 +226,16 @@ class ReaperTask:
                     REAPER_TASK_TIMEOUT,
                     task_id=task_id,
                     reason="task_timeout",
+                )
+
+            # (c) Stale workers — mark offline if heartbeat expired
+            stale_rows = await conn.fetch(STALE_WORKER_QUERY)
+            for row in stale_rows:
+                worker_id = row["worker_id"]
+                await self._log.awarning(
+                    "reaper_stale_worker",
+                    worker_id=worker_id,
+                    action="marked_offline",
                 )
 
             # Update queue depth metric

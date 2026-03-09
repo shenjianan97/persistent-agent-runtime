@@ -27,6 +27,15 @@ public class TaskController {
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
+    @GetMapping
+    public ResponseEntity<TaskListResponse> listTasks(
+            @RequestParam(name = "status", required = false) String status,
+            @RequestParam(name = "agent_id", required = false) String agentId,
+            @RequestParam(name = "limit", required = false) Integer limit) {
+        TaskListResponse response = taskService.listTasks(status, agentId, limit);
+        return ResponseEntity.ok(response);
+    }
+
     @GetMapping("/{taskId}")
     public ResponseEntity<TaskStatusResponse> getTaskStatus(@PathVariable UUID taskId) {
         TaskStatusResponse response = taskService.getTaskStatus(taskId);

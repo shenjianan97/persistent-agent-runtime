@@ -24,8 +24,8 @@ class WorkerConfig:
     worker_pool_id: str = "shared"
     tenant_id: str = "default"
 
-    # Database
-    db_dsn: str = "postgresql://localhost:5432/agent_runtime"
+    # Database (no default — must be provided explicitly)
+    db_dsn: str = ""
 
     # Concurrency
     max_concurrent_tasks: int = 10

@@ -4,32 +4,33 @@ import { Button } from '@/components/ui/button';
 import { AlertCircle, RotateCcw, Ghost } from 'lucide-react';
 import { toast } from 'sonner';
 import { Link } from 'react-router';
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { Input } from '@/components/ui/input';
 
 export function DeadLetterPage() {
     const [agentId, setAgentId] = useState('');
     const [debouncedAgentId, setDebouncedAgentId] = useState('');
-    const { data, isLoading } = useDeadLetters(debouncedAgentId ? debouncedAgentId : undefined);
+    const { data, isLoading } = useDeadLetters(debouncedAgentId || undefined);
     const redriveMutation = useRedriveTask();
+    const debounceTimer = useRef<ReturnType<typeof setTimeout>>(null);
 
     const handleRedrive = (taskId: string) => {
         redriveMutation.mutate(taskId, {
             onSuccess: () => {
                 toast.success(`Task redrive initiated`, { description: taskId });
             },
-            onError: (err: any) => {
+            onError: (err: Error) => {
                 toast.error('Redrive failed', { description: err.message });
             }
         });
     };
 
-    // Debounce search
-    const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-        setAgentId(e.target.value);
-        // Simple timeout for demo
-        setTimeout(() => setDebouncedAgentId(e.target.value), 500);
-    };
+    const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+        const value = e.target.value;
+        setAgentId(value);
+        if (debounceTimer.current) clearTimeout(debounceTimer.current);
+        debounceTimer.current = setTimeout(() => setDebouncedAgentId(value), 500);
+    }, []);
 
     return (
         <div className="space-y-6 animate-in fade-in duration-500">

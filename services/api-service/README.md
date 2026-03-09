@@ -35,6 +35,34 @@ Submit a new task for execution.
 }
 ```
 
+### GET /v1/tasks
+
+List tasks with optional filters. Supports `status`, `agent_id`, and `limit` query parameters.
+
+**Query Parameters:**
+- `status` (optional) — Filter by task status: `queued`, `running`, `completed`, `dead_letter`
+- `agent_id` (optional) — Filter by agent ID
+- `limit` (optional) — Max results (1-200, default 50)
+
+**Response (200 OK):**
+```json
+{
+  "items": [
+    {
+      "task_id": "...",
+      "agent_id": "support_agent_v1",
+      "status": "running",
+      "retry_count": 0,
+      "checkpoint_count": 3,
+      "total_cost_microdollars": 8500,
+      "created_at": "2026-03-05T10:00:00Z",
+      "updated_at": "2026-03-05T10:00:15Z"
+    }
+  ],
+  "total": 1
+}
+```
+
 ### GET /v1/tasks/{task_id}
 
 Get task status with checkpoint aggregates.
@@ -136,7 +164,7 @@ Redrive a dead-lettered task back to queued state. Resets retry_count and clears
 
 ### GET /v1/health
 
-Health check with database connectivity and queue/worker counts.
+Health check with database connectivity and queue/worker counts. `active_workers` counts workers registered in the `workers` table with a heartbeat within the last 60 seconds (includes idle workers, not just those running tasks).
 
 **Response (200 OK):**
 ```json

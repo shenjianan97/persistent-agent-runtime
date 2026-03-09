@@ -2,6 +2,7 @@ import { CheckpointResponse } from '@/types';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Zap, MoveRight } from 'lucide-react';
 import { useEffect, useRef } from 'react';
+import { formatUsd } from '@/lib/utils';
 
 interface CheckpointTimelineProps {
     checkpoints: CheckpointResponse[];
@@ -62,7 +63,7 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                                             </div>
 
                                             {isHandoff && (
-                                                <div className="bg-[#FFB000]/10 border border-[#FFB000]/20 p-2 text-xs text-[#FFB000] flex items-center gap-2">
+                                                <div className="bg-warning/10 border border-warning/20 p-2 text-xs text-warning flex items-center gap-2">
                                                     <MoveRight className="w-3 h-3 shrink-0" />
                                                     <span className="font-bold tracking-widest uppercase shrink-0">Handoff:</span>
                                                     <span className="opacity-80 truncate" title={`${prevWorker} → ${cp.worker_id}`}>
@@ -78,7 +79,7 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                                                 </div>
                                                 <div>
                                                     <span className="text-muted-foreground block mb-1">Cost Delta</span>
-                                                    <span className="text-[#ccff00]">+${(cp.cost_microdollars / 1_000_000).toFixed(4)}</span>
+                                                    <span className="text-success">+${formatUsd(cp.cost_microdollars)}</span>
                                                 </div>
                                             </div>
                                         </div>

@@ -60,7 +60,7 @@ infrastructure/
 - [`docs/implementation_plan/`](./docs/implementation_plan/): implementation planning and progress
 - [`services/api-service/`](./services/api-service/): Spring Boot API service
 - [`services/worker-service/`](./services/worker-service/): Python worker, checkpointer, executor, and tools
-- [`tests/e2e/`](./tests/e2e/): end-to-end test suite
+- [`tests/backend-integration/`](./tests/backend-integration/): cross-service integration tests (API + Worker + PostgreSQL, mocked LLMs)
 - [`experiments/langgraph/`](./experiments/langgraph/): proof-of-concept and validation work
 - [`infrastructure/`](./infrastructure/): database and deployment infrastructure
 
@@ -105,7 +105,7 @@ Then point the API and worker services at that database with their normal enviro
 
 - API service: [`services/api-service/README.md`](./services/api-service/README.md)
 - Worker service: [`services/worker-service/README.md`](./services/worker-service/README.md)
-- E2E tests: [`tests/e2e/README.md`](./tests/e2e/README.md)
+- Backend integration tests: [`tests/backend-integration/README.md`](./tests/backend-integration/README.md)
 - Database schema: [`infrastructure/database/README.md`](./infrastructure/database/README.md)
 
 ### Common Commands
@@ -166,9 +166,9 @@ There are three practical test layers in the repo:
 
 - API service tests in `services/api-service`
 - worker service tests in `services/worker-service/tests`
-- full end-to-end tests in [`tests/e2e/`](./tests/e2e/)
+- backend integration tests in [`tests/backend-integration/`](./tests/backend-integration/)
 
-The E2E suite is the best place to validate the intended runtime lifecycle:
+The integration suite is the best place to validate the intended runtime lifecycle:
 
 - queued -> running -> completed
 - retries and exponential backoff

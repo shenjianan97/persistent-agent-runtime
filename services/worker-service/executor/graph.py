@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncGenerator
 
@@ -112,10 +113,15 @@ class GraphExecutor:
         allowed_tools = agent_config.get("allowed_tools", [])
         system_prompt = agent_config.get("system_prompt", "")
 
-        # Use Anthropic directly if model name has "claude" 
-        # (This satisfies Phase 1's requirement to configure Bedrock/Anthropic from model)
+        # Use Anthropic directly if model name has "claude"
+        # Note: api_key passed explicitly because Python 3.14 breaks Pydantic V1's
+        # env var auto-loading in langchain-anthropic.
         if "claude" in model_name.lower():
-            llm = ChatAnthropic(model=model_name, temperature=temperature)
+            llm = ChatAnthropic(
+                model=model_name,
+                temperature=temperature,
+                api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
+            )
         else:
             llm = ChatBedrock(model_id=model_name, model_kwargs={"temperature": temperature})
             

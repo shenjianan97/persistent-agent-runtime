@@ -1263,9 +1263,10 @@ CREATE INDEX idx_checkpoints_task_created ON checkpoints(task_id, checkpoint_ns,
 
 -- Checkpoint writes table (stores pending writes within a super-step)
 -- Required by LangGraph's BaseCheckpointSaver.put_writes() contract and persisted
--- alongside checkpoints for library-managed recovery behavior. With the pinned
--- Phase 1 LangGraph versions, writes are associated with an existing checkpoint
--- id, so a composite FK to checkpoints is safe and keeps the schema honest.
+-- alongside checkpoints for library-managed recovery behavior.
+-- No FK to checkpoints: LangGraph calls aput_writes() before aput(), so the
+-- checkpoint row does not exist yet when writes are inserted. This matches the
+-- upstream langgraph-checkpoint-postgres schema.
 CREATE TABLE checkpoint_writes (
     task_id             UUID NOT NULL REFERENCES tasks(task_id),
     checkpoint_ns       TEXT NOT NULL DEFAULT '',
@@ -1276,9 +1277,7 @@ CREATE TABLE checkpoint_writes (
     type                TEXT,
     blob                BYTEA NOT NULL,
 
-    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx),
-    FOREIGN KEY (task_id, checkpoint_ns, checkpoint_id)
-        REFERENCES checkpoints(task_id, checkpoint_ns, checkpoint_id)
+    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
 );
 ```
 

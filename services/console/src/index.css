@@ -27,6 +27,8 @@
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -59,12 +61,14 @@
   --destructive: #FF3366;
   --destructive-foreground: #fafafa;
 
+  --success: #ccff00;
+  --warning: #FFB000;
+
   --border: #27272a;
   --input: #27272a;
   --ring: #00F0FF;
 
   --radius: 0px;
-  /* Brutalist sharp corners */
 }
 
 @layer base {

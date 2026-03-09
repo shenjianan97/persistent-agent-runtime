@@ -189,6 +189,34 @@ public class TaskRepository {
     }
 
     /**
+     * Lists tasks with optional status and agent_id filters, ordered by most recent first.
+     */
+    public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
+        StringBuilder sql = new StringBuilder("""
+                SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
+                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
+                       (SELECT COALESCE(SUM(cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
+                FROM tasks t
+                WHERE t.tenant_id = ?
+                """);
+        List<Object> params = new java.util.ArrayList<>();
+        params.add(tenantId);
+
+        if (status != null && !status.isBlank()) {
+            sql.append(" AND t.status = ?");
+            params.add(status);
+        }
+        if (agentId != null && !agentId.isBlank()) {
+            sql.append(" AND t.agent_id = ?");
+            params.add(agentId);
+        }
+        sql.append(" ORDER BY t.created_at DESC LIMIT ?");
+        params.add(limit);
+
+        return jdbcTemplate.queryForList(sql.toString(), params.toArray());
+    }
+
+    /**
      * Checks database connectivity.
      */
     public boolean isDatabaseConnected() {
@@ -201,13 +229,14 @@ public class TaskRepository {
     }
 
     /**
-     * Gets count of distinct active workers (tasks with status='running' and
-     * lease_owner not null).
+     * Gets count of online workers from the workers registry table.
+     * A worker is considered online if its status is 'online' and it has
+     * sent a heartbeat within the last 60 seconds.
      */
     public int getActiveWorkerCount() {
         try {
             Integer count = jdbcTemplate.queryForObject(
-                    "SELECT COUNT(DISTINCT lease_owner) FROM tasks WHERE status = 'running' AND lease_owner IS NOT NULL",
+                    "SELECT COUNT(*) FROM workers WHERE status = 'online' AND last_heartbeat_at > NOW() - INTERVAL '60 seconds'",
                     Integer.class);
             return count != null ? count : 0;
         } catch (Exception e) {

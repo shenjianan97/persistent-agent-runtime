@@ -10,7 +10,7 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 | [Task 4](./agent_tasks/task-4-langgraph-checkpointer.md) | LangGraph Checkpointer | Done | Added a lease-aware `PostgresDurableCheckpointer`, public package exports, and unit/integration coverage for checkpoint writes, reads, and lease revocation behavior. |
 | [Task 5](./agent_tasks/task-5-mcp-server.md) | Co-located MCP Server | Done | Added a FastMCP-based in-process tool server exposing `web_search`, `read_url`, and `calculator`, plus worker-service documentation and test coverage. |
 | [Task 6](./agent_tasks/task-6-graph-executor.md) | Graph Executor | Done | Graph assembly, failure classification, retryable/non-retryable handling, cost tracking, unit/integration testing. |
-| [Task 7](./agent_tasks/task-7-console.md) | Console | Todo | Not started. |
+| [Task 7](./agent_tasks/task-7-console.md) | Console | Done | Dashboard, task list, task dispatcher, execution telemetry, dead letter queue. Brutalist dark-mode UI with IBM Plex Mono + Syne fonts. |
 | [Task 8](./agent_tasks/task-8-aws-infrastructure.md) | AWS Cloud Infrastructure | Todo | Not started. |
 
 ## Notes

@@ -7,7 +7,7 @@ worker-test:
 	services/worker-service/.venv/bin/python -m pytest services/worker-service/tests -q
 
 e2e-test:
-	services/worker-service/.venv/bin/python -m pytest tests/e2e -q
+	services/worker-service/.venv/bin/python -m pytest tests/backend-integration -q
 
 db-verify:
 	./infrastructure/database/verify_schema.sh

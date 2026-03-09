@@ -84,7 +84,7 @@ CREATE TABLE checkpoint_writes (
     type                  TEXT,
     blob                  BYTEA NOT NULL,
 
-    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx),
-    FOREIGN KEY (task_id, checkpoint_ns, checkpoint_id)
-        REFERENCES checkpoints(task_id, checkpoint_ns, checkpoint_id)
+    PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
+    -- No FK to checkpoints: LangGraph calls aput_writes() before aput(),
+    -- so the checkpoint row does not exist yet when writes are inserted.
 );

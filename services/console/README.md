@@ -1,90 +1,62 @@
-# Persistent Agent Runtime - Console
+# Console
 
-The Console is a production-grade React Single Page Application (SPA) providing a utilitarian, terminal-inspired dashboard for monitoring and interacting with the Persistent Agent Runtime. It proves out durable execution concepts by providing visibility into step-by-step agent checkpoints, worker handoffs, precise cost aggregation, and dead-letter queue management.
+React SPA for monitoring and controlling the Persistent Agent Runtime. Dark-mode terminal aesthetic using IBM Plex Mono + Syne fonts, brutalist (zero border-radius) design.
 
-## Aesthetic & Design
-The console adheres to a strict "Industrial Terminal Dashboard" design system:
-- **Dark Mode Only**: Built on deep charcoal and void black backgrounds.
-- **Typography:** Driven by `IBM Plex Mono` for structural and data elements, with `Syne` for large metric displays.
-- **Accents:** High-contrast, highly-saturated alerts (CRT Cyan for active, Acid Green for completion, Warning Amber for queued, Alert Red for failures).
-- **Brutalism:** Pure geometric forms with zero border-radius (`rounded-none`). 
+## Features
 
-## Key Features
-
-- **Dashboard Overview**: Aggregated view of system health and active workers.
-- **Task Dispatcher**: A structured form to submit new directives, configuring agent parameters, LLM model choice, and allowed tools.
-- **Execution Telemetry (Task Detail)**:
-  - **Live Timeline**: An automatically scrolling, polling timeline of execution checkpoints.
-  - **Worker Tracking**: Visual indicators when a task is handed off from one worker node to another between checkpoints.
-  - **Financial Visibility**: Real-time micro-dollar to USD cost aggregation visualized with Recharts bar charts.
-- **Dead Letter Queue (DLQ)**: A dedicated queue for tasks that have fatally failed or exhausted their retry limits, featuring rapid 1-click "Redrive" capabilities.
+- **Dashboard** — real-time system health (runtime, DB, workers, queue depth)
+- **Task List** — browse all tasks with status/agent filters, links to detail view
+- **Task Dispatcher** — submit tasks with agent config, model, tools, and execution params
+- **Execution Telemetry** — live checkpoint timeline, worker handoff detection, per-step cost chart
+- **Dead Letter Queue** — browse failed tasks, 1-click redrive
 
 ## Tech Stack
 
-- **Core**: React 19, TypeScript
-- **Bundler**: Vite 6
-- **Styling**: Tailwind CSS v4
-- **Components**: Customized [shadcn/ui](https://ui.shadcn.com/) (Radix UI primitives)
-- **State & Data Fetching**: TanStack Query v5 (React Query)
-- **Routing**: React Router v7
-- **Forms**: React Hook Form + Zod validation
-- **Charts**: Recharts 2
-- **Icons**: Lucide React
+React 19, TypeScript, Vite 6, Tailwind CSS v4, TanStack Query v5, React Router v7, React Hook Form + Zod, Recharts 2, shadcn/ui (Radix)
 
-## Local Development Setup
-
-### Prerequisites
-- Node.js (v20+ recommended)
-- npm (v10+)
-
-### Installation
-From the `services/console` directory, install the project dependencies:
+## Setup
 
 ```bash
 npm install
+cp .env.example .env   # set VITE_API_BASE_URL (default: http://localhost:8080)
+npm run dev             # http://localhost:5173
 ```
 
-### Environment Configuration
-Copy the `.env.example` file to create your local `.env` configuration:
+## API Base URL
+
+The console calls the Spring Boot API service at the URL set by `VITE_API_BASE_URL`. If unset, defaults to `http://localhost:8080`.
+
+Ways to configure it (highest priority first):
+
+1. **Inline env var** — overrides everything: `VITE_API_BASE_URL=https://api.example.com npm run dev`
+2. **`.env.local`** — always loaded, gitignored. For personal overrides not committed to repo.
+3. **`.env.[mode]`** — mode-specific: `.env.development` loads on `npm run dev`, `.env.production` loads on `npm run build`.
+4. **`.env`** — base defaults, loaded in all modes.
+
+Example multi-environment setup:
+```
+.env                → VITE_API_BASE_URL=http://localhost:8080
+.env.production     → VITE_API_BASE_URL=https://api.prod.example.com
+```
+
+`VITE_` prefix is required — Vite only exposes prefixed vars to client code. The value is embedded at build time, not at runtime.
+
+## Build
 
 ```bash
-cp .env.example .env
-```
-Ensure `VITE_API_BASE_URL` points to your running instance of the Spring Boot API Service (typically `http://localhost:8080`).
-
-### Running the Development Server
-Start the Vite development server:
-
-```bash
-npm run dev
+npm run build           # outputs to dist/
 ```
 
-The console will be accessible at [http://localhost:5173](http://localhost:5173).
+## Structure
 
-## Building for Production
-
-To create an optimized production build:
-
-```bash
-npm run build
 ```
-
-This will run the TypeScript compiler (`tsc`) and bundle the application into the `dist/` directory, ready to be served by any static file host or CDN.
-
-## Project Structure
-
-```text
 src/
-├── api/            # Base API fetch client and payload mapping
-├── components/     # Reusable UI primitives (shadcn overrides)
-├── features/       # Feature-driven module directories
-│   ├── dashboard/  # Health overview
-│   ├── dead-letter/# DLQ management and redrive actions
-│   ├── submit/     # Task creation forms and validation schemas
-│   └── task-detail/# Live telemetry, charts, and execution logs
-├── layout/         # App Shell (Sidebar, Header)
-├── lib/            # Utility functions (e.g., Tailwind class merging)
-├── types/          # TypeScript interfaces mapping to Java backend DTOs
-├── App.tsx         # Root Router and QueryClientProvider
-└── main.tsx        # React DOM mounting
+├── api/            # Fetch client + payload mapping
+├── components/ui/  # shadcn/ui primitives
+├── features/       # Feature modules (dashboard, task-list, submit, task-detail, dead-letter)
+├── layout/         # AppShell, Header, Sidebar
+├── lib/            # Utilities (class merging, formatting)
+├── types/          # TypeScript interfaces (maps to Java DTOs)
+├── App.tsx         # Router + QueryClientProvider
+└── main.tsx        # Entry point
 ```

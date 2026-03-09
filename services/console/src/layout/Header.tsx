@@ -6,7 +6,7 @@ export function Header() {
     const { data: health, isError } = useHealth();
 
     const isServerDown = isError || !health;
-    const isHealthy = !isServerDown && health?.status === 'UP' && health?.database_connected;
+    const isHealthy = !isServerDown && health?.status === 'healthy' && health?.database === 'connected';
 
     return (
         <div className="flex flex-col shrink-0 z-10 w-full">
@@ -28,7 +28,7 @@ export function Header() {
                     <div className="flex items-center gap-2">
                         <Database className="w-4 h-4 text-muted-foreground" />
                         <span className="text-muted-foreground mr-1">DB</span>
-                        <div className={cn("w-2 h-2 rounded-full", isHealthy ? "bg-[#ccff00] shadow-[0_0_8px_rgba(204,255,0,0.6)]" : "bg-destructive shadow-[0_0_8px_rgba(255,51,102,0.6)]")} />
+                        <div className={cn("w-2 h-2 rounded-full", isHealthy ? "bg-success shadow-[0_0_8px_var(--color-success)]" : "bg-destructive shadow-[0_0_8px_var(--color-destructive)]")} />
                     </div>
 
                     <div className="flex items-center gap-2">
@@ -42,7 +42,7 @@ export function Header() {
                     <div className="flex items-center gap-2 border-l border-border/40 pl-6">
                         <Activity className="w-4 h-4 text-muted-foreground" />
                         <span className="text-muted-foreground">SYSTEM</span>
-                        <div className={cn("px-2 py-0.5 text-xs font-bold tracking-wider", isHealthy ? "bg-[#ccff00]/10 text-[#ccff00] border border-[#ccff00]/20" : "bg-destructive/10 text-destructive border border-destructive/20")}>
+                        <div className={cn("px-2 py-0.5 text-xs font-bold tracking-wider", isHealthy ? "bg-success/10 text-success border border-success/20" : "bg-destructive/10 text-destructive border border-destructive/20")}>
                             {isHealthy ? 'ONLINE' : 'OFFLINE'}
                         </div>
                     </div>

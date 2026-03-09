@@ -2,6 +2,7 @@ import { CheckpointResponse } from '@/types';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DollarSign, Cpu } from 'lucide-react';
+import { formatUsd } from '@/lib/utils';
 
 interface CostSummaryProps {
     checkpoints: CheckpointResponse[];
@@ -9,7 +10,7 @@ interface CostSummaryProps {
 }
 
 export function CostSummary({ checkpoints, totalCostMicrodollars }: CostSummaryProps) {
-    const formattedCost = (totalCostMicrodollars / 1_000_000).toFixed(4);
+    const formattedCost = formatUsd(totalCostMicrodollars);
 
     const chartData = checkpoints.map(cp => ({
         name: cp.node_name,
@@ -21,11 +22,11 @@ export function CostSummary({ checkpoints, totalCostMicrodollars }: CostSummaryP
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                    <CardTitle className="text-sm font-display uppercase tracking-widest text-[#ccff00]">Total Cost</CardTitle>
-                    <DollarSign className="h-4 w-4 text-[#ccff00]" />
+                    <CardTitle className="text-sm font-display uppercase tracking-widest text-success">Total Cost</CardTitle>
+                    <DollarSign className="h-4 w-4 text-success" />
                 </CardHeader>
                 <CardContent>
-                    <div className="text-3xl font-display font-medium text-[#ccff00] drop-shadow-[0_0_8px_rgba(204,255,0,0.4)]">
+                    <div className="text-3xl font-display font-medium text-success drop-shadow-[0_0_8px_var(--color-success)]">
                         ${formattedCost}
                     </div>
                     <p className="text-xs text-muted-foreground mt-1 tracking-wider uppercase">USD</p>
@@ -38,7 +39,7 @@ export function CostSummary({ checkpoints, totalCostMicrodollars }: CostSummaryP
                     <Cpu className="h-4 w-4 text-primary" />
                 </CardHeader>
                 <CardContent>
-                    <div className="text-3xl font-display font-medium text-primary drop-shadow-[0_0_8px_rgba(0,240,255,0.4)]">
+                    <div className="text-3xl font-display font-medium text-primary drop-shadow-[0_0_8px_var(--color-primary)]">
                         {checkpoints.length}
                     </div>
                     <p className="text-xs text-muted-foreground mt-1 tracking-wider uppercase">Saved states</p>
@@ -77,7 +78,7 @@ export function CostSummary({ checkpoints, totalCostMicrodollars }: CostSummaryP
                                                     <div className="bg-black border border-primary p-2 text-xs font-mono shadow-[0_0_8px_rgba(0,240,255,0.2)]">
                                                         <p className="text-primary font-bold">{payload[0].payload.name}</p>
                                                         <p className="text-muted-foreground">Step: {payload[0].payload.step}</p>
-                                                        <p className="text-[#ccff00]">Cost: ${(payload[0].value as number).toFixed(4)}</p>
+                                                        <p className="text-success">Cost: ${(payload[0].value as number).toFixed(4)}</p>
                                                     </div>
                                                 );
                                             }

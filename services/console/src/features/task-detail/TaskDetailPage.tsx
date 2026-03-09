@@ -14,7 +14,7 @@ import { CheckpointResponse } from '@/types';
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
-    const { data: checkpointsData } = useCheckpoints(taskId!);
+    const { data: checkpointsData } = useCheckpoints(taskId!, task?.status);
 
     const cancelMutation = useCancelTask();
     const redriveMutation = useRedriveTask();
@@ -39,26 +39,29 @@ export function TaskDetailPage() {
     const isRunning = task.status === 'running' || task.status === 'queued';
     const isDeadLetter = task.status === 'dead_letter';
 
-    const formatJson = (text?: string) => {
-        if (!text) return '';
-        try {
-            return JSON.stringify(JSON.parse(text), null, 2);
-        } catch {
-            return text;
+    const formatJson = (value?: unknown) => {
+        if (!value) return '';
+        if (typeof value === 'string') {
+            try {
+                return JSON.stringify(JSON.parse(value), null, 2);
+            } catch {
+                return value;
+            }
         }
+        return JSON.stringify(value, null, 2);
     };
 
     const handleCancel = () => {
         cancelMutation.mutate(task.task_id, {
             onSuccess: () => toast.success("Task cancellation requested"),
-            onError: (err: any) => toast.error(err.message || "Failed to cancel task"),
+            onError: (err: Error) => toast.error(err.message || "Failed to cancel task"),
         });
     };
 
     const handleRedrive = () => {
         redriveMutation.mutate(task.task_id, {
             onSuccess: () => toast.success("Task redriven successfully"),
-            onError: (err: any) => toast.error(err.message || "Failed to redrive task"),
+            onError: (err: Error) => toast.error(err.message || "Failed to redrive task"),
         });
     };
 
@@ -148,15 +151,15 @@ export function TaskDetailPage() {
                         </CardContent>
                     </Card>
 
-                    {task.status === 'completed' && task.output && (
-                        <Card className="rounded-none border-[#ccff00]/40 bg-black/40 backdrop-blur shadow-none h-[400px] flex flex-col">
-                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-[#ccff00]/40 shrink-0 bg-[#ccff00]/5">
-                                <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-[#ccff00]">
+                    {task.status === 'completed' && !!task.output && (
+                        <Card className="rounded-none border-success/40 bg-black/40 backdrop-blur shadow-none h-[400px] flex flex-col">
+                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/40 shrink-0 bg-success/5">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-success">
                                     <Terminal className="w-4 h-4" /> Execution Result
                                 </CardTitle>
                             </CardHeader>
                             <CardContent className="pt-4 flex-1 h-0 overflow-auto">
-                                <pre className="text-xs font-mono text-[#ccff00] whitespace-pre-wrap">
+                                <pre className="text-xs font-mono text-success whitespace-pre-wrap">
                                     {formatJson(task.output)}
                                 </pre>
                             </CardContent>

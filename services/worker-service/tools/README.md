@@ -1,12 +1,12 @@
-# Co-located MCP Server
+# Tools Package
 
-This package contains the Phase 1 in-process MCP server used by the worker service. It is implemented with `FastMCP` from the official Python MCP SDK and exposes only the read-only built-in tools allowed by the Phase 1 design:
+This package contains the Phase 1 tool implementations and a standalone FastMCP server. It exposes three read-only built-in tools:
 
 - `web_search`
 - `read_url`
 - `calculator`
 
-The intent is that a worker instance creates this server locally and the graph executor dispatches tool calls through it without any public network exposure.
+**At runtime, the `GraphExecutor` does not use the MCP server.** It imports the tool functions directly from this package and wraps them as LangGraph `StructuredTool` instances for in-process execution. The standalone MCP server (`server.py`) exists for manual testing and future independent deployment.
 
 ## Files
 
@@ -20,47 +20,23 @@ The intent is that a worker instance creates this server locally and the graph e
 - `read_url.py` implements bounded URL fetching, SSRF-style host rejection, and text extraction.
 - `providers/search.py` contains the search provider abstraction and the Tavily-backed default implementation.
 
-## Running The Server Locally
+## Running The Standalone MCP Server
 
-Create the extractable MCP application:
-
-```python
-from tools.app import create_tool_server_app
-
-server = create_tool_server_app()
-```
-
-Create the current worker-owned compatibility wrapper:
-
-```python
-from tools.server import create_mcp_server
-
-server = create_mcp_server()
-```
-
-Run it over stdio:
+Run over stdio:
 
 ```bash
 cd services/worker-service
 .venv/bin/python -m tools.server
 ```
 
-That stdio mode matches the subprocess transport used by the automated stdio integration test.
-
-Run it over local attachable HTTP:
+Run over HTTP:
 
 ```bash
 cd services/worker-service
 .venv/bin/python -m tools.server --transport http --host 127.0.0.1 --port 8000
 ```
 
-The default streamable HTTP endpoint is:
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-Use the sample client to connect:
+Connect with the sample client:
 
 ```bash
 cd services/worker-service
@@ -148,4 +124,3 @@ When running the HTTP server locally, you should expect both FastMCP/Uvicorn log
 
 - The stdio subprocess test uses deterministic fake dependencies for `web_search` and mocked HTTP transport for `read_url`. It tests the MCP transport and server wiring without depending on public internet access.
 - `app.py` is intentionally the portable assembly layer so this package can move into a future standalone `services/mcp-server/` module with minimal changes.
-- Task 6 is expected to instantiate `create_mcp_server()` inside the worker process and dispatch through that local server instance.

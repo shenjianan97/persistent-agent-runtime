@@ -7,15 +7,15 @@ export function TaskStatusBadge({ status, className }: { status: TaskStatus, cla
     const getBadgeStyle = (status: TaskStatus) => {
         switch (status) {
             case 'queued':
-                return 'bg-[#FFB000]/10 text-[#FFB000] border-[#FFB000]/50 shadow-[0_0_8px_rgba(255,176,0,0.4)]';
+                return 'bg-warning/10 text-warning border-warning/50 shadow-[0_0_8px_var(--color-warning)]';
             case 'running':
-                return 'bg-[#00F0FF]/10 text-[#00F0FF] border-[#00F0FF]/50 shadow-[0_0_8px_rgba(0,240,255,0.4)]';
+                return 'bg-primary/10 text-primary border-primary/50 shadow-[0_0_8px_var(--color-primary)]';
             case 'completed':
-                return 'bg-[#ccff00]/10 text-[#ccff00] border-[#ccff00]/50 shadow-[0_0_8px_rgba(204,255,0,0.4)]';
+                return 'bg-success/10 text-success border-success/50 shadow-[0_0_8px_var(--color-success)]';
             case 'cancelled':
                 return 'bg-muted text-muted-foreground border-border';
             case 'dead_letter':
-                return 'bg-[#FF3366]/10 text-[#FF3366] border-[#FF3366]/50 shadow-[0_0_8px_rgba(255,51,102,0.4)]';
+                return 'bg-destructive/10 text-destructive border-destructive/50 shadow-[0_0_8px_var(--color-destructive)]';
             default:
                 return 'bg-muted text-foreground';
         }

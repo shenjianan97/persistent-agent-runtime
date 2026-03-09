@@ -2,6 +2,7 @@ import {
     TaskStatusResponse,
     TaskSubmissionRequest,
     TaskSubmissionResponse,
+    TaskListResponse,
     CheckpointListResponse,
     DeadLetterListResponse,
     HealthResponse,
@@ -69,6 +70,15 @@ export const api = {
         });
     },
 
+    listTasks: (status?: string, agentId?: string, limit?: number) => {
+        const params = new URLSearchParams();
+        if (status) params.append('status', status);
+        if (agentId) params.append('agent_id', agentId);
+        if (limit) params.append('limit', limit.toString());
+        const query = params.toString();
+        return fetchApi<TaskListResponse>(`/v1/tasks${query ? `?${query}` : ''}`);
+    },
+
     getTaskStatus: (taskId: string) =>
         fetchApi<TaskStatusResponse>(`/v1/tasks/${taskId}`),
 
@@ -85,7 +95,7 @@ export const api = {
         if (agentId) params.append('agent_id', agentId);
         if (limit) params.append('limit', limit.toString());
         const query = params.toString();
-        return fetchApi<DeadLetterListResponse>(`/v1/dead-letter${query ? `?${query}` : ''}`);
+        return fetchApi<DeadLetterListResponse>(`/v1/tasks/dead-letter${query ? `?${query}` : ''}`);
     },
 
     redriveTask: (taskId: string) =>
