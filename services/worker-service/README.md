@@ -16,6 +16,15 @@ WorkerService
 
 ## Quick Start
 
+For normal local development from the repo root, prefer:
+
+```bash
+make install
+make dev
+```
+
+That root workflow installs console and worker dependencies first, then starts the console, API, and worker in one terminal and ensures the local PostgreSQL container is running.
+
 ### Prerequisites
 
 - Python 3.11+
@@ -55,6 +64,7 @@ cd services/worker-service
 source .venv/bin/activate
 export DB_DSN="postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
 export ANTHROPIC_API_KEY="sk-ant-..."
+export TAVILY_API_KEY="tvly-..."
 
 python main.py
 ```

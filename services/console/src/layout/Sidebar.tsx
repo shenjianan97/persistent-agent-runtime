@@ -11,11 +11,11 @@ const NAV_ITEMS = [
 ];
 
 export function Sidebar() {
-    const { data: health, isError } = useHealth();
+    const { data: health, isError, isLoading } = useHealth();
 
-    const sysStatus = isError || !health ? 'DOWN' : health.status === 'healthy' ? 'STABLE' : 'DEGRADED';
-    const dbStatus = health?.database === 'connected' ? 'OK' : 'ERR';
-    const workerCount = health?.active_workers ?? 0;
+    const sysStatus = isLoading ? 'SYNC' : isError || !health ? 'DOWN' : health.status === 'healthy' ? 'STABLE' : 'DEGRADED';
+    const dbStatus = isLoading ? '...' : health?.database === 'connected' ? 'OK' : 'ERR';
+    const workerCount = isLoading ? '...' : String(health?.active_workers ?? 0);
 
     return (
         <aside className="w-64 flex flex-col border-r border-border/40 bg-background/95 backdrop-blur shrink-0 z-20">

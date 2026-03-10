@@ -19,12 +19,14 @@ React 19, TypeScript, Vite 6, Tailwind CSS v4, TanStack Query v5, React Router v
 ```bash
 npm install
 cp .env.example .env   # set VITE_API_BASE_URL (default: http://localhost:8080)
-npm run dev             # http://localhost:5173
+npm run dev             # listens on 0.0.0.0:5173 by default
 ```
 
 ## API Base URL
 
 The console calls the Spring Boot API service at the URL set by `VITE_API_BASE_URL`. If unset, defaults to `http://localhost:8080`.
+
+For remote development and SSH port forwarding, the Vite dev server binds to `0.0.0.0` by default. Override it with `VITE_DEV_HOST` if you need a different interface.
 
 Ways to configure it (highest priority first):
 

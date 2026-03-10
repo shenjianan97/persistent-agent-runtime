@@ -122,11 +122,63 @@ Then point the API and worker services at that database with their normal enviro
 Use the root `Makefile` for the common workflows:
 
 ```bash
+make install
+make dev
+make dev-check
 make api-test
 make worker-test
 make e2e-test
 make db-verify
 make clean
+```
+
+### One-Command Local Development
+
+For the default local development flow, use the root launcher instead of starting the console, API, and worker in separate terminals.
+
+```bash
+cp .env.localdev.example .env.localdev
+# Fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
+make install
+make dev
+```
+
+Recommended local workflow:
+
+```text
+fresh clone
+-> copy .env.localdev
+-> make install
+-> make dev
+```
+
+What `make dev` does:
+
+- loads local overrides from `.env.localdev`
+- uses sensible local defaults for `DB_DSN` and `VITE_API_BASE_URL`
+- checks the existing `persistent-agent-runtime-postgres` container and starts it if needed
+- expects dependencies to already be installed via `make install`
+- starts the console, API service, and worker in a single terminal with prefixed logs
+- stops all child processes cleanly when you press `Ctrl+C`
+
+What `make install` does:
+
+- runs `npm install` in `services/console`
+- creates `services/worker-service/.venv` when missing
+- installs worker dependencies with `pip install -e '.[dev]'`
+
+If you only want to verify runtime prerequisites without starting services, run:
+
+```bash
+make dev-check
+```
+
+`make dev-check` is non-mutating: it validates the environment and the database container state, but it does not start the database for you. `make dev` may start the existing database container if it is currently stopped.
+
+This is a host-based development workflow, not a Docker Compose stack. It expects the named PostgreSQL container to already exist. If it does not, bootstrap it with:
+
+```bash
+KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
 ```
 
 For database bootstrap and verification:

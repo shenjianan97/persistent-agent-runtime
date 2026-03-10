@@ -13,6 +13,7 @@ Environment:
 import asyncio
 import logging
 import os
+from urllib.parse import urlsplit
 
 from core.config import WorkerConfig
 from core.db import create_pool
@@ -37,6 +38,15 @@ def _check_env():
         logger.info("TAVILY_API_KEY is not set — web_search tool will be unavailable")
 
 
+def _format_db_endpoint(dsn: str) -> str:
+    parsed = urlsplit(dsn)
+    if parsed.scheme and parsed.hostname:
+        port = f":{parsed.port}" if parsed.port else ""
+        database = parsed.path.lstrip("/") or "<default>"
+        return f"{parsed.scheme}://{parsed.hostname}{port}/{database}"
+    return dsn
+
+
 async def main():
     # Configure stdlib logging so graph.py loggers are not silently swallowed
     logging.basicConfig(
@@ -53,6 +63,8 @@ async def main():
             "Example: export DB_DSN=\"postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime\""
         )
         raise SystemExit(1)
+
+    logging.getLogger(__name__).info("Worker DB endpoint: %s", _format_db_endpoint(dsn))
 
     config = WorkerConfig(db_dsn=dsn)
 
