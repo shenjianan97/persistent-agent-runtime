@@ -1,5 +1,6 @@
 package com.persistentagent.api.service;
 
+import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
@@ -9,21 +10,11 @@ import com.persistentagent.api.model.response.DevTaskMutationResponse;
 import com.persistentagent.api.repository.TaskRepository;
 import org.springframework.stereotype.Service;
 
-import java.util.Set;
 import java.util.UUID;
 
 @Service
 public class DevTaskControlService {
 
-    private static final Set<String> ALLOWED_DEAD_LETTER_REASONS = Set.of(
-            "cancelled_by_user",
-            "retries_exhausted",
-            "task_timeout",
-            "non_retryable_error",
-            "max_steps_exceeded"
-    );
-
-    private static final String DEFAULT_REASON = "non_retryable_error";
     private static final String DEFAULT_ERROR_MESSAGE = "Forced dead letter by dev control";
 
     private final TaskRepository taskRepository;
@@ -54,8 +45,8 @@ public class DevTaskControlService {
 
         String reason = request != null && request.reason() != null && !request.reason().isBlank()
                 ? request.reason()
-                : DEFAULT_REASON;
-        if (!ALLOWED_DEAD_LETTER_REASONS.contains(reason)) {
+                : ValidationConstants.DEFAULT_DEAD_LETTER_REASON;
+        if (!ValidationConstants.ALLOWED_DEAD_LETTER_REASONS.contains(reason)) {
             throw new ValidationException("Unsupported dead_letter reason: " + reason);
         }
 

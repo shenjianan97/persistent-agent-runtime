@@ -31,6 +31,7 @@ from tools.definitions import (
     dev_task_controls_enabled,
 )
 from tools.calculator import evaluate_expression
+from tools.errors import ToolTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +392,9 @@ class GraphExecutor:
         if "429" in error_str or "rate limit" in error_str:
             return True
         if any(code in error_str for code in ("500", "502", "503", "504")):
+            return True
+
+        if isinstance(e, ToolTransportError):
             return True
             
         if isinstance(e, (ConnectionError, TimeoutError)):

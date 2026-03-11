@@ -24,7 +24,8 @@ if TYPE_CHECKING:
     pass
 
 # Exact claim query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
-CLAIM_QUERY = """
+def build_claim_query(lease_duration_seconds: int) -> str:
+    return f"""
 WITH claimable AS (
     SELECT task_id
     FROM tasks
@@ -39,13 +40,16 @@ WITH claimable AS (
 UPDATE tasks t
 SET status = 'running',
     lease_owner = $3,
-    lease_expiry = NOW() + INTERVAL '60 seconds',
+    lease_expiry = NOW() + INTERVAL '{lease_duration_seconds} seconds',
     version = t.version + 1,
     updated_at = NOW()
 FROM claimable c
 WHERE t.task_id = c.task_id
 RETURNING t.*;
 """
+
+
+CLAIM_QUERY = build_claim_query(60)
 
 
 class TaskPoller:
@@ -196,7 +200,7 @@ class TaskPoller:
         try:
             async with self._pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    CLAIM_QUERY,
+                    build_claim_query(self._config.lease_duration_seconds),
                     self._config.worker_pool_id,
                     self._config.tenant_id,
                     self._config.worker_id,

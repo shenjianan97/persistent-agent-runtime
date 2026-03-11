@@ -101,3 +101,29 @@ async def test_dev_sleep_tool_supports_short_timeout_testing(e2e):
     tool_calls = [cp for cp in checkpoints if cp["event"] and cp["event"]["type"] == "tool_call"]
     assert tool_calls
     assert tool_calls[0]["event"]["tool_name"] == "dev_sleep"
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeat_restores_registry_and_health_after_offline_mark(e2e):
+    """A live worker should restore its own registry row and health count on heartbeat."""
+    worker_id = "e2e-worker-registry-recovery"
+    await e2e.start_worker(
+        worker_id,
+        config_overrides={
+            "heartbeat_interval_seconds": 1,
+        },
+    )
+
+    await e2e.db.execute(
+        "UPDATE workers SET status = 'offline', last_heartbeat_at = NOW() - INTERVAL '5 minutes' WHERE worker_id = $1",
+        worker_id,
+    )
+
+    async def _health_recovered() -> bool:
+        health = e2e.api.health()["body"]
+        if health["active_workers"] < 1:
+            return False
+        status = await e2e.db.fetchval("SELECT status FROM workers WHERE worker_id = $1", worker_id)
+        return status == "online"
+
+    await e2e.wait_for(_health_recovered, timeout=10.0, description="worker registry recovers to online")

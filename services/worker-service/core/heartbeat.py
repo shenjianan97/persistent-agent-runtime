@@ -24,15 +24,19 @@ if TYPE_CHECKING:
     pass
 
 # Exact heartbeat query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
-HEARTBEAT_QUERY = """
+def build_heartbeat_query(lease_duration_seconds: int) -> str:
+    return f"""
 UPDATE tasks
-SET lease_expiry = NOW() + INTERVAL '60 seconds',
+SET lease_expiry = NOW() + INTERVAL '{lease_duration_seconds} seconds',
     updated_at = NOW()
 WHERE task_id = $1
   AND tenant_id = $2
   AND lease_owner = $3
   AND status = 'running';
 """
+
+
+HEARTBEAT_QUERY = build_heartbeat_query(60)
 
 
 class HeartbeatHandle:
@@ -135,7 +139,7 @@ class HeartbeatManager:
                 try:
                     async with self._pool.acquire() as conn:
                         result = await conn.execute(
-                            HEARTBEAT_QUERY,
+                            build_heartbeat_query(self._config.lease_duration_seconds),
                             task_id,
                             tenant_id,
                             self._config.worker_id,

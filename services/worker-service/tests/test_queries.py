@@ -1,7 +1,7 @@
 """Tests verifying SQL queries match the design document exactly."""
 
-from core.heartbeat import HEARTBEAT_QUERY
-from core.poller import CLAIM_QUERY
+from core.heartbeat import HEARTBEAT_QUERY, build_heartbeat_query
+from core.poller import CLAIM_QUERY, build_claim_query
 from core.reaper import (
     REAPER_DEAD_LETTER_QUERY,
     REAPER_REQUEUE_QUERY,
@@ -45,6 +45,9 @@ class TestClaimQueryContract:
     def test_sets_lease_expiry_60s(self):
         assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in CLAIM_QUERY
 
+    def test_claim_query_respects_configured_lease_duration(self):
+        assert "lease_expiry = NOW() + INTERVAL '7 seconds'" in build_claim_query(7)
+
     def test_increments_version(self):
         assert "version = t.version + 1" in CLAIM_QUERY
 
@@ -71,6 +74,9 @@ class TestHeartbeatQueryContract:
 
     def test_extends_lease_60s(self):
         assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in HEARTBEAT_QUERY
+
+    def test_heartbeat_query_respects_configured_lease_duration(self):
+        assert "lease_expiry = NOW() + INTERVAL '7 seconds'" in build_heartbeat_query(7)
 
     def test_checks_task_id(self):
         assert "task_id = $1" in HEARTBEAT_QUERY

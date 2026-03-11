@@ -72,7 +72,8 @@ class ReadUrlFetcher:
         self._max_redirects = max_redirects
 
     async def fetch(self, url: str, max_chars: int) -> ReadUrlResultData:
-        current_url = _normalize_url(url)
+        original_url = _normalize_url(url)
+        current_url = original_url
 
         for _ in range(self._max_redirects + 1):
             await self._validate_public_url(current_url)
@@ -81,30 +82,32 @@ class ReadUrlFetcher:
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
                 if not location:
-                    raise ToolExecutionError("Redirect response did not include a location header.")
+                    raise ToolExecutionError(
+                        f"Redirect response for {current_url} did not include a location header."
+                    )
                 current_url = _normalize_url(urljoin(current_url, location))
                 continue
 
             if response.status_code in {408, 429} or response.status_code >= 500:
                 raise ToolTransportError(
-                    f"URL fetch failed temporarily with status {response.status_code}."
+                    f"URL fetch failed temporarily for {current_url} with status {response.status_code}."
                 )
             if response.status_code >= 400:
                 raise ToolExecutionError(
-                    f"URL fetch failed with status {response.status_code}."
+                    f"URL fetch failed for {current_url} with status {response.status_code}."
                 )
 
             content_type = response.headers.get("content-type", "")
             media_type = content_type.split(";", 1)[0].strip().lower()
             if not _is_allowed_content_type(media_type):
                 raise ToolExecutionError(
-                    f"Unsupported content type: {media_type or 'unknown'}."
+                    f"Unsupported content type for {current_url}: {media_type or 'unknown'}."
                 )
 
             title, content = _extract_content(response.body, media_type)
             truncated = _truncate_text(content, max_chars)
             if not truncated:
-                raise ToolExecutionError("No readable content was extracted from the URL.")
+                raise ToolExecutionError(f"No readable content was extracted from {current_url}.")
 
             return ReadUrlResultData(
                 final_url=response.url,
@@ -112,17 +115,17 @@ class ReadUrlFetcher:
                 content=truncated,
             )
 
-        raise ToolExecutionError("Too many redirects while fetching URL.")
+        raise ToolExecutionError(f"Too many redirects while fetching {original_url}.")
 
     async def _validate_public_url(self, url: str) -> None:
         parsed = urlparse(url)
         hostname = parsed.hostname
         if hostname is None:
-            raise ToolInputError("URL must include a hostname.")
+            raise ToolInputError(f"URL must include a hostname: {url}")
 
         host = hostname.lower()
         if host == "localhost" or host.endswith(DISALLOWED_HOST_SUFFIXES):
-            raise ToolInputError("Local and internal hostnames are not allowed.")
+            raise ToolInputError(f"Local and internal hostnames are not allowed: {url}")
 
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         literal_ip = _try_parse_ip(host)
@@ -133,10 +136,10 @@ class ReadUrlFetcher:
         try:
             resolved_ips = await self._resolver(host, port)
         except OSError as exc:
-            raise ToolTransportError("Hostname could not be resolved.") from exc
+            raise ToolTransportError(f"Hostname could not be resolved for {url}.") from exc
 
         if not resolved_ips:
-            raise ToolTransportError("Hostname could not be resolved.")
+            raise ToolTransportError(f"Hostname could not be resolved for {url}.")
 
         for ip_text in resolved_ips:
             _assert_public_ip(ipaddress.ip_address(ip_text))
@@ -195,9 +198,9 @@ async def _stream_response(
                 body=bytes(body),
             )
     except httpx.TimeoutException as exc:
-        raise ToolTransportError("URL fetch timed out.") from exc
+        raise ToolTransportError(f"URL fetch timed out for {url}.") from exc
     except httpx.HTTPError as exc:
-        raise ToolTransportError("URL fetch request failed.") from exc
+        raise ToolTransportError(f"URL fetch request failed for {url}: {exc}") from exc
 
 
 async def _default_resolver(host: str, port: int) -> list[str]:

@@ -2,13 +2,14 @@ import asyncio
 import json
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 from core.worker import WorkerService
 from core.config import WorkerConfig
 from executor.graph import GraphExecutor
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
+from tools.errors import ToolTransportError
 
 
 @pytest.fixture
@@ -433,3 +434,53 @@ async def test_cancellation_awareness(mock_worker, task_data):
             # No completed and no dead letter should be written by the executor.
             mock_worker.pool.execute.assert_not_called()
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_read_url_failure_preserves_failing_url_on_retryable_requeue(mock_worker, task_data):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def failing_astream(*args, **kwargs):
+                raise ToolTransportError("URL fetch request failed for https://bad.example/fail: network down")
+                yield {}
+
+            mock_compiled.astream = failing_astream
+
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+    mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_any_call(
+        '''UPDATE tasks 
+                   SET status='queued', 
+                       retry_count=$1, 
+                       retry_after=$2, 
+                       retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
+                       last_error_code='retryable_error', 
+                       last_error_message=$3, 
+                       version=version+1,
+                       lease_owner=NULL,
+                       lease_expiry=NULL
+                   WHERE task_id=$4::uuid''',
+        1,
+        ANY,
+        "URL fetch request failed for https://bad.example/fail: network down",
+        task_data["task_id"],
+    )
+
+
+def test_tool_transport_error_is_retryable(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    assert executor._is_retryable_error(
+        ToolTransportError("URL fetch request failed for https://bad.example/fail: network down")
+    ) is True

@@ -22,6 +22,17 @@ public final class ValidationConstants {
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
 
+    /** Allowed dead-letter reasons matching the database constraint. */
+    public static final Set<String> ALLOWED_DEAD_LETTER_REASONS = Set.of(
+            "cancelled_by_user",
+            "retries_exhausted",
+            "task_timeout",
+            "non_retryable_error",
+            "max_steps_exceeded"
+    );
+
+    public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";
+
     /** Supported LLM models for Phase 1. */
     public static final Set<String> SUPPORTED_MODELS = Set.of(
             "claude-sonnet-4-6",

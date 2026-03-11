@@ -126,3 +126,16 @@ class TestReadUrlFetcher:
 
         with pytest.raises(ToolExecutionError):
             await fetcher.fetch("https://example.com/file.pdf", 5000)
+
+    @pytest.mark.asyncio
+    async def test_transport_errors_include_the_failing_url(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("network down", request=request)
+
+        fetcher = ReadUrlFetcher(
+            client=_build_client(handler),
+            resolver=_public_resolver,
+        )
+
+        with pytest.raises(ToolExecutionError, match=r"https://example.com/fail"):
+            await fetcher.fetch("https://example.com/fail", 5000)

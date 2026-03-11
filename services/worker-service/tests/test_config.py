@@ -1,7 +1,6 @@
 """Tests for WorkerConfig."""
 
 import json
-
 import pytest
 
 from core.config import WorkerConfig, load_model_pricing, _generate_worker_id
@@ -81,3 +80,22 @@ class TestWorkerConfig:
     def test_model_pricing_override_validates_payload(self):
         with pytest.raises(ValueError, match="must be an object"):
             WorkerConfig(model_pricing={"broken-model": "invalid"})  # type: ignore[arg-type]
+
+    def test_timing_values_can_be_loaded_from_environment(self, monkeypatch):
+        monkeypatch.setenv("LEASE_DURATION_SECONDS", "11")
+        monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "4")
+        monkeypatch.setenv("REAPER_INTERVAL_SECONDS", "9")
+        monkeypatch.setenv("REAPER_JITTER_SECONDS", "2")
+
+        config = WorkerConfig()
+
+        assert config.lease_duration_seconds == 11
+        assert config.heartbeat_interval_seconds == 4
+        assert config.reaper_interval_seconds == 9
+        assert config.reaper_jitter_seconds == 2
+
+    def test_invalid_timing_environment_value_raises(self, monkeypatch):
+        monkeypatch.setenv("LEASE_DURATION_SECONDS", "not-an-int")
+
+        with pytest.raises(ValueError, match="LEASE_DURATION_SECONDS must be an integer"):
+            WorkerConfig()

@@ -280,6 +280,9 @@ Configuration via environment variables or `application.yml`:
 | `SERVER_PORT` | `8080` | HTTP server port |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | `false` | Enables `/v1/dev/tasks/*`, allows `dev_sleep`, and lowers the minimum timeout to `1` for local/dev testing |
 
+**Allowed dead-letter reasons:**
+`cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`
+
 ## Running Tests
 
 **Unit tests only:**

@@ -37,6 +37,16 @@ def _default_model_pricing_file() -> str:
     return os.environ.get("MODEL_PRICING_FILE", str(DEFAULT_MODEL_PRICING_FILE))
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
 def _coerce_model_pricing(model_name: str, payload: object) -> ModelPricing:
     if not isinstance(payload, dict):
         raise ValueError(f"Pricing entry for model {model_name!r} must be an object.")
@@ -98,12 +108,12 @@ class WorkerConfig:
     poll_backoff_multiplier: float = 2.0
 
     # Lease / heartbeat
-    lease_duration_seconds: int = 60
-    heartbeat_interval_seconds: int = 15
+    lease_duration_seconds: int = field(default_factory=lambda: _env_int("LEASE_DURATION_SECONDS", 60))
+    heartbeat_interval_seconds: int = field(default_factory=lambda: _env_int("HEARTBEAT_INTERVAL_SECONDS", 15))
 
     # Reaper
-    reaper_interval_seconds: int = 30
-    reaper_jitter_seconds: int = 10
+    reaper_interval_seconds: int = field(default_factory=lambda: _env_int("REAPER_INTERVAL_SECONDS", 30))
+    reaper_jitter_seconds: int = field(default_factory=lambda: _env_int("REAPER_JITTER_SECONDS", 10))
 
     # Pricing
     model_pricing_file: str = field(default_factory=_default_model_pricing_file)

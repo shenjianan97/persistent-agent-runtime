@@ -88,6 +88,13 @@ services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/
 
 The suite enables API dev task controls automatically for any API instance it starts itself.
 
+Allowed dead-letter reasons for the dev task-control endpoint:
+- `cancelled_by_user`
+- `retries_exhausted`
+- `task_timeout`
+- `non_retryable_error`
+- `max_steps_exceeded`
+
 ## Troubleshooting
 
 - If tests hang on status waits, check API and worker logs first.
