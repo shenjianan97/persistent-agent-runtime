@@ -1,7 +1,7 @@
 """Tests verifying SQL queries match the design document exactly."""
 
-from core.heartbeat import HEARTBEAT_QUERY, build_heartbeat_query
-from core.poller import CLAIM_QUERY, build_claim_query
+from core.heartbeat import build_heartbeat_query
+from core.poller import build_claim_query
 from core.reaper import (
     REAPER_DEAD_LETTER_QUERY,
     REAPER_REQUEUE_QUERY,
@@ -13,51 +13,57 @@ class TestClaimQueryContract:
     """Verify the claim query matches docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1."""
 
     def test_uses_cte_pattern(self):
-        assert "WITH claimable AS" in CLAIM_QUERY
+        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
+
+    def test_claim_query_checks_retry_after(self):
+        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
+
+    def test_claim_query_uses_cte(self):
+        assert "WITH claimable AS" in build_claim_query(60)
 
     def test_selects_queued_tasks(self):
-        assert "status = 'queued'" in CLAIM_QUERY
+        assert "status = 'queued'" in build_claim_query(60)
 
     def test_filters_by_pool(self):
-        assert "worker_pool_id = $1" in CLAIM_QUERY
+        assert "worker_pool_id = $1" in build_claim_query(60)
 
     def test_filters_by_tenant(self):
-        assert "tenant_id = $2" in CLAIM_QUERY
+        assert "tenant_id = $2" in build_claim_query(60)
 
     def test_respects_retry_after(self):
-        assert "retry_after IS NULL OR retry_after < NOW()" in CLAIM_QUERY
+        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
 
     def test_orders_by_created_at(self):
-        assert "ORDER BY created_at" in CLAIM_QUERY
+        assert "ORDER BY created_at" in build_claim_query(60)
 
     def test_limits_to_one(self):
-        assert "LIMIT 1" in CLAIM_QUERY
+        assert "LIMIT 1" in build_claim_query(60)
 
     def test_for_update_skip_locked(self):
-        assert "FOR UPDATE SKIP LOCKED" in CLAIM_QUERY
+        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
 
     def test_updates_to_running(self):
-        assert "SET status = 'running'" in CLAIM_QUERY
+        assert "SET status = 'running'" in build_claim_query(60)
 
     def test_sets_lease_owner(self):
-        assert "lease_owner = $3" in CLAIM_QUERY
+        assert "lease_owner = $3" in build_claim_query(60)
 
     def test_sets_lease_expiry_60s(self):
-        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in CLAIM_QUERY
+        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in build_claim_query(60)
 
     def test_claim_query_respects_configured_lease_duration(self):
         assert "lease_expiry = NOW() + INTERVAL '7 seconds'" in build_claim_query(7)
 
     def test_increments_version(self):
-        assert "version = t.version + 1" in CLAIM_QUERY
+        assert "version = t.version + 1" in build_claim_query(60)
 
     def test_returns_full_row(self):
-        assert "RETURNING t.*" in CLAIM_QUERY
+        assert "RETURNING t.*" in build_claim_query(60)
 
     def test_no_version_in_where(self):
         """Version check is intentionally omitted from WHERE clause per design doc."""
         # Ensure version is not in the WHERE of the CTE or UPDATE
-        where_sections = CLAIM_QUERY.split("WHERE")
+        where_sections = build_claim_query(60).split("WHERE")
         for section in where_sections[1:]:
             # Only check until SET or RETURNING
             end = section.find("SET")
@@ -73,26 +79,26 @@ class TestHeartbeatQueryContract:
     """Verify the heartbeat query matches design doc."""
 
     def test_extends_lease_60s(self):
-        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in HEARTBEAT_QUERY
+        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in build_heartbeat_query(60)
 
     def test_heartbeat_query_respects_configured_lease_duration(self):
         assert "lease_expiry = NOW() + INTERVAL '7 seconds'" in build_heartbeat_query(7)
 
     def test_checks_task_id(self):
-        assert "task_id = $1" in HEARTBEAT_QUERY
+        assert "task_id = $1" in build_heartbeat_query(60)
 
     def test_checks_tenant_id(self):
-        assert "tenant_id = $2" in HEARTBEAT_QUERY
+        assert "tenant_id = $2" in build_heartbeat_query(60)
 
     def test_checks_lease_owner(self):
-        assert "lease_owner = $3" in HEARTBEAT_QUERY
+        assert "lease_owner = $3" in build_heartbeat_query(60)
 
     def test_checks_running_status(self):
-        assert "status = 'running'" in HEARTBEAT_QUERY
+        assert "status = 'running'" in build_heartbeat_query(60)
 
     def test_no_version_check(self):
         """Heartbeat must NOT check version per design doc."""
-        assert "version" not in HEARTBEAT_QUERY.lower()
+        assert "version" not in build_heartbeat_query(60).lower()
 
 
 class TestReaperRequeueQueryContract:

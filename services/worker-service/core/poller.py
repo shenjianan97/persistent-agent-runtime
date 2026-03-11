@@ -8,7 +8,7 @@ Concurrency bounded by asyncio.Semaphore(MAX_CONCURRENT_TASKS).
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable, Awaitable
+from typing import Any, Callable, Awaitable
 
 import asyncpg
 
@@ -19,9 +19,6 @@ from core.logging import (
     MetricsCollector,
     get_logger,
 )
-
-if TYPE_CHECKING:
-    pass
 
 # Exact claim query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
 def build_claim_query(lease_duration_seconds: int) -> str:
@@ -47,9 +44,6 @@ FROM claimable c
 WHERE t.task_id = c.task_id
 RETURNING t.*;
 """
-
-
-CLAIM_QUERY = build_claim_query(60)
 
 
 class TaskPoller:
@@ -83,6 +77,7 @@ class TaskPoller:
         self._notify_event = asyncio.Event()
         self._poll_task: asyncio.Task | None = None
         self._listen_task: asyncio.Task | None = None
+        self._active_tasks_count = 0
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -193,7 +188,7 @@ class TaskPoller:
     async def _try_claim(self) -> bool:
         """Attempt to claim a single task. Returns True if a task was claimed."""
         # Check semaphore availability without blocking
-        if self._semaphore.locked() and self._semaphore._value == 0:  # type: ignore[attr-defined]
+        if self._active_tasks_count >= self._config.max_concurrent_tasks:
             return False
 
         await self._semaphore.acquire()
@@ -213,10 +208,11 @@ class TaskPoller:
             task_data = dict(row)
             task_id = str(task_data["task_id"])
 
+            self._active_tasks_count += 1
             self._metrics.increment("tasks.active", worker_id=self._config.worker_id)
             self._metrics.set_gauge(
                 "workers.active_tasks",
-                self._config.max_concurrent_tasks - self._semaphore._value,  # type: ignore[attr-defined]
+                self._active_tasks_count,
                 worker_id=self._config.worker_id,
             )
 
@@ -239,6 +235,7 @@ class TaskPoller:
             return True
 
         except Exception:
+            self._active_tasks_count = max(0, self._active_tasks_count - 1)
             self._semaphore.release()
             raise
 
@@ -266,11 +263,11 @@ class TaskPoller:
         finally:
             # 4. Cleanup: Tell HeartbeatManager to stop pinging, and release semaphore
             await self._heartbeat.stop_heartbeat(task_id)
+            self._active_tasks_count = max(0, self._active_tasks_count - 1)
             self._semaphore.release()
-            active = self._config.max_concurrent_tasks - self._semaphore._value  # type: ignore[attr-defined]
             self._metrics.set_gauge(
                 "workers.active_tasks",
-                max(0, active),
+                self._active_tasks_count,
                 worker_id=self._config.worker_id,
             )
 

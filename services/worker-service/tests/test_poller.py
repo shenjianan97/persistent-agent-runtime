@@ -8,39 +8,39 @@ import pytest
 
 from core.config import WorkerConfig
 from core.logging import MetricsCollector
-from core.poller import CLAIM_QUERY, TaskPoller
+from core.poller import build_claim_query, TaskPoller
 
 
 class TestClaimQuery:
     """Verify the claim query matches the design doc."""
 
     def test_claim_query_has_for_update_skip_locked(self):
-        assert "FOR UPDATE SKIP LOCKED" in CLAIM_QUERY
+        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
 
     def test_claim_query_checks_retry_after(self):
-        assert "retry_after IS NULL OR retry_after < NOW()" in CLAIM_QUERY
+        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
 
     def test_claim_query_uses_cte(self):
-        assert "WITH claimable AS" in CLAIM_QUERY
+        assert "WITH claimable AS" in build_claim_query(60)
 
     def test_claim_query_sets_running(self):
-        assert "status = 'running'" in CLAIM_QUERY
+        assert "status = 'running'" in build_claim_query(60)
 
     def test_claim_query_sets_lease_expiry(self):
-        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in CLAIM_QUERY
+        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in build_claim_query(60)
 
     def test_claim_query_returns_full_row(self):
-        assert "RETURNING t.*" in CLAIM_QUERY
+        assert "RETURNING t.*" in build_claim_query(60)
 
     def test_claim_query_orders_by_created_at(self):
-        assert "ORDER BY created_at" in CLAIM_QUERY
+        assert "ORDER BY created_at" in build_claim_query(60)
 
     def test_claim_query_filters_by_pool_and_tenant(self):
-        assert "worker_pool_id = $1" in CLAIM_QUERY
-        assert "tenant_id = $2" in CLAIM_QUERY
+        assert "worker_pool_id = $1" in build_claim_query(60)
+        assert "tenant_id = $2" in build_claim_query(60)
 
     def test_claim_query_increments_version(self):
-        assert "version = t.version + 1" in CLAIM_QUERY
+        assert "version = t.version + 1" in build_claim_query(60)
 
 
 class TestPollerBackoff:

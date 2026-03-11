@@ -2,13 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import asyncpg
-
-if TYPE_CHECKING:
-    pass
-
 
 async def create_pool(dsn: str, min_size: int = 2, max_size: int = 10) -> asyncpg.Pool:
     """Create an asyncpg connection pool.

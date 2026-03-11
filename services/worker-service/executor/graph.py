@@ -1,7 +1,13 @@
+"""LangGraph executor for agent tasks.
+
+Builds and executes the LangGraph state machine with the given agent configuration.
+"""
+
 import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, AsyncGenerator
 
@@ -150,12 +156,11 @@ class GraphExecutor:
         max_steps = task_data.get("max_steps", 100)
         task_timeout_seconds = task_data.get("task_timeout_seconds", 3600)
         worker_id = self.config.worker_id
-        
-        pool = self.pool
+
         try:
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(
-                pool,
+                self.pool,
                 worker_id=worker_id,
                 tenant_id=tenant_id
             )
@@ -184,11 +189,11 @@ class GraphExecutor:
                     # Step 6: Cancellation Awareness
                     if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
+                        await self._backfill_checkpoint_costs(task_id, model_name)
                         return
 
-                    await self._backfill_checkpoint_costs(task_id, model_name)
-
                 if cancel_event.is_set():
+                    await self._backfill_checkpoint_costs(task_id, model_name)
                     return
 
                 await self._backfill_checkpoint_costs(task_id, model_name)
@@ -199,7 +204,7 @@ class GraphExecutor:
                 output_content = messages[-1].content if messages else ""
                 
                 # Step 5: Completion Path
-                await pool.execute(
+                await self.pool.execute(
                     '''UPDATE tasks 
                        SET status='completed', 
                            output=$1, 
@@ -230,7 +235,7 @@ class GraphExecutor:
             if self._is_retryable_error(e):
                 await self._handle_retryable_error(task_data, e)
             else:
-                await self._handle_dead_letter(task_id, "non_retryable_error", str(e))
+                await self._handle_dead_letter(task_id, "non_retryable_error", str(e), error_code="fatal_error")
 
     def _extract_cost_from_stream_event(self, event: Any, model_name: str) -> int:
         usage = self._extract_usage_from_stream_event(event)
@@ -385,13 +390,13 @@ class GraphExecutor:
             return False
         
         # 4xx HTTP responses (usually fatal)
-        if "400" in error_str or "401" in error_str or "403" in error_str or "404" in error_str:
+        if re.search(r'\b40[0-4]\b', error_str):
             return False
 
         # 429 and 5xx are retryable
         if "429" in error_str or "rate limit" in error_str:
             return True
-        if any(code in error_str for code in ("500", "502", "503", "504")):
+        if re.search(r'\b50[0234]\b', error_str):
             return True
 
         if isinstance(e, ToolTransportError):
@@ -441,7 +446,7 @@ class GraphExecutor:
         
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
-    async def _handle_dead_letter(self, task_id: str, reason: str, error_msg: str):
+    async def _handle_dead_letter(self, task_id: str, reason: str, error_msg: str, error_code: str | None = None):
         worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
         
@@ -451,14 +456,16 @@ class GraphExecutor:
                    SET status='dead_letter', 
                        dead_letter_reason=$1, 
                        last_error_message=$2,
-                       last_worker_id=$3,
+                       last_error_code=$3,
+                       last_worker_id=$4,
                        dead_lettered_at=NOW(),
                        version=version+1,
                        lease_owner=NULL,
                        lease_expiry=NULL
-                   WHERE task_id=$4::uuid''',
+                   WHERE task_id=$5::uuid''',
                 reason,
                 error_msg,
+                error_code or reason,
                 worker_id,
                 task_id
             )

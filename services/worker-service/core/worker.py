@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import signal
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 import asyncpg
 
+if TYPE_CHECKING:
+    from executor.router import TaskRouter
+
 from core.config import WorkerConfig
-from core.db import create_pool
 from core.heartbeat import HeartbeatManager
 from core.logging import MetricsCollector, configure_logging, get_logger
 from core.poller import TaskPoller
@@ -43,7 +45,7 @@ class WorkerService:
         self,
         config: WorkerConfig,
         pool: asyncpg.Pool,
-        router: Any,
+        router: "TaskRouter",
     ) -> None:
         self._config = config
         self._pool = pool

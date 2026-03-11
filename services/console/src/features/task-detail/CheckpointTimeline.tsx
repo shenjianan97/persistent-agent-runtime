@@ -256,7 +256,7 @@ export function CheckpointTimeline({
                                                             Resumed From Saved Progress
                                                         </span>
                                                     </div>
-                                                    <div className="pl-5 opacity-80 leading-5 break-words">
+                                                    <div className="pl-5 opacity-80 leading-5 wrap-break-word">
                                                         {resumeMarker.resumedAfterStep === null
                                                             ? 'Execution continued from the latest saved checkpoint instead of restarting.'
                                                             : `Execution continued from the checkpoint saved after step ${resumeMarker.resumedAfterStep}, so earlier progress was preserved.`}
@@ -395,7 +395,7 @@ export function CheckpointTimeline({
                                             )}
                                         </div>
 
-                                        <div className="text-sm leading-6 text-destructive/90 whitespace-pre-wrap break-words">
+                                        <div className="text-sm leading-6 text-destructive/90 whitespace-pre-wrap wrap-break-word">
                                             {terminalFailureMarker.failedBeforeNextCheckpoint
                                                 ? 'A later attempt failed before another checkpoint could be saved, so the timeline ends at the last durable step below.'
                                                 : 'Execution ended in a failure after the last recorded checkpoint.'}

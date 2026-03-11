@@ -69,6 +69,12 @@ class TestReaperRunOnce:
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
         conn.fetchrow = AsyncMock(return_value={"depth": 0})
+        
+        tx_ctx = AsyncMock()
+        tx_ctx.__aenter__ = AsyncMock(return_value=None)
+        tx_ctx.__aexit__ = AsyncMock(return_value=False)
+        conn.transaction = MagicMock(return_value=tx_ctx)
+
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)

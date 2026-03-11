@@ -147,6 +147,7 @@ public class TaskRepository {
     /**
      * Lists dead-lettered tasks with optional agent_id filter.
      */
+    @SuppressWarnings("null")
     public List<Map<String, Object>> listDeadLetterTasks(String tenantId, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT task_id, agent_id, dead_letter_reason, last_error_code,
@@ -270,6 +271,7 @@ public class TaskRepository {
     /**
      * Lists tasks with optional status and agent_id filters, ordered by most recent first.
      */
+    @SuppressWarnings("null")
     public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,

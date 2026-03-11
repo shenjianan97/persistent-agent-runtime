@@ -8,7 +8,7 @@ corresponding executor is signalled to stop.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 import asyncpg
 
@@ -19,9 +19,6 @@ from core.logging import (
     MetricsCollector,
     get_logger,
 )
-
-if TYPE_CHECKING:
-    pass
 
 # Exact heartbeat query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
 def build_heartbeat_query(lease_duration_seconds: int) -> str:
@@ -34,9 +31,6 @@ WHERE task_id = $1
   AND lease_owner = $3
   AND status = 'running';
 """
-
-
-HEARTBEAT_QUERY = build_heartbeat_query(60)
 
 
 class HeartbeatHandle:

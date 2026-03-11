@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import TYPE_CHECKING
 
 import asyncpg
 
@@ -23,9 +22,6 @@ from core.logging import (
     MetricsCollector,
     get_logger,
 )
-
-if TYPE_CHECKING:
-    pass
 
 # Exact reaper queries from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
 
@@ -191,56 +187,58 @@ class ReaperTask:
         }
 
         async with self._pool.acquire() as conn:
-            # (a) Expired leases — requeue
-            requeued_rows = await conn.fetch(REAPER_REQUEUE_QUERY)
-            for row in requeued_rows:
-                task_id = str(row["task_id"])
-                results["requeued"].append(task_id)
-                self._metrics.increment("leases.expired")
-                await self._log.ainfo(
-                    REAPER_LEASE_EXPIRED,
-                    task_id=task_id,
-                    action="requeued",
-                )
+            async with conn.transaction():
+                # (a) Expired leases — requeue
+                requeued_rows = await conn.fetch(REAPER_REQUEUE_QUERY)
+                for row in requeued_rows:
+                    task_id = str(row["task_id"])
+                    results["requeued"].append(task_id)
+                    self._metrics.increment("leases.expired")
+                    await self._log.ainfo(
+                        REAPER_LEASE_EXPIRED,
+                        task_id=task_id,
+                        action="requeued",
+                    )
 
-            # (a) Expired leases — dead-letter (retries exhausted)
-            dl_rows = await conn.fetch(REAPER_DEAD_LETTER_QUERY)
-            for row in dl_rows:
-                task_id = str(row["task_id"])
-                results["dead_lettered_expired"].append(task_id)
-                self._metrics.increment("leases.expired")
-                self._metrics.increment("tasks.dead_letter")
-                await self._log.ainfo(
-                    REAPER_DEAD_LETTERED,
-                    task_id=task_id,
-                    reason="retries_exhausted",
-                )
+                # (a) Expired leases — dead-letter (retries exhausted)
+                dl_rows = await conn.fetch(REAPER_DEAD_LETTER_QUERY)
+                for row in dl_rows:
+                    task_id = str(row["task_id"])
+                    results["dead_lettered_expired"].append(task_id)
+                    self._metrics.increment("leases.expired")
+                    self._metrics.increment("tasks.dead_letter")
+                    await self._log.ainfo(
+                        REAPER_DEAD_LETTERED,
+                        task_id=task_id,
+                        reason="retries_exhausted",
+                    )
 
-            # (b) Task timeouts
-            timeout_rows = await conn.fetch(REAPER_TIMEOUT_QUERY)
-            for row in timeout_rows:
-                task_id = str(row["task_id"])
-                results["dead_lettered_timeout"].append(task_id)
-                self._metrics.increment("tasks.dead_letter")
-                await self._log.ainfo(
-                    REAPER_TASK_TIMEOUT,
-                    task_id=task_id,
-                    reason="task_timeout",
-                )
+                # (b) Task timeouts
+                timeout_rows = await conn.fetch(REAPER_TIMEOUT_QUERY)
+                for row in timeout_rows:
+                    task_id = str(row["task_id"])
+                    results["dead_lettered_timeout"].append(task_id)
+                    self._metrics.increment("tasks.dead_letter")
+                    await self._log.ainfo(
+                        REAPER_TASK_TIMEOUT,
+                        task_id=task_id,
+                        reason="task_timeout",
+                    )
 
-            # (c) Stale workers — mark offline if heartbeat expired
-            stale_rows = await conn.fetch(STALE_WORKER_QUERY)
-            for row in stale_rows:
-                worker_id = row["worker_id"]
-                await self._log.awarning(
-                    "reaper_stale_worker",
-                    worker_id=worker_id,
-                    action="marked_offline",
-                )
+                # (c) Stale workers — mark offline if heartbeat expired
+                stale_rows = await conn.fetch(STALE_WORKER_QUERY)
+                for row in stale_rows:
+                    worker_id = row["worker_id"]
+                    self._metrics.increment("workers.stale")
+                    await self._log.awarning(
+                        "reaper_stale_worker",
+                        worker_id=worker_id,
+                        action="marked_offline",
+                    )
 
-            # Update queue depth metric
-            depth_row = await conn.fetchrow(QUEUE_DEPTH_QUERY)
-            if depth_row:
-                self._metrics.set_gauge("queue.depth", float(depth_row["depth"]))
+                # Update queue depth metric
+                depth_row = await conn.fetchrow(QUEUE_DEPTH_QUERY)
+                if depth_row:
+                    self._metrics.set_gauge("queue.depth", float(depth_row["depth"]))
 
         return results

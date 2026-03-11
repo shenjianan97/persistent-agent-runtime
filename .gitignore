@@ -91,3 +91,6 @@ pnpm-debug.log*
 dist-ssr/
 *.tsbuildinfo
 *.local
+
+# Un-ignore frontend lib/ which conflicts with Python lib/ ignore
+!services/console/src/lib/
