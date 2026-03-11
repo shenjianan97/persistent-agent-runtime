@@ -38,7 +38,7 @@ class TaskServiceTest {
         objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        taskService = new TaskService(taskRepository, objectMapper, new CheckpointEventParser(objectMapper));
+        taskService = new TaskService(taskRepository, objectMapper, new CheckpointEventParser(objectMapper), false);
     }
 
     // --- submitTask tests ---
@@ -81,6 +81,26 @@ class TaskServiceTest {
                 "prompt", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, null);
+
+        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+    }
+
+    @Test
+    void submitTask_devOnlyToolRejectedWhenDevTaskControlsDisabled() {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "prompt", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "input", null, null, null);
+
+        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+    }
+
+    @Test
+    void submitTask_shortTimeoutRejectedWhenDevTaskControlsDisabled() {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "prompt", "claude-sonnet-4-6", 0.5, List.of());
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "input", null, null, 30);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }

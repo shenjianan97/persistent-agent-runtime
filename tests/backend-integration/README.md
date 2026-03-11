@@ -13,6 +13,7 @@ No frontend is involved.
 - Checkpoint ordering and resume behavior
 - Multi-worker coordination and concurrency
 - API validation and tenant isolation
+- Dev task controls (`expire-lease`, `force-dead-letter`) and deterministic timeout testing via `dev_sleep`
 
 ## Test Design
 
@@ -35,7 +36,7 @@ By default, the suite:
 
 Specifically:
 - If PostgreSQL is not reachable on `localhost:55432`, tests may start Docker container `par-e2e-postgres`.
-- If API health is not available on `http://localhost:8080/v1/health`, tests may start `services/api-service` via `./gradlew bootRun`.
+- If API health is not available on `http://localhost:8080/v1/health`, tests may start `services/api-service` via `./gradlew bootRun` with `APP_DEV_TASK_CONTROLS_ENABLED=true`.
 - If schema is missing, migration `infrastructure/database/migrations/0001_phase1_durable_execution.sql` is applied.
 
 ## Prerequisites
@@ -59,6 +60,12 @@ Run a single file:
 services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/test_recovery.py
 ```
 
+Run the dev task controls scenarios only:
+
+```bash
+services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/test_dev_task_controls.py
+```
+
 Run a single test:
 
 ```bash
@@ -78,6 +85,8 @@ services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/
 - `E2E_PG_CONTAINER` (default: `par-e2e-postgres`)
 - `E2E_PG_IMAGE` (default: `postgres:16`)
 - `E2E_SKIP_AUTO_INFRA=1` (disable auto start/reuse logic)
+
+The suite enables API dev task controls automatically for any API instance it starts itself.
 
 ## Troubleshooting
 

@@ -41,6 +41,8 @@ DB_DSN = os.getenv(
 API_PORT = int(os.getenv("E2E_API_PORT", "8080"))
 API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
 
+os.environ.setdefault("APP_DEV_TASK_CONTROLS_ENABLED", "true")
+
 PG_CONTAINER = os.getenv("E2E_PG_CONTAINER", "par-e2e-postgres")
 PG_IMAGE = os.getenv("E2E_PG_IMAGE", "postgres:16")
 
@@ -115,6 +117,7 @@ def _start_api_process() -> subprocess.Popen[str]:
             "DB_USER": DB_USER,
             "DB_PASSWORD": DB_PASSWORD,
             "SERVER_PORT": str(API_PORT),
+            "APP_DEV_TASK_CONTROLS_ENABLED": "true",
         }
     )
     log_file = REPO_ROOT / ".tmp" / "e2e-api-service.log"
@@ -286,6 +289,11 @@ class WorkerManager:
         await worker.start()
         self._workers.append(worker)
         return worker
+
+    async def stop(self, worker: Any) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+        await stop_worker(worker)
 
     async def stop_all(self) -> None:
         while self._workers:

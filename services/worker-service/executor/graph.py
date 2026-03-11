@@ -23,9 +23,12 @@ from tools.definitions import (
     WEB_SEARCH_TOOL, 
     READ_URL_TOOL, 
     CALCULATOR_TOOL,
+    DEV_SLEEP_TOOL,
     WebSearchArguments, 
     ReadUrlArguments, 
-    CalculatorArguments
+    CalculatorArguments,
+    DevSleepArguments,
+    dev_task_controls_enabled,
 )
 from tools.calculator import evaluate_expression
 
@@ -72,6 +75,17 @@ class GraphExecutor:
                 name="calculator",
                 description=CALCULATOR_TOOL.description,
                 args_schema=CalculatorArguments
+            ))
+
+        if dev_task_controls_enabled() and "dev_sleep" in allowed_tools:
+            async def dev_sleep(seconds: int = 10):
+                await asyncio.sleep(seconds)
+                return {"slept_seconds": seconds}
+            tools.append(StructuredTool.from_function(
+                coroutine=dev_sleep,
+                name="dev_sleep",
+                description=DEV_SLEEP_TOOL.description,
+                args_schema=DevSleepArguments
             ))
             
         return tools

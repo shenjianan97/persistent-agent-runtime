@@ -80,6 +80,37 @@ class ApiClient:
     def redrive_task(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
         return self._request("POST", f"/tasks/{task_id}/redrive", expected_status=expected_status, raise_for_status=raise_for_status)
 
+    def dev_expire_lease(
+        self,
+        task_id: str,
+        *,
+        lease_owner: str | None = None,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        payload = {"lease_owner": lease_owner} if lease_owner is not None else None
+        return self._request("POST", f"/dev/tasks/{task_id}/expire-lease", payload, expected_status, raise_for_status)
+
+    def dev_force_dead_letter(
+        self,
+        task_id: str,
+        *,
+        reason: str = "non_retryable_error",
+        error_code: str | None = None,
+        error_message: str | None = None,
+        last_worker_id: str | None = None,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"reason": reason}
+        if error_code is not None:
+            payload["error_code"] = error_code
+        if error_message is not None:
+            payload["error_message"] = error_message
+        if last_worker_id is not None:
+            payload["last_worker_id"] = last_worker_id
+        return self._request("POST", f"/dev/tasks/{task_id}/force-dead-letter", payload, expected_status, raise_for_status)
+
     def get_dead_letters(
         self,
         *,

@@ -123,3 +123,14 @@ def tool_then_slow_final(expression: str = "5*5", delay: float = 30.0) -> MagicM
     mock = _new_mock()
     mock.ainvoke = AsyncMock(side_effect=[call_msg, _slow])
     return mock
+
+
+def dev_sleep_tool_call(seconds: int = 10, final_answer: str = "done after sleep") -> MagicMock:
+    call_msg = AIMessage(
+        content="",
+        tool_calls=[ToolCall(name="dev_sleep", args={"seconds": seconds}, id="call_dev_sleep")],
+    )
+    final_msg = AIMessage(content=final_answer)
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[call_msg, final_msg])
+    return mock

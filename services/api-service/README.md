@@ -25,6 +25,8 @@ Submit a new task for execution.
 }
 ```
 
+When `app.dev-task-controls.enabled=true`, task submission also allows the dev-only `dev_sleep` tool in `allowed_tools` and permits short `task_timeout_seconds` values down to `1` for local recovery testing.
+
 **Response (201 Created):**
 ```json
 {
@@ -176,6 +178,53 @@ Health check with database connectivity and queue/worker counts. `active_workers
 }
 ```
 
+### POST /v1/dev/tasks/{task_id}/expire-lease
+
+Dev-only task control. Forces a running task's lease to expire immediately so the normal reaper recovery path can reclaim it.
+
+This endpoint only exists when `app.dev-task-controls.enabled=true`.
+
+**Request (optional):**
+```json
+{
+  "lease_owner": "optional-owner-override"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "task_id": "...",
+  "status": "running",
+  "message": "lease expired for recovery testing"
+}
+```
+
+### POST /v1/dev/tasks/{task_id}/force-dead-letter
+
+Dev-only task control. Forces a queued or running task into the normal `dead_letter` state while preserving existing checkpoints.
+
+This endpoint only exists when `app.dev-task-controls.enabled=true`.
+
+**Request (optional):**
+```json
+{
+  "reason": "non_retryable_error",
+  "error_code": "non_retryable_error",
+  "error_message": "Forced dead letter for local testing",
+  "last_worker_id": "worker-a-123"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "task_id": "...",
+  "status": "dead_letter",
+  "message": "task moved to dead letter for recovery testing"
+}
+```
+
 ## Validation Rules
 
 | Field | Constraint |
@@ -185,10 +234,10 @@ Health check with database connectivity and queue/worker counts. `active_workers
 | `agent_config.system_prompt` | Required, max 50KB |
 | `agent_config.model` | Required, must be a supported model |
 | `agent_config.temperature` | 0.0 - 2.0 (default 0.7) |
-| `agent_config.allowed_tools` | Each tool must be in: `web_search`, `read_url`, `calculator` |
+| `agent_config.allowed_tools` | Each tool must be in: `web_search`, `read_url`, `calculator` (`dev_sleep` is also allowed when dev task controls are enabled) |
 | `max_retries` | 0 - 10 (default 3) |
 | `max_steps` | 1 - 1000 (default 100) |
-| `task_timeout_seconds` | 60 - 86400 (default 3600) |
+| `task_timeout_seconds` | 60 - 86400 (default 3600), or 1 - 86400 when dev task controls are enabled |
 
 **Supported Models:**
 `claude-sonnet-4-6`, `claude-sonnet-4-20250514`, `claude-haiku-4-20250514`, `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `us.anthropic.claude-sonnet-4-20250514-v1:0`, `us.anthropic.claude-haiku-4-20250514-v1:0`
@@ -229,6 +278,7 @@ Configuration via environment variables or `application.yml`:
 | `DB_USER` | `postgres` | Database username |
 | `DB_PASSWORD` | `postgres` | Database password |
 | `SERVER_PORT` | `8080` | HTTP server port |
+| `APP_DEV_TASK_CONTROLS_ENABLED` | `false` | Enables `/v1/dev/tasks/*`, allows `dev_sleep`, and lowers the minimum timeout to `1` for local/dev testing |
 
 ## Running Tests
 

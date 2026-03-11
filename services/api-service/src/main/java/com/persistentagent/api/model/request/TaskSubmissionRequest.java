@@ -36,7 +36,7 @@ public record TaskSubmissionRequest(
         @JsonProperty("max_steps")
         Integer maxSteps,
 
-        @Min(value = 60, message = "task_timeout_seconds must be >= 60")
+        @Min(value = 1, message = "task_timeout_seconds must be >= 1")
         @Max(value = 86400, message = "task_timeout_seconds must be <= 86400")
         @JsonProperty("task_timeout_seconds")
         Integer taskTimeoutSeconds

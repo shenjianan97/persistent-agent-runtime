@@ -141,6 +141,7 @@ ensure_required_env() {
         export DB_NAME="${BASH_REMATCH[5]}"
     fi
     export VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://localhost:8080}"
+    export VITE_DEV_TASK_CONTROLS_ENABLED="${VITE_DEV_TASK_CONTROLS_ENABLED:-${APP_DEV_TASK_CONTROLS_ENABLED:-false}}"
 
     [[ -n "${ANTHROPIC_API_KEY:-}" ]] || fail "ANTHROPIC_API_KEY must be set in your shell or .env.localdev."
     if [[ -z "${TAVILY_API_KEY:-}" ]]; then

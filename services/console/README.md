@@ -28,6 +28,8 @@ The console calls the Spring Boot API service at the URL set by `VITE_API_BASE_U
 
 For remote development and SSH port forwarding, the Vite dev server binds to `0.0.0.0` by default. Override it with `VITE_DEV_HOST` if you need a different interface.
 
+When `VITE_DEV_TASK_CONTROLS_ENABLED=true`, the submit form also exposes the dev-only `Dev Sleep` tool and allows short task timeouts for local recovery/timeout testing.
+
 Ways to configure it (highest priority first):
 
 1. **Inline env var** — overrides everything: `VITE_API_BASE_URL=https://api.example.com npm run dev`
@@ -38,6 +40,7 @@ Ways to configure it (highest priority first):
 Example multi-environment setup:
 ```
 .env                → VITE_API_BASE_URL=http://localhost:8080
+.env.local          → VITE_DEV_TASK_CONTROLS_ENABLED=true
 .env.production     → VITE_API_BASE_URL=https://api.prod.example.com
 ```
 

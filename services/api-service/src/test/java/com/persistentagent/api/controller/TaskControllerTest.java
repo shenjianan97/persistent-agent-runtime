@@ -250,7 +250,7 @@ class TaskControllerTest {
                                     "model": "claude-sonnet-4-6"
                                   },
                                   "input": "test",
-                                  "task_timeout_seconds": 30
+                                  "task_timeout_seconds": 0
                                 }
                                 """;
 

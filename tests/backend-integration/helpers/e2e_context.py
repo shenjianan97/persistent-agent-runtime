@@ -33,6 +33,9 @@ class E2EContext:
     async def start_worker(self, worker_id: str, **kwargs: Any) -> Any:
         return await self.workers.start(worker_id=worker_id, **kwargs)
 
+    async def stop_worker(self, worker: Any) -> None:
+        await self.workers.stop(worker)
+
     async def stop_workers(self) -> None:
         await self.workers.stop_all()
 
@@ -44,6 +47,12 @@ class E2EContext:
 
     def get_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
         return self.api.get_checkpoints(task_id)["body"]["checkpoints"]
+
+    def dev_expire_lease(self, task_id: str, **overrides: Any) -> dict[str, Any]:
+        return self.api.dev_expire_lease(task_id, **overrides)["body"]
+
+    def dev_force_dead_letter(self, task_id: str, **overrides: Any) -> dict[str, Any]:
+        return self.api.dev_force_dead_letter(task_id, **overrides)["body"]
 
     async def wait_for_status(self, task_id: str, status: str, timeout: float = 20.0) -> dict[str, Any]:
         return await wait_until_task_status_async(self.api, task_id, status, timeout=timeout)

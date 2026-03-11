@@ -10,6 +10,7 @@ import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.TaskRepository;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
@@ -24,20 +25,24 @@ public class TaskService {
     private final TaskRepository taskRepository;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
+    private final boolean devTaskControlsEnabled;
 
     public TaskService(
             TaskRepository taskRepository,
             ObjectMapper objectMapper,
-            CheckpointEventParser checkpointEventParser) {
+            CheckpointEventParser checkpointEventParser,
+            @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.taskRepository = taskRepository;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
+        this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
     public TaskSubmissionResponse submitTask(TaskSubmissionRequest request) {
         // Additional validations beyond Bean Validation
         validateModel(request.agentConfig().model());
         validateAllowedTools(request.agentConfig().allowedTools());
+        validateTaskTimeoutSeconds(request.taskTimeoutSeconds());
 
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String workerPoolId = ValidationConstants.DEFAULT_WORKER_POOL_ID;
@@ -251,11 +256,30 @@ public class TaskService {
         if (tools == null || tools.isEmpty()) {
             return; // no tools is valid
         }
+        Set<String> allowedTools = new LinkedHashSet<>(ValidationConstants.ALLOWED_TOOLS);
+        if (devTaskControlsEnabled) {
+            allowedTools.addAll(ValidationConstants.DEV_TASK_CONTROL_TOOLS);
+        }
         for (String tool : tools) {
-            if (!ValidationConstants.ALLOWED_TOOLS.contains(tool)) {
+            if (!allowedTools.contains(tool)) {
                 throw new ValidationException("Unsupported tool: " + tool
-                        + ". Allowed tools: " + ValidationConstants.ALLOWED_TOOLS);
+                        + ". Allowed tools: " + allowedTools);
             }
+        }
+    }
+
+    private void validateTaskTimeoutSeconds(Integer taskTimeoutSeconds) {
+        if (taskTimeoutSeconds == null) {
+            return;
+        }
+
+        int minimumTimeoutSeconds = devTaskControlsEnabled ? 1 : 60;
+        if (taskTimeoutSeconds < minimumTimeoutSeconds || taskTimeoutSeconds > 86400) {
+            throw new ValidationException(
+                    "task_timeout_seconds must be between "
+                            + minimumTimeoutSeconds
+                            + " and 86400"
+            );
         }
     }
 

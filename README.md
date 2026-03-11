@@ -39,6 +39,12 @@ Core properties:
 - per-step checkpoint history and cost tracking
 - read-only Phase 1 tools exposed through a co-located MCP server
 
+For local testing, the runtime also supports optional dev-only task controls:
+
+- `/v1/dev/tasks/{taskId}/expire-lease` to force a running task into normal lease-expiry recovery
+- `/v1/dev/tasks/{taskId}/force-dead-letter` to force a task into the normal dead-letter path
+- a dev-only `dev_sleep` tool so long-running tasks and timeout behavior can be exercised deterministically
+
 ## Repository Layout
 
 ```text
@@ -156,10 +162,17 @@ What `make dev` does:
 
 - loads local overrides from `.env.localdev`
 - uses sensible local defaults for `DB_DSN` and `VITE_API_BASE_URL`
+- forwards `APP_DEV_TASK_CONTROLS_ENABLED` to the API, worker, and console when set
 - checks the existing `persistent-agent-runtime-postgres` container and starts it if needed
 - expects dependencies to already be installed via `make install`
 - starts the console, API service, and worker in a single terminal with prefixed logs
 - stops all child processes cleanly when you press `Ctrl+C`
+
+If you want the dev-only task controls and the `dev_sleep` tool available in the local console/API flow:
+
+```bash
+APP_DEV_TASK_CONTROLS_ENABLED=true make dev
+```
 
 What `make install` does:
 
@@ -201,6 +214,8 @@ Implemented or substantially defined already:
 - Worker registry with self-registration, heartbeat, and stale worker cleanup
 - PostgreSQL-backed LangGraph checkpointer
 - In-process MCP server for `web_search`, `read_url`, and `calculator`
+- Dev-only task controls for forced lease expiry and dead-letter transitions
+- Dev-only `dev_sleep` tool for deterministic timeout and long-running-task testing
 - Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
 - End-to-end test coverage for crash recovery and lifecycle behavior
 

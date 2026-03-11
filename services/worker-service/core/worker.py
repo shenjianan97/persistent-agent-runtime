@@ -193,7 +193,7 @@ class WorkerService:
                 try:
                     async with self._pool.acquire() as conn:
                         await conn.execute(
-                            "UPDATE workers SET last_heartbeat_at = NOW() WHERE worker_id = $1 AND status = 'online'",
+                            "UPDATE workers SET status = 'online', last_heartbeat_at = NOW() WHERE worker_id = $1",
                             self._config.worker_id,
                         )
                 except Exception as exc:

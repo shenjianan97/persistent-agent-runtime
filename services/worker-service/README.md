@@ -51,6 +51,7 @@ Create a `.env` file in `services/worker-service/` or export directly:
 | `AWS_REGION` | Bedrock models | — |
 | `TAVILY_API_KEY` | `web_search` tool | — |
 | `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
+| `APP_DEV_TASK_CONTROLS_ENABLED` | Dev-only task controls and `dev_sleep` tool | `false` |
 
 The model is selected per-agent via `agent_config.model`. Names containing `claude` use Anthropic; others use Bedrock.
 Checkpoint cost estimation uses the local pricing file, not a runtime provider lookup. Update `config/model_pricing.json` or point `MODEL_PRICING_FILE` at another JSON file to add or override model rates.
@@ -92,6 +93,12 @@ The `GraphExecutor` calls tool functions directly as in-process LangGraph `Struc
 | `web_search(query, max_results=5)` | Tavily-backed web search | `TAVILY_API_KEY` |
 | `read_url(url, max_chars=5000)` | Bounded URL fetch with SSRF guards | None |
 | `calculator(expression)` | Safe AST-based arithmetic | None |
+
+When `APP_DEV_TASK_CONTROLS_ENABLED=true`, the worker also allows a dev-only tool:
+
+| Tool | Description | Credentials |
+|------|-------------|-------------|
+| `dev_sleep(seconds)` | Sleeps for a bounded duration so timeout and recovery behavior can be tested deterministically | None |
 
 The `tools/` package can also run as a standalone FastMCP server for manual testing and future independent deployment. See [`tools/README.md`](tools/README.md) for how to run the standalone server, the tool contract, and test coverage.
 

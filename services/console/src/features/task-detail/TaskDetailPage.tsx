@@ -14,7 +14,7 @@ import { CheckpointResponse } from '@/types';
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
-    const { data: checkpointsData } = useCheckpoints(taskId!, task?.status);
+    const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
 
     const cancelMutation = useCancelTask();
     const redriveMutation = useRedriveTask();

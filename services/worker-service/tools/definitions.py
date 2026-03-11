@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -56,6 +57,15 @@ CALCULATOR_EXPRESSION = Annotated[
         description="Arithmetic expression using only numeric literals and operators.",
     ),
 ]
+DEV_SLEEP_SECONDS = Annotated[
+    int,
+    Field(
+        default=10,
+        ge=1,
+        le=600,
+        description="Number of seconds to sleep before returning.",
+    ),
+]
 
 
 class WebSearchArguments(BaseModel):
@@ -95,6 +105,14 @@ class CalculatorResult(BaseModel):
     result: int | float
 
 
+class DevSleepArguments(BaseModel):
+    seconds: DEV_SLEEP_SECONDS = 10
+
+
+class DevSleepResult(BaseModel):
+    slept_seconds: int
+
+
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
@@ -127,6 +145,12 @@ CALCULATOR_TOOL = ToolDefinition(
     input_model=CalculatorArguments,
     output_model=CalculatorResult,
 )
+DEV_SLEEP_TOOL = ToolDefinition(
+    name="dev_sleep",
+    description="Dev-only control tool that sleeps for a bounded duration before returning.",
+    input_model=DevSleepArguments,
+    output_model=DevSleepResult,
+)
 
 TOOL_DEFINITIONS = (WEB_SEARCH_TOOL, READ_URL_TOOL, CALCULATOR_TOOL)
 TOOL_NAMES = tuple(definition.name for definition in TOOL_DEFINITIONS)
@@ -142,6 +166,10 @@ def create_default_dependencies() -> ToolDependencies:
 
 def get_tool_definitions() -> tuple[ToolDefinition, ...]:
     return TOOL_DEFINITIONS
+
+
+def dev_task_controls_enabled() -> bool:
+    return os.environ.get("APP_DEV_TASK_CONTROLS_ENABLED", "").lower() == "true"
 
 
 def get_tool_definition(name: str) -> ToolDefinition:

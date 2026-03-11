@@ -30,7 +30,7 @@ export function SubmitTaskPage() {
             allowed_tools: ['web_search', 'read_url', 'calculator'],
             max_steps: 100,
             max_retries: 3,
-            task_timeout_seconds: 3600,
+            task_timeout_seconds: import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? 60 : 3600,
         },
     });
 
@@ -199,8 +199,13 @@ export function SubmitTaskPage() {
                                         <FormItem>
                                             <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Timeout (s)</FormLabel>
                                             <FormControl>
-                                                <Input type="number" min="60" max="86400" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
+                                                <Input type="number" min={import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? "1" : "60"} max="86400" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
                                             </FormControl>
+                                            <FormDescription className="text-xs text-muted-foreground">
+                                                {import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true'
+                                                    ? 'Dev task controls enabled: short timeouts are allowed for local recovery testing.'
+                                                    : 'Minimum timeout is 60 seconds.'}
+                                            </FormDescription>
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
                                     )}

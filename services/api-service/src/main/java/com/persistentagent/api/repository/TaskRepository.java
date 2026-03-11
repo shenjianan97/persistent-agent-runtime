@@ -188,6 +188,60 @@ public class TaskRepository {
         return Optional.of((UUID) results.get(0).get("task_id"));
     }
 
+    public boolean expireLease(UUID taskId, String tenantId, String leaseOwnerOverride) {
+        String sql = """
+                UPDATE tasks
+                SET lease_owner = COALESCE(?, lease_owner),
+                    lease_expiry = NOW() - INTERVAL '1 second',
+                    version = version + 1,
+                    updated_at = NOW()
+                WHERE task_id = ? AND tenant_id = ?
+                  AND status = 'running'
+                  AND lease_owner IS NOT NULL
+                RETURNING task_id
+                """;
+
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql, leaseOwnerOverride, taskId, tenantId);
+        return !results.isEmpty();
+    }
+
+    public boolean forceDeadLetter(
+            UUID taskId,
+            String tenantId,
+            String reason,
+            String errorCode,
+            String errorMessage,
+            String lastWorkerId
+    ) {
+        String sql = """
+                UPDATE tasks
+                SET status = 'dead_letter',
+                    last_worker_id = COALESCE(?, lease_owner, last_worker_id),
+                    lease_owner = NULL,
+                    lease_expiry = NULL,
+                    last_error_code = ?,
+                    last_error_message = ?,
+                    dead_letter_reason = ?,
+                    dead_lettered_at = NOW(),
+                    version = version + 1,
+                    updated_at = NOW()
+                WHERE task_id = ? AND tenant_id = ?
+                  AND status IN ('queued', 'running')
+                RETURNING task_id
+                """;
+
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+                sql,
+                lastWorkerId,
+                errorCode,
+                errorMessage,
+                reason,
+                taskId,
+                tenantId
+        );
+        return !results.isEmpty();
+    }
+
     /**
      * Lists tasks with optional status and agent_id filters, ordered by most recent first.
      */

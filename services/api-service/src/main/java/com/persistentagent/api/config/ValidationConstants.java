@@ -16,8 +16,11 @@ public final class ValidationConstants {
     /** Phase 1 worker pool ID - always "shared". */
     public static final String DEFAULT_WORKER_POOL_ID = "shared";
 
-    /** Hardcoded Phase 1 allowed tools matching the co-located MCP server's listTools. */
+    /** Stable public tools available in all environments. */
     public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator");
+
+    /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
+    public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
 
     /** Supported LLM models for Phase 1. */
     public static final Set<String> SUPPORTED_MODELS = Set.of(
