@@ -123,6 +123,7 @@ class DbHelper:
     ) -> str:
         task_id = str(uuid.uuid4())
         agent_config = {
+            "provider": "anthropic",
             "system_prompt": "You are a test assistant.",
             "model": "claude-sonnet-4-6",
             "temperature": 0.5,

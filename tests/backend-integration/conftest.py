@@ -272,7 +272,7 @@ async def db(db_pool: asyncpg.Pool) -> DbHelper:
 @pytest.fixture
 def llm_provider() -> DynamicChatProvider:
     provider = DynamicChatProvider(default_factory=lambda: simple_response("ok"))
-    patcher = patch("executor.graph.ChatAnthropic", side_effect=provider.build)
+    patcher = patch("executor.providers.create_llm", side_effect=provider.build)
     patcher.start()
     try:
         yield provider

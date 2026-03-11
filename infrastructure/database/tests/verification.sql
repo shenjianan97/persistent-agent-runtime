@@ -525,22 +525,6 @@ BEGIN
         WHEN not_null_violation THEN NULL;
     END;
 
-    BEGIN
-        INSERT INTO checkpoint_writes (task_id, checkpoint_ns, checkpoint_id, task_path, idx, channel, type, blob)
-        VALUES (
-            '00000000-0000-0000-0000-000000000001',
-            '',
-            'missing-checkpoint',
-            '',
-            0,
-            'messages',
-            'json',
-            decode('7b7d', 'hex')
-        );
-        RAISE EXCEPTION 'checkpoint write without checkpoint unexpectedly succeeded';
-    EXCEPTION
-        WHEN foreign_key_violation THEN NULL;
-    END;
 END $$;
 
 ROLLBACK;

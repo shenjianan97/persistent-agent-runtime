@@ -20,7 +20,7 @@ No frontend is involved.
 - `pytest` + `pytest-asyncio`
 - **Real** API service + PostgreSQL
 - In-process worker startup (workers are created directly with tuned configs for fast test execution, not via `main.py`)
-- **Mock LLMs** — all tests patch `executor.graph.ChatAnthropic` via `helpers/mock_llm.py`. There is no real LLM mode.
+- **Mock LLMs** — all tests patch `executor.providers.create_llm` via `helpers/mock_llm.py`. There is no real LLM mode.
 
 Common test behavior is centralized in:
 - [`helpers/e2e_context.py`](helpers/e2e_context.py)

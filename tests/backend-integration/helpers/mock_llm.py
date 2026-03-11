@@ -7,7 +7,7 @@ from langchain_core.messages import AIMessage, ToolCall
 
 
 class DynamicChatProvider:
-    """Builds mock LLM instances for patched ChatAnthropic calls."""
+    """Builds mock LLM instances for the patched LLM factory."""
 
     def __init__(self, default_factory: Callable[[], MagicMock]):
         self._default_factory = default_factory

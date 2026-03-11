@@ -7,7 +7,8 @@ import {
     DeadLetterListResponse,
     HealthResponse,
     TaskCancelResponse,
-    RedriveResponse
+    RedriveResponse,
+    ModelResponse
 } from '@/types';
 
 export class ApiError extends Error {
@@ -58,6 +59,7 @@ export const api = {
             task_timeout_seconds: request.task_timeout_seconds,
             agent_config: {
                 system_prompt: request.system_prompt,
+                provider: request.provider,
                 model: request.model,
                 temperature: request.temperature,
                 allowed_tools: request.allowed_tools
@@ -105,4 +107,7 @@ export const api = {
 
     getHealth: () =>
         fetchApi<HealthResponse>('/v1/health'),
+
+    getModels: () =>
+        fetchApi<ModelResponse[]>('/v1/models'),
 };

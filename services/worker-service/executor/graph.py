@@ -14,8 +14,7 @@ from typing import Any, AsyncGenerator
 import asyncpg
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_anthropic import ChatAnthropic
-from langchain_aws import ChatBedrock
+
 from langchain_core.tools import StructuredTool
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -49,6 +48,7 @@ class GraphExecutor:
         self.config = config
         self.pool = pool
         self.deps = create_default_dependencies()
+        self.pricing_cache = None
 
     def _get_tools(self, allowed_tools: list[str]) -> list[StructuredTool]:
         tools = []
@@ -97,24 +97,16 @@ class GraphExecutor:
             
         return tools
 
-    def _build_graph(self, agent_config: dict[str, Any]) -> StateGraph:
+    async def _build_graph(self, agent_config: dict[str, Any]) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
+        provider = agent_config.get("provider", "anthropic")
         model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
         temperature = agent_config.get("temperature", 0.7)
         allowed_tools = agent_config.get("allowed_tools", [])
         system_prompt = agent_config.get("system_prompt", "")
 
-        # Use Anthropic directly if model name has "claude"
-        # Note: api_key passed explicitly because Python 3.14 breaks Pydantic V1's
-        # env var auto-loading in langchain-anthropic.
-        if "claude" in model_name.lower():
-            llm = ChatAnthropic(
-                model=model_name,
-                temperature=temperature,
-                api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-            )
-        else:
-            llm = ChatBedrock(model_id=model_name, model_kwargs={"temperature": temperature})
+        from executor.providers import create_llm
+        llm = await create_llm(self.pool, provider, model_name, temperature)
             
         # Register the local MCP tools with the LLM 
         tools = self._get_tools(allowed_tools)
@@ -166,11 +158,17 @@ class GraphExecutor:
             )
             
             # 3. Build & Compile graph
-            graph = self._build_graph(agent_config)
+            graph = await self._build_graph(agent_config)
             compiled_graph = graph.compile(checkpointer=checkpointer)
             
             # 4. Config map
+            provider = agent_config.get("provider", "anthropic")
             model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
+            self.pricing_cache = await self.pool.fetchrow(
+                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE provider_id = $1 AND model_id = $2",
+                provider, model_name
+            )
+
             config = {
                 "configurable": {
                     "thread_id": task_id,
@@ -329,15 +327,14 @@ class GraphExecutor:
         return None
 
     def _calculate_cost_microdollars(self, model_name: str, usage: dict[str, int]) -> int:
-        pricing = self.config.model_pricing.get(model_name)
-        if pricing is None:
+        if not self.pricing_cache:
             logger.warning("No pricing configured for model %s; checkpoint cost will remain zero.", model_name)
             return 0
 
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
-        input_cost = self._cost_from_tokens(input_tokens, pricing.input_microdollars_per_million)
-        output_cost = self._cost_from_tokens(output_tokens, pricing.output_microdollars_per_million)
+        input_cost = self._cost_from_tokens(input_tokens, self.pricing_cache["input_microdollars_per_million"])
+        output_cost = self._cost_from_tokens(output_tokens, self.pricing_cache["output_microdollars_per_million"])
         return input_cost + output_cost
 
     def _cost_from_tokens(self, tokens: int, microdollars_per_million: int) -> int:

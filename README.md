@@ -144,10 +144,13 @@ For the default local development flow, use the root launcher instead of startin
 
 ```bash
 cp .env.localdev.example .env.localdev
-# Fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
+# Required: ANTHROPIC_API_KEY and TAVILY_API_KEY
+# Optional: OPENAI_API_KEY, GOOGLE_API_KEY (enables additional LLM providers)
 make install
 make dev
 ```
+
+The worker auto-discovers which LLM providers are available based on configured API keys. Only providers with a valid key will appear in the console model selector. At minimum, set `ANTHROPIC_API_KEY` for Claude models. Add `OPENAI_API_KEY` for GPT models, `GOOGLE_API_KEY` for Gemini models, or configure AWS credentials for Bedrock models.
 
 Recommended local workflow:
 

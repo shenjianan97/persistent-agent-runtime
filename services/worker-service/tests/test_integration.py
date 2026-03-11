@@ -70,8 +70,9 @@ async def test_worker_e2e_integration():
     router = DefaultTaskRouter(config, pool)
     worker = WorkerService(config, pool, router)
     
-    # We patch ChatAnthropic to return a deterministic message avoiding network calls
-    with patch("executor.graph.ChatAnthropic") as MockChat:
+    from unittest.mock import AsyncMock
+    # We patch create_llm to return a deterministic message avoiding network calls
+    with patch("executor.providers.create_llm", new_callable=AsyncMock) as MockChat:
         mock_llm = MagicMock()
         mock_ainvoke = AsyncMock()
         
@@ -218,8 +219,9 @@ async def test_worker_mcp_tool_execution_integration():
     router = DefaultTaskRouter(config, pool)
     worker = WorkerService(config, pool, router)
     
-    # We patch ChatAnthropic to simulate an LLM deciding to call the calculator tool
-    with patch("executor.graph.ChatAnthropic") as MockChat:
+    from unittest.mock import AsyncMock
+    # We patch create_llm to simulate an LLM deciding to call the calculator tool
+    with patch("executor.providers.create_llm", new_callable=AsyncMock) as MockChat:
         mock_llm = MagicMock()
         mock_ainvoke = AsyncMock()
         

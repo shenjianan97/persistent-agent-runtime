@@ -45,6 +45,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "You are a helper",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6",
                                     "temperature": 0.7,
                                     "allowed_tools": ["web_search"]
@@ -68,6 +69,7 @@ class TaskControllerTest {
                                 {
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6"
                                   },
                                   "input": "test"
@@ -87,6 +89,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6"
                                   }
                                 }
@@ -144,6 +147,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "bad-model"
                                   },
                                   "input": "test"
@@ -167,6 +171,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6",
                                     "allowed_tools": ["web_search", "hack_tool"]
                                   },
@@ -187,6 +192,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6",
                                     "temperature": 3.0
                                   },
@@ -207,6 +213,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6"
                                   },
                                   "input": "test",
@@ -227,6 +234,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6"
                                   },
                                   "input": "test",
@@ -247,6 +255,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "agent_config": {
                                     "system_prompt": "prompt",
+                                    "provider": "anthropic",
                                     "model": "claude-sonnet-4-6"
                                   },
                                   "input": "test",

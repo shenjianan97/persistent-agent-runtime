@@ -9,6 +9,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
@@ -24,16 +25,19 @@ import java.util.stream.IntStream;
 public class TaskService {
 
     private final TaskRepository taskRepository;
+    private final ModelRepository modelRepository;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
     private final boolean devTaskControlsEnabled;
 
     public TaskService(
             TaskRepository taskRepository,
+            ModelRepository modelRepository,
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.taskRepository = taskRepository;
+        this.modelRepository = modelRepository;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
         this.devTaskControlsEnabled = devTaskControlsEnabled;
@@ -41,7 +45,7 @@ public class TaskService {
 
     public TaskSubmissionResponse submitTask(TaskSubmissionRequest request) {
         // Additional validations beyond Bean Validation
-        validateModel(request.agentConfig().model());
+        validateModel(request.agentConfig().provider(), request.agentConfig().model());
         validateAllowedTools(request.agentConfig().allowedTools());
         validateTaskTimeoutSeconds(request.taskTimeoutSeconds());
 
@@ -51,6 +55,7 @@ public class TaskService {
         // Build agent_config_snapshot
         AgentConfigRequest agentConfigSnapshot = new AgentConfigRequest(
                 request.agentConfig().systemPrompt(),
+                request.agentConfig().provider(),
                 request.agentConfig().model(),
                 request.agentConfig().temperature() != null
                         ? request.agentConfig().temperature()
@@ -245,10 +250,10 @@ public class TaskService {
 
     // --- Validation helpers ---
 
-    private void validateModel(String model) {
-        if (!ValidationConstants.SUPPORTED_MODELS.contains(model)) {
-            throw new ValidationException("Unsupported model: " + model
-                    + ". Supported models: " + ValidationConstants.SUPPORTED_MODELS);
+    private void validateModel(String provider, String model) {
+        if (!modelRepository.isModelActive(provider, model)) {
+            throw new ValidationException("Unsupported model or provider: " + provider + "/" + model
+                    + ". Check GET /v1/models for supported ones.");
         }
     }
 

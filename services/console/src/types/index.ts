@@ -24,6 +24,7 @@ export interface TaskSubmissionRequest {
     agent_id: string;
     input: string;
     system_prompt: string;
+    provider: string;
     model: string;
     temperature?: number;
     allowed_tools?: string[];
@@ -119,4 +120,10 @@ export interface RedriveResponse {
     task_id: string;
     status: string;
     message: string;
+}
+
+export interface ModelResponse {
+    provider: string;
+    model_id: string;
+    display_name: string;
 }
