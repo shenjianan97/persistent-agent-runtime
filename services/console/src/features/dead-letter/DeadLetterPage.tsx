@@ -3,11 +3,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Button } from '@/components/ui/button';
 import { AlertCircle, RotateCcw, Ghost } from 'lucide-react';
 import { toast } from 'sonner';
-import { Link } from 'react-router';
+import { Link, useNavigate } from 'react-router';
 import { useState, useRef, useCallback } from 'react';
 import { Input } from '@/components/ui/input';
 
 export function DeadLetterPage() {
+    const navigate = useNavigate();
     const [agentId, setAgentId] = useState('');
     const [debouncedAgentId, setDebouncedAgentId] = useState('');
     const { data, isLoading } = useDeadLetters(debouncedAgentId || undefined);
@@ -16,8 +17,9 @@ export function DeadLetterPage() {
 
     const handleRedrive = (taskId: string) => {
         redriveMutation.mutate(taskId, {
-            onSuccess: () => {
-                toast.success(`Task redrive initiated`, { description: taskId });
+            onSuccess: (response) => {
+                toast.success(`Task redrive initiated`, { description: response.task_id });
+                navigate(`/tasks/${response.task_id}`);
             },
             onError: (err: Error) => {
                 toast.error('Redrive failed', { description: err.message });

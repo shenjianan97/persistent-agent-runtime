@@ -174,6 +174,24 @@ If you want the dev-only task controls and the `dev_sleep` tool available in the
 APP_DEV_TASK_CONTROLS_ENABLED=true make dev
 ```
 
+For faster local recovery testing, you can also shorten the lease, heartbeat, and reaper timings:
+
+```bash
+APP_DEV_TASK_CONTROLS_ENABLED=true \
+LEASE_DURATION_SECONDS=10 \
+HEARTBEAT_INTERVAL_SECONDS=2 \
+REAPER_INTERVAL_SECONDS=5 \
+REAPER_JITTER_SECONDS=0 \
+make dev
+```
+
+These local-dev timing knobs are also supported in `.env.localdev`:
+
+- `LEASE_DURATION_SECONDS`: how long a worker lease lasts before another worker can reclaim it
+- `HEARTBEAT_INTERVAL_SECONDS`: how often the worker refreshes its lease and registry heartbeat
+- `REAPER_INTERVAL_SECONDS`: base interval for expired-lease and timeout scans
+- `REAPER_JITTER_SECONDS`: random jitter added to the reaper interval
+
 What `make install` does:
 
 - runs `npm install` in `services/console`

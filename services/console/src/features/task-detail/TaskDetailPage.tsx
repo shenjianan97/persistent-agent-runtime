@@ -1,4 +1,4 @@
-import { useParams } from 'react-router';
+import { useNavigate, useParams } from 'react-router';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
 import { useCheckpoints } from './useCheckpoints';
 import { useRedriveTask } from '@/features/dead-letter/useDeadLetter';
@@ -13,6 +13,7 @@ import { CheckpointResponse } from '@/types';
 
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
+    const navigate = useNavigate();
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
     const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
 
@@ -60,7 +61,12 @@ export function TaskDetailPage() {
 
     const handleRedrive = () => {
         redriveMutation.mutate(task.task_id, {
-            onSuccess: () => toast.success("Task redriven successfully"),
+            onSuccess: (response) => {
+                toast.success("Task redriven successfully");
+                if (response.task_id !== task.task_id) {
+                    navigate(`/tasks/${response.task_id}`);
+                }
+            },
             onError: (err: Error) => toast.error(err.message || "Failed to redrive task"),
         });
     };
@@ -169,7 +175,16 @@ export function TaskDetailPage() {
 
                 {/* Right Column: Timeline */}
                 <div className="lg:col-span-1">
-                    <CheckpointTimeline checkpoints={checkpoints} isRunning={isRunning} />
+                    <CheckpointTimeline
+                        checkpoints={checkpoints}
+                        isRunning={isRunning}
+                        retryHistory={task.retry_history}
+                        status={task.status}
+                        deadLetterReason={task.dead_letter_reason}
+                        lastErrorCode={task.last_error_code}
+                        lastErrorMessage={task.last_error_message}
+                        deadLetteredAt={task.dead_lettered_at}
+                    />
                 </div>
             </div>
         </div>

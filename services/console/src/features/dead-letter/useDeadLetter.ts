@@ -13,8 +13,15 @@ export function useRedriveTask() {
     const queryClient = useQueryClient();
     return useMutation({
         mutationFn: (taskId: string) => api.redriveTask(taskId),
-        onSuccess: () => {
+        onSuccess: (response, taskId) => {
             queryClient.invalidateQueries({ queryKey: ['dead-letters'] });
+            queryClient.invalidateQueries({ queryKey: ['tasks'] });
+            queryClient.invalidateQueries({ queryKey: ['task', taskId] });
+            queryClient.invalidateQueries({ queryKey: ['checkpoints', taskId] });
+            if (response.task_id !== taskId) {
+                queryClient.invalidateQueries({ queryKey: ['task', response.task_id] });
+                queryClient.invalidateQueries({ queryKey: ['checkpoints', response.task_id] });
+            }
         },
     });
 }

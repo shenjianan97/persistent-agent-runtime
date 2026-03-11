@@ -1,12 +1,105 @@
 import { CheckpointEvent, CheckpointResponse } from '@/types';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { CheckCircle2, MoveRight, User, Wrench, Zap } from 'lucide-react';
+import { AlertCircle, CheckCircle2, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
+import { TaskStatus } from '@/types';
 
 interface CheckpointTimelineProps {
     checkpoints: CheckpointResponse[];
     isRunning: boolean;
+    retryHistory?: string[];
+    status?: TaskStatus;
+    deadLetterReason?: string;
+    lastErrorCode?: string;
+    lastErrorMessage?: string;
+    deadLetteredAt?: string;
+}
+
+interface ResumeMarker {
+    resumedAfterStep: number | null;
+}
+
+interface TerminalFailureMarker {
+    failedAfterStep: number | null;
+    reason?: string;
+    errorCode?: string;
+    failedAt?: string;
+    failedBeforeNextCheckpoint: boolean;
+}
+
+function getTimestamp(value: string) {
+    const timestamp = Date.parse(value);
+    return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+export function getResumeMarkers(checkpoints: CheckpointResponse[], retryHistory: string[] = []) {
+    const markers = new Map<string, ResumeMarker>();
+    if (checkpoints.length === 0 || retryHistory.length === 0) {
+        return markers;
+    }
+
+    const checkpointTimes = checkpoints.map((checkpoint) => getTimestamp(checkpoint.created_at));
+
+    retryHistory.forEach((retryAt, retryIndex) => {
+        const retryTimestamp = getTimestamp(retryAt);
+        if (retryTimestamp === null) {
+            return;
+        }
+
+        const nextRetryTimestamp = retryIndex + 1 < retryHistory.length
+            ? getTimestamp(retryHistory[retryIndex + 1])
+            : null;
+
+        const checkpointIndex = checkpoints.findIndex((_, index) => {
+            const checkpointTimestamp = checkpointTimes[index];
+            if (checkpointTimestamp === null || checkpointTimestamp <= retryTimestamp) {
+                return false;
+            }
+
+            return nextRetryTimestamp === null || checkpointTimestamp <= nextRetryTimestamp;
+        });
+
+        if (checkpointIndex === -1) {
+            return;
+        }
+
+        markers.set(checkpoints[checkpointIndex].checkpoint_id, {
+            resumedAfterStep: checkpointIndex > 0 ? checkpoints[checkpointIndex - 1].step_number : null,
+        });
+    });
+
+    return markers;
+}
+
+export function getTerminalFailureMarker(
+    checkpoints: CheckpointResponse[],
+    status?: TaskStatus,
+    retryHistory: string[] = [],
+    deadLetterReason?: string,
+    lastErrorCode?: string,
+    _lastErrorMessage?: string,
+    deadLetteredAt?: string,
+) {
+    if (status !== 'dead_letter') {
+        return null;
+    }
+
+    const lastCheckpoint = checkpoints.at(-1);
+    const lastCheckpointTimestamp = lastCheckpoint ? getTimestamp(lastCheckpoint.created_at) : null;
+    const latestRetryTimestamp = retryHistory.length > 0 ? getTimestamp(retryHistory[retryHistory.length - 1]) : null;
+
+    return {
+        failedAfterStep: lastCheckpoint?.step_number ?? null,
+        reason: deadLetterReason,
+        errorCode: lastErrorCode,
+        failedAt: deadLetteredAt,
+        failedBeforeNextCheckpoint: (
+            latestRetryTimestamp !== null &&
+            lastCheckpointTimestamp !== null &&
+            latestRetryTimestamp > lastCheckpointTimestamp
+        ),
+    } satisfies TerminalFailureMarker;
 }
 
 const EVENT_STYLES: Record<CheckpointEvent['type'], { label: string; chipClassName: string }> = {
@@ -83,8 +176,27 @@ function getContentLabel(event?: CheckpointEvent) {
     }
 }
 
-export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelineProps) {
+export function CheckpointTimeline({
+    checkpoints,
+    isRunning,
+    retryHistory = [],
+    status,
+    deadLetterReason,
+    lastErrorCode,
+    lastErrorMessage,
+    deadLetteredAt,
+}: CheckpointTimelineProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
+    const resumeMarkers = getResumeMarkers(checkpoints, retryHistory);
+    const terminalFailureMarker = getTerminalFailureMarker(
+        checkpoints,
+        status,
+        retryHistory,
+        deadLetterReason,
+        lastErrorCode,
+        lastErrorMessage,
+        deadLetteredAt,
+    );
 
     useEffect(() => {
         if (scrollRef.current) {
@@ -120,6 +232,7 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                             {checkpoints.map((cp, idx) => {
                                 const prevWorker = idx > 0 ? checkpoints[idx - 1].worker_id : null;
                                 const isHandoff = prevWorker && prevWorker !== cp.worker_id;
+                                const resumeMarker = resumeMarkers.get(cp.checkpoint_id);
                                 const event = cp.event;
                                 const style = getEventStyle(event);
                                 const EventIcon = getEventIcon(event);
@@ -135,6 +248,22 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                                         </div>
 
                                         <div className="space-y-3 border border-border/30 bg-black/35 p-4">
+                                            {resumeMarker && (
+                                                <div className="bg-primary/10 border border-primary/20 p-3 text-xs text-primary space-y-2">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <RotateCcw className="w-3 h-3 shrink-0" />
+                                                        <span className="font-bold tracking-widest uppercase">
+                                                            Resumed From Saved Progress
+                                                        </span>
+                                                    </div>
+                                                    <div className="pl-5 opacity-80 leading-5 break-words">
+                                                        {resumeMarker.resumedAfterStep === null
+                                                            ? 'Execution continued from the latest saved checkpoint instead of restarting.'
+                                                            : `Execution continued from the checkpoint saved after step ${resumeMarker.resumedAfterStep}, so earlier progress was preserved.`}
+                                                    </div>
+                                                </div>
+                                            )}
+
                                             <div className="flex flex-col gap-2">
                                                 <div className="flex flex-wrap items-center gap-2">
                                                     <span className="text-xs font-bold text-primary tracking-wider uppercase">
@@ -165,10 +294,10 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                                             </div>
 
                                             {isHandoff && (
-                                                <div className="bg-warning/10 border border-warning/20 p-2 text-xs text-warning flex items-center gap-2">
-                                                    <MoveRight className="w-3 h-3 shrink-0" />
+                                                <div className="bg-warning/10 border border-warning/20 p-2 text-xs text-warning flex flex-wrap items-start gap-2 min-w-0">
+                                                    <MoveRight className="w-3 h-3 shrink-0 mt-0.5" />
                                                     <span className="font-bold tracking-widest uppercase shrink-0">Handoff</span>
-                                                    <span className="opacity-80 truncate" title={`${prevWorker} → ${cp.worker_id}`}>
+                                                    <span className="opacity-80 min-w-0 flex-1 break-all" title={`${prevWorker} → ${cp.worker_id}`}>
                                                         {prevWorker} → {cp.worker_id}
                                                     </span>
                                                 </div>
@@ -242,6 +371,49 @@ export function CheckpointTimeline({ checkpoints, isRunning }: CheckpointTimelin
                                     </div>
                                 );
                             })}
+
+                            {terminalFailureMarker && (
+                                <div className="relative animate-in slide-in-from-left-4 fade-in duration-300">
+                                    <div className="absolute -left-[45px] top-1 h-6 w-6 rounded-full border-2 border-background bg-destructive shadow-[0_0_8px_var(--color-destructive)] ring-2 ring-destructive/20 flex items-center justify-center">
+                                        <AlertCircle className="w-3 h-3 text-black" />
+                                    </div>
+
+                                    <div className="space-y-3 border border-destructive/30 bg-destructive/10 p-4">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="text-xs font-bold text-destructive tracking-wider uppercase">
+                                                Execution Failed
+                                            </span>
+                                            {terminalFailureMarker.reason && (
+                                                <span className="border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.2em] text-destructive">
+                                                    {terminalFailureMarker.reason}
+                                                </span>
+                                            )}
+                                            {terminalFailureMarker.failedAt && (
+                                                <span className="text-xs text-muted-foreground tabular-nums">
+                                                    {new Date(terminalFailureMarker.failedAt).toLocaleTimeString()}
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        <div className="text-sm leading-6 text-destructive/90 whitespace-pre-wrap break-words">
+                                            {terminalFailureMarker.failedBeforeNextCheckpoint
+                                                ? 'A later attempt failed before another checkpoint could be saved, so the timeline ends at the last durable step below.'
+                                                : 'Execution ended in a failure after the last recorded checkpoint.'}
+                                        </div>
+
+                                        {terminalFailureMarker.failedAfterStep !== null && (
+                                            <div className="text-xs font-mono uppercase tracking-widest text-destructive/70">
+                                                Last durable checkpoint: step {terminalFailureMarker.failedAfterStep}
+                                            </div>
+                                        )}
+                                        {terminalFailureMarker.errorCode && (
+                                            <div className="text-xs font-mono uppercase tracking-widest text-destructive/70">
+                                                Error code: {terminalFailureMarker.errorCode}
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
 
                             {isRunning && (
                                 <div className="relative pt-4">
