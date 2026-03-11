@@ -10,6 +10,7 @@ import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.TaskRepository;
+import com.persistentagent.api.repository.TaskRepository.MutationResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -145,6 +146,7 @@ class TaskServiceTest {
         taskRow.put("dead_letter_reason", null);
         taskRow.put("dead_lettered_at", null);
         taskRow.put("created_at", now);
+        taskRow.put("updated_at", now);
         taskRow.put("checkpoint_count", 3L);
         taskRow.put("total_cost_microdollars", 5000L);
 
@@ -172,9 +174,7 @@ class TaskServiceTest {
     @Test
     void cancelTask_queuedTask_succeeds() {
         UUID taskId = UUID.randomUUID();
-        Map<String, Object> taskRow = Map.of("task_id", taskId, "status", "queued");
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.cancelTask(taskId, "default")).thenReturn(1);
+        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.UPDATED);
 
         TaskCancelResponse response = taskService.cancelTask(taskId);
 
@@ -186,9 +186,7 @@ class TaskServiceTest {
     @Test
     void cancelTask_completedTask_throwsConflict() {
         UUID taskId = UUID.randomUUID();
-        Map<String, Object> taskRow = Map.of("task_id", taskId, "status", "completed");
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.cancelTask(taskId, "default")).thenReturn(0);
+        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.WRONG_STATE);
 
         assertThrows(InvalidStateTransitionException.class, () -> taskService.cancelTask(taskId));
     }
@@ -196,7 +194,7 @@ class TaskServiceTest {
     @Test
     void cancelTask_notFound_throwsNotFound() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.empty());
+        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.NOT_FOUND);
 
         assertThrows(TaskNotFoundException.class, () -> taskService.cancelTask(taskId));
     }
@@ -206,9 +204,7 @@ class TaskServiceTest {
     @Test
     void redriveTask_deadLetteredTask_succeeds() {
         UUID taskId = UUID.randomUUID();
-        Map<String, Object> taskRow = Map.of("task_id", taskId, "status", "dead_letter");
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.redriveTask(taskId, "default")).thenReturn(Optional.of(taskId));
+        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.UPDATED);
 
         RedriveResponse response = taskService.redriveTask(taskId);
 
@@ -219,9 +215,7 @@ class TaskServiceTest {
     @Test
     void redriveTask_queuedTask_throwsConflict() {
         UUID taskId = UUID.randomUUID();
-        Map<String, Object> taskRow = Map.of("task_id", taskId, "status", "queued");
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.redriveTask(taskId, "default")).thenReturn(Optional.empty());
+        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.WRONG_STATE);
 
         assertThrows(InvalidStateTransitionException.class, () -> taskService.redriveTask(taskId));
     }
@@ -229,7 +223,7 @@ class TaskServiceTest {
     @Test
     void redriveTask_notFound_throwsNotFound() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.findByIdAndTenant(taskId, "default")).thenReturn(Optional.empty());
+        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.NOT_FOUND);
 
         assertThrows(TaskNotFoundException.class, () -> taskService.redriveTask(taskId));
     }
@@ -283,7 +277,7 @@ class TaskServiceTest {
                                 {"channel_values":{"messages":[{"kwargs":{"type":"human","content":"what is 2+2?"}}]}}
                                 """,
                         "created_at", now));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
 
         CheckpointListResponse response = taskService.getCheckpoints(taskId);
 
@@ -323,7 +317,7 @@ class TaskServiceTest {
                                 }
                                 """,
                         now));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
 
         CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
 
@@ -361,7 +355,7 @@ class TaskServiceTest {
                                 }
                                 """,
                         now));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
 
         CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
 
@@ -399,7 +393,7 @@ class TaskServiceTest {
                                 }
                                 """,
                         now));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
 
         CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
 
@@ -424,7 +418,7 @@ class TaskServiceTest {
                         "{\"source\": \"loop\", \"step\": 3}",
                         "{not valid json",
                         now));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(rows);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
 
         CheckpointResponse checkpoint = taskService.getCheckpoints(taskId).checkpoints().get(0);
 
@@ -436,9 +430,16 @@ class TaskServiceTest {
     @Test
     void getCheckpoints_notFound_throwsException() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(null);
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.empty());
 
         assertThrows(TaskNotFoundException.class, () -> taskService.getCheckpoints(taskId));
+    }
+
+    // --- listTasks tests ---
+
+    @Test
+    void listTasks_invalidStatus_throwsValidation() {
+        assertThrows(ValidationException.class, () -> taskService.listTasks("garbage", null, null));
     }
 
     // --- getHealth tests ---

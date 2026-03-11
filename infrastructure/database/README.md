@@ -15,6 +15,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 - `tasks.status` values are exactly `queued`, `running`, `completed`, `dead_letter`.
 - `dead_letter_reason` values are exactly `cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`.
 - `updated_at` uses `DEFAULT NOW()` for inserts only. Application update queries must set `updated_at = NOW()` explicitly. There are no triggers or database functions that maintain `updated_at`.
+- Both `checkpoints` and `checkpoint_writes` reference `tasks(task_id)` with `ON DELETE CASCADE`. Deleting a task automatically removes all associated checkpoint data.
 
 ## LISTEN/NOTIFY
 

@@ -54,7 +54,7 @@ CREATE INDEX idx_tasks_dead_letter ON tasks (tenant_id, agent_id, dead_lettered_
 
 -- Checkpoints table (acts as LangGraph BaseCheckpointSaver)
 CREATE TABLE checkpoints (
-    task_id               UUID NOT NULL REFERENCES tasks(task_id),
+    task_id               UUID NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
     checkpoint_ns         TEXT NOT NULL DEFAULT '',
     checkpoint_id         TEXT NOT NULL,
     worker_id             TEXT NOT NULL,
@@ -75,7 +75,7 @@ CREATE INDEX idx_checkpoints_task_created ON checkpoints (task_id, checkpoint_ns
 
 -- Checkpoint writes table (stores pending writes within a super-step)
 CREATE TABLE checkpoint_writes (
-    task_id               UUID NOT NULL REFERENCES tasks(task_id),
+    task_id               UUID NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
     checkpoint_ns         TEXT NOT NULL DEFAULT '',
     checkpoint_id         TEXT NOT NULL,
     task_path             TEXT NOT NULL DEFAULT '',

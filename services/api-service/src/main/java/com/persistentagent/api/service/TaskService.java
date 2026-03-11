@@ -10,6 +10,7 @@ import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.TaskRepository;
+import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -123,10 +124,8 @@ public class TaskService {
     public CheckpointListResponse getCheckpoints(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        List<Map<String, Object>> rows = taskRepository.getCheckpoints(taskId, tenantId);
-        if (rows == null) {
-            throw new TaskNotFoundException(taskId);
-        }
+        List<Map<String, Object>> rows = taskRepository.getCheckpoints(taskId, tenantId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
 
         List<CheckpointResponse> checkpoints = IntStream.range(0, rows.size())
                 .mapToObj(i -> {
@@ -157,17 +156,13 @@ public class TaskService {
     public TaskCancelResponse cancelTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        // First check if task exists
-        taskRepository.findByIdAndTenant(taskId, tenantId)
-                .orElseThrow(() -> new TaskNotFoundException(taskId));
-
-        int rowsAffected = taskRepository.cancelTask(taskId, tenantId);
-        if (rowsAffected == 0) {
-            throw new InvalidStateTransitionException(taskId,
+        TaskRepository.MutationResult result = taskRepository.cancelTask(taskId, tenantId);
+        return switch (result) {
+            case UPDATED -> new TaskCancelResponse(taskId, "dead_letter", "cancelled_by_user");
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
                     "Task " + taskId + " cannot be cancelled (must be in queued or running state)");
-        }
-
-        return new TaskCancelResponse(taskId, "dead_letter", "cancelled_by_user");
+        };
     }
 
     public DeadLetterListResponse listDeadLetterTasks(String agentId, Integer limit) {
@@ -196,7 +191,16 @@ public class TaskService {
 
     public TaskListResponse listTasks(String status, String agentId, Integer limit) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
-        int effectiveLimit = limit != null ? Math.min(Math.max(limit, 1), 200) : 50;
+
+        if (status != null && !status.isBlank()
+                && !ValidationConstants.VALID_TASK_STATUSES.contains(status)) {
+            throw new ValidationException("Invalid status filter: " + status
+                    + ". Valid statuses: " + ValidationConstants.VALID_TASK_STATUSES);
+        }
+
+        int effectiveLimit = limit != null
+                ? Math.min(Math.max(limit, 1), ValidationConstants.MAX_TASK_LIST_LIMIT)
+                : ValidationConstants.DEFAULT_TASK_LIST_LIMIT;
 
         List<Map<String, Object>> rows = taskRepository.listTasks(tenantId, status, agentId, effectiveLimit);
 
@@ -212,23 +216,19 @@ public class TaskService {
                         toOffsetDateTime(row.get("updated_at"))))
                 .toList();
 
-        return new TaskListResponse(items, items.size());
+        return new TaskListResponse(items);
     }
 
     public RedriveResponse redriveTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        // First check if task exists
-        taskRepository.findByIdAndTenant(taskId, tenantId)
-                .orElseThrow(() -> new TaskNotFoundException(taskId));
-
-        Optional<UUID> result = taskRepository.redriveTask(taskId, tenantId);
-        if (result.isEmpty()) {
-            throw new InvalidStateTransitionException(taskId,
+        TaskRepository.MutationResult result = taskRepository.redriveTask(taskId, tenantId);
+        return switch (result) {
+            case UPDATED -> new RedriveResponse(taskId, "queued");
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
                     "Task " + taskId + " cannot be redriven (must be in dead_letter state)");
-        }
-
-        return new RedriveResponse(taskId, "queued");
+        };
     }
 
     public HealthResponse getHealth() {
@@ -298,22 +298,7 @@ public class TaskService {
     }
 
     private Object parseJson(Object value) {
-        if (value == null)
-            return null;
-        try {
-            if (value instanceof String s) {
-                return objectMapper.readValue(s, Object.class);
-            }
-            if (value instanceof org.postgresql.util.PGobject pgObj) {
-                String val = pgObj.getValue();
-                if (val == null)
-                    return null;
-                return objectMapper.readValue(val, Object.class);
-            }
-        } catch (Exception e) {
-            // fall through
-        }
-        return value;
+        return JsonParseUtil.parseJson(objectMapper, value, "field", "n/a");
     }
 
     private List<Object> parseJsonList(Object value) {

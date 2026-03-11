@@ -3,7 +3,7 @@ package com.persistentagent.api.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.model.response.CheckpointEventResponse;
-import org.postgresql.util.PGobject;
+import com.persistentagent.api.util.JsonParseUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -275,25 +275,6 @@ public class CheckpointEventParser {
     }
 
     private Object parseJson(Object value, String fieldName, String checkpointId) {
-        if (value == null) {
-            return null;
-        }
-
-        try {
-            if (value instanceof String s) {
-                return objectMapper.readValue(s, Object.class);
-            }
-            if (value instanceof PGobject pgObj) {
-                String raw = pgObj.getValue();
-                if (raw == null) {
-                    return null;
-                }
-                return objectMapper.readValue(raw, Object.class);
-            }
-        } catch (Exception e) {
-            log.debug("Failed to parse {} for checkpoint {}", fieldName, checkpointId, e);
-        }
-
-        return value;
+        return JsonParseUtil.parseJson(objectMapper, value, fieldName, checkpointId);
     }
 }

@@ -34,7 +34,7 @@ public class TaskRepository {
                 , notified AS (
                     SELECT pg_notify('new_task', ?)
                 )
-                SELECT task_id, created_at FROM inserted
+                SELECT i.task_id, i.created_at FROM inserted i, notified n
                 """;
 
         return jdbcTemplate.queryForMap(sql,
@@ -81,13 +81,14 @@ public class TaskRepository {
 
     /**
      * Gets root-namespace checkpoints ordered by creation time.
+     * Returns Optional.empty() if the task does not exist for the given tenant.
      */
-    public List<Map<String, Object>> getCheckpoints(UUID taskId, String tenantId) {
+    public Optional<List<Map<String, Object>>> getCheckpoints(UUID taskId, String tenantId) {
         // First verify task exists and belongs to tenant
         String checkSql = "SELECT 1 FROM tasks WHERE task_id = ? AND tenant_id = ?";
         List<Map<String, Object>> check = jdbcTemplate.queryForList(checkSql, taskId, tenantId);
         if (check.isEmpty()) {
-            return null; // signals not found
+            return Optional.empty();
         }
 
         String sql = """
@@ -97,66 +98,85 @@ public class TaskRepository {
                 WHERE task_id = ? AND checkpoint_ns = ''
                 ORDER BY created_at ASC
                 """;
-        return jdbcTemplate.queryForList(sql, taskId);
+        return Optional.of(jdbcTemplate.queryForList(sql, taskId));
     }
 
     /**
-     * Cancels a task (queued or running -> dead_letter).
-     * Returns number of rows affected.
+     * Result of a state-transition operation that distinguishes
+     * "task not found" from "task found but in wrong state."
      */
-    public int cancelTask(UUID taskId, String tenantId) {
+    public enum MutationResult { UPDATED, WRONG_STATE, NOT_FOUND }
+
+    /**
+     * Cancels a task (queued or running -> dead_letter) in a single query.
+     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
+     */
+    public MutationResult cancelTask(UUID taskId, String tenantId) {
         String sql = """
-                UPDATE tasks
-                SET status = 'dead_letter',
-                    last_worker_id = lease_owner,
-                    lease_owner = NULL,
-                    lease_expiry = NULL,
-                    last_error_code = 'cancelled_by_user',
-                    last_error_message = 'task cancelled by user request',
-                    dead_letter_reason = 'cancelled_by_user',
-                    dead_lettered_at = NOW(),
-                    version = version + 1,
-                    updated_at = NOW()
-                WHERE task_id = ? AND tenant_id = ?
-                  AND status IN ('queued', 'running')
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                )
+                , updated AS (
+                    UPDATE tasks
+                    SET status = 'dead_letter',
+                        last_worker_id = lease_owner,
+                        lease_owner = NULL,
+                        lease_expiry = NULL,
+                        last_error_code = 'cancelled_by_user',
+                        last_error_message = 'task cancelled by user request',
+                        dead_letter_reason = 'cancelled_by_user',
+                        dead_lettered_at = NOW(),
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE task_id = ? AND tenant_id = ?
+                      AND status IN ('queued', 'running')
+                    RETURNING task_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS updated
                 """;
-        return jdbcTemplate.update(sql, taskId, tenantId);
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
+        long updated = ((Number) result.get("updated")).longValue();
+        if (updated > 0) return MutationResult.UPDATED;
+        long found = ((Number) result.get("found")).longValue();
+        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
     }
 
     /**
      * Lists dead-lettered tasks with optional agent_id filter.
      */
     public List<Map<String, Object>> listDeadLetterTasks(String tenantId, String agentId, int limit) {
+        StringBuilder sql = new StringBuilder("""
+                SELECT task_id, agent_id, dead_letter_reason, last_error_code,
+                       last_error_message, retry_count, last_worker_id, dead_lettered_at
+                FROM tasks
+                WHERE tenant_id = ? AND status = 'dead_letter'
+                """);
+        List<Object> params = new java.util.ArrayList<>();
+        params.add(tenantId);
+
         if (agentId != null && !agentId.isBlank()) {
-            String sql = """
-                    SELECT task_id, agent_id, dead_letter_reason, last_error_code,
-                           last_error_message, retry_count, last_worker_id, dead_lettered_at
-                    FROM tasks
-                    WHERE tenant_id = ? AND agent_id = ? AND status = 'dead_letter'
-                    ORDER BY dead_lettered_at DESC, task_id DESC
-                    LIMIT ?
-                    """;
-            return jdbcTemplate.queryForList(sql, tenantId, agentId, limit);
-        } else {
-            String sql = """
-                    SELECT task_id, agent_id, dead_letter_reason, last_error_code,
-                           last_error_message, retry_count, last_worker_id, dead_lettered_at
-                    FROM tasks
-                    WHERE tenant_id = ? AND status = 'dead_letter'
-                    ORDER BY dead_lettered_at DESC, task_id DESC
-                    LIMIT ?
-                    """;
-            return jdbcTemplate.queryForList(sql, tenantId, limit);
+            sql.append(" AND agent_id = ?");
+            params.add(agentId);
         }
+        sql.append(" ORDER BY dead_lettered_at DESC, task_id DESC LIMIT ?");
+        params.add(limit);
+
+        return jdbcTemplate.queryForList(sql.toString(), params.toArray());
     }
 
     /**
      * Redrives a dead-lettered task back to queued with pg_notify.
-     * Returns the task_id if redrive succeeded, empty otherwise.
+     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
      */
-    public Optional<UUID> redriveTask(UUID taskId, String tenantId) {
+    public MutationResult redriveTask(UUID taskId, String tenantId) {
         String sql = """
-                WITH redriven AS (
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                )
+                , redriven AS (
                     UPDATE tasks
                     SET status = 'queued',
                         retry_count = 0,
@@ -175,17 +195,22 @@ public class TaskRepository {
                     RETURNING task_id, worker_pool_id
                 )
                 , notified AS (
-                    SELECT pg_notify('new_task', worker_pool_id)
-                    FROM redriven
+                    SELECT pg_notify('new_task', r.worker_pool_id)
+                    FROM redriven r
                 )
-                SELECT task_id FROM redriven
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM redriven) AS updated,
+                    n.*
+                FROM notified n
+                RIGHT JOIN (SELECT 1) AS dummy ON true
                 """;
 
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql, taskId, tenantId);
-        if (results.isEmpty()) {
-            return Optional.empty();
-        }
-        return Optional.of((UUID) results.get(0).get("task_id"));
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
+        long updated = ((Number) result.get("updated")).longValue();
+        if (updated > 0) return MutationResult.UPDATED;
+        long found = ((Number) result.get("found")).longValue();
+        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
     }
 
     public boolean expireLease(UUID taskId, String tenantId, String leaseOwnerOverride) {
@@ -248,9 +273,10 @@ public class TaskRepository {
     public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
-                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
-                       (SELECT COALESCE(SUM(cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
+                       COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count,
+                       COALESCE(SUM(c.cost_microdollars), 0) AS total_cost_microdollars
                 FROM tasks t
+                LEFT JOIN checkpoints c ON c.task_id = t.task_id AND c.checkpoint_ns = ''
                 WHERE t.tenant_id = ?
                 """);
         List<Object> params = new java.util.ArrayList<>();
@@ -264,6 +290,7 @@ public class TaskRepository {
             sql.append(" AND t.agent_id = ?");
             params.add(agentId);
         }
+        sql.append(" GROUP BY t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at");
         sql.append(" ORDER BY t.created_at DESC LIMIT ?");
         params.add(limit);
 

@@ -51,7 +51,16 @@ public final class ValidationConstants {
     public static final int DEFAULT_TASK_TIMEOUT_SECONDS = 3600;
     public static final double DEFAULT_TEMPERATURE = 0.7;
 
+    // Task listing defaults
+    public static final int DEFAULT_TASK_LIST_LIMIT = 50;
+    public static final int MAX_TASK_LIST_LIMIT = 200;
+
     // Dead letter listing defaults
     public static final int DEFAULT_DEAD_LETTER_LIMIT = 50;
     public static final int MAX_DEAD_LETTER_LIMIT = 200;
+
+    /** Valid task statuses matching the database CHECK constraint. */
+    public static final Set<String> VALID_TASK_STATUSES = Set.of(
+            "queued", "running", "completed", "dead_letter"
+    );
 }

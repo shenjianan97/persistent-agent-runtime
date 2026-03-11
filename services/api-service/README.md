@@ -42,7 +42,7 @@ When `app.dev-task-controls.enabled=true`, task submission also allows the dev-o
 List tasks with optional filters. Supports `status`, `agent_id`, and `limit` query parameters.
 
 **Query Parameters:**
-- `status` (optional) — Filter by task status: `queued`, `running`, `completed`, `dead_letter`
+- `status` (optional) — Filter by task status: `queued`, `running`, `completed`, `dead_letter`. Returns 400 for invalid values.
 - `agent_id` (optional) — Filter by agent ID
 - `limit` (optional) — Max results (1-200, default 50)
 
@@ -60,8 +60,7 @@ List tasks with optional filters. Supports `status`, `agent_id`, and `limit` que
       "created_at": "2026-03-05T10:00:00Z",
       "updated_at": "2026-03-05T10:00:15Z"
     }
-  ],
-  "total": 1
+  ]
 }
 ```
 
@@ -279,6 +278,7 @@ Configuration via environment variables or `application.yml`:
 | `DB_PASSWORD` | `postgres` | Database password |
 | `SERVER_PORT` | `8080` | HTTP server port |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | `false` | Enables `/v1/dev/tasks/*`, allows `dev_sleep`, and lowers the minimum timeout to `1` for local/dev testing |
+| `APP_CORS_ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Comma-separated list of allowed CORS origins |
 
 **Allowed dead-letter reasons:**
 `cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`

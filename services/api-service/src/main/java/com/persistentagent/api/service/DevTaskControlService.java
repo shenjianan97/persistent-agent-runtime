@@ -24,7 +24,7 @@ public class DevTaskControlService {
     }
 
     public DevTaskMutationResponse expireLease(UUID taskId, DevExpireLeaseRequest request) {
-        String tenantId = "default";
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         taskRepository.findByIdAndTenant(taskId, tenantId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
@@ -39,7 +39,7 @@ public class DevTaskControlService {
     }
 
     public DevTaskMutationResponse forceDeadLetter(UUID taskId, DevForceDeadLetterRequest request) {
-        String tenantId = "default";
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         taskRepository.findByIdAndTenant(taskId, tenantId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
