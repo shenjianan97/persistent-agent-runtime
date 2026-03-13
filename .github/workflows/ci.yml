@@ -138,9 +138,11 @@ jobs:
           # test_checkpointer_integration.py reads this env var
           E2E_DB_DSN: postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
         run: |
+          set -o pipefail
           python -m pytest tests/test_checkpointer_integration.py \
             tests/test_integration.py \
-            -q
+            -ra -q | tee /tmp/worker-integration.log
+          ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/worker-integration.log
 
   e2e-tests:
     name: E2E Tests
@@ -199,4 +201,7 @@ jobs:
           E2E_DB_PASSWORD: postgres
           APP_DEV_TASK_CONTROLS_ENABLED: "true"
           # conftest will auto-start the API via ./gradlew bootRun
-        run: python -m pytest tests/backend-integration -q
+        run: |
+          set -o pipefail
+          python -m pytest tests/backend-integration -ra -q | tee /tmp/e2e.log
+          ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log

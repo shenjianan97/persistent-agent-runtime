@@ -4,7 +4,6 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKER_PY="${WORKER_PY:-$ROOT_DIR/services/worker-service/.venv/bin/python}"
-PY311="${PY311:-/opt/homebrew/bin/python3.11}"
 PG_CONTAINER="${PG_CONTAINER:-persistent-agent-runtime-postgres}"
 DB_NAME="${DB_NAME:-persistent_agent_runtime}"
 API_DIR="$ROOT_DIR/services/api-service"
@@ -22,6 +21,26 @@ log() {
 fail() {
     printf '[local-ci] ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+find_python311() {
+    if [[ -n "${PY311:-}" ]]; then
+        printf '%s\n' "$PY311"
+        return 0
+    fi
+
+    local candidate
+    for candidate in python3.11 python3 python; do
+        if ! command -v "$candidate" >/dev/null 2>&1; then
+            continue
+        fi
+        if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+            command -v "$candidate"
+            return 0
+        fi
+    done
+
+    fail "Python 3.11+ is required. Set PY311=/path/to/python3.11 if it is not on PATH."
 }
 
 require_executable() {
@@ -43,6 +62,9 @@ docker_psql() {
 preflight() {
     mkdir -p "$TMP_DIR"
 
+    local python311
+    python311="$(find_python311)"
+
     local running
     running="$(docker inspect -f '{{.State.Running}}' "$PG_CONTAINER" 2>/dev/null || true)"
     [[ "$running" == "true" ]] || fail "PostgreSQL container '$PG_CONTAINER' is not running."
@@ -52,11 +74,10 @@ preflight() {
     grep -q '55432' <<<"$port_output" || fail "PostgreSQL container '$PG_CONTAINER' is not exposed on host port 55432."
 
     require_executable "$WORKER_PY" "Worker virtualenv python"
-    require_executable "$PY311" "Python 3.11"
     require_directory "$CONSOLE_DIR/node_modules" "Console node_modules"
     require_executable "$API_DIR/gradlew" "Gradle wrapper"
 
-    "$PY311" --version >/dev/null
+    "$python311" --version >/dev/null
     "$API_DIR/gradlew" -v >/dev/null
 }
 
