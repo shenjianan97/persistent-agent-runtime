@@ -54,6 +54,7 @@ class ApiClient:
         payload = {
             "agent_id": overrides.get("agent_id", "e2e_agent"),
             "agent_config": {
+                "provider": overrides.get("provider", "anthropic"),
                 "system_prompt": overrides.get("system_prompt", "You are a test assistant."),
                 "model": overrides.get("model", "claude-sonnet-4-6"),
                 "temperature": overrides.get("temperature", 0.5),

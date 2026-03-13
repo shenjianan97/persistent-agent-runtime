@@ -273,6 +273,11 @@ main() {
     trap 'cleanup; exit 0' INT TERM
     trap cleanup EXIT
 
+    log "Discovering available models and syncing database..."
+    if ! "$WORKER_VENV_PYTHON" "$ROOT_DIR/scripts/discover_models.py"; then
+        log "Warning: Model discovery script failed."
+    fi
+
     start_service "console" "cd '$CONSOLE_DIR' && exec npm run dev"
     start_service "api" "cd '$API_DIR' && exec ./gradlew bootRun"
     start_service "worker" "cd '$WORKER_DIR' && source .venv/bin/activate && exec python main.py"

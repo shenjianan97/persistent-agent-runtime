@@ -9,6 +9,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
 import org.junit.jupiter.api.BeforeEach;
@@ -31,6 +32,9 @@ class TaskServiceTest {
     @Mock
     private TaskRepository taskRepository;
 
+    @Mock
+    private ModelRepository modelRepository;
+
     private TaskService taskService;
     private ObjectMapper objectMapper;
 
@@ -39,7 +43,7 @@ class TaskServiceTest {
         objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        taskService = new TaskService(taskRepository, objectMapper, new CheckpointEventParser(objectMapper), false);
+        taskService = new TaskService(taskRepository, modelRepository, objectMapper, new CheckpointEventParser(objectMapper), false);
     }
 
     // --- submitTask tests ---
@@ -47,13 +51,14 @@ class TaskServiceTest {
     @Test
     void submitTask_validRequest_returnsCreated() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helper", "claude-sonnet-4-6", 0.7, List.of("web_search"));
+                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of("web_search"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "do something", 3, 100, 3600);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> inserted = Map.of("task_id", taskId, "created_at", now);
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyInt(), anyInt(), anyInt())).thenReturn(inserted);
 
@@ -69,7 +74,7 @@ class TaskServiceTest {
     @Test
     void submitTask_unsupportedModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "unsupported-model", 0.5, List.of());
+                "prompt", "anthropic", "unsupported-model", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, null);
 
@@ -79,9 +84,11 @@ class TaskServiceTest {
     @Test
     void submitTask_unsupportedTool_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
+                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, null);
+
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -89,9 +96,11 @@ class TaskServiceTest {
     @Test
     void submitTask_devOnlyToolRejectedWhenDevTaskControlsDisabled() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
+                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, null);
+
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -99,9 +108,11 @@ class TaskServiceTest {
     @Test
     void submitTask_shortTimeoutRejectedWhenDevTaskControlsDisabled() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "claude-sonnet-4-6", 0.5, List.of());
+                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, 30);
+
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -109,12 +120,13 @@ class TaskServiceTest {
     @Test
     void submitTask_defaultValues_usedWhenNull() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "gpt-4o", null, null);
+                "prompt", "openai", "gpt-4o", null, null);
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", config, "input", null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
                 eq("input"), eq(3), eq(100), eq(3600)))
                 .thenReturn(Map.of("task_id", taskId, "created_at", now));

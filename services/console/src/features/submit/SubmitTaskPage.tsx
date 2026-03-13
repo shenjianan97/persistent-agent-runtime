@@ -2,7 +2,8 @@ import { useNavigate } from 'react-router';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useSubmitTask } from './useSubmitTask';
-import { submitTaskSchema, SubmitTaskFormValues, SUPPORTED_MODELS, ALLOWED_TOOLS } from './schema';
+import { useModels } from './useModels';
+import { submitTaskSchema, SubmitTaskFormValues, ALLOWED_TOOLS } from './schema';
 import { toast } from 'sonner';
 
 import {
@@ -14,10 +15,42 @@ import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { PlaySquare } from 'lucide-react';
+import type { ModelResponse } from '@/types';
+
+const PROVIDER_LABELS: Record<string, string> = {
+    anthropic: 'Anthropic',
+    openai: 'OpenAI',
+};
+
+function formatProviderLabel(provider: string) {
+    return PROVIDER_LABELS[provider] ?? (provider.charAt(0).toUpperCase() + provider.slice(1));
+}
+
+function groupModelsByProvider(models: ModelResponse[]) {
+    const groups = new Map<string, { provider: string; label: string; models: ModelResponse[] }>();
+
+    models.forEach((model) => {
+        const existingGroup = groups.get(model.provider);
+        if (existingGroup) {
+            existingGroup.models.push(model);
+            return;
+        }
+
+        groups.set(model.provider, {
+            provider: model.provider,
+            label: formatProviderLabel(model.provider),
+            models: [model],
+        });
+    });
+
+    return Array.from(groups.values());
+}
 
 export function SubmitTaskPage() {
     const navigate = useNavigate();
     const mutation = useSubmitTask();
+    const { data: models = [], isLoading: isLoadingModels } = useModels();
+    const modelGroups = groupModelsByProvider(models);
 
     const form = useForm<SubmitTaskFormValues>({
         resolver: zodResolver(submitTaskSchema),
@@ -25,7 +58,8 @@ export function SubmitTaskPage() {
             agent_id: '',
             input: '',
             system_prompt: 'You are a helpful assistant. Provide concise and accurate answers.',
-            model: 'claude-sonnet-4-20250514',
+            provider: 'anthropic',
+            model: 'claude-3-5-sonnet-latest',
             temperature: 0.7,
             allowed_tools: ['web_search', 'read_url', 'calculator'],
             max_steps: 100,
@@ -86,23 +120,44 @@ export function SubmitTaskPage() {
                                 <FormField
                                     control={form.control}
                                     name="model"
-                                    render={({ field }) => (
+                                    render={({ field }) => {
+                                        const currentValue = form.getValues('provider') && field.value
+                                            ? `${form.getValues('provider')}|${field.value}`
+                                            : "";
+                                        return (
                                         <FormItem>
                                             <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Model</FormLabel>
                                             <FormControl>
                                                 <select
                                                     className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
-                                                    {...field}
+                                                    value={currentValue}
+                                                    onChange={(e) => {
+                                                        const val = e.target.value;
+                                                        if (val) {
+                                                            const [provider, modelId] = val.split('|');
+                                                            form.setValue('provider', provider);
+                                                            field.onChange(modelId);
+                                                        } else {
+                                                            form.setValue('provider', '');
+                                                            field.onChange('');
+                                                        }
+                                                    }}
                                                 >
-                                                    <option value="" disabled>Select model</option>
-                                                    {SUPPORTED_MODELS.map(model => (
-                                                        <option key={model} value={model}>{model}</option>
+                                                    <option value="" disabled>{isLoadingModels ? "Loading models..." : "Select model"}</option>
+                                                    {modelGroups.map((group) => (
+                                                        <optgroup key={group.provider} label={group.label}>
+                                                            {group.models.map((model) => (
+                                                                <option key={`${model.provider}|${model.model_id}`} value={`${model.provider}|${model.model_id}`}>
+                                                                    {model.display_name}
+                                                                </option>
+                                                            ))}
+                                                        </optgroup>
                                                     ))}
                                                 </select>
                                             </FormControl>
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
-                                    )}
+                                    )}}
                                 />
                             </div>
 

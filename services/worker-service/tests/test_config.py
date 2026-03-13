@@ -3,7 +3,7 @@
 import json
 import pytest
 
-from core.config import WorkerConfig, load_model_pricing, _generate_worker_id
+from core.config import WorkerConfig, _generate_worker_id
 
 
 class TestWorkerConfig:
@@ -19,7 +19,6 @@ class TestWorkerConfig:
         assert config.heartbeat_interval_seconds == 15
         assert config.reaper_interval_seconds == 30
         assert config.reaper_jitter_seconds == 10
-        assert "claude-sonnet-4-20250514" in config.model_pricing
 
     def test_worker_id_generated(self):
         config = WorkerConfig()
@@ -50,36 +49,6 @@ class TestWorkerConfig:
         assert config.worker_id == "custom-worker"
         assert config.max_concurrent_tasks == 5
         assert config.poll_backoff_initial_ms == 200
-
-    def test_model_pricing_file_override(self, tmp_path):
-        pricing_file = tmp_path / "pricing.json"
-        pricing_file.write_text(
-            json.dumps(
-                {
-                    "custom-model": {
-                        "input_microdollars_per_million": 123,
-                        "output_microdollars_per_million": 456,
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        config = WorkerConfig(model_pricing_file=str(pricing_file))
-
-        assert config.model_pricing["custom-model"].input_microdollars_per_million == 123
-        assert config.model_pricing["custom-model"].output_microdollars_per_million == 456
-
-    def test_load_model_pricing_raises_for_invalid_json(self, tmp_path):
-        pricing_file = tmp_path / "pricing.json"
-        pricing_file.write_text("{ invalid json", encoding="utf-8")
-
-        with pytest.raises(ValueError, match="not valid JSON"):
-            load_model_pricing(pricing_file)
-
-    def test_model_pricing_override_validates_payload(self):
-        with pytest.raises(ValueError, match="must be an object"):
-            WorkerConfig(model_pricing={"broken-model": "invalid"})  # type: ignore[arg-type]
 
     def test_timing_values_can_be_loaded_from_environment(self, monkeypatch):
         monkeypatch.setenv("LEASE_DURATION_SECONDS", "11")

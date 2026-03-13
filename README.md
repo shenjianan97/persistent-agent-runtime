@@ -111,6 +111,7 @@ If you already have your own PostgreSQL instance, Docker is not strictly require
 ```text
 infrastructure/database/migrations/0001_phase1_durable_execution.sql
 infrastructure/database/migrations/0002_worker_registry.sql
+infrastructure/database/migrations/0003_dynamic_models.sql
 ```
 
 Then point the API and worker services at that database with their normal environment variables.
@@ -144,10 +145,13 @@ For the default local development flow, use the root launcher instead of startin
 
 ```bash
 cp .env.localdev.example .env.localdev
-# Fill in ANTHROPIC_API_KEY and TAVILY_API_KEY
+# Required: ANTHROPIC_API_KEY and TAVILY_API_KEY
+# Optional: OPENAI_API_KEY, GOOGLE_API_KEY (enables additional LLM providers)
 make install
 make dev
 ```
+
+On startup, `make dev` runs `scripts/discover_models.py` to auto-discover available LLM providers from configured API keys and populate the `provider_keys` and `models` tables in PostgreSQL. The API service validates task submissions against these tables, and the console model selector is populated from `GET /v1/models`. At minimum, set `ANTHROPIC_API_KEY` for Claude models. Add `OPENAI_API_KEY` for GPT models, `GOOGLE_API_KEY` for Gemini models, or configure AWS credentials for Bedrock models.
 
 Recommended local workflow:
 
@@ -234,6 +238,7 @@ Implemented or substantially defined already:
 - In-process MCP server for `web_search`, `read_url`, and `calculator`
 - Dev-only task controls for forced lease expiry and dead-letter transitions
 - Dev-only `dev_sleep` tool for deterministic timeout and long-running-task testing
+- Dynamic model provider management: database-backed provider/model registry, auto-discovery from API keys, per-model cost tracking, and console model selector via `GET /v1/models`
 - Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
 - End-to-end test coverage for crash recovery and lifecycle behavior
 

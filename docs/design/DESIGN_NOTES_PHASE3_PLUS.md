@@ -62,3 +62,18 @@ These ideas are later than the core Phase 2 BYOT runtime:
 
 - **OpenAPI auto-wrapping:** accept an OpenAPI spec and auto-generate an MCP server from it
 - **A2A (Agent-to-Agent) protocol:** enable cross-agent tool invocation via Google's A2A protocol for multi-agent coordination scenarios
+
+---
+
+## 5. Bring Your Own Key (BYOK)
+
+Phase 2 uses platform-owned LLM API keys (see [PHASE2_MULTI_AGENT.md, Section 6](./PHASE2_MULTI_AGENT.md)). If customer demand arises for users to bring their own provider API keys, this would require:
+
+- per-tenant credential vaults in Secrets Manager
+- per-agent API key overrides in the Agent entity
+- provider-specific rate-limit isolation (each tenant's key has its own rate limits)
+- billing model changes (platform no longer bears LLM cost for BYOK tenants)
+- `create_llm()` in the worker accepting an optional `api_key` parameter override
+
+This is feasible on top of the dynamic provider registry architecture but adds significant complexity to secret management and billing.
+

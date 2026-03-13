@@ -95,6 +95,7 @@ async def test_completion_path(mock_worker, task_data):
 
 def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     event = {
         "agent": {
             "messages": [
@@ -115,6 +116,7 @@ def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
 
 def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     checkpoint_payload = {
         "channel_values": {
             "messages": [
@@ -131,6 +133,7 @@ def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
 
 def test_extract_cost_from_checkpoint_payload_ignores_prior_ai_usage_when_latest_message_is_tool(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     checkpoint_payload = {
         "channel_values": {
             "messages": [
@@ -201,6 +204,7 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
                 [],
             ]
 
+            mock_worker.pool.fetchrow.return_value = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
             assert mock_worker.pool.execute.call_count == 2

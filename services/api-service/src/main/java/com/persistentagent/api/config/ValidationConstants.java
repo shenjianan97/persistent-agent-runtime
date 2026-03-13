@@ -33,17 +33,7 @@ public final class ValidationConstants {
 
     public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";
 
-    /** Supported LLM models for Phase 1. */
-    public static final Set<String> SUPPORTED_MODELS = Set.of(
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-20250514",
-            "claude-haiku-4-20250514",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4-turbo",
-            "us.anthropic.claude-sonnet-4-20250514-v1:0",
-            "us.anthropic.claude-haiku-4-20250514-v1:0"
-    );
+
 
     // Default values
     public static final int DEFAULT_MAX_RETRIES = 3;

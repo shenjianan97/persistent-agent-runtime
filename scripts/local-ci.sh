@@ -97,7 +97,9 @@ apply_migrations() {
     local sql_file
     for sql_file in \
         "$ROOT_DIR/infrastructure/database/migrations/0001_phase1_durable_execution.sql" \
-        "$ROOT_DIR/infrastructure/database/migrations/0002_worker_registry.sql"; do
+        "$ROOT_DIR/infrastructure/database/migrations/0002_worker_registry.sql" \
+        "$ROOT_DIR/infrastructure/database/migrations/0003_dynamic_models.sql" \
+        "$ROOT_DIR/infrastructure/database/migrations/test_seed.sql"; do
         docker_psql <"$sql_file"
     done
 }

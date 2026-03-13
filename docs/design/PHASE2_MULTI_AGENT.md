@@ -222,14 +222,46 @@ created_at:           timestamp
 
 ---
 
-## 6. Secret Management
+## 6. LLM Credential Model and Secret Management
 
-Phase 1 keeps secret handling simple: Worker Service and API Service load provider/tool credentials from environment variables, and the primary safety requirement is that secrets never enter task payloads, LangGraph state, checkpoints, or logs.
+### Platform-owns-keys (decided)
 
-Phase 2 hardens this by moving runtime credentials to AWS Secrets Manager:
+The platform holds all LLM provider API keys centrally. Users never provide their own provider credentials. The platform bills users based on per-checkpoint cost data tracked in the `models` database table, enforced through the budget model in Section 2.
 
-- runtime retrieval through a `SecretProvider` abstraction backed by Secrets Manager
-- rotation without rebuilding task payloads or agent config snapshots
+This decision aligns with the cost-aware scheduling design: the platform must control LLM spending to enforce `budget_max_per_task` and `budget_max_per_hour`. Platform-owned keys also enable centralized rate-limit management and negotiated enterprise pricing with providers.
+
+**BYOK (Bring Your Own Key) is explicitly deferred to Phase 3+.** See [DESIGN_NOTES_PHASE3_PLUS.md](./DESIGN_NOTES_PHASE3_PLUS.md).
+
+### Centralized model and key registry
+
+A **Python discovery script** runs at system startup. It reads the platform's API keys from its environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.), then queries each provider's model listing API (e.g., Anthropic and OpenAI both expose `GET /v1/models`) to discover available chat models. It upserts the keys and discovered models into the shared PostgreSQL database (`provider_keys` and `models` tables). Models are marked active only if their provider's API key is present and the provider confirms the model's availability.
+
+The **API Service** reads active models from the database. It validates task submissions and serves `GET /v1/models` to the Console.
+
+The **Worker Service** is a stateless executor. When it claims a task, it reads the required API key from the `provider_keys` table and passes it to LangChain's `init_chat_model`. Workers do not need LLM API keys in their own environment.
+
+**Multi-instance safety:** The discovery script acquires a PostgreSQL advisory lock before syncing, ensuring only one instance writes at a time.
+
+### Discovery service evolution
+
+Phase 1 runs discovery as a startup script (like DB migrations). The database schema (`provider_keys` and `models` tables) is the stable contract between the writer (discovery component) and readers (API Service, Workers, Console). This contract enables a clean evolution path:
+
+- **Phase 1:** Startup script — runs once at deploy, reads env vars, queries providers, writes to DB, exits.
+- **Phase 2:** Long-running service — runs continuously, periodically re-syncs models, picks up key rotations from Secrets Manager without restarting any other service. Enables zero-downtime key rotation.
+- **Phase 3+:** Same service extended with per-tenant credential vaults for BYOK support.
+
+The readers never change — only the writer evolves.
+
+### Secret management hardening (Phase 2)
+
+Phase 1 stores API keys in the `provider_keys` database table (plaintext, acceptable for local development and early production).
+
+Phase 2 hardens this by migrating to AWS Secrets Manager:
+
+- API Service reads keys from Secrets Manager instead of environment variables
+- Workers read keys from Secrets Manager instead of the `provider_keys` table
+- `provider_keys` table is dropped; `models` table remains for pricing and availability
+- rotation without restarting any services
 - least-privilege IAM scoping for API Service, Worker Service, and customer tool runtimes
 
 Even after migration to Secrets Manager, secrets remain operational configuration, not business data. They must never be stored in `tasks`, `checkpoints`, or `task_events`.

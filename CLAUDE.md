@@ -25,7 +25,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - SQS FIFO — Phase 2 queue (transactional outbox)
 - ECS Fargate — workers
 - OpenTelemetry → CloudWatch — observability
-- Bedrock + OpenAI/Anthropic APIs — LLM integration
+- LangChain `init_chat_model` — LLM integration (Anthropic, OpenAI, Google, Bedrock; providers auto-discovered from configured API keys)
 
 ## Documents
 

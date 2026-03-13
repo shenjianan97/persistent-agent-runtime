@@ -1704,3 +1704,29 @@ A single-page HTML dashboard that polls `GET /v1/tasks/{id}` and displays:
 - Running cost total vs. estimated cost without checkpointing
 
 This makes the crash-recovery story visually compelling for a demo video, compared to raw API responses.
+
+---
+
+## 8. Dynamic Provider Integration
+
+The LangChain `init_chat_model` function uses standard `api_key` values for the vast majority of AI providers (e.g., Anthropic, OpenAI, Groq, Mistral, Cohere), meaning they require **no code changes at all** to be added dynamically to this Phase 1 runtime. Simply inserting their API keys into the database is enough!
+
+**Example: AWS Bedrock Integration**
+For providers that require complex credentials (like AWS Bedrock), you can keep the `api_key` database column simple (e.g., a delimited string) and add a minimal unpacking routine in `providers.py`:
+
+1. Add a routine to `discover_models.py` (or a similar future registry tool) to list AWS Bedrock models via `boto3`.
+2. Upsert the models to the `models` table with `provider_id='bedrock'`.
+3. Insert an encoded string into the `provider_keys` table's `api_key` column: `AKIA...:SECRET...:us-east-1`
+4. In `providers.py`, just add a 3-line check to split the string and feed it into Langchain AWS native fields:
+   ```python
+   if provider == "bedrock":
+       access, secret, region = api_key.split(":")
+       return init_chat_model(
+           model=model_name,
+           model_provider=provider,
+           temperature=temperature,
+           aws_access_key_id=access,
+           aws_secret_access_key=secret,
+           region_name=region
+       )
+   ```

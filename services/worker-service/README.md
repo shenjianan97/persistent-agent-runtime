@@ -80,7 +80,7 @@ There is no built-in mock LLM mode in the worker process. For local development 
    ```bash
    pytest tests/ -v
    ```
-   Tests mock `ChatAnthropic` via `unittest.mock.patch("executor.graph.ChatAnthropic")` and inject fake `AIMessage` responses.
+   Tests mock `create_llm` via `unittest.mock.patch("executor.providers.create_llm")` and inject fake `AIMessage` responses.
 
 2. **Backend integration tests** — cross-service tests (API + Worker + PostgreSQL) located in [`tests/backend-integration/`](../../tests/backend-integration/). Workers are wired up directly via test helpers, not through `main.py`.
 
