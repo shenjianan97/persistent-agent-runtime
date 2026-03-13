@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import uuid
 import sys
 import asyncpg
@@ -14,7 +15,10 @@ from executor.graph import GraphExecutor
 from langchain_core.messages import AIMessage, ToolCall
 import pytest_asyncio
 
-DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
+DB_DSN = os.getenv(
+    "E2E_DB_DSN",
+    "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime",
+)
 
 
 async def cleanup_test_db(pool: asyncpg.Pool) -> None:

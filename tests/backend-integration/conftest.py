@@ -26,7 +26,7 @@ from helpers.e2e_context import E2EContext
 from helpers.mock_llm import DynamicChatProvider, simple_response
 from helpers.worker_launcher import create_worker, stop_worker
 
-MIGRATION_FILE = REPO_ROOT / "infrastructure" / "database" / "migrations" / "0001_phase1_durable_execution.sql"
+MIGRATIONS_DIR = REPO_ROOT / "infrastructure" / "database" / "migrations"
 
 DB_HOST = os.getenv("E2E_DB_HOST", "localhost")
 DB_PORT = int(os.getenv("E2E_DB_PORT", "55432"))
@@ -103,8 +103,9 @@ async def _schema_exists() -> bool:
         await conn.close()
 
 
-def _apply_migration() -> None:
-    _run(["psql", DB_DSN, "-f", str(MIGRATION_FILE)], check=True)
+def _apply_migrations() -> None:
+    for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        _run(["psql", DB_DSN, "-f", str(sql_file)], check=True)
 
 
 def _start_api_process() -> subprocess.Popen[str]:
@@ -201,7 +202,7 @@ def runtime_environment() -> RuntimeHandles:
 
     try:
         if not asyncio_run(_schema_exists()):
-            _apply_migration()
+            _apply_migrations()
     except Exception as exc:  # pragma: no cover - startup failure path
         pytest.skip(f"Failed to verify/apply schema: {exc}")
 
