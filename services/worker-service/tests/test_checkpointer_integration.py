@@ -12,7 +12,7 @@ import pytest
 from checkpointer.postgres import LeaseRevokedException, PostgresDurableCheckpointer
 
 DB_DSN = os.getenv(
-    "CHECKPOINTER_TEST_DSN",
+    "E2E_DB_DSN",
     "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime",
 )
 

@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # ── Fast unit tests (no database) ─────────────────────────────────────────
+
+  api-unit-tests:
+    name: API Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - name: Run API unit tests
+        run: cd services/api-service && ./gradlew test
+
+  worker-unit-tests:
+    name: Worker Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install worker dependencies
+        run: pip install -e 'services/worker-service[dev]'
+
+      - name: Run worker unit tests
+        working-directory: services/worker-service
+        run: |
+          python -m pytest tests \
+            --ignore=tests/test_checkpointer_integration.py \
+            --ignore=tests/test_integration.py \
+            -q
+
+  # ── Integration tests (require PostgreSQL) ────────────────────────────────
+
+  api-integration-tests:
+    name: API Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: persistent_agent_runtime
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y postgresql-client
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0002_worker_registry.sql
+
+      - name: Run API integration tests
+        env:
+          INTEGRATION_TESTS_ENABLED: "true"
+        run: cd services/api-service && ./gradlew test
+
+  worker-integration-tests:
+    name: Worker Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: persistent_agent_runtime
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y postgresql-client
+
+      - name: Install worker dependencies
+        run: pip install -e 'services/worker-service[dev]'
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0002_worker_registry.sql
+
+      - name: Run worker integration tests
+        working-directory: services/worker-service
+        env:
+          # test_checkpointer_integration.py reads this env var
+          E2E_DB_DSN: postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_checkpointer_integration.py \
+            tests/test_integration.py \
+            -ra -q | tee /tmp/worker-integration.log
+          ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/worker-integration.log
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: persistent_agent_runtime
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y postgresql-client
+
+      - name: Install worker and E2E dependencies
+        run: pip install -e 'services/worker-service[dev]'
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0002_worker_registry.sql
+
+      - name: Run E2E tests
+        env:
+          # Point conftest at the GH Actions PostgreSQL service (skips Docker management)
+          E2E_DB_HOST: localhost
+          E2E_DB_PORT: "55432"
+          E2E_DB_NAME: persistent_agent_runtime
+          E2E_DB_USER: postgres
+          E2E_DB_PASSWORD: postgres
+          APP_DEV_TASK_CONTROLS_ENABLED: "true"
+          # conftest will auto-start the API via ./gradlew bootRun
+        run: |
+          set -o pipefail
+          python -m pytest tests/backend-integration -ra -q | tee /tmp/e2e.log
+          ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log

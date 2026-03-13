@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import sys
 
 import pytest
 from mcp import ClientSession
@@ -11,7 +12,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 WORKER_SERVICE_DIR = Path(__file__).resolve().parents[1]
-PYTHON_BIN = WORKER_SERVICE_DIR / ".venv" / "bin" / "python"
+PYTHON_BIN = Path(sys.executable)
 HTTP_SERVER_SCRIPT = WORKER_SERVICE_DIR / "tests" / "fixtures" / "http_test_server.py"
 
 

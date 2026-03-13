@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import pytest
 from mcp import ClientSession
@@ -10,7 +11,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 WORKER_SERVICE_DIR = Path(__file__).resolve().parents[1]
-PYTHON_BIN = WORKER_SERVICE_DIR / ".venv" / "bin" / "python"
+PYTHON_BIN = Path(sys.executable)
 STDIO_SERVER_SCRIPT = WORKER_SERVICE_DIR / "tests" / "fixtures" / "stdio_test_server.py"
 
 
