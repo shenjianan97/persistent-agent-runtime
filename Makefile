@@ -1,4 +1,4 @@
-.PHONY: install dev dev-check api-test worker-test e2e-test db-verify clean
+.PHONY: install dev dev-check api-test worker-test e2e-test db-verify local-ci clean
 
 install:
 	bash scripts/dev-stack.sh --install
@@ -27,6 +27,9 @@ e2e-test:
 
 db-verify:
 	./infrastructure/database/verify_schema.sh
+
+local-ci:
+	bash scripts/local-ci.sh
 
 clean:
 	mkdir -p .tmp && rm -f .tmp/*
