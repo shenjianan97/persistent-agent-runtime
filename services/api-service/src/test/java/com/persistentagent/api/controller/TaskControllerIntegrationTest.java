@@ -53,6 +53,7 @@ class TaskControllerIntegrationTest {
                                 {
                                   "agent_id": "test_agent",
                                   "agent_config": {
+                                    "provider": "anthropic",
                                     "system_prompt": "You are a test assistant",
                                     "model": "claude-sonnet-4-6",
                                     "temperature": 0.5,
@@ -125,6 +126,7 @@ class TaskControllerIntegrationTest {
                                 {
                                   "agent_id": "agent1",
                                   "agent_config": {
+                                    "provider": "anthropic",
                                     "system_prompt": "prompt",
                                     "model": "invalid-model",
                                     "temperature": 0.5
@@ -145,6 +147,7 @@ class TaskControllerIntegrationTest {
                                 {
                                   "agent_id": "agent1",
                                   "agent_config": {
+                                    "provider": "anthropic",
                                     "system_prompt": "prompt",
                                     "model": "claude-sonnet-4-6",
                                     "allowed_tools": ["shell_exec"]
@@ -166,6 +169,7 @@ class TaskControllerIntegrationTest {
                                 {
                                   "agent_id": "agent1",
                                   "agent_config": {
+                                    "provider": "anthropic",
                                     "system_prompt": "prompt",
                                     "model": "claude-sonnet-4-6"
                                   },
@@ -197,6 +201,7 @@ class TaskControllerIntegrationTest {
                                 {
                                   "agent_id": "agent1",
                                   "agent_config": {
+                                    "provider": "anthropic",
                                     "system_prompt": "prompt",
                                     "model": "claude-sonnet-4-6"
                                   },

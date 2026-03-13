@@ -87,6 +87,8 @@ jobs:
             -f infrastructure/database/migrations/0002_worker_registry.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0003_dynamic_models.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run API integration tests
         env:
@@ -135,6 +137,8 @@ jobs:
             -f infrastructure/database/migrations/0002_worker_registry.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0003_dynamic_models.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run worker integration tests
         working-directory: services/worker-service
@@ -196,6 +200,8 @@ jobs:
             -f infrastructure/database/migrations/0002_worker_registry.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0003_dynamic_models.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run E2E tests
         env:
