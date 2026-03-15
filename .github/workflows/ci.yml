@@ -23,8 +23,8 @@ jobs:
       - name: Run API unit tests
         run: cd services/api-service && ./gradlew test
 
-  worker-unit-tests:
-    name: Worker Unit Tests
+  python-unit-tests:
+    name: Python Unit Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +44,9 @@ jobs:
             --ignore=tests/test_checkpointer_integration.py \
             --ignore=tests/test_integration.py \
             -q
+
+      - name: Run model-discovery unit tests
+        run: python -m pytest tests/test_discover_models.py -q
 
   # ── Integration tests (require PostgreSQL) ────────────────────────────────
 
