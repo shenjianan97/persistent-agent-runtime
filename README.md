@@ -2,23 +2,17 @@
 
 Durable execution infrastructure for AI agents.
 
-This project is building a cloud-native runtime for long-running agent tasks that need to survive worker crashes, resume from checkpoints, and expose operational control over retries, leases, dead letters, and cost tracking.
-
 ## Why This Exists
 
-Most agent frameworks are good at defining workflows, but not at running them safely in production. In practice:
+Running AI agents in production — not as chatbots, but as long-running multi-step tasks on remote compute — surfaces infrastructure problems that most agent frameworks don't address:
 
-- LLM calls are non-deterministic, so deterministic replay models break down
-- agent tasks may run for minutes or hours, so crashes cannot mean starting over
-- tool calls and multi-step execution need durable state, retries, and observability
-- platform operators need queueing, worker coordination, and failure handling, not just prompt orchestration
+- **Crash recovery:** Agent tasks can run for minutes or hours across many LLM calls. On ephemeral compute (containers, spot instances), the process can be killed at any time. Without durable checkpointing, all completed steps are lost and must be re-executed — wasting time and LLM spend.
 
-This repo combines:
+- **Execution visibility:** When agents run on remote workers instead of your terminal, you need per-step cost tracking, failure diagnostics, and execution history to understand what happened and why.
 
-- a Java API service for task submission and querying
-- a Python worker service for lease-based execution and LangGraph orchestration
-- a React console for monitoring tasks, workers, and dead letters
-- PostgreSQL as the Phase 1 queue and durable checkpoint store
+- **Failure management:** At scale, agent task failures need to be inspectable and actionable — structured dead-letter queues with redrive, not just a stack trace in logs.
+
+This project is a portfolio implementation that tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, per-node cost tracking, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
 
 ## Current Architecture
 
@@ -31,39 +25,7 @@ Phase 1 uses a database-as-queue model:
 5. Heartbeats extend the lease while work is in progress.
 6. A reaper recovers expired leases and handles timeout/dead-letter transitions.
 
-Core properties:
-
-- checkpoint-resume instead of event-sourced replay
-- lease-based task ownership
-- dead-letter and redrive support
-- per-step checkpoint history and cost tracking
-- read-only Phase 1 tools exposed through a co-located MCP server
-
-For local testing, the runtime also supports optional dev-only task controls:
-
-- `/v1/dev/tasks/{taskId}/expire-lease` to force a running task into normal lease-expiry recovery
-- `/v1/dev/tasks/{taskId}/force-dead-letter` to force a task into the normal dead-letter path
-- a dev-only `dev_sleep` tool so long-running tasks and timeout behavior can be exercised deterministically
-
 ## Repository Layout
-
-```text
-docs/
-  PROJECT.md
-  design/
-  implementation_plan/
-services/
-  api-service/
-  console/
-  worker-service/
-tests/
-  backend-integration/
-experiments/
-  langgraph/
-infrastructure/
-  database/
-  cdk/
-```
 
 - [`docs/PROJECT.md`](./docs/PROJECT.md): project overview, phases, tradeoffs, and roadmap
 - [`docs/design/`](./docs/design/): architecture and design documents
@@ -80,41 +42,25 @@ infrastructure/
 
 ### Prerequisites
 
-- Java 21+
-- Python 3.11+
-- Node.js 18+
-- PostgreSQL
-- Docker
+- Java 21+, Python 3.11+, Node.js 18+, Docker
 
-### First-Run Database Setup
-
-The API service and worker service expect the Phase 1 PostgreSQL schema to already exist.
-
-Warning: `./infrastructure/database/verify_schema.sh` and `make db-verify` are destructive verification flows. They reset the `public` schema with `DROP SCHEMA ... CASCADE` before recreating the tables from the migration. Do not run them against a PostgreSQL database you want to preserve.
-
-The easiest bootstrap path is the provided verification script, which uses Docker to start a disposable PostgreSQL instance, apply the schema, and verify it:
+### Quick Start
 
 ```bash
-./infrastructure/database/verify_schema.sh
-```
-
-If you want to keep that PostgreSQL container running for local development:
-
-```bash
+# 1. Bootstrap the database (first time only)
 KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
+
+# 2. Configure environment
+cp .env.localdev.example .env.localdev
+# At least one LLM key: ANTHROPIC_API_KEY, OPENAI_API_KEY
+# Optional: TAVILY_API_KEY (web_search tool)
+
+# 3. Install and run
+make install
+make dev
 ```
 
-That gives you a local database with the required `tasks`, `checkpoints`, and `checkpoint_writes` tables already created.
-
-If you already have your own PostgreSQL instance, Docker is not strictly required. In that case, apply the migrations manually in order:
-
-```text
-infrastructure/database/migrations/0001_phase1_durable_execution.sql
-infrastructure/database/migrations/0002_worker_registry.sql
-infrastructure/database/migrations/0003_dynamic_models.sql
-```
-
-Then point the API and worker services at that database with their normal environment variables.
+For detailed setup options, environment variables, timing configuration, and manual database setup, see [`docs/LOCAL_DEVELOPMENT.md`](./docs/LOCAL_DEVELOPMENT.md).
 
 ### Useful Entry Points
 
@@ -126,103 +72,16 @@ Then point the API and worker services at that database with their normal enviro
 
 ### Common Commands
 
-Use the root `Makefile` for the common workflows:
-
 ```bash
-make install
-make dev
-make dev-check
-make api-test
-make worker-test
-make e2e-test
-make db-verify
-make clean
+make install        # install all dependencies
+make dev            # start all services locally
+make dev-check      # verify prerequisites without starting
+make api-test       # API service tests
+make worker-test    # worker service tests
+make e2e-test       # backend integration tests
+make db-verify      # reset and verify database schema (destructive)
+make clean          # remove build artifacts
 ```
-
-### One-Command Local Development
-
-For the default local development flow, use the root launcher instead of starting the console, API, and worker in separate terminals.
-
-```bash
-cp .env.localdev.example .env.localdev
-# Required: ANTHROPIC_API_KEY and TAVILY_API_KEY
-# Optional: OPENAI_API_KEY, GOOGLE_API_KEY (enables additional LLM providers)
-make install
-make dev
-```
-
-On startup, `make dev` runs `scripts/discover_models.py` to auto-discover available LLM providers from configured API keys and populate the `provider_keys` and `models` tables in PostgreSQL. The API service validates task submissions against these tables, and the console model selector is populated from `GET /v1/models`. At minimum, set `ANTHROPIC_API_KEY` for Claude models. Add `OPENAI_API_KEY` for GPT models, `GOOGLE_API_KEY` for Gemini models, or configure AWS credentials for Bedrock models.
-
-Recommended local workflow:
-
-```text
-fresh clone
--> copy .env.localdev
--> make install
--> make dev
-```
-
-What `make dev` does:
-
-- loads local overrides from `.env.localdev`
-- uses sensible local defaults for `DB_DSN` and `VITE_API_BASE_URL`
-- forwards `APP_DEV_TASK_CONTROLS_ENABLED` to the API, worker, and console when set
-- checks the existing `persistent-agent-runtime-postgres` container and starts it if needed
-- expects dependencies to already be installed via `make install`
-- starts the console, API service, and worker in a single terminal with prefixed logs
-- stops all child processes cleanly when you press `Ctrl+C`
-
-If you want the dev-only task controls and the `dev_sleep` tool available in the local console/API flow:
-
-```bash
-APP_DEV_TASK_CONTROLS_ENABLED=true make dev
-```
-
-For faster local recovery testing, you can also shorten the lease, heartbeat, and reaper timings:
-
-```bash
-APP_DEV_TASK_CONTROLS_ENABLED=true \
-LEASE_DURATION_SECONDS=10 \
-HEARTBEAT_INTERVAL_SECONDS=2 \
-REAPER_INTERVAL_SECONDS=5 \
-REAPER_JITTER_SECONDS=0 \
-make dev
-```
-
-These local-dev timing knobs are also supported in `.env.localdev`:
-
-- `LEASE_DURATION_SECONDS`: how long a worker lease lasts before another worker can reclaim it
-- `HEARTBEAT_INTERVAL_SECONDS`: how often the worker refreshes its lease and registry heartbeat
-- `REAPER_INTERVAL_SECONDS`: base interval for expired-lease and timeout scans
-- `REAPER_JITTER_SECONDS`: random jitter added to the reaper interval
-
-What `make install` does:
-
-- runs `npm install` in `services/console`
-- creates `services/worker-service/.venv` when missing
-- installs worker dependencies with `pip install -e '.[dev]'`
-
-If you only want to verify runtime prerequisites without starting services, run:
-
-```bash
-make dev-check
-```
-
-`make dev-check` is non-mutating: it validates the environment and the database container state, but it does not start the database for you. `make dev` may start the existing database container if it is currently stopped.
-
-This is a host-based development workflow, not a Docker Compose stack. It expects the named PostgreSQL container to already exist. If it does not, bootstrap it with:
-
-```bash
-KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
-```
-
-For database bootstrap and verification:
-
-```bash
-make db-verify
-```
-
-Warning: `make db-verify` is destructive to existing data in the target database. It resets the `public` schema with `DROP SCHEMA ... CASCADE` before recreating the tables. Use it only against a disposable/local verification database.
 
 ## Development Status
 

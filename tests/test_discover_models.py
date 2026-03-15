@@ -5,7 +5,7 @@ import types
 
 
 def load_discover_models_module():
-    module_path = Path(__file__).resolve().parents[1] / "scripts" / "discover_models.py"
+    module_path = Path(__file__).resolve().parents[1] / "services" / "model-discovery" / "main.py"
     spec = importlib.util.spec_from_file_location("discover_models", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

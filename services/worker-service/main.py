@@ -6,8 +6,8 @@ Usage:
 
 Environment:
     DB_DSN  PostgreSQL connection string (default: postgresql://localhost:55432/agent_runtime)
-    ANTHROPIC_API_KEY / AWS credentials for LLM calls
-    TAVILY_API_KEY for web_search tool
+    At least one LLM API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
+    TAVILY_API_KEY for web_search tool (optional)
 """
 
 import asyncio
@@ -21,16 +21,22 @@ from core.worker import WorkerService
 from executor.router import DefaultTaskRouter
 
 
+_LLM_KEY_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+
+
 def _check_env():
     """Log which API keys are available at startup."""
     logger = logging.getLogger(__name__)
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-    if anthropic_key:
-        masked = anthropic_key[:12] + "..." + anthropic_key[-4:]
-        logger.info("ANTHROPIC_API_KEY is set (%s)", masked)
-    else:
-        logger.warning("ANTHROPIC_API_KEY is NOT set — Claude models will fail")
+    found_llm = False
+    for var in _LLM_KEY_VARS:
+        key = os.environ.get(var)
+        if key:
+            masked = key[:12] + "..." + key[-4:]
+            logger.info("%s is set (%s)", var, masked)
+            found_llm = True
+    if not found_llm:
+        logger.warning("No LLM API keys found — set at least one of: %s", ", ".join(_LLM_KEY_VARS))
 
     if os.environ.get("TAVILY_API_KEY"):
         logger.info("TAVILY_API_KEY is set")
