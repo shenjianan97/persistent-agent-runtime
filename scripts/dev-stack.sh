@@ -143,7 +143,9 @@ ensure_required_env() {
     export VITE_API_BASE_URL="${VITE_API_BASE_URL:-http://localhost:8080}"
     export VITE_DEV_TASK_CONTROLS_ENABLED="${VITE_DEV_TASK_CONTROLS_ENABLED:-${APP_DEV_TASK_CONTROLS_ENABLED:-false}}"
 
-    [[ -n "${ANTHROPIC_API_KEY:-}" ]] || fail "ANTHROPIC_API_KEY must be set in your shell or .env.localdev."
+    if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
+        fail "At least one LLM API key must be set in your shell or .env.localdev (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY)."
+    fi
     if [[ -z "${TAVILY_API_KEY:-}" ]]; then
         log "Warning: TAVILY_API_KEY is not set. The web_search tool will be unavailable."
     fi
@@ -274,7 +276,7 @@ main() {
     trap cleanup EXIT
 
     log "Discovering available models and syncing database..."
-    if ! "$WORKER_VENV_PYTHON" "$ROOT_DIR/scripts/discover_models.py"; then
+    if ! "$WORKER_VENV_PYTHON" "$ROOT_DIR/services/model-discovery/main.py"; then
         log "Warning: Model discovery script failed."
     fi
 
