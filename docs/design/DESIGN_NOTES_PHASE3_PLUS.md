@@ -77,3 +77,46 @@ Phase 2 uses platform-owned LLM API keys (see [PHASE2_MULTI_AGENT.md, Section 6]
 
 This is feasible on top of the dynamic provider registry architecture but adds significant complexity to secret management and billing.
 
+---
+
+## 6. Execution Sandbox
+
+Phase 2 BYOT isolates customer-provided MCP servers in separate ECS tasks with network restrictions. Phase 3+ extends this with deeper sandboxing for all tool execution, particularly important if the platform adds a `code_interpreter` tool or allows agents to run LLM-generated code.
+
+### Threat model
+
+| Threat | Example | Current mitigation |
+|--------|---------|-------------------|
+| Code escape to host | LLM-generated code accesses host filesystem or network | None — Phase 1 tools run in-process |
+| Secret exfiltration | Compromised tool reads worker's DB credentials or API keys | None — co-located tools share the worker's process memory |
+| Resource exhaustion | Runaway tool consumes unbounded CPU/memory/time | None — no per-tool resource limits |
+| Lateral movement | Tool accesses other tenants' containers or internal services | Phase 2 BYOT network policy (customer tools only) |
+
+### Sandbox layers
+
+**Process-level isolation:** Run each tool invocation in a sandboxed process (e.g., gVisor, Firecracker microVM, or at minimum a restricted container) with no access to the worker's filesystem or memory. The worker communicates with the sandbox over a local socket or stdio pipe using the MCP protocol.
+
+**Network policy per tool:** Each tool execution gets a network policy specifying exactly which external endpoints it may reach. Built-in tools like `web_search` get outbound HTTPS only. `calculator` gets no network access. Customer tools get their registered endpoint allowlist.
+
+**Resource quotas:** Per-tool-invocation limits on CPU time, memory, and wall-clock duration. Exceeded limits kill the sandbox and return a structured error to the graph executor for retry/dead-letter classification.
+
+**Filesystem restrictions:** Tool sandboxes get an ephemeral scratch directory only. No access to the worker's checkpoint data, configuration, or credentials. Credentials needed by the tool (e.g., API keys) are injected as environment variables into the sandbox, scoped to the minimum required.
+
+### Migration path
+
+- **Phase 2:** BYOT isolation (already designed) covers customer tools. Built-in tools remain co-located but are limited to the read-only set (`web_search`, `read_url`, `calculator`).
+- **Phase 3:** Move built-in tools into sandboxed execution. Add `code_interpreter` tool with full sandbox isolation. This is a prerequisite for any tool that executes LLM-generated code.
+- **Phase 3+:** Per-tenant sandbox policies, audit logging of sandbox escapes, and integration with cloud-native security tooling (e.g., AWS Nitro Enclaves for sensitive workloads).
+
+---
+
+## 7. Orchestrator Component Rewrites (Poller, Heartbeat, Reaper)
+
+Currently, the entire worker service (orchestrator + LangGraph executor) is written in Python to maintain architectural simplicity and allow AI agents (like Claude) to easily reason about the entire codebase. 
+
+If performance, concurrency, or footprint becomes a significant issue at scale, Phase 3+ could consider:
+- Rewriting the **Poller**, **Heartbeat**, and **Reaper** components in **Go** or **Java** for true multi-threading and lower resource overhead.
+- Keeping the LangGraph **Executor** in Python.
+- Establishing an IPC or local RPC layer between the Go/Java orchestrator and the Python executor.
+
+This is a heavy architectural shift and should only be pursued if the Python `asyncio` event loop becomes a demonstrable bottleneck.
