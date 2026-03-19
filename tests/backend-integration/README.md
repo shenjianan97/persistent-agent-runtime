@@ -37,7 +37,7 @@ By default, the suite:
 Specifically:
 - If PostgreSQL is not reachable on `localhost:55432`, tests may start Docker container `par-e2e-postgres`.
 - If API health is not available on `http://localhost:8080/v1/health`, tests may start `services/api-service` via `./gradlew bootRun` with `APP_DEV_TASK_CONTROLS_ENABLED=true`.
-- If schema is missing, migration `infrastructure/database/migrations/0001_phase1_durable_execution.sql` is applied.
+- If schema is missing, all SQL files under `infrastructure/database/migrations/` are applied in order.
 
 ## Prerequisites
 

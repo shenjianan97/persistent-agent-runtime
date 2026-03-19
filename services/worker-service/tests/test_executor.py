@@ -9,7 +9,7 @@ from core.config import WorkerConfig
 from executor.graph import GraphExecutor
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
-from tools.errors import ToolTransportError
+from tools.errors import ToolExecutionError, ToolTransportError
 
 
 @pytest.fixture
@@ -95,7 +95,7 @@ async def test_completion_path(mock_worker, task_data):
 
 def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
+    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     event = {
         "agent": {
             "messages": [
@@ -109,14 +109,14 @@ def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
         }
     }
 
-    cost = executor._extract_cost_from_stream_event(event, "claude-sonnet-4-20250514")
+    cost = executor._extract_cost_from_stream_event(event, "claude-sonnet-4-20250514", pricing)
 
     assert cost == 2079
 
 
 def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
+    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     checkpoint_payload = {
         "channel_values": {
             "messages": [
@@ -126,14 +126,18 @@ def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
         }
     }
 
-    cost = executor._extract_cost_from_checkpoint_payload(checkpoint_payload, "claude-sonnet-4-20250514")
+    cost = executor._extract_cost_from_checkpoint_payload(
+        checkpoint_payload,
+        "claude-sonnet-4-20250514",
+        pricing,
+    )
 
     assert cost == 2079
 
 
 def test_extract_cost_from_checkpoint_payload_ignores_prior_ai_usage_when_latest_message_is_tool(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    executor.pricing_cache = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
+    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
     checkpoint_payload = {
         "channel_values": {
             "messages": [
@@ -144,9 +148,62 @@ def test_extract_cost_from_checkpoint_payload_ignores_prior_ai_usage_when_latest
         }
     }
 
-    cost = executor._extract_cost_from_checkpoint_payload(checkpoint_payload, "claude-sonnet-4-20250514")
+    cost = executor._extract_cost_from_checkpoint_payload(
+        checkpoint_payload,
+        "claude-sonnet-4-20250514",
+        pricing,
+    )
 
     assert cost == 0
+
+
+@pytest.mark.asyncio
+async def test_build_graph_configures_tool_node_for_expected_tool_errors(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    cancel_event = asyncio.Event()
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock()
+    llm.bind_tools.return_value = llm
+
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)):
+        with patch("executor.graph.ToolNode") as MockToolNode:
+            await executor._build_graph(
+                {
+                    "model": "claude-3-5-sonnet-latest",
+                    "temperature": 0.5,
+                    "allowed_tools": ["calculator"],
+                },
+                cancel_event=cancel_event,
+                task_id="task-123",
+            )
+
+    _, kwargs = MockToolNode.call_args
+    assert kwargs["handle_tool_errors"] is ToolExecutionError
+
+
+@pytest.mark.asyncio
+async def test_await_or_cancel_interrupts_long_running_operation(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    cancel_event = asyncio.Event()
+    started = asyncio.Event()
+
+    async def slow_operation():
+        started.set()
+        await asyncio.sleep(10)
+
+    pending = asyncio.create_task(
+        executor._await_or_cancel(
+            slow_operation(),
+            cancel_event,
+            task_id="task-123",
+            operation="agent",
+        )
+    )
+    await started.wait()
+    cancel_event.set()
+
+    with pytest.raises(LeaseRevokedException):
+        await pending
 
 
 @pytest.mark.asyncio
