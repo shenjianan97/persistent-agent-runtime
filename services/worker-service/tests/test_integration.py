@@ -12,6 +12,7 @@ from core.config import WorkerConfig
 from core.worker import WorkerService
 from core.db import create_pool
 from executor.graph import GraphExecutor
+import executor.providers
 from langchain_core.messages import AIMessage, ToolCall
 import pytest_asyncio
 
@@ -41,10 +42,10 @@ async def setup_test_task(pool: asyncpg.Pool) -> str:
         await conn.execute("""
             INSERT INTO tasks (
                 task_id, tenant_id, agent_id, agent_config_snapshot, 
-                status, input, max_retries, max_steps, task_timeout_seconds
-            ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test input', 3, 5, 300)
+                status, input, max_retries, max_steps, task_timeout_seconds, worker_pool_id
+            ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test input', 3, 5, 300, 'test_pool')
         """, task_id, json.dumps(agent_config))
-        await conn.execute("SELECT pg_notify('new_task', 'shared')")
+        await conn.execute("SELECT pg_notify('new_task', 'test_pool')")
     return task_id
 
 @pytest.mark.asyncio
@@ -63,7 +64,8 @@ async def test_worker_e2e_integration():
         heartbeat_interval_seconds=1,
         lease_duration_seconds=5,
         reaper_interval_seconds=2,
-        reaper_jitter_seconds=0
+        reaper_jitter_seconds=0,
+        worker_pool_id="test_pool"
     )
     
     from executor.router import DefaultTaskRouter
@@ -94,7 +96,7 @@ async def test_worker_e2e_integration():
             
             async with pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT status, output, version FROM tasks WHERE task_id=$1", t1)
-                assert str(row["status"]) == "completed", f"Status was {row['status']}"
+                assert str(row["status"]) == "completed", f"Status was {row['status']}. Details: {row.get('dead_letter_reason')} {row.get('dead_letter_error_details')}"
                 
                 output = json.loads(row["output"])
                 assert output["result"] == "I am a fake integrated response!"
@@ -123,7 +125,8 @@ async def test_worker_core_primitives_integration():
         heartbeat_interval_seconds=1,
         lease_duration_seconds=5,
         reaper_interval_seconds=2,
-        reaper_jitter_seconds=0
+        reaper_jitter_seconds=0,
+        worker_pool_id="test_pool"
     )
     
     executed_tasks = []
@@ -150,8 +153,8 @@ async def test_worker_core_primitives_integration():
         await asyncio.sleep(4)
         
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT status FROM tasks WHERE task_id=$1", t1)
-            assert str(row["status"]) == "completed"
+            row = await conn.fetchrow("SELECT * FROM tasks WHERE task_id=$1", t1)
+            assert str(row["status"]) == "completed", f"Status was {row['status']}. Details: {row.get('dead_letter_reason')} {row.get('dead_letter_error_details')}"
         assert str(t1) in executed_tasks
         
         # Scenario 3: Reaper reclaims crashed task
@@ -162,8 +165,8 @@ async def test_worker_core_primitives_integration():
                 INSERT INTO tasks (
                     task_id, tenant_id, agent_id, agent_config_snapshot, 
                     status, input, max_retries, max_steps, task_timeout_seconds,
-                    lease_owner, lease_expiry
-                ) VALUES ($1, 'default', 'test_agent', $2, 'running', 'Test', 3, 5, 300, 'crashed-worker', NOW() - INTERVAL '10 seconds')
+                    lease_owner, lease_expiry, worker_pool_id
+                ) VALUES ($1, 'default', 'test_agent', $2, 'running', 'Test', 3, 5, 300, 'crashed-worker', NOW() - INTERVAL '10 seconds', 'test_pool')
             """, t3, json.dumps(agent_config))
 
         await asyncio.sleep(3) # Wait for Reaper
@@ -181,8 +184,8 @@ async def test_worker_core_primitives_integration():
                 INSERT INTO tasks (
                     task_id, tenant_id, agent_id, agent_config_snapshot, 
                     status, input, max_retries, max_steps, task_timeout_seconds,
-                    created_at
-                ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test', 3, 5, 10, NOW() - INTERVAL '20 seconds')
+                    created_at, worker_pool_id
+                ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test', 3, 5, 10, NOW() - INTERVAL '20 seconds', 'test_pool')
             """, t4, json.dumps(agent_config))
 
         await asyncio.sleep(3)
@@ -212,7 +215,8 @@ async def test_worker_mcp_tool_execution_integration():
         heartbeat_interval_seconds=1,
         lease_duration_seconds=5,
         reaper_interval_seconds=2,
-        reaper_jitter_seconds=0
+        reaper_jitter_seconds=0,
+        worker_pool_id="test_pool"
     )
     
     from executor.router import DefaultTaskRouter
@@ -250,8 +254,8 @@ async def test_worker_mcp_tool_execution_integration():
             await asyncio.sleep(4)
             
             async with pool.acquire() as conn:
-                row = await conn.fetchrow("SELECT status, output FROM tasks WHERE task_id=$1", t1)
-                assert str(row["status"]) == "completed"
+                row = await conn.fetchrow("SELECT * FROM tasks WHERE task_id=$1", t1)
+                assert str(row["status"]) == "completed", f"Status was {row['status']}. Details: {row.get('dead_letter_reason')} {row.get('dead_letter_error_details')}"
                 
                 output = json.loads(row["output"])
                 assert output["result"] == "The result is 25!"

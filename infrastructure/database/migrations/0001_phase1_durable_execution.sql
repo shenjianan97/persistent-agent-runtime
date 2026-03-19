@@ -78,6 +78,7 @@ CREATE TABLE checkpoint_writes (
     task_id               UUID NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
     checkpoint_ns         TEXT NOT NULL DEFAULT '',
     checkpoint_id         TEXT NOT NULL,
+    writer_task_id        TEXT,
     task_path             TEXT NOT NULL DEFAULT '',
     idx                   INT NOT NULL,
     channel               TEXT NOT NULL,

@@ -315,7 +315,7 @@ async def test_put_writes_persists_rows(integration_pool: asyncpg.Pool) -> None:
     async with integration_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT checkpoint_id, task_path, idx, channel
+            SELECT checkpoint_id, writer_task_id, task_path, idx, channel
             FROM checkpoint_writes
             WHERE task_id = $1::uuid
             ORDER BY idx
@@ -324,5 +324,54 @@ async def test_put_writes_persists_rows(integration_pool: asyncpg.Pool) -> None:
         )
 
     assert [row["checkpoint_id"] for row in rows] == ["checkpoint-001", "checkpoint-001"]
+    assert [row["writer_task_id"] for row in rows] == ["writer-task", "writer-task"]
     assert [row["task_path"] for row in rows] == ["root/agent", "root/agent"]
     assert [row["channel"] for row in rows] == ["custom", "other"]
+
+
+@pytest.mark.asyncio
+async def test_revoked_lease_prevents_checkpoint_writes(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    task_id = str(uuid.uuid4())
+    await _insert_task(integration_pool, task_id=task_id)
+    saver = PostgresDurableCheckpointer(
+        integration_pool,
+        worker_id="worker-integration",
+        tenant_id="default",
+    )
+
+    await saver.aput(
+        {"configurable": {"thread_id": task_id, "checkpoint_ns": ""}},
+        _checkpoint("checkpoint-001", 1),
+        {"source": "loop", "step": 1},
+        {"count": "1"},
+    )
+
+    async with integration_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE tasks SET lease_owner = 'other-worker' WHERE task_id = $1::uuid",
+            task_id,
+        )
+
+    with pytest.raises(LeaseRevokedException):
+        await saver.aput_writes(
+            {
+                "configurable": {
+                    "thread_id": task_id,
+                    "checkpoint_ns": "",
+                    "checkpoint_id": "checkpoint-001",
+                }
+            },
+            [("custom", {"value": 1})],
+            task_id="writer-task",
+            task_path="root/agent",
+        )
+
+    async with integration_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM checkpoint_writes WHERE task_id = $1::uuid",
+            task_id,
+        )
+
+    assert count == 0

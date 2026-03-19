@@ -6,10 +6,9 @@ Builds and executes the LangGraph state machine with the given agent configurati
 import asyncio
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone, timedelta
-from typing import Any, AsyncGenerator
+from typing import Any, Awaitable
 
 import asyncpg
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -36,7 +35,7 @@ from tools.definitions import (
     dev_task_controls_enabled,
 )
 from tools.calculator import evaluate_expression
-from tools.errors import ToolTransportError
+from tools.errors import ToolExecutionError, ToolTransportError
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +47,23 @@ class GraphExecutor:
         self.config = config
         self.pool = pool
         self.deps = create_default_dependencies()
-        self.pricing_cache = None
 
-    def _get_tools(self, allowed_tools: list[str]) -> list[StructuredTool]:
+    def _get_tools(
+        self,
+        allowed_tools: list[str],
+        *,
+        cancel_event: asyncio.Event,
+        task_id: str,
+    ) -> list[StructuredTool]:
         tools = []
         if "web_search" in allowed_tools:
             async def web_search(query: str, max_results: int = 5):
-                results = await self.deps.search_provider.search(query, max_results)
+                results = await self._await_or_cancel(
+                    self.deps.search_provider.search(query, max_results),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="web_search",
+                )
                 return [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results]
             tools.append(StructuredTool.from_function(
                 coroutine=web_search,
@@ -62,10 +71,15 @@ class GraphExecutor:
                 description=WEB_SEARCH_TOOL.description,
                 args_schema=WebSearchArguments
             ))
-            
+
         if "read_url" in allowed_tools:
             async def read_url(url: str, max_chars: int = 5000):
-                result = await self.deps.read_url_fetcher.fetch(url, max_chars)
+                result = await self._await_or_cancel(
+                    self.deps.read_url_fetcher.fetch(url, max_chars),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="read_url",
+                )
                 return {"final_url": result.final_url, "title": result.title, "content": result.content}
             tools.append(StructuredTool.from_function(
                 coroutine=read_url,
@@ -86,7 +100,12 @@ class GraphExecutor:
 
         if dev_task_controls_enabled() and "dev_sleep" in allowed_tools:
             async def dev_sleep(seconds: int = 10):
-                await asyncio.sleep(seconds)
+                await self._await_or_cancel(
+                    asyncio.sleep(seconds),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="dev_sleep",
+                )
                 return {"slept_seconds": seconds}
             tools.append(StructuredTool.from_function(
                 coroutine=dev_sleep,
@@ -97,7 +116,13 @@ class GraphExecutor:
             
         return tools
 
-    async def _build_graph(self, agent_config: dict[str, Any]) -> StateGraph:
+    async def _build_graph(
+        self,
+        agent_config: dict[str, Any],
+        *,
+        cancel_event: asyncio.Event,
+        task_id: str,
+    ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
         model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
@@ -109,7 +134,7 @@ class GraphExecutor:
         llm = await create_llm(self.pool, provider, model_name, temperature)
             
         # Register the local MCP tools with the LLM 
-        tools = self._get_tools(allowed_tools)
+        tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id)
         if tools:
             llm_with_tools = llm.bind_tools(tools)
         else:
@@ -119,8 +144,13 @@ class GraphExecutor:
             messages = state["messages"]
             if system_prompt and not any(isinstance(m, SystemMessage) for m in messages):
                 messages = [SystemMessage(content=system_prompt)] + messages
-                
-            response = await llm_with_tools.ainvoke(messages, config)
+
+            response = await self._await_or_cancel(
+                llm_with_tools.ainvoke(messages, config),
+                cancel_event,
+                task_id=task_id,
+                operation="agent",
+            )
             return {"messages": [response]}
 
         # Define the Graph layout
@@ -129,7 +159,7 @@ class GraphExecutor:
         
         if tools:
             # LangGraph handles routing the LLM's ToolCall directly to our python functions
-            tool_node = ToolNode(tools)
+            tool_node = ToolNode(tools, handle_tool_errors=ToolExecutionError)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
             workflow.add_conditional_edges("agent", tools_condition)
@@ -158,13 +188,13 @@ class GraphExecutor:
             )
             
             # 3. Build & Compile graph
-            graph = await self._build_graph(agent_config)
+            graph = await self._build_graph(agent_config, cancel_event=cancel_event, task_id=task_id)
             compiled_graph = graph.compile(checkpointer=checkpointer)
             
             # 4. Config map
             provider = agent_config.get("provider", "anthropic")
             model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
-            self.pricing_cache = await self.pool.fetchrow(
+            pricing = await self.pool.fetchrow(
                 "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE provider_id = $1 AND model_id = $2",
                 provider, model_name
             )
@@ -187,14 +217,14 @@ class GraphExecutor:
                     # Step 6: Cancellation Awareness
                     if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
-                        await self._backfill_checkpoint_costs(task_id, model_name)
+                        await self._backfill_checkpoint_costs(task_id, model_name, pricing)
                         return
 
                 if cancel_event.is_set():
-                    await self._backfill_checkpoint_costs(task_id, model_name)
+                    await self._backfill_checkpoint_costs(task_id, model_name, pricing)
                     return
 
-                await self._backfill_checkpoint_costs(task_id, model_name)
+                await self._backfill_checkpoint_costs(task_id, model_name, pricing)
 
                 # Execution Finished successfully. Compute final output.
                 final_state = await compiled_graph.aget_state(config)
@@ -235,13 +265,18 @@ class GraphExecutor:
             else:
                 await self._handle_dead_letter(task_id, "non_retryable_error", str(e), error_code="fatal_error")
 
-    def _extract_cost_from_stream_event(self, event: Any, model_name: str) -> int:
+    def _extract_cost_from_stream_event(self, event: Any, model_name: str, pricing: Any) -> int:
         usage = self._extract_usage_from_stream_event(event)
         if usage is None:
             return 0
-        return self._calculate_cost_microdollars(model_name, usage)
+        return self._calculate_cost_microdollars(model_name, usage, pricing)
 
-    def _extract_cost_from_checkpoint_payload(self, checkpoint_payload: Any, model_name: str) -> int:
+    def _extract_cost_from_checkpoint_payload(
+        self,
+        checkpoint_payload: Any,
+        model_name: str,
+        pricing: Any,
+    ) -> int:
         if checkpoint_payload is None:
             return 0
 
@@ -267,7 +302,7 @@ class GraphExecutor:
         if usage is None:
             return 0
 
-        return self._calculate_cost_microdollars(model_name, usage)
+        return self._calculate_cost_microdollars(model_name, usage, pricing)
 
     def _extract_usage_from_stream_event(self, event: Any) -> dict[str, int] | None:
         if not isinstance(event, dict):
@@ -326,15 +361,15 @@ class GraphExecutor:
                 return int(value)
         return None
 
-    def _calculate_cost_microdollars(self, model_name: str, usage: dict[str, int]) -> int:
-        if not self.pricing_cache:
+    def _calculate_cost_microdollars(self, model_name: str, usage: dict[str, int], pricing: Any) -> int:
+        if not pricing:
             logger.warning("No pricing configured for model %s; checkpoint cost will remain zero.", model_name)
             return 0
 
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
-        input_cost = self._cost_from_tokens(input_tokens, self.pricing_cache["input_microdollars_per_million"])
-        output_cost = self._cost_from_tokens(output_tokens, self.pricing_cache["output_microdollars_per_million"])
+        input_cost = self._cost_from_tokens(input_tokens, pricing["input_microdollars_per_million"])
+        output_cost = self._cost_from_tokens(output_tokens, pricing["output_microdollars_per_million"])
         return input_cost + output_cost
 
     def _cost_from_tokens(self, tokens: int, microdollars_per_million: int) -> int:
@@ -358,7 +393,7 @@ class GraphExecutor:
             checkpoint_id,
         )
 
-    async def _backfill_checkpoint_costs(self, task_id: str, model_name: str) -> None:
+    async def _backfill_checkpoint_costs(self, task_id: str, model_name: str, pricing: Any) -> None:
         rows = await self.pool.fetch(
             '''
             SELECT checkpoint_id, checkpoint_payload, cost_microdollars
@@ -375,10 +410,48 @@ class GraphExecutor:
             return
 
         for row in rows:
-            pending_cost = self._extract_cost_from_checkpoint_payload(row["checkpoint_payload"], model_name)
+            pending_cost = self._extract_cost_from_checkpoint_payload(
+                row["checkpoint_payload"],
+                model_name,
+                pricing,
+            )
             if pending_cost <= 0:
                 continue
             await self._persist_checkpoint_cost(task_id, row["checkpoint_id"], pending_cost)
+
+    async def _await_or_cancel(
+        self,
+        awaitable: Awaitable[Any],
+        cancel_event: asyncio.Event,
+        *,
+        task_id: str,
+        operation: str,
+    ) -> Any:
+        if cancel_event.is_set():
+            raise LeaseRevokedException(
+                f"Task {task_id} cancelled or lease revoked before {operation} started."
+            )
+
+        operation_task = asyncio.create_task(awaitable)
+        cancel_task = asyncio.create_task(cancel_event.wait())
+
+        try:
+            done, _ = await asyncio.wait(
+                {operation_task, cancel_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if cancel_task in done and cancel_event.is_set():
+                operation_task.cancel()
+                await asyncio.gather(operation_task, return_exceptions=True)
+                raise LeaseRevokedException(
+                    f"Task {task_id} cancelled or lease revoked during {operation}."
+                )
+
+            return await operation_task
+        finally:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""

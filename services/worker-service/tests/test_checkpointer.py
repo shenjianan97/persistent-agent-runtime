@@ -194,9 +194,35 @@ class TestPostgresDurableCheckpointer:
         assert conn.executemany_args is not None
         query, params = conn.executemany_args
         assert INSERT_CHECKPOINT_WRITES_QUERY.strip() in query
-        assert params[0][4] == 0
-        assert params[1][4] == WRITES_IDX_MAP["__interrupt__"]
-        assert params[0][3] == "root/agent"
+        assert any(call[0] == "fetchval" and LEASE_VALIDATION_QUERY.strip() in call[1] for call in conn.calls)
+        assert params[0][5] == 0
+        assert params[1][5] == WRITES_IDX_MAP["__interrupt__"]
+        assert params[0][3] == "task-path-id"
+        assert params[0][4] == "root/agent"
+
+    async def test_aput_writes_raises_when_lease_revoked(self) -> None:
+        conn = _FakeConnection(fetchval_result=None)
+        saver = PostgresDurableCheckpointer(
+            _FakePool(conn),
+            worker_id="worker-123",
+            tenant_id="default",
+        )
+
+        with pytest.raises(LeaseRevokedException):
+            await saver.aput_writes(
+                {
+                    "configurable": {
+                        "thread_id": "00000000-0000-0000-0000-000000000123",
+                        "checkpoint_ns": "",
+                        "checkpoint_id": "checkpoint-002",
+                    }
+                },
+                [("custom", {"value": 1})],
+                task_id="writer-task",
+                task_path="root/agent",
+            )
+
+        assert conn.executemany_args is None
 
     async def test_aget_tuple_reconstructs_parent_and_pending_writes(self) -> None:
         write_type, write_blob = saver_typed({"value": 1})
@@ -213,6 +239,7 @@ class TestPostgresDurableCheckpointer:
             },
             pending_writes=[
                 {
+                    "writer_task_id": "writer-task",
                     "task_path": "root/agent",
                     "channel": "custom",
                     "type": write_type,
@@ -237,7 +264,7 @@ class TestPostgresDurableCheckpointer:
             }
         }
         assert checkpoint_tuple.pending_writes == [
-            ("root/agent", "custom", {"value": 1})
+            ("writer-task", "custom", {"value": 1})
         ]
 
     async def test_alist_applies_before_limit_and_filter(self) -> None:

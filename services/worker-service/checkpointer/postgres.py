@@ -78,15 +78,19 @@ INSERT INTO checkpoint_writes (
     task_id,
     checkpoint_ns,
     checkpoint_id,
+    writer_task_id,
     task_path,
     idx,
     channel,
     type,
     blob
 )
-VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
+VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
-DO UPDATE SET channel = EXCLUDED.channel, type = EXCLUDED.type, blob = EXCLUDED.blob
+DO UPDATE SET writer_task_id = EXCLUDED.writer_task_id,
+              channel = EXCLUDED.channel,
+              type = EXCLUDED.type,
+              blob = EXCLUDED.blob
 """
 
 INSERT_CHECKPOINT_WRITES_QUERY = """
@@ -94,13 +98,14 @@ INSERT INTO checkpoint_writes (
     task_id,
     checkpoint_ns,
     checkpoint_id,
+    writer_task_id,
     task_path,
     idx,
     channel,
     type,
     blob
 )
-VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8)
+VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
 DO NOTHING
 """
@@ -119,7 +124,7 @@ FROM checkpoints
 """
 
 SELECT_PENDING_WRITES_QUERY = """
-SELECT task_path, channel, type, blob
+SELECT writer_task_id, task_path, channel, type, blob
 FROM checkpoint_writes
 WHERE task_id = $1::uuid
   AND checkpoint_ns = $2
@@ -213,9 +218,6 @@ class PostgresDurableCheckpointer(BaseCheckpointSaver[str]):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        # The Phase 1 schema links writes to the root task/thread via the checkpoint FK.
-        # The upstream write-scoped task_id is not persisted separately in this schema.
-        del task_id
         thread_id, checkpoint_ns, checkpoint_id = self._extract_checkpoint_target(config)
         if checkpoint_id is None:
             raise ValueError("checkpoint_id is required for put_writes()")
@@ -230,6 +232,7 @@ class PostgresDurableCheckpointer(BaseCheckpointSaver[str]):
                 thread_id,
                 checkpoint_ns,
                 checkpoint_id,
+                task_id,
                 task_path,
                 WRITES_IDX_MAP.get(channel, idx),
                 channel,
@@ -242,7 +245,19 @@ class PostgresDurableCheckpointer(BaseCheckpointSaver[str]):
             return
 
         async with self._connection() as conn:
-            await conn.executemany(query, params)
+            async with conn.transaction():
+                lease_ok = await conn.fetchval(
+                    LEASE_VALIDATION_QUERY,
+                    thread_id,
+                    self._tenant_id,
+                    self._worker_id,
+                )
+                if lease_ok is None:
+                    raise LeaseRevokedException(
+                        f"Lease revoked before checkpoint write for task {thread_id}"
+                    )
+
+                await conn.executemany(query, params)
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         thread_id, checkpoint_ns, checkpoint_id = self._extract_checkpoint_target(config)
@@ -419,12 +434,9 @@ LIMIT 1
         checkpoint_payload = self._coerce_json(row["checkpoint_payload"])
         metadata_payload = self._coerce_json(row["metadata_payload"])
 
-        # The Phase 1 schema stores task_path but not the upstream writer task ID.
-        # We surface task_path in the first pending write slot to preserve a stable
-        # ordering key for recovery.
         pending_writes = [
             (
-                pending_row["task_path"],
+                pending_row["writer_task_id"] or pending_row["task_path"],
                 pending_row["channel"],
                 self.serde.loads_typed((pending_row["type"], pending_row["blob"])),
             )

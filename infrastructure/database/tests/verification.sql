@@ -170,8 +170,8 @@ BEGIN
     END IF;
 END $$;
 
-INSERT INTO checkpoint_writes (task_id, checkpoint_ns, checkpoint_id, task_path, idx, channel, type, blob)
-VALUES ('00000000-0000-0000-0000-000000000001', '', 'cp-1', '', 0, 'messages', 'json', decode('7b7d', 'hex'))
+INSERT INTO checkpoint_writes (task_id, checkpoint_ns, checkpoint_id, writer_task_id, task_path, idx, channel, type, blob)
+VALUES ('00000000-0000-0000-0000-000000000001', '', 'cp-1', 'writer-1', '', 0, 'messages', 'json', decode('7b7d', 'hex'))
 ON CONFLICT (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
 DO UPDATE SET channel = EXCLUDED.channel, type = EXCLUDED.type, blob = EXCLUDED.blob;
 
@@ -183,6 +183,7 @@ BEGIN
         WHERE task_id = '00000000-0000-0000-0000-000000000001'
           AND checkpoint_id = 'cp-1'
           AND idx = 0
+          AND writer_task_id = 'writer-1'
     ) THEN
         RAISE EXCEPTION 'checkpoint_writes insert failed';
     END IF;
