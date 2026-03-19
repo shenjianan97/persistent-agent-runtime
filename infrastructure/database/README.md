@@ -7,7 +7,6 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 - `migrations/0001_phase1_durable_execution.sql`: initial schema for `tasks`, `checkpoints`, and `checkpoint_writes`
 - `migrations/0002_worker_registry.sql`: `workers` table for worker self-registration and heartbeat tracking
 - `migrations/0003_dynamic_models.sql`: provider keys and model pricing tables
-- `migrations/0004_checkpoint_write_writer_task_id.sql`: stores LangGraph writer task ids alongside pending writes
 - `tests/verification.sql`: integration-style verification of the shipped schema and canonical query patterns
 - `verify_schema.sh`: launches or reuses a disposable PostgreSQL container and runs the verification suite
 
