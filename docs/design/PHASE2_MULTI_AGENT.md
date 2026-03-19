@@ -14,7 +14,7 @@
 - Cost-aware scheduling: per-agent budgets, tasks paused (not failed) when budget is exceeded
 - Long-term memory: append-only S3 entries with LLM-based compaction
 - Custom Tool Runtime (BYOT): customer-provided MCP servers running in platform-managed isolated containers
-- `waiting_for_approval` task status for human-in-the-loop workflows
+- `waiting_for_approval` and `waiting_for_input` task statuses for human-in-the-loop workflows
 - Non-idempotent tool guards: `idempotent: true|false` annotation on MCP tool schema, checkpoint-before-call for mutable tools, dead-letter on re-execution after crash
 - Redrive checkpoint rollback: `rollback_last_checkpoint` option on `POST /redrive`
 - Mid-node task cancellation during in-flight LLM/tool calls
@@ -268,7 +268,34 @@ Even after migration to Secrets Manager, secrets remain operational configuratio
 
 ---
 
-## 7. Reliability Additions
+## 7. Human-in-the-Loop Input
+
+Phase 2 adds two distinct human-in-the-loop mechanisms, both built on LangGraph's `interrupt()` primitive.
+
+### Approval gates (`waiting_for_approval`)
+
+When a non-idempotent tool is about to execute, the graph executor pauses the task and transitions it to `waiting_for_approval`. A human reviews the pending action and either approves or rejects it via the API.
+
+- `POST /v1/tasks/{id}/approve` — resumes execution, the tool call proceeds
+- `POST /v1/tasks/{id}/reject` — resumes execution with the rejection reason injected as a tool error, allowing the agent to adjust its plan
+
+### Freeform input (`waiting_for_input`)
+
+When the agent determines it needs clarification or additional information from the user, it can invoke a built-in `request_human_input` tool. This pauses the task and transitions it to `waiting_for_input`, surfacing a prompt message to the user.
+
+- `POST /v1/tasks/{id}/respond` — accepts `{ "message": "..." }`, injects the human response into the conversation as a `HumanMessage`, and resumes graph execution
+- The prompt message is stored on the task record (e.g., `pending_input_prompt`) so the Console and API can display what the agent is asking
+
+### Shared semantics
+
+- Both `waiting_for_approval` and `waiting_for_input` are durable pause states — the task holds its lease, heartbeat continues, and the checkpoint is persisted before pausing
+- Tasks in either state do not count against the agent's `max_concurrent_tasks` limit (they are not consuming compute)
+- A configurable timeout (default: 24 hours) auto-transitions unanswered tasks to `dead_letter` with reason `human_input_timeout`
+- The Console UI surfaces pending approval/input tasks in a dedicated queue with the agent's prompt and action context
+
+---
+
+## 8. Reliability Additions
 
 Phase 2 extends the Phase 1 recovery model with:
 
