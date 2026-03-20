@@ -11,7 +11,7 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 | [Task 5](./agent_tasks/task-5-mcp-server.md) | Co-located MCP Server | Done | Added a FastMCP-based in-process tool server exposing `web_search`, `read_url`, and `calculator`, plus worker-service documentation and test coverage. |
 | [Task 6](./agent_tasks/task-6-graph-executor.md) | Graph Executor | Done | Graph assembly, failure classification, retryable/non-retryable handling, cost tracking, unit/integration testing. |
 | [Task 7](./agent_tasks/task-7-console.md) | Console | Done | Dashboard, task list, task dispatcher, execution telemetry, dead letter queue. Brutalist dark-mode UI with IBM Plex Mono + Syne fonts. |
-| [Task 8](./agent_tasks/task-8-aws-infrastructure.md) | AWS Cloud Infrastructure | Todo | Not started. |
+| [Task 8](./agent_tasks/task-8-aws-infrastructure.md) | AWS Cloud Infrastructure | Done | Added CDK network/data/compute stacks, service container packaging, schema bootstrap + model discovery deployment hooks, and infrastructure deployment docs. |
 
 ## Notes
 - Task 1 must be completed before downstream components that rely on the schema can be fully tested.
@@ -20,3 +20,10 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 - Task 6 depends on 3, 4, and 5.
 - Task 7 (Demo Dashboard) depends on Task 2 (API Service) for endpoint consumption.
 - Task 8 can be worked on in parallel with all other tasks but is required for cloud deployment.
+
+## Task 8 — CDK Test Fix (Post-Completion)
+- **Issue:** `npm test` in `infrastructure/cdk/` failed during synth-time with `CannotFindFile: api-image.Dockerfile`.
+- **Root cause:** Stale compiled `.js` files (`compute-stack.js`, `data-stack.js`, `network-stack.js`) in `infrastructure/cdk/lib/` shadowed the TypeScript sources during ts-jest module resolution. These artifacts were from an earlier iteration that used different Dockerfile paths and lacked `unitTestMode` support. Node resolved `.js` over `.ts`, bypassing the test-mode Docker image stubs.
+- **Fix:** Deleted the three stale `.js` files (already covered by `.gitignore` pattern `infrastructure/cdk/lib/*.js`). No source code changes needed.
+- **Prevention:** The `.gitignore` already excludes compiled output from `lib/`. If stale artifacts reappear locally, run `rm infrastructure/cdk/lib/*.js` before testing.
+- **Verified:** `cd infrastructure/cdk && npm run build` passes; `cd infrastructure/cdk && npm test -- --runInBand` passes (4/4 tests, all 3 stacks synthesize cleanly).

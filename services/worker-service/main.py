@@ -5,15 +5,15 @@ Usage:
     python main.py
 
 Environment:
-    DB_DSN  PostgreSQL connection string (default: postgresql://localhost:55432/agent_runtime)
-    At least one LLM API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.)
+    DB_DSN  PostgreSQL connection string.
+    Or split DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD values.
     TAVILY_API_KEY for web_search tool (optional)
 """
 
 import asyncio
 import logging
 import os
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from core.config import WorkerConfig
 from core.db import create_pool
@@ -21,27 +21,47 @@ from core.worker import WorkerService
 from executor.router import DefaultTaskRouter
 
 
-_LLM_KEY_VARS = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
-
-
-def _check_env():
-    """Log which API keys are available at startup."""
+def _log_runtime_env() -> None:
+    """Log the runtime features available to the worker."""
     logger = logging.getLogger(__name__)
-
-    found_llm = False
-    for var in _LLM_KEY_VARS:
-        key = os.environ.get(var)
-        if key:
-            masked = key[:12] + "..." + key[-4:]
-            logger.info("%s is set (%s)", var, masked)
-            found_llm = True
-    if not found_llm:
-        logger.warning("No LLM API keys found — set at least one of: %s", ", ".join(_LLM_KEY_VARS))
 
     if os.environ.get("TAVILY_API_KEY"):
         logger.info("TAVILY_API_KEY is set")
     else:
         logger.info("TAVILY_API_KEY is not set — web_search tool will be unavailable")
+
+
+def _build_db_dsn() -> str:
+    """Resolve the PostgreSQL connection string from either direct or split env vars."""
+    dsn = os.environ.get("DB_DSN")
+    if dsn:
+        return dsn
+
+    required_vars = ("DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD")
+    values = {name: os.environ.get(name) for name in required_vars}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "DB_DSN is not set and the following split DB env vars are missing: "
+            f"{', '.join(missing)}"
+        )
+
+    netloc = (
+        f"{quote(values['DB_USER'], safe='')}:{quote(values['DB_PASSWORD'], safe='')}@"
+        f"{values['DB_HOST']}"
+    )
+    if values["DB_PORT"]:
+        netloc = f"{netloc}:{values['DB_PORT']}"
+
+    return urlunsplit(
+        (
+            "postgresql",
+            netloc,
+            f"/{quote(values['DB_NAME'], safe='')}",
+            "",
+            "",
+        )
+    )
 
 
 def _format_db_endpoint(dsn: str) -> str:
@@ -60,15 +80,13 @@ async def main():
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    _check_env()
+    _log_runtime_env()
 
-    dsn = os.environ.get("DB_DSN")
-    if not dsn:
-        logging.getLogger(__name__).error(
-            "DB_DSN environment variable is not set. "
-            "Example: export DB_DSN=\"postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime\""
-        )
-        raise SystemExit(1)
+    try:
+        dsn = _build_db_dsn()
+    except RuntimeError as exc:
+        logging.getLogger(__name__).error(str(exc))
+        raise SystemExit(1) from exc
 
     logging.getLogger(__name__).info("Worker DB endpoint: %s", _format_db_endpoint(dsn))
 

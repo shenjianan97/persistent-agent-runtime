@@ -1,0 +1,10 @@
+.git
+.gradle
+build
+out
+.idea
+*.iml
+*.log
+src/test
+api_integration_test.py
+README.md

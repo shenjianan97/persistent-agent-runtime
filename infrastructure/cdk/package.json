@@ -1,0 +1,30 @@
+{
+  "name": "persistent-agent-runtime-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --runInBand",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.244.0",
+    "constructs": "^10.4.2",
+    "@aws-sdk/client-secrets-manager": "^3.1013.0",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.13.10",
+    "@types/aws-lambda": "^8.10.147",
+    "@types/pg": "^8.11.11",
+    "esbuild": "^0.27.4",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

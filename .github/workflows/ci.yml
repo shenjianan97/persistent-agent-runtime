@@ -8,6 +8,30 @@ on:
 jobs:
   # ── Fast unit tests (no database) ─────────────────────────────────────────
 
+  cdk-tests:
+    name: CDK Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: infrastructure/cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: infrastructure/cdk
+        run: npm ci
+
+      - name: Run CDK build
+        working-directory: infrastructure/cdk
+        run: npm run build
+
+      - name: Run CDK tests
+        working-directory: infrastructure/cdk
+        run: npm test -- --runInBand
+
   api-unit-tests:
     name: API Unit Tests
     runs-on: ubuntu-latest

@@ -1,0 +1,11 @@
+.git
+.vite
+dist
+node_modules
+coverage
+*.log
+.env
+.env.local
+.env.development
+.env.production
+README.md
