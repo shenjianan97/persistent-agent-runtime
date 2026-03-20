@@ -14,13 +14,10 @@ public class CorsConfig implements WebMvcConfigurer {
     @Override
     @SuppressWarnings("null")
     public void addCorsMappings(CorsRegistry registry) {
-        if (allowedOriginsRaw == null || allowedOriginsRaw.isBlank()) {
-            // No explicit origins configured — allow any origin (Phase 1: internal ALB, no auth)
-            registry.addMapping("/v1/**")
-                    .allowedOriginPatterns("*")
-                    .allowedMethods("GET", "POST", "OPTIONS")
-                    .allowedHeaders("*");
-        } else {
+        if (allowedOriginsRaw != null && !allowedOriginsRaw.isBlank()) {
+            // Only register CORS mappings when explicit origins are configured (local dev).
+            // In deployed environments (same-origin behind ALB), no CORS config is needed —
+            // omitting the mapping means Spring won't activate its CORS interceptor at all.
             registry.addMapping("/v1/**")
                     .allowedOrigins(allowedOriginsRaw.split(","))
                     .allowedMethods("GET", "POST", "OPTIONS")
