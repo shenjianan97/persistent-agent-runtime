@@ -198,3 +198,20 @@ Please refer to the following tasks in the `agent_tasks/` directory:
 - [Task 8: AWS Cloud Infrastructure](./agent_tasks/task-8-aws-infrastructure.md)
 
 Tracking of these tasks can be found in [progress.md](./progress.md).
+
+---
+
+### SECTION C — Task 8 Progress Tracking
+
+**Status (2026-03-19):** Implementation complete and ready for AWS account validation.
+
+Completed work:
+- CDK app scaffolded under `infrastructure/cdk/` with Network, Data, and Compute stacks.
+- Aurora Serverless v2, imported Secrets Manager references, schema bootstrap, ECS services, internal ALB, access host, and Model Discovery scheduling/initial invocation wired.
+- Service-owned Dockerfiles and `.dockerignore` files added for API, Worker, Console, and Model Discovery packaging.
+- Worker and console runtime compatibility updated for split DB env vars and same-origin production API requests.
+- Infrastructure README and CDK assertion coverage added.
+
+Verification:
+- Service-side console build and Python syntax/import checks passed locally.
+- Live AWS bootstrap/deploy remains pending AWS credentials and account access.

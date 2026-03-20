@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
+import json
 import os
 import sys
-import json
-import urllib.request
 import urllib.error
+import urllib.request
 from urllib.error import HTTPError
+from typing import Any, Mapping
+
 import psycopg
 
 # Prices in microdollars per million tokens (e.g. 3,000,000 = $3.00)
@@ -32,6 +36,14 @@ PRICING_FALLBACKS = {
     "openai": {"input": 15_000_000, "output": 60_000_000},
 }
 
+LOCK_ID = 543210987
+DB_CREDENTIALS_SECRET_ENV = "DB_CREDENTIALS_SECRET_ARN"
+PROVIDER_SOURCES = (
+    ("anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_SECRET_ARN"),
+    ("openai", "OPENAI_API_KEY", "OPENAI_API_KEY_SECRET_ARN"),
+)
+
+
 def resolve_model_pricing(provider_id, model_id):
     pricing = PRICING_DEFAULTS.get(model_id)
     if pricing:
@@ -44,19 +56,93 @@ def resolve_model_pricing(provider_id, model_id):
     )
     return dict(fallback)
 
+
+def _load_secret_text(secret_arn: str) -> str:
+    try:
+        import boto3
+    except ImportError as exc:  # pragma: no cover - boto3 exists in Lambda runtime
+        raise RuntimeError(
+            "boto3 is required to resolve Secrets Manager ARNs at runtime"
+        ) from exc
+
+    client = boto3.client("secretsmanager")
+    response = client.get_secret_value(SecretId=secret_arn)
+    secret_text = response.get("SecretString")
+    if secret_text is None:
+        secret_binary = response.get("SecretBinary")
+        if secret_binary is None:
+            raise RuntimeError(f"Secret {secret_arn!r} did not contain a string payload")
+        if isinstance(secret_binary, bytes):
+            secret_text = secret_binary.decode("utf-8")
+        else:
+            secret_text = bytes(secret_binary).decode("utf-8")
+    return secret_text.strip()
+
+
+def _load_secret_json(secret_arn: str) -> Mapping[str, Any]:
+    return json.loads(_load_secret_text(secret_arn))
+
+
+def _coerce_port(value: Any) -> Any:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return value
+
+
+def _resolve_db_connection_kwargs() -> dict[str, Any]:
+    dsn = os.environ.get("DB_DSN")
+    if dsn:
+        return {"conninfo": dsn}
+
+    credentials: Mapping[str, Any] = {}
+    credentials_secret_arn = os.environ.get(DB_CREDENTIALS_SECRET_ENV)
+    if credentials_secret_arn:
+        credentials = _load_secret_json(credentials_secret_arn)
+
+    host = credentials.get("host") or os.environ.get("DB_HOST", "localhost")
+    port = credentials.get("port") or os.environ.get("DB_PORT", "55432")
+    dbname = (
+        credentials.get("dbname")
+        or credentials.get("database")
+        or os.environ.get("DB_NAME", "persistent_agent_runtime")
+    )
+    user = credentials.get("username") or credentials.get("user") or os.environ.get("DB_USER", "postgres")
+    password = credentials.get("password") or os.environ.get("DB_PASSWORD", "postgres")
+
+    return {
+        "host": host,
+        "port": _coerce_port(port),
+        "dbname": dbname,
+        "user": user,
+        "password": password,
+    }
+
+
 def get_db_connection():
-    db_dsn = os.environ.get("DB_DSN")
-    if db_dsn:
-        return psycopg.connect(db_dsn)
-        
-    host = os.environ.get("DB_HOST", "localhost")
-    port = os.environ.get("DB_PORT", "55432")
-    user = os.environ.get("DB_USER", "postgres")
-    password = os.environ.get("DB_PASSWORD", "postgres")
-    dbname = os.environ.get("DB_NAME", "persistent_agent_runtime")
-    
-    conninfo = f"host={host} port={port} user={user} password={password} dbname={dbname}"
-    return psycopg.connect(conninfo)
+    params = _resolve_db_connection_kwargs()
+    return psycopg.connect(**params)
+
+
+def _load_provider_api_keys() -> dict[str, str]:
+    provider_keys: dict[str, str] = {}
+
+    for provider_id, env_var, secret_env_var in PROVIDER_SOURCES:
+        api_key = os.environ.get(env_var)
+        source = "environment"
+        if not api_key:
+            secret_arn = os.environ.get(secret_env_var)
+            if secret_arn:
+                api_key = _load_secret_text(secret_arn)
+                source = "Secrets Manager"
+
+        if api_key:
+            provider_keys[provider_id] = api_key.strip()
+            print(f"[Discovery] Loaded {provider_id} API key from {source}")
+
+    return provider_keys
+
 
 def fetch_anthropic_models(api_key):
     print("[Discovery] Querying Anthropic models...")
@@ -65,7 +151,7 @@ def fetch_anthropic_models(api_key):
         headers={
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
-        }
+        },
     )
     models = []
     try:
@@ -73,15 +159,18 @@ def fetch_anthropic_models(api_key):
             data = json.loads(response.read().decode())
             for m in data.get("data", []):
                 if m.get("type") == "model":
-                    models.append({
-                        "id": m["id"],
-                        "display_name": m.get("display_name") or m["id"]
-                    })
+                    models.append(
+                        {
+                            "id": m["id"],
+                            "display_name": m.get("display_name") or m["id"],
+                        }
+                    )
     except HTTPError as e:
         print(f"[Discovery] Failed to fetch Anthropic models: HTTP {e.code}")
     except Exception as e:
         print(f"[Discovery] Failed to fetch Anthropic models: {e}")
     return models
+
 
 def fetch_openai_models(api_key):
     print("[Discovery] Querying OpenAI models...")
@@ -89,7 +178,7 @@ def fetch_openai_models(api_key):
         "https://api.openai.com/v1/models",
         headers={
             "Authorization": f"Bearer {api_key}",
-        }
+        },
     )
     models = []
     try:
@@ -99,114 +188,149 @@ def fetch_openai_models(api_key):
                 # Filter to chat models only to avoid cluttering UI with whisper/dall-e/tts
                 m_id = m["id"]
                 if m_id.startswith("gpt-") or m_id.startswith("o1") or m_id.startswith("o3"):
-                    models.append({
-                        "id": m_id,
-                        "display_name": m_id
-                    })
+                    models.append(
+                        {
+                            "id": m_id,
+                            "display_name": m_id,
+                        }
+                    )
     except HTTPError as e:
         print(f"[Discovery] Failed to fetch OpenAI models: HTTP {e.code}")
     except Exception as e:
         print(f"[Discovery] Failed to fetch OpenAI models: {e}")
     return models
 
-def upsert_models(conn, num_providers_found):
-    print(f"[Discovery] Starting database sync (found {num_providers_found} provider keys)")
-    
-    # Use a PostgreSQL advisory lock to prevent concurrent writers from interfering
-    LOCK_ID = 543210987
-    
+
+def _fetch_models(provider_id: str, api_key: str) -> list[dict[str, str]]:
+    if provider_id == "anthropic":
+        return fetch_anthropic_models(api_key)
+    if provider_id == "openai":
+        return fetch_openai_models(api_key)
+    print(f"[Discovery] Skipping unsupported provider: {provider_id}")
+    return []
+
+
+def _delete_stale_provider_data(cur, configured_provider_ids: set[str]) -> list[str]:
+    cur.execute("SELECT provider_id FROM provider_keys ORDER BY provider_id")
+    existing_provider_ids = {row[0] for row in cur.fetchall()}
+    stale_provider_ids = sorted(existing_provider_ids.difference(configured_provider_ids))
+    if not stale_provider_ids:
+        return []
+
+    cur.execute("DELETE FROM models WHERE provider_id = ANY(%s)", (stale_provider_ids,))
+    deleted_models = cur.rowcount
+    cur.execute("DELETE FROM provider_keys WHERE provider_id = ANY(%s)", (stale_provider_ids,))
+    deleted_keys = cur.rowcount
+    print(
+        "[Discovery] Removed stale provider metadata for "
+        f"{', '.join(stale_provider_ids)} "
+        f"({deleted_keys} key rows, {deleted_models} model rows)"
+    )
+    return stale_provider_ids
+
+
+def upsert_models(conn, provider_keys):
+    configured_provider_ids = set(provider_keys)
+    print(
+        "[Discovery] Starting database sync (configured providers: "
+        f"{', '.join(sorted(configured_provider_ids)) or 'none'})"
+    )
+
     with conn.cursor() as cur:
         cur.execute("SELECT pg_advisory_lock(%s)", (LOCK_ID,))
         try:
-            # First, mark everything inactive. We will exclusively reactivate what we find.
+            stale_provider_ids = _delete_stale_provider_data(cur, configured_provider_ids)
+
+            # First, mark all remaining models inactive. We will exclusively reactivate what we find.
             cur.execute("UPDATE models SET is_active = false")
-            
-            # --- Anthropic ---
-            anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-            if anthropic_key:
-                cur.execute("""
+
+            for provider_id, api_key in provider_keys.items():
+                cur.execute(
+                    """
                     INSERT INTO provider_keys (provider_id, api_key, updated_at)
-                    VALUES ('anthropic', %s, NOW())
-                    ON CONFLICT (provider_id) DO UPDATE SET api_key = EXCLUDED.api_key, updated_at = NOW()
-                """, (anthropic_key,))
-                
-                models = fetch_anthropic_models(anthropic_key)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (provider_id) DO UPDATE
+                    SET api_key = EXCLUDED.api_key, updated_at = NOW()
+                    """,
+                    (provider_id, api_key),
+                )
+
+                models = _fetch_models(provider_id, api_key)
                 for m in models:
-                    pricing = resolve_model_pricing("anthropic", m["id"])
-                    cur.execute("""
-                        INSERT INTO models (model_id, provider_id, display_name, input_microdollars_per_million, output_microdollars_per_million, is_active, created_at)
-                        VALUES (%s, 'anthropic', %s, %s, %s, true, NOW())
+                    pricing = resolve_model_pricing(provider_id, m["id"])
+                    cur.execute(
+                        """
+                        INSERT INTO models (
+                            model_id,
+                            provider_id,
+                            display_name,
+                            input_microdollars_per_million,
+                            output_microdollars_per_million,
+                            is_active,
+                            created_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, true, NOW())
                         ON CONFLICT (provider_id, model_id) DO UPDATE SET
                             is_active = true,
                             display_name = EXCLUDED.display_name,
                             input_microdollars_per_million = EXCLUDED.input_microdollars_per_million,
                             output_microdollars_per_million = EXCLUDED.output_microdollars_per_million
-                    """, (m["id"], m["display_name"], pricing["input"], pricing["output"]))
-            
-            # --- OpenAI ---
-            openai_key = os.environ.get("OPENAI_API_KEY")
-            if openai_key:
-                cur.execute("""
-                    INSERT INTO provider_keys (provider_id, api_key, updated_at)
-                    VALUES ('openai', %s, NOW())
-                    ON CONFLICT (provider_id) DO UPDATE SET api_key = EXCLUDED.api_key, updated_at = NOW()
-                """, (openai_key,))
-                
-                models = fetch_openai_models(openai_key)
-                for m in models:
-                    pricing = resolve_model_pricing("openai", m["id"])
-                    cur.execute("""
-                        INSERT INTO models (model_id, provider_id, display_name, input_microdollars_per_million, output_microdollars_per_million, is_active, created_at)
-                        VALUES (%s, 'openai', %s, %s, %s, true, NOW())
-                        ON CONFLICT (provider_id, model_id) DO UPDATE SET
-                            is_active = true,
-                            display_name = EXCLUDED.display_name,
-                            input_microdollars_per_million = EXCLUDED.input_microdollars_per_million,
-                            output_microdollars_per_million = EXCLUDED.output_microdollars_per_million
-                    """, (m["id"], m["display_name"], pricing["input"], pricing["output"]))
-                    
-            # --- AWS Bedrock (Example Future Integration) ---
-            # bedrock_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
-            # bedrock_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
-            # bedrock_region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-            # if bedrock_access_key and bedrock_secret_key:
-            #     # Encode credentials securely into the single string column
-            #     api_key_str = f"{bedrock_access_key}:{bedrock_secret_key}:{bedrock_region}"
-            #     cur.execute("""
-            #         INSERT INTO provider_keys (provider_id, api_key, updated_at)
-            #         VALUES ('bedrock', %s, NOW())
-            #         ON CONFLICT (provider_id) DO UPDATE SET api_key = EXCLUDED.api_key, updated_at = NOW()
-            #     """, (api_key_str,))
-            #     
-            #     # Example boto3 fetching routine:
-            #     # import boto3
-            #     # client = boto3.client('bedrock', region_name=bedrock_region, ...)
-            #     # models = client.list_foundation_models(byOutputModality='TEXT')
-            #     # for m in models.get('modelSummaries', []):
-            #     #     # Execute INSERT into models using m['modelId'] and 'bedrock' provider...
-            
+                        """,
+                        (m["id"], provider_id, m["display_name"], pricing["input"], pricing["output"]),
+                    )
+
             conn.commit()
-            
+
             cur.execute("SELECT COUNT(*) FROM models WHERE is_active = true")
             active_count = cur.fetchone()[0]
-            print(f"[Discovery] Sync complete. {active_count} models are currently active.")
-            
+            if configured_provider_ids:
+                print(
+                    f"[Discovery] Sync complete. {active_count} models are currently active."
+                )
+            else:
+                print(
+                    "[Discovery] No provider secrets configured; cleared stale provider "
+                    f"data for {len(stale_provider_ids)} provider(s) and left {active_count} active models."
+                )
+
+            return {
+                "configured_providers": sorted(configured_provider_ids),
+                "active_models": active_count,
+                "stale_providers_removed": stale_provider_ids,
+            }
+
         finally:
             cur.execute("SELECT pg_advisory_unlock(%s)", (LOCK_ID,))
             conn.commit()
 
-if __name__ == "__main__":
-    found = 0
-    if os.environ.get("ANTHROPIC_API_KEY"): found += 1
-    if os.environ.get("OPENAI_API_KEY"): found += 1
-    
-    if found == 0:
-        print("[Discovery] WARNING: No LLM API keys found in environment. No models will be activated.")
-    
+
+def run_discovery() -> dict[str, Any]:
+    provider_keys = _load_provider_api_keys()
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
-        upsert_models(conn, found)
+        return upsert_models(conn, provider_keys)
+    finally:
         conn.close()
+
+
+def lambda_handler(event, context):  # noqa: D401 - AWS Lambda entrypoint
+    """Lambda entrypoint used by the scheduled job and deploy-time invocation."""
+    return run_discovery()
+
+
+def main() -> int:
+    result = run_discovery()
+    print(
+        "[Discovery] Completed discovery run with "
+        f"{result['active_models']} active models across "
+        f"{len(result['configured_providers'])} configured provider(s)."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
     except Exception as e:
         print(f"[Discovery] FATAL ERROR: {e}")
         sys.exit(1)

@@ -94,3 +94,15 @@ dist-ssr/
 
 # Un-ignore frontend lib/ which conflicts with Python lib/ ignore
 !services/console/src/lib/
+!infrastructure/cdk/lib/
+!infrastructure/cdk/lib/**
+
+infrastructure/cdk/dist/
+infrastructure/cdk/cdk.out/
+infrastructure/cdk/bin/*.js
+infrastructure/cdk/bin/*.js.map
+infrastructure/cdk/lib/*.js
+infrastructure/cdk/lib/*.js.map
+infrastructure/cdk/lib/schema-bootstrap/*.js
+infrastructure/cdk/lib/schema-bootstrap/*.js.map
+infrastructure/cdk/lib/compute/
