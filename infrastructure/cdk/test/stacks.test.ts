@@ -141,6 +141,6 @@ describe('Task 8 stacks', () => {
       ScheduleExpression: 'rate(1 day)',
     });
 
-    templates.compute.resourceCountIs('Custom::AWS', 1);
+    templates.compute.resourceCountIs('AWS::CloudFormation::CustomResource', 1);
   });
 });

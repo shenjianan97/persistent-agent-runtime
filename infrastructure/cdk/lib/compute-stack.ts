@@ -2,6 +2,7 @@ import * as path from 'path';
 
 import {
   CfnOutput,
+  CustomResource,
   Duration,
   RemovalPolicy,
   Stack,
@@ -64,7 +65,12 @@ const DEFAULT_ACCESS_HOST_TYPE = 't3.micro';
 const EXECUTION_POLICY = iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AmazonECSTaskExecutionRolePolicy');
 const SSM_POLICY = iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore');
 
-function parseInstanceType(instanceType: string): ec2.InstanceType {
+interface ParsedInstanceType {
+  readonly instanceType: ec2.InstanceType;
+  readonly cpuType: ec2.AmazonLinuxCpuType;
+}
+
+function parseInstanceType(instanceType: string): ParsedInstanceType {
   const [familyToken, sizeToken] = instanceType.toLowerCase().split('.');
   const families: Record<string, ec2.InstanceClass> = {
     t2: ec2.InstanceClass.T2,
@@ -96,9 +102,16 @@ function parseInstanceType(instanceType: string): ec2.InstanceType {
   const family = families[familyToken];
   const size = sizes[sizeToken];
   if (!family || !size) {
-    return ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO);
+    return {
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      cpuType: ec2.AmazonLinuxCpuType.X86_64,
+    };
   }
-  return ec2.InstanceType.of(family, size);
+
+  return {
+    instanceType: ec2.InstanceType.of(family, size),
+    cpuType: familyToken.endsWith('g') ? ec2.AmazonLinuxCpuType.ARM_64 : ec2.AmazonLinuxCpuType.X86_64,
+  };
 }
 
 function logGroup(scope: Construct, id: string): logs.LogGroup {
@@ -121,7 +134,7 @@ export class ComputeStack extends Stack {
   public readonly apiService: ecs.FargateService;
   public readonly consoleService: ecs.FargateService;
   public readonly workerService: ecs.FargateService;
-  public readonly modelDiscoveryFunction: lambda.IFunction;
+  public readonly modelDiscoveryFunction: lambda.Function;
 
   constructor(scope: Construct, id: string, props: ComputeStackProps) {
     super(scope, id, props);
@@ -129,6 +142,7 @@ export class ComputeStack extends Stack {
     const workerDesiredCount = props.workerDesiredCount;
     const accessHostInstanceType = props.accessHostInstanceType ?? DEFAULT_ACCESS_HOST_TYPE;
     const unitTestMode = props.unitTestMode ?? false;
+    const parsedAccessHostInstance = parseInstanceType(accessHostInstanceType);
 
     const { accessHost: accessHostSg, alb, api, console: consoleSg, worker, lambda: lambdaSg } = props.securityGroups;
     const { database } = props;
@@ -371,29 +385,56 @@ export class ComputeStack extends Stack {
     });
     discoverySchedule.addTarget(new eventsTargets.LambdaFunction(this.modelDiscoveryFunction));
 
-    const initialDiscoveryInvoke = new cr.AwsCustomResource(this, 'InitialModelDiscoveryInvoke', {
-      onCreate: {
-        service: 'Lambda',
-        action: 'invoke',
-        parameters: {
-          FunctionName: this.modelDiscoveryFunction.functionName,
-          InvocationType: 'RequestResponse',
-        },
-        physicalResourceId: cr.PhysicalResourceId.of(`initial-model-discovery-${props.envName}`),
-      },
-      onUpdate: {
-        service: 'Lambda',
-        action: 'invoke',
-        parameters: {
-          FunctionName: this.modelDiscoveryFunction.functionName,
-          InvocationType: 'RequestResponse',
-        },
-        physicalResourceId: cr.PhysicalResourceId.of(`initial-model-discovery-${props.envName}`),
-      },
-      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
-        resources: [this.modelDiscoveryFunction.functionArn],
-      }),
+    const initialDiscoveryHandler = new lambda.Function(this, 'InitialModelDiscoveryHandler', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: Duration.seconds(120),
+      memorySize: 256,
       logRetention: logs.RetentionDays.ONE_MONTH,
+      code: lambda.Code.fromInline(`
+import boto3
+
+lambda_client = boto3.client("lambda")
+
+def handler(event, context):
+    physical_resource_id = event.get("PhysicalResourceId", "initial-model-discovery")
+    if event["RequestType"] == "Delete":
+        return {"PhysicalResourceId": physical_resource_id}
+
+    function_name = event["ResourceProperties"]["FunctionName"]
+    response = lambda_client.invoke(
+        FunctionName=function_name,
+        InvocationType="RequestResponse",
+    )
+
+    payload_bytes = response["Payload"].read()
+    payload_text = payload_bytes.decode("utf-8") if payload_bytes else ""
+
+    if response.get("FunctionError"):
+        raise RuntimeError(
+            f"Model discovery invoke failed with {response['FunctionError']}: {payload_text}"
+        )
+
+    return {
+        "PhysicalResourceId": physical_resource_id,
+        "Data": {"Payload": payload_text},
+    }
+`),
+    });
+    this.modelDiscoveryFunction.grantInvoke(initialDiscoveryHandler);
+
+    const initialDiscoveryProvider = new cr.Provider(this, 'InitialModelDiscoveryProvider', {
+      onEventHandler: initialDiscoveryHandler,
+    });
+
+    const initialDiscoveryInvoke = new CustomResource(this, 'InitialModelDiscoveryInvoke', {
+      serviceToken: initialDiscoveryProvider.serviceToken,
+      properties: {
+        FunctionName: this.modelDiscoveryFunction.functionName,
+        FunctionRevision: this.modelDiscoveryFunction.currentVersion.functionArn,
+        AnthropicSecretArn: props.anthropicSecret?.secretArn ?? '',
+        OpenAiSecretArn: props.openaiSecret?.secretArn ?? '',
+      },
     });
     if (props.schemaBootstrapReady) {
       initialDiscoveryInvoke.node.addDependency(props.schemaBootstrapReady);
@@ -403,8 +444,10 @@ export class ComputeStack extends Stack {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       securityGroup: accessHostSg,
-      instanceType: parseInstanceType(accessHostInstanceType),
-      machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+      instanceType: parsedAccessHostInstance.instanceType,
+      machineImage: ec2.MachineImage.latestAmazonLinux2023({
+        cpuType: parsedAccessHostInstance.cpuType,
+      }),
       role: new iam.Role(this, 'AccessHostRole', {
         assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
         managedPolicies: [SSM_POLICY],
