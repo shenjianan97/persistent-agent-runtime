@@ -62,6 +62,10 @@ make dev
 
 For detailed setup options, environment variables, timing configuration, and manual database setup, see [`docs/LOCAL_DEVELOPMENT.md`](./docs/LOCAL_DEVELOPMENT.md).
 
+### Deploy to AWS
+
+For a full AWS deployment (Aurora Serverless v2, ECS Fargate, internal ALB, SSM access), see [`infrastructure/README.md`](./infrastructure/README.md).
+
 ### Useful Entry Points
 
 - API service: [`services/api-service/README.md`](./services/api-service/README.md)
@@ -101,9 +105,14 @@ Implemented or substantially defined already:
 - Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
 - End-to-end test coverage for crash recovery and lifecycle behavior
 
+AWS deployment (validated end-to-end):
+
+- CDK infrastructure: VPC, Aurora Serverless v2, ECS Fargate, internal ALB, SSM access host
+- Automated schema bootstrap and model discovery on deploy
+- Full deployment walkthrough: see [`infrastructure/README.md`](./infrastructure/README.md)
+
 Still evolving:
 
-- AWS infrastructure and deployment flow (Task 8)
 - Later-phase multi-agent scheduling and budget enforcement
 
 ## Design Documents

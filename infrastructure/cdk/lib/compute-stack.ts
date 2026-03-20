@@ -204,16 +204,19 @@ export class ComputeStack extends Stack {
       ? ecs.ContainerImage.fromRegistry('public.ecr.aws/docker/library/nginx:1.27-alpine')
       : ecs.ContainerImage.fromDockerImageAsset(new ecrAssets.DockerImageAsset(this, 'ApiImageAsset', {
           directory: path.join(PROJECT_ROOT, 'services/api-service'),
+          platform: ecrAssets.Platform.LINUX_AMD64,
         }));
     const consoleImage = unitTestMode
       ? ecs.ContainerImage.fromRegistry('public.ecr.aws/docker/library/nginx:1.27-alpine')
       : ecs.ContainerImage.fromDockerImageAsset(new ecrAssets.DockerImageAsset(this, 'ConsoleImageAsset', {
           directory: path.join(PROJECT_ROOT, 'services/console'),
+          platform: ecrAssets.Platform.LINUX_AMD64,
         }));
     const workerImage = unitTestMode
       ? ecs.ContainerImage.fromRegistry('public.ecr.aws/docker/library/python:3.11-slim')
       : ecs.ContainerImage.fromDockerImageAsset(new ecrAssets.DockerImageAsset(this, 'WorkerImageAsset', {
           directory: path.join(PROJECT_ROOT, 'services/worker-service'),
+          platform: ecrAssets.Platform.LINUX_AMD64,
         }));
     const apiTaskRole = ecsRole(this, 'ApiTaskRole');
     const apiTaskDefinition = new ecs.FargateTaskDefinition(this, 'ApiTaskDefinition', {
@@ -357,7 +360,9 @@ export class ComputeStack extends Stack {
     } else {
       this.modelDiscoveryFunction = new lambda.DockerImageFunction(this, 'ModelDiscoveryFunction', {
         functionName: `par-${props.envName}-model-discovery`,
-        code: lambda.DockerImageCode.fromImageAsset(path.join(PROJECT_ROOT, 'services/model-discovery')),
+        code: lambda.DockerImageCode.fromImageAsset(path.join(PROJECT_ROOT, 'services/model-discovery'), {
+          platform: ecrAssets.Platform.LINUX_AMD64,
+        }),
         memorySize: 256,
         timeout: Duration.seconds(120),
         architecture: lambda.Architecture.X86_64,
