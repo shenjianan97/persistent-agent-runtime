@@ -42,6 +42,8 @@ interface MigrationFile {
   readonly sql: string;
 }
 
+const CANONICAL_MIGRATIONS_DIR = path.join(__dirname, '../../database/migrations');
+
 function secretFromIdentifier(scope: Construct, id: string, identifier?: string): ImportedSecretReference {
   if (!identifier) {
     return {};
@@ -53,13 +55,12 @@ function secretFromIdentifier(scope: Construct, id: string, identifier?: string)
 }
 
 function loadMigrationFiles(): MigrationFile[] {
-  const migrationsDir = path.join(__dirname, 'schema-bootstrap', 'migrations');
   return fs
-    .readdirSync(migrationsDir)
+    .readdirSync(CANONICAL_MIGRATIONS_DIR)
     .filter((file) => /^\d{4}_.*\.sql$/.test(file))
     .sort()
     .map((filename) => {
-      const sql = fs.readFileSync(path.join(migrationsDir, filename), 'utf8');
+      const sql = fs.readFileSync(path.join(CANONICAL_MIGRATIONS_DIR, filename), 'utf8');
       const checksum = crypto.createHash('sha256').update(sql).digest('hex');
       return { filename, checksum, sql };
     });
@@ -139,8 +140,12 @@ export class DataStack extends Stack {
           beforeInstall() {
             return [];
           },
-          afterBundling() {
-            return [];
+          afterBundling(_inputDir: string, outputDir: string) {
+            const sourceDir = JSON.stringify(CANONICAL_MIGRATIONS_DIR);
+            const targetDir = JSON.stringify(path.join(outputDir, 'migrations'));
+            return [
+              `node -e 'const fs=require("fs"); const path=require("path"); const source=${sourceDir}; const target=${targetDir}; fs.mkdirSync(target,{recursive:true}); for (const file of fs.readdirSync(source).filter((name)=>/^\\d{4}_.*\\.sql$/.test(name)).sort()) { fs.copyFileSync(path.join(source,file), path.join(target,file)); }'`,
+            ];
           },
         },
       },

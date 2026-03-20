@@ -1,4 +1,6 @@
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { Client } from 'pg';
 
@@ -27,17 +29,19 @@ const secretArn = process.env.DB_CREDENTIALS_SECRET_ARN;
 const secretsClient = new SecretsManagerClient({});
 
 function loadMigrations(): Migration[] {
-  const migrations = [
-    ['0001_phase1_durable_execution.sql', require('./migrations/0001_phase1_durable_execution.sql')],
-    ['0002_worker_registry.sql', require('./migrations/0002_worker_registry.sql')],
-    ['0003_dynamic_models.sql', require('./migrations/0003_dynamic_models.sql')],
-  ] as const;
-
-  return migrations.map(([filename, sql]) => ({
-    filename,
-    checksum: crypto.createHash('sha256').update(sql).digest('hex'),
-    sql,
-  }));
+  const migrationsDir = path.join(__dirname, 'migrations');
+  return fs
+    .readdirSync(migrationsDir)
+    .filter((file) => /^\d{4}_.*\.sql$/.test(file))
+    .sort()
+    .map((filename) => {
+      const sql = fs.readFileSync(path.join(migrationsDir, filename), 'utf8');
+      return {
+        filename,
+        checksum: crypto.createHash('sha256').update(sql).digest('hex'),
+        sql,
+      };
+    });
 }
 
 async function loadDbCredentials(): Promise<SecretPayload> {
