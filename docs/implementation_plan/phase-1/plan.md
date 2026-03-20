@@ -54,8 +54,8 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
 
   Component: AWS Cloud Infrastructure
   Change type: new code
-  Path: `infrastructure/cdk/`, `services/api-service/`, and `services/worker-service/`
-  Description: Provision foundational AWS resources using AWS CDK in TypeScript and implement application containerization assets required for deployment. This includes Docker build contexts for the API and Worker services, image packaging/publication strategy, a VPC, Aurora Serverless v2 PostgreSQL cluster, ECS Fargate services, IAM execution/task roles, and OpenTelemetry/CloudWatch integration.
+  Path: `infrastructure/cdk/`, `services/api-service/`, `services/worker-service/`, `services/console/`, and `services/model-discovery/`
+  Description: Provision foundational AWS resources using AWS CDK in TypeScript and implement application containerization assets required for deployment. This includes Docker build contexts for the API, Worker, and Console services, image packaging/publication strategy, a VPC, Aurora Serverless v2 PostgreSQL cluster, ECS Fargate services (API with CPU autoscaling, Console behind the same ALB, Worker with fixed instance count), an internal ALB reached through an SSM-managed access host, Model Discovery as a scheduled-and-initialized Lambda, imported Secrets Manager references, IAM execution/task roles, schema bootstrap with migration tracking, and CloudWatch integration. The edge layer should be structured so moving to a future public/customer-facing ALB is a contained change.
 
 #### A3. Dependency Graph
 All tasks are mostly independent except where schema or runtime contracts are shared:
@@ -99,7 +99,7 @@ Each task should leave explicit artifacts for downstream consumers:
   A production-ready React SPA with typed API client, live-polling checkpoint timeline, cost charts, and dead letter management, plus CORS configuration in the API Service.
 
   Task 8 output
-  Deployable CDK stacks, API/Worker container build assets (for example Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, and clear instructions for schema bootstrap ordering relative to service rollout.
+  Deployable CDK stacks (Network, Data, Compute), API/Worker/Console container build assets (Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, Console deployment behind the shared ALB, Model Discovery scheduled Lambda plus initial invocation, imported Secrets Manager references, schema bootstrap with migration tracking, and clear instructions for deploy/destroy workflow.
 
 #### A5. Integration Points
   Caller: API Service
@@ -143,11 +143,11 @@ Before implementation begins in earnest, the repo should pin or explicitly docum
 #### A6. Deployment and Rollout Plan
   Infrastructure as Code: AWS CDK must be used to deploy all components. Manual AWS Console configuration or Terraform are prohibited.
   IaC language: TypeScript, matching the project-level stack decision.
-  Containerization: API Service and Worker Service must each have a reproducible container build definition suitable for local verification and ECS deployment; container packaging must not be left implicit.
-  Compute: ECS Fargate for API Service (Java) and Worker Service (Python).
+  Containerization: API Service, Worker Service, and Console Service must each have a reproducible container build definition suitable for local verification and ECS deployment; container packaging must not be left implicit.
+  Compute: ECS Fargate for API Service (Java), Worker Service (Python), and Console Service (containerized SPA served by nginx).
   Database: Amazon Aurora Serverless v2 (PostgreSQL).
-  Networking: Services must run in private subnets with NAT Gateways for external LLM API access.
-  Migration execution: Execute DB schema initialization independently via Infrastructure deployment tools (e.g. AWS CDK Custom Resources) or via dedicated manual script execution prior to API Service launch. Schema logic must be strictly decoupled from Spring Boot/App startup.
+  Networking: ECS services and VPC-attached Lambdas run in private subnets with NAT egress, Aurora runs in isolated subnets, and an internal ALB provides path-based routing for the API and Console. Operator access flows through an SSM-managed access host. The ALB/listener/target-group layout should remain reusable if a future public edge is introduced.
+  Migration execution: Execute DB schema initialization independently via Infrastructure deployment tools (for example an AWS CDK Custom Resource). Schema logic must be strictly decoupled from Spring Boot/App startup and must use migration tracking rather than blind re-execution of all SQL files.
   Rollback trigger and steps: N/A
 
 #### A7. Observability
@@ -160,10 +160,11 @@ Before implementation begins in earnest, the repo should pin or explicitly docum
   Technical risks: Divergent timeline state/billing artifacts if split-brain worker re-processes nodes simultaneously. Mitigated securely by Checkpointer verifying `lease_owner` before flushing payloads.
   Assumptions made:
   - ASSUMPTION: The API Service utilizes Java 21+ alongside Spring Boot 3+. — needs confirmation.
-  - ASSUMPTION: The Worker Service utilizes Python 3.12+ and `asyncpg` for optimized database operations. — needs confirmation.
+  - RESOLVED: The Worker Service utilizes Python 3.11+ (`requires-python = ">=3.11"` in pyproject.toml) and `asyncpg` for optimized database operations.
   - RESOLVED: LangGraph versions are pinned in Section 5.0 of the design doc: `langgraph==1.0.5`, `langgraph-checkpoint==4.0.0`, `langgraph-checkpoint-postgres==3.0.4`.
+  - RESOLVED: The Console uses React 19 + TypeScript with Vite and is deployed in AWS as a containerized SPA behind the same ALB as the API for Phase 1.
   Open questions:
-  - OPEN QUESTION: What frontend technology (e.g. React, Vanilla JS, HTML templates) acts as the foundation for the stretch goal Demo Dashboard? — blocks Demo UI Task.
+  - OPEN QUESTION: None currently blocking orchestration.
 
 #### A9. Orchestrator Guidance
 When assigning tasks to implementation agents:

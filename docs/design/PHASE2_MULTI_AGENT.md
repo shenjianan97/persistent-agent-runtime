@@ -250,7 +250,7 @@ Phase 1 runs discovery as a startup script (like DB migrations). The database sc
 - **Phase 2:** Long-running service — runs continuously, periodically re-syncs models, picks up key rotations from Secrets Manager without restarting any other service. Enables zero-downtime key rotation.
 - **Phase 3+:** Same service extended with per-tenant credential vaults for BYOK support.
 
-The readers never change — only the writer evolves.
+The API Service and Console continue reading model availability from `models`. The writer evolves first; the Worker secret-resolution path hardens in Phase 2 as described below.
 
 ### Secret management hardening (Phase 2)
 
@@ -258,13 +258,112 @@ Phase 1 stores API keys in the `provider_keys` database table (plaintext, accept
 
 Phase 2 hardens this by migrating to AWS Secrets Manager:
 
-- API Service reads keys from Secrets Manager instead of environment variables
-- Workers read keys from Secrets Manager instead of the `provider_keys` table
-- `provider_keys` table is dropped; `models` table remains for pricing and availability
-- rotation without restarting any services
-- least-privilege IAM scoping for API Service, Worker Service, and customer tool runtimes
+- raw provider and tool secrets live in AWS Secrets Manager, not in PostgreSQL
+- the database stores secret references and configuration metadata, not plaintext secret values
+- Workers resolve the required secret at point of use from Secrets Manager instead of reading plaintext from `provider_keys`
+- Model Discovery resolves provider secrets from the same mechanism and writes only model availability/pricing to `models`
+- rotation happens without restarting any services
+- least-privilege IAM scoping applies to API Service, Worker Service, Model Discovery, and customer tool runtimes
 
 Even after migration to Secrets Manager, secrets remain operational configuration, not business data. They must never be stored in `tasks`, `checkpoints`, or `task_events`.
+
+### Phase 2+ idea: unified secret reference model
+
+Phase 2 should move away from treating LLM provider keys as a special case. The same control-plane pattern should work for:
+
+- platform-owned LLM provider credentials
+- built-in tool credentials (for example `web_search`)
+- customer-provided MCP tool runtime credentials
+- future BYOK tenant credentials
+
+The key rule is:
+
+- **raw secrets stay in Secrets Manager**
+- **PostgreSQL stores only references, scope, policy, and audit metadata**
+
+#### Proposed entities
+
+Provider credential registry:
+
+```
+provider_credentials
+  provider_id:          text primary key
+  secret_ref:           text not null         -- Secrets Manager ARN/name
+  credential_scope:     enum(platform)
+  status:               enum(active | disabled | invalid)
+  last_validated_at:    timestamptz
+  last_rotated_at:      timestamptz
+  metadata:             jsonb                 -- optional provider-specific info
+```
+
+Tool credential registry:
+
+```
+tool_credentials
+  credential_id:        uuid primary key
+  tenant_id:            text not null
+  worker_pool_id:       text not null         -- "shared" for built-ins, custom pool for BYOT
+  tool_name:            text not null
+  secret_ref:           text not null         -- Secrets Manager ARN/name
+  exposure_mode:        enum(env | file)      -- how runtime injects it to the MCP server
+  status:               enum(active | disabled | invalid)
+  created_at:           timestamptz
+  updated_at:           timestamptz
+  metadata:             jsonb                 -- endpoint allowlist, alias names, etc.
+```
+
+These tables are not business data stores for secrets. They are registries telling the runtime:
+
+- which secret to load
+- who may use it
+- where it may be injected
+- whether it is currently valid
+
+#### Runtime resolution path
+
+Instead of loading raw keys from PostgreSQL, the runtime uses a shared secret resolver:
+
+1. Task execution determines which provider/tool credential is needed
+2. Worker looks up the reference row in PostgreSQL
+3. Worker or tool runtime fetches the raw secret from Secrets Manager using the stored `secret_ref`
+4. Secret is held in memory briefly, used for the outbound call, then discarded
+5. Secret is never written to checkpoints, task rows, event history, or logs
+
+This gives one consistent pattern for both LLM and tool credentials.
+
+#### Why this is better than storing raw keys in PostgreSQL
+
+- PostgreSQL remains the control plane, not the secret vault
+- IAM can scope which runtime may read which secret
+- key rotation no longer requires rewriting plaintext values in application tables
+- tool credentials and model credentials follow the same operational model
+- future BYOK support can reuse the same registry/resolver path without redesigning the worker
+
+#### Service responsibilities
+
+- **Model Discovery:** loads provider secrets via the resolver, validates them, discovers models, updates `models`, and updates credential status/validation timestamps
+- **Worker Service:** resolves provider credentials only when instantiating the selected model
+- **Built-in tools:** resolve tool credentials from the registry/resolver path instead of reading worker-wide env vars directly
+- **Custom Tool Runtime (BYOT):** receives only the secrets explicitly registered for that tool/runtime, not the Worker's full credential set
+
+#### Injection model for tools
+
+Built-in tools and customer MCP servers should not get a broad bag of env vars from the Worker process. Instead:
+
+- the Worker resolves only the credentials required for the invoked tool
+- credentials are injected into the built-in tool handler or MCP runtime in the narrowest supported form (`env` or mounted file)
+- unrelated credentials are never exposed to the tool process
+
+This is especially important once customer-provided MCP servers exist, because it reduces blast radius if a tool is compromised.
+
+#### Compatibility / migration path
+
+- **Phase 1:** `provider_keys` contains plaintext provider keys; built-in tools like `web_search` still read env vars
+- **Phase 2 initial hardening:** introduce resolver + Secrets Manager-backed provider credentials; keep `models` table unchanged
+- **Phase 2 extension:** move built-in tool credentials onto the same registry/resolver path
+- **Phase 3+:** add tenant-scoped secret ownership and BYOK on top of the same abstraction
+
+The important architectural boundary is that `models` remains the availability/pricing catalog, while credential storage and credential resolution move behind a separate secret-management layer.
 
 ---
 
