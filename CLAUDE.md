@@ -58,16 +58,16 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - Tracking: Created `docs/implementation_plan/phase-1/progress.md` for orchestrator execution tracking
 - POC logic: Created LangGraph POC validation tasks in `experiments/langgraph/` to test assumptions
 
-### Stage 4 — Implementation [IN PROGRESS]
-- Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, graph executor, and console frontend (Tasks 1-7)
+### Stage 4 — Implementation [DONE]
+- Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, graph executor, console frontend, and AWS infrastructure/containerization (Tasks 1-8)
 - Post-Task 7 additions: worker registry table (`0002_worker_registry.sql`), worker self-registration/heartbeat/deregistration, reaper stale-worker cleanup, `GET /v1/tasks` list endpoint, task list UI
-- Remaining: AWS infrastructure and containerization (Task 8)
+- Task 8 additions: AWS CDK app (`infrastructure/cdk/`) with Network/Data/Compute stacks, schema bootstrap custom resource, internal ALB + SSM access host, ECS services, scheduled-and-initial model discovery, service-owned Dockerfiles, and GitHub Actions coverage for CDK build/tests
+- Follow-up fixes landed: canonical migration bundling from `infrastructure/database/migrations/`, initial model-discovery redeploy triggering, failure surfacing for the bootstrap invoke, and access-host AMI architecture matching
 - Source of truth: `docs/implementation_plan/phase-1/progress.md`
 
-### Stage 5 — Validation [NOT STARTED]
-- End-to-end crash-recovery demo
-- Performance testing against scaling numbers
-- Record demo video
+### Stage 5 — Validation [IN PROGRESS]
+- Completed: local CDK build/test verification, console production build verification, worker/model-discovery entrypoint verification
+- Remaining: end-to-end crash-recovery demo, AWS account deployment validation, performance testing against scaling numbers, demo video
 
 ### Stage 6 — Launch / Publish [NOT STARTED]
 - README with setup instructions
