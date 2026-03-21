@@ -8,15 +8,18 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class CorsConfig implements WebMvcConfigurer {
 
-    @Value("${app.cors.allowed-origins:http://localhost:5173,http://localhost:3000}")
-    private String[] allowedOrigins;
+    @Value("${app.cors.allowed-origins:}")
+    private String allowedOriginsRaw;
 
     @Override
     @SuppressWarnings("null")
     public void addCorsMappings(CorsRegistry registry) {
-        if (allowedOrigins != null) {
+        if (allowedOriginsRaw != null && !allowedOriginsRaw.isBlank()) {
+            // Only register CORS mappings when explicit origins are configured (local dev).
+            // In deployed environments (same-origin behind ALB), no CORS config is needed —
+            // omitting the mapping means Spring won't activate its CORS interceptor at all.
             registry.addMapping("/v1/**")
-                    .allowedOrigins(allowedOrigins)
+                    .allowedOrigins(allowedOriginsRaw.split(","))
                     .allowedMethods("GET", "POST", "OPTIONS")
                     .allowedHeaders("*");
         }
