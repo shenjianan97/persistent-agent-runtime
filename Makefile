@@ -21,13 +21,18 @@ MIGRATION_FILES := $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrati
 WORKER_VENV_DIR := $(WORKER_DIR)/.venv
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
 
+PYTHON ?= $(shell command -v python3.11 || command -v python3 || command -v python)
+
 DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
 DB_DSN ?= postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
+DB_HOST ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "localhost")' "$(DB_DSN)")
+DB_PORT ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 55432)' "$(DB_DSN)")
+DB_NAME ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).path.lstrip("/") or "persistent_agent_runtime")' "$(DB_DSN)")
+DB_USER ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).username or "postgres"))' "$(DB_DSN)")
+DB_PASSWORD ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).password or "postgres"))' "$(DB_DSN)")
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
 VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
-
-PYTHON ?= $(shell command -v python3.11 || command -v python3 || command -v python)
 
 # Color Output
 GREEN := \033[0;32m
@@ -190,14 +195,19 @@ start-api:
 start-worker:
 	@mkdir -p $(TMP_DIR)
 	@n=$(N); n=$${n:-$(WORKER_COUNT)}; \
+	pid_is_worker() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+	}; \
 	started=0; skipped=0; \
 	i=1; while [ $$i -le $$n ]; do \
 		pidfile=$(TMP_DIR)/worker-$$i.pid; \
-		if [ -f $$pidfile ] && ps -p $$(cat $$pidfile) > /dev/null 2>&1; then \
+		if [ -f $$pidfile ] && pid_is_worker $$(cat $$pidfile); then \
 			skipped=$$((skipped + 1)); \
 		else \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && python main.py" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python main.py" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); \
 		fi; \
 		i=$$((i + 1)); \
@@ -212,10 +222,15 @@ start-worker:
 scale-worker:
 	@mkdir -p $(TMP_DIR)
 	@target=$(N); target=$${target:-$(WORKER_COUNT)}; \
+	pid_is_worker() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+	}; \
 	current=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
 		[ -f "$$pidfile" ] || continue; \
-		if ps -p $$(cat "$$pidfile") > /dev/null 2>&1; then \
+		if pid_is_worker $$(cat "$$pidfile"); then \
 			current=$$((current + 1)); \
 		else \
 			rm -f "$$pidfile"; \
@@ -229,11 +244,11 @@ scale-worker:
 		started=0; slot=1; \
 		while [ $$started -lt $$need ]; do \
 			pidfile=$(TMP_DIR)/worker-$$slot.pid; \
-			if [ -f $$pidfile ] && ps -p $$(cat $$pidfile) > /dev/null 2>&1; then \
+			if [ -f $$pidfile ] && pid_is_worker $$(cat $$pidfile); then \
 				slot=$$((slot + 1)); continue; \
 			fi; \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && python main.py" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python main.py" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); slot=$$((slot + 1)); \
 		done; \
 		echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
@@ -245,7 +260,7 @@ scale-worker:
 			[ $$stopped -ge $$excess ] && break; \
 			if [ -f "$$pidfile" ]; then \
 				pid=$$(cat "$$pidfile"); \
-				kill -9 $$pid 2>/dev/null || true; \
+				if pid_is_worker $$pid; then kill -9 $$pid 2>/dev/null || true; fi; \
 				rm -f "$$pidfile"; \
 				stopped=$$((stopped + 1)); \
 			fi; \
@@ -269,13 +284,17 @@ stop-api:
 
 stop-worker:
 	@echo "$(CYAN)Stopping all workers...$(NC)"
-	@-count=0; \
+	@-pid_is_worker() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+	}; \
+	count=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
 		[ -f "$$pidfile" ] || continue; \
 		pid=$$(cat "$$pidfile"); \
-		kill -9 $$pid 2>/dev/null || true; \
+		if pid_is_worker $$pid; then kill -9 $$pid 2>/dev/null || true; count=$$((count + 1)); fi; \
 		rm -f "$$pidfile"; \
-		count=$$((count + 1)); \
 	done; \
 	if [ $$count -gt 0 ]; then \
 		echo "$(GREEN)✅ Stopped $$count worker(s)$(NC)"; \
@@ -290,15 +309,22 @@ status:
 	@echo "$(CYAN)Background Processes:$(NC)"
 	@if [ -f $(TMP_DIR)/console.pid ] && ps -p `cat $(TMP_DIR)/console.pid` >/dev/null; then echo "  Console: $(GREEN)Running$(NC) (PID: `cat $(TMP_DIR)/console.pid`)"; else echo "  Console: $(RED)Stopped$(NC)"; fi
 	@if [ -f $(TMP_DIR)/api.pid ] && ps -p `cat $(TMP_DIR)/api.pid` >/dev/null; then echo "  API:     $(GREEN)Running$(NC) (PID: `cat $(TMP_DIR)/api.pid`)"; else echo "  API:     $(RED)Stopped$(NC)"; fi
-	@worker_count=0; worker_running=0; \
+	@pid_is_worker() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+	}; \
+	worker_count=0; worker_running=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
 		[ -f "$$pidfile" ] || continue; \
 		slot=$$(basename "$$pidfile" | sed 's/worker-//;s/.pid//'); \
 		pid=$$(cat "$$pidfile"); \
 		worker_count=$$((worker_count + 1)); \
-		if ps -p $$pid > /dev/null 2>&1; then \
+		if pid_is_worker $$pid; then \
 			echo "  Worker $$slot: $(GREEN)Running$(NC) (PID: $$pid)"; \
 			worker_running=$$((worker_running + 1)); \
+		elif ps -p $$pid > /dev/null 2>&1; then \
+			echo "  Worker $$slot: $(RED)Stale$(NC) (PID reused by another process: $$pid)"; \
 		else \
 			echo "  Worker $$slot: $(RED)Stopped$(NC) (stale PID: $$pid)"; \
 		fi; \
