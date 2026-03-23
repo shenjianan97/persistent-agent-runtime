@@ -119,6 +119,7 @@ check: check-python check-env
 	@command -v npm >/dev/null 2>&1 || (echo "$(RED)npm is required$(NC)" && exit 1)
 	@command -v java >/dev/null 2>&1 || (echo "$(RED)Java is required$(NC)" && exit 1)
 	@command -v sed >/dev/null 2>&1 || (echo "$(RED)sed is required$(NC)" && exit 1)
+	@command -v pgrep >/dev/null 2>&1 || (echo "$(RED)pgrep is required$(NC)" && exit 1)
 	@[ -f "$(API_DIR)/gradlew" ] || (echo "$(RED)Gradle wrapper missing in $(API_DIR)$(NC)" && exit 1)
 	@[ -x "$(WORKER_VENV_PYTHON)" ] || (echo "$(RED)❌ Worker venv not found. Run 'make install-worker' first.$(NC)" && exit 1)
 	@[ -d "$(CONSOLE_DIR)/node_modules" ] || (echo "$(RED)❌ Console node_modules missing. Run 'make install-console' first.$(NC)" && exit 1)
@@ -241,9 +242,19 @@ start-console:
 	@pid_is_console() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs" || \
+			printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/node_modules/.bin/vite --host"; \
+	}; \
+	find_console_pid() { \
+		{ \
+			pgrep -f "$(CONSOLE_DIR)/scripts/dev.mjs" || true; \
+			pgrep -f "$(CONSOLE_DIR)/node_modules/.bin/vite --host" || true; \
+		} | head -n 1; \
 	}; \
 	if [ -f $(TMP_DIR)/console.pid ] && pid_is_console $$(cat $(TMP_DIR)/console.pid); then \
+		echo "$(GREEN)✅ Console already running$(NC)"; \
+	elif existing_pid=$$(find_console_pid) && [ -n "$$existing_pid" ]; then \
+		echo "$$existing_pid" > $(TMP_DIR)/console.pid; \
 		echo "$(GREEN)✅ Console already running$(NC)"; \
 	else \
 		rm -f $(TMP_DIR)/console.pid; \
@@ -259,7 +270,16 @@ start-api:
 		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
 			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
 	}; \
+	find_api_pid() { \
+		{ \
+			pgrep -f "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || true; \
+			pgrep -f "$(API_DIR)/gradlew bootRun" || true; \
+		} | head -n 1; \
+	}; \
 	if [ -f $(TMP_DIR)/api.pid ] && pid_is_api $$(cat $(TMP_DIR)/api.pid); then \
+		echo "$(GREEN)✅ API Service already running$(NC)"; \
+	elif existing_pid=$$(find_api_pid) && [ -n "$$existing_pid" ]; then \
+		echo "$$existing_pid" > $(TMP_DIR)/api.pid; \
 		echo "$(GREEN)✅ API Service already running$(NC)"; \
 	else \
 		rm -f $(TMP_DIR)/api.pid; \
@@ -365,13 +385,40 @@ stop-console:
 	@-pid_is_console() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs" || \
+			printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/node_modules/.bin/vite --host"; \
+	}; \
+	stop_console_pid() { \
+		pid="$$1"; \
+		if ! pid_is_console "$$pid"; then \
+			return 1; \
+		fi; \
+		kill -TERM "$$pid" 2>/dev/null || true; \
+		attempts=0; \
+		while ps -p "$$pid" >/dev/null 2>&1; do \
+			attempts=$$((attempts + 1)); \
+			if [ $$attempts -ge 10 ]; then \
+				kill -9 "$$pid" 2>/dev/null || true; \
+				break; \
+			fi; \
+			sleep 1; \
+		done; \
+		return 0; \
+	}; \
+	list_console_pids() { \
+		{ \
+			pgrep -f "$(CONSOLE_DIR)/scripts/dev.mjs" || true; \
+			pgrep -f "$(CONSOLE_DIR)/node_modules/.bin/vite --host" || true; \
+		} | sort -u; \
 	}; \
 	if [ -f $(TMP_DIR)/console.pid ]; then \
 		pid=$$(cat $(TMP_DIR)/console.pid); \
-		if pid_is_console "$$pid"; then kill -9 "$$pid" 2>/dev/null || true; fi; \
+		stop_console_pid "$$pid" || true; \
 		rm -f $(TMP_DIR)/console.pid; \
-	fi
+	fi; \
+	for pid in $$(list_console_pids); do \
+		stop_console_pid "$$pid" || true; \
+	done
 	@echo "$(GREEN)✅ Console stopped$(NC)"
 
 stop-api:
@@ -382,11 +429,20 @@ stop-api:
 		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
 			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
 	}; \
+	list_api_pids() { \
+		{ \
+			pgrep -f "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || true; \
+			pgrep -f "$(API_DIR)/gradlew bootRun" || true; \
+		} | sort -u; \
+	}; \
 	if [ -f $(TMP_DIR)/api.pid ]; then \
 		pid=$$(cat $(TMP_DIR)/api.pid); \
 		if pid_is_api "$$pid"; then kill -9 "$$pid" 2>/dev/null || true; fi; \
 		rm -f $(TMP_DIR)/api.pid; \
-	fi
+	fi; \
+	for pid in $$(list_api_pids); do \
+		kill -9 "$$pid" 2>/dev/null || true; \
+	done
 	@echo "$(GREEN)✅ API Service stopped$(NC)"
 
 stop-worker:
@@ -434,10 +490,26 @@ status:
 	@pid_is_console() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs" || \
+			printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/node_modules/.bin/vite --host"; \
 	}; \
+	find_console_pid() { \
+		{ \
+			pgrep -f "$(CONSOLE_DIR)/scripts/dev.mjs" || true; \
+			pgrep -f "$(CONSOLE_DIR)/node_modules/.bin/vite --host" || true; \
+		} | head -n 1; \
+	}; \
+	pid=""; \
 	if [ -f $(TMP_DIR)/console.pid ]; then \
 		pid=$$(cat $(TMP_DIR)/console.pid); \
+	fi; \
+	if [ -z "$$pid" ] || ! pid_is_console "$$pid"; then \
+		discovered_pid=$$(find_console_pid); \
+		if [ -n "$$discovered_pid" ]; then \
+			pid="$$discovered_pid"; \
+		fi; \
+	fi; \
+	if [ -n "$$pid" ]; then \
 		if pid_is_console "$$pid"; then \
 			echo "  Console: $(GREEN)Running$(NC) (PID: $$pid)"; \
 		elif ps -p "$$pid" >/dev/null 2>&1; then \
@@ -454,8 +526,23 @@ status:
 		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
 			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
 	}; \
+	find_api_pid() { \
+		{ \
+			pgrep -f "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || true; \
+			pgrep -f "$(API_DIR)/gradlew bootRun" || true; \
+		} | head -n 1; \
+	}; \
+	pid=""; \
 	if [ -f $(TMP_DIR)/api.pid ]; then \
 		pid=$$(cat $(TMP_DIR)/api.pid); \
+	fi; \
+	if [ -z "$$pid" ] || ! pid_is_api "$$pid"; then \
+		discovered_pid=$$(find_api_pid); \
+		if [ -n "$$discovered_pid" ]; then \
+			pid="$$discovered_pid"; \
+		fi; \
+	fi; \
+	if [ -n "$$pid" ]; then \
 		if pid_is_api "$$pid"; then \
 			echo "  API:     $(GREEN)Running$(NC) (PID: $$pid)"; \
 		elif ps -p "$$pid" >/dev/null 2>&1; then \
