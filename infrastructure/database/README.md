@@ -8,7 +8,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 - `migrations/0002_worker_registry.sql`: `workers` table for worker self-registration and heartbeat tracking
 - `migrations/0003_dynamic_models.sql`: provider keys and model pricing tables
 - `tests/verification.sql`: integration-style verification of the shipped schema and canonical query patterns
-- `verify_schema.sh`: launches or reuses a disposable PostgreSQL container and runs the verification suite
+- `make db-verify`: launches or reuses a disposable PostgreSQL container and runs the verification suite
 
 ## Contract Boundaries
 
@@ -33,7 +33,7 @@ Those SQL patterns are part of the downstream contract for the API Service and W
 
 ## Verification
 
-Warning: `verify_schema.sh` is destructive. It resets the `public` schema with `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;` before applying the migration and running verification. Do not point it at a database whose contents you want to keep.
+Warning: `make db-verify` is destructive. It resets the `public` schema with `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;` before applying the migration and running verification. Do not point it at a database whose contents you want to keep. Use `make db-migrate` for safe, additive migrations.
 
 Run:
 

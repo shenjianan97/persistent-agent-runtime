@@ -4,7 +4,7 @@
 
 ```bash
 # 1. Bootstrap the database (first time only)
-KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
+make init
 
 # 2. Configure API keys
 cp .env.localdev.example .env.localdev
@@ -68,6 +68,21 @@ These are also supported in `.env.localdev`:
 - `REAPER_INTERVAL_SECONDS`: base interval for expired-lease and timeout scans
 - `REAPER_JITTER_SECONDS`: random jitter added to the reaper interval
 
+## Running Multiple Workers
+
+The system supports running multiple workers in the background for local multi-worker testing:
+
+```bash
+make start-worker N=3       # start 3 workers (default: 1)
+make start N=3              # full stack with 3 workers
+make scale-worker N=5       # scale up to 5 workers
+make scale-worker N=2       # scale down to 2 workers
+make stop-worker            # stop all workers
+make status                 # see each worker's status
+```
+
+Each worker auto-generates a unique ID (`worker-{hostname}-{pid}-{uuid}`) and gets its own PID and log file in `.tmp/` (e.g., `worker-1.pid`, `worker-1.log`). Workers share the same database and compete for task leases via `FOR UPDATE SKIP LOCKED`.
+
 ## Verifying Prerequisites
 
 If you only want to verify runtime prerequisites without starting services, run:
@@ -80,7 +95,7 @@ make dev-check
 
 ## Database Bootstrap
 
-This is a host-based development workflow, not a Docker Compose stack. The quick start's `verify_schema.sh` creates a named PostgreSQL container (`persistent-agent-runtime-postgres`) with the schema applied. On subsequent runs, `make dev` will start that container if it's stopped.
+This is a host-based development workflow, not a Docker Compose stack. The quick start's `make init` creates a named PostgreSQL container (`persistent-agent-runtime-postgres`) with the schema applied. On subsequent runs, `make start` will start that container if it's stopped.
 
 If you already have your own PostgreSQL instance, skip the script and apply the migrations manually:
 

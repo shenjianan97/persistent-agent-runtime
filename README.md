@@ -48,7 +48,7 @@ Phase 1 uses a database-as-queue model:
 
 ```bash
 # 1. Bootstrap the database (first time only)
-KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
+make init
 
 # 2. Configure environment
 cp .env.localdev.example .env.localdev
@@ -57,7 +57,8 @@ cp .env.localdev.example .env.localdev
 
 # 3. Install and run
 make install
-make dev
+make start          # single worker (default)
+make start N=3      # or start with multiple workers
 ```
 
 For detailed setup options, environment variables, timing configuration, and manual database setup, see [`docs/LOCAL_DEVELOPMENT.md`](./docs/LOCAL_DEVELOPMENT.md).
@@ -77,14 +78,19 @@ For a full AWS deployment (Aurora Serverless v2, ECS Fargate, internal ALB, SSM 
 ### Common Commands
 
 ```bash
-make install        # install all dependencies
-make dev            # start all services locally
-make dev-check      # verify prerequisites without starting
-make api-test       # API service tests
-make worker-test    # worker service tests
-make e2e-test       # backend integration tests
-make db-verify      # reset and verify database schema (destructive)
-make clean          # remove build artifacts
+make install             # install all dependencies
+make start               # start all services (1 worker)
+make start N=3           # start all services with 3 workers
+make scale-worker N=5    # scale workers up or down to N
+make stop                # stop all services
+make status              # show service statuses
+make dev                 # foreground mode (single terminal, hot reload)
+make dev-check           # verify prerequisites without starting
+make api-test            # API service tests
+make worker-test         # worker service tests
+make e2e-test            # backend integration tests
+make db-verify           # reset and verify database schema (destructive)
+make clean               # remove build artifacts
 ```
 
 ## Development Status
