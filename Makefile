@@ -21,7 +21,13 @@ MIGRATION_FILES := $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrati
 WORKER_VENV_DIR := $(WORKER_DIR)/.venv
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
 
-PYTHON ?= $(shell command -v python3.11 || command -v python3 || command -v python)
+PYTHON ?= $(shell \
+	for py in python3.13 python3.12 python3.11 python3 python; do \
+		if command -v $$py >/dev/null 2>&1 && $$py -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then \
+			command -v $$py; \
+			break; \
+		fi; \
+	done)
 
 DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
 DB_DSN ?= postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
@@ -126,6 +132,7 @@ check: check-python check-env
 	@echo "$(GREEN)✅ Dependency checks passed$(NC)"
 
 check-python:
+	@[ -n "$(PYTHON)" ] || (echo "$(RED)Python 3.11+ is required$(NC)" && exit 1)
 	@$(PYTHON) -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' || (echo "$(RED)Python 3.11+ is required$(NC)" && exit 1)
 
 check-env:
@@ -166,7 +173,7 @@ start: check
 	@echo "$(YELLOW)🚀 Starting local stack...$(NC)"
 	@$(MAKE) db-up
 	@echo "$(YELLOW)🔍 Discovering models...$(NC)"
-	@$(WORKER_VENV_PYTHON) services/model-discovery/main.py || (echo "$(RED)❌ Model discovery failed (is the database running?)$(NC)" && exit 1)
+	@$(WORKER_VENV_PYTHON) services/model-discovery/main.py || echo "$(YELLOW)⚠️ Model discovery failed; continuing startup with existing models$(NC)"
 	@$(MAKE) start-console
 	@$(MAKE) start-api
 	@$(MAKE) start-worker N=$(if $(N),$(N),$(WORKER_COUNT))
@@ -178,7 +185,7 @@ start: check
 		pid_is_worker() { \
 			pid="$$1"; \
 			command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-			printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+			printf '%s\n' "$$command" | grep -Fq "$(WORKER_DIR)/main.py"; \
 		}; \
 		wait_for_http() { \
 			name="$$1"; pidfile="$$2"; url="$$3"; timeout="$$4"; elapsed=0; \
@@ -294,7 +301,7 @@ start-worker:
 	pid_is_worker() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+		printf '%s\n' "$$command" | grep -Fq "$(WORKER_DIR)/main.py"; \
 	}; \
 	started=0; skipped=0; \
 	i=1; while [ $$i -le $$n ]; do \
@@ -303,7 +310,7 @@ start-worker:
 			skipped=$$((skipped + 1)); \
 		else \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python main.py" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); \
 		fi; \
 		i=$$((i + 1)); \
@@ -321,7 +328,7 @@ scale-worker:
 	pid_is_worker() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+		printf '%s\n' "$$command" | grep -Fq "$(WORKER_DIR)/main.py"; \
 	}; \
 	stop_worker_pid() { \
 		pid="$$1"; \
@@ -361,7 +368,7 @@ scale-worker:
 				slot=$$((slot + 1)); continue; \
 			fi; \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python main.py" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); slot=$$((slot + 1)); \
 		done; \
 		echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
@@ -450,7 +457,7 @@ stop-worker:
 	@-pid_is_worker() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+		printf '%s\n' "$$command" | grep -Fq "$(WORKER_DIR)/main.py"; \
 	}; \
 	stop_worker_pid() { \
 		pid="$$1"; \
@@ -479,7 +486,7 @@ stop-worker:
 	if [ $$count -gt 0 ]; then \
 		echo "$(GREEN)✅ Stopped $$count worker(s)$(NC)"; \
 	fi
-	@-pkill -f "$(WORKER_DIR).*main.py" || true
+	@-pkill -f "$(WORKER_DIR)/main.py" || true
 	@echo "$(GREEN)✅ All workers stopped$(NC)"
 
 status:
@@ -556,7 +563,7 @@ status:
 	@pid_is_worker() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
-		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+		printf '%s\n' "$$command" | grep -Fq "$(WORKER_DIR)/main.py"; \
 	}; \
 	worker_count=0; worker_running=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
