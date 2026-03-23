@@ -25,7 +25,7 @@ Validate the full request lifecycle across all three runtime components — **AP
 | File | Purpose |
 |------|---------|
 | `infrastructure/database/migrations/0001_phase1_durable_execution.sql` | **The schema DDL.** Defines `tasks`, `checkpoints`, `checkpoint_writes` tables, all indexes, and CHECK constraints. This is the source of truth for column names, types, defaults, and valid enum values. |
-| `infrastructure/database/verify_schema.sh` | Script that spins up a Docker PG container, applies the migration, and runs verification queries. Use `KEEP_DB_CONTAINER=1` to keep it running for inspection. |
+| `make db-reset-verify` | Make target that spins up a Docker PG container, applies the migration, and runs verification queries. Container is kept running natively. |
 | `infrastructure/database/tests/verification.sql` | SQL verification queries for schema contract. |
 | `infrastructure/database/README.md` | Schema documentation and usage instructions. |
 

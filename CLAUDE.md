@@ -40,6 +40,11 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | docs/implementation_plan/phase-1/agent_tasks/*.md | 8 parallelizable, single-responsibility execution templates for agents |
 | experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
+## Local Validation Notes
+
+- For local testing, follow the repo's documented local development and validation workflow in `README.md` unless it is not feasible in the current environment.
+- When validating background `Makefile` targets such as `make start`, `make status`, and `make stop`, prefer an interactive shell / PTY. Some non-interactive command runners reap or detach child processes when the parent command exits, which can make background-service checks look broken even when the `Makefile` logic is correct.
+
 ## Project Stages
 
 ### Stage 1 — Problem & Scope [DONE]
@@ -60,7 +65,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ### Stage 4 — Implementation [DONE]
 - Completed: DB schema, API service, worker core, LangGraph checkpointer, co-located MCP server, graph executor, console frontend, and AWS infrastructure/containerization (Tasks 1-8)
-- Post-Task 7 additions: worker registry table (`0002_worker_registry.sql`), worker self-registration/heartbeat/deregistration, reaper stale-worker cleanup, `GET /v1/tasks` list endpoint, task list UI
+- Post-Task 7 additions: worker registry table (`0002_worker_registry.sql`), worker self-registration/heartbeat/deregistration, reaper stale-worker cleanup, `GET /v1/tasks` list endpoint, task list UI, multi-worker scaling (`make start-worker N=`, `make scale-worker N=`)
 - Task 8 additions: AWS CDK app (`infrastructure/cdk/`) with Network/Data/Compute stacks, schema bootstrap custom resource, internal ALB + SSM access host, ECS services, scheduled-and-initial model discovery, service-owned Dockerfiles, and GitHub Actions coverage for CDK build/tests
 - Follow-up fixes landed: canonical migration bundling from `infrastructure/database/migrations/`, initial model-discovery redeploy triggering, failure surfacing for the bootstrap invoke, access-host AMI architecture matching, Docker `platform: LINUX_AMD64` for ARM Mac cross-compilation, and CORS config disabled by default for same-origin ALB access
 - Source of truth: `docs/implementation_plan/phase-1/progress.md`

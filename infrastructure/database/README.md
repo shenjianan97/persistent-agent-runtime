@@ -8,7 +8,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 - `migrations/0002_worker_registry.sql`: `workers` table for worker self-registration and heartbeat tracking
 - `migrations/0003_dynamic_models.sql`: provider keys and model pricing tables
 - `tests/verification.sql`: integration-style verification of the shipped schema and canonical query patterns
-- `verify_schema.sh`: launches or reuses a disposable PostgreSQL container and runs the verification suite
+- `make db-reset-verify`: launches or reuses the local PostgreSQL container, reapplies the canonical versioned schema migrations, and runs the verification suite
 
 ## Contract Boundaries
 
@@ -33,18 +33,18 @@ Those SQL patterns are part of the downstream contract for the API Service and W
 
 ## Verification
 
-Warning: `verify_schema.sh` is destructive. It resets the `public` schema with `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;` before applying the migration and running verification. Do not point it at a database whose contents you want to keep.
+Warning: `make db-reset-verify` is destructive. It resets the `public` schema with `DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;` before applying the migrations and running verification. Do not point it at a database whose contents you want to keep. Use `make db-migrate` for safe, additive migrations; it records applied files in `schema_migrations` and skips them on subsequent runs.
 
 Run:
 
 ```bash
-./infrastructure/database/verify_schema.sh
+make db-reset-verify
 ```
 
-To keep the disposable PostgreSQL container for inspection after the run:
+To ensure the local PostgreSQL container is running for inspection after verification:
 
 ```bash
-KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
+make db-up
 ```
 
 Then inspect it with:
@@ -54,7 +54,7 @@ docker ps -a --filter name=persistent-agent-runtime-postgres
 docker logs persistent-agent-runtime-postgres
 ```
 
-The script starts a disposable PostgreSQL container if needed, applies all migrations in order from `migrations/`, and runs verification coverage for:
+The Make targets start the local PostgreSQL container if needed, apply the numbered migrations in order from `migrations/`, and run verification coverage for:
 
 - schema creation and required indexes
 - claim via `FOR UPDATE SKIP LOCKED`

@@ -48,7 +48,7 @@ Phase 1 uses a database-as-queue model:
 
 ```bash
 # 1. Bootstrap the database (first time only)
-KEEP_DB_CONTAINER=1 ./infrastructure/database/verify_schema.sh
+make init
 
 # 2. Configure environment
 cp .env.localdev.example .env.localdev
@@ -57,7 +57,8 @@ cp .env.localdev.example .env.localdev
 
 # 3. Install and run
 make install
-make dev
+make start          # single worker (default)
+make start N=3      # or start with multiple workers
 ```
 
 For detailed setup options, environment variables, timing configuration, and manual database setup, see [`docs/LOCAL_DEVELOPMENT.md`](./docs/LOCAL_DEVELOPMENT.md).
@@ -77,15 +78,22 @@ For a full AWS deployment (Aurora Serverless v2, ECS Fargate, internal ALB, SSM 
 ### Common Commands
 
 ```bash
-make install        # install all dependencies
-make dev            # start all services locally
-make dev-check      # verify prerequisites without starting
-make api-test       # API service tests
-make worker-test    # worker service tests
-make e2e-test       # backend integration tests
-make db-verify      # reset and verify database schema (destructive)
-make clean          # remove build artifacts
+make install             # install all dependencies
+make start               # start all services (1 worker)
+make start N=3           # start all services with 3 workers
+make scale-worker N=5    # scale workers up or down to N
+make stop                # stop all services
+make status              # show service statuses
+make check               # verify prerequisites without starting services
+make logs                # tail background service logs
+make api-test            # API service tests
+make worker-test         # worker service tests
+make e2e-test            # backend integration tests
+make db-reset-verify     # reset and verify database schema (destructive)
+make clean               # remove build artifacts
 ```
+
+Tip: use `make -n <target>` to preview the shell commands for a target without executing them. For example, `make -n start N=3` shows the full startup flow for three workers.
 
 ## Development Status
 
@@ -144,6 +152,21 @@ The integration suite is the best place to validate the intended runtime lifecyc
 - cancellation and redrive
 - crash recovery and checkpoint resume
 - multi-worker coordination
+
+### Local Validation Workflow
+
+For local end-to-end validation of the `Makefile` workflow:
+
+1. Run `make check` to confirm prerequisites and local dependencies.
+2. Use `make db-migrate` for safe schema setup, or `make db-reset-verify` if you explicitly want a destructive reset plus schema verification.
+3. Start the stack with `make start` or `make start N=3`.
+4. Confirm the stack is healthy with `make status`, `curl http://localhost:8080/actuator/health`, and optionally `curl -I http://localhost:5173`.
+5. Tail logs with `make logs` if startup looks suspicious.
+6. Stop the stack with `make stop` when finished.
+
+`make start` waits for the console, API, and requested worker count to come up before reporting success.
+
+When validating background service management, prefer running `make start`, `make status`, and `make stop` from a real interactive terminal. Some non-interactive runners can reap child processes when the parent command exits, which makes background-service checks look misleading.
 
 ## Notes
 
