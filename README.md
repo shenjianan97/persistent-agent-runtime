@@ -164,6 +164,8 @@ For local end-to-end validation of the `Makefile` workflow:
 5. Tail logs with `make logs` if startup looks suspicious.
 6. Stop the stack with `make stop` when finished.
 
+`make start` waits for the console, API, and requested worker count to come up before reporting success.
+
 When validating background service management, prefer running `make start`, `make status`, and `make stop` from a real interactive terminal. Some non-interactive runners can reap child processes when the parent command exits, which makes background-service checks look misleading.
 
 ## Notes

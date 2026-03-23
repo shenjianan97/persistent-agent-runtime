@@ -113,6 +113,7 @@ init:
 check: check-python check-env
 	@echo "$(YELLOW)🔍 Checking dependencies...$(NC)"
 	@command -v docker >/dev/null 2>&1 || (echo "$(RED)Docker is required$(NC)" && exit 1)
+	@command -v curl >/dev/null 2>&1 || (echo "$(RED)curl is required$(NC)" && exit 1)
 	@command -v node >/dev/null 2>&1 || (echo "$(RED)Node.js is required$(NC)" && exit 1)
 	@command -v npm >/dev/null 2>&1 || (echo "$(RED)npm is required$(NC)" && exit 1)
 	@command -v java >/dev/null 2>&1 || (echo "$(RED)Java is required$(NC)" && exit 1)
@@ -167,7 +168,68 @@ start: check
 	@$(MAKE) start-console
 	@$(MAKE) start-api
 	@$(MAKE) start-worker N=$(if $(N),$(N),$(WORKER_COUNT))
-	@echo "$(GREEN)✅ All services started in background. Use 'make logs' to watch output.$(NC)"
+	@if printf '%s' '$(MAKEFLAGS)' | grep -Eq -- '(^|[[:space:]])(n|--just-print|--dry-run|--recon)($|[[:space:]])'; then \
+		echo "$(YELLOW)ℹ️ Dry run: skipping startup verification$(NC)"; \
+	else \
+		echo "$(YELLOW)⏳ Verifying background services...$(NC)"; \
+		expected_workers=$(if $(N),$(N),$(WORKER_COUNT)); \
+		pid_is_worker() { \
+			pid="$$1"; \
+			command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+			printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
+		}; \
+		wait_for_http() { \
+			name="$$1"; pidfile="$$2"; url="$$3"; timeout="$$4"; elapsed=0; \
+			while [ $$elapsed -lt $$timeout ]; do \
+				if [ ! -f "$$pidfile" ]; then \
+					echo "$(RED)❌ $$name failed to create a PID file$(NC)"; \
+					return 1; \
+				fi; \
+				pid=$$(cat "$$pidfile"); \
+				if ! ps -p "$$pid" >/dev/null 2>&1; then \
+					echo "$(RED)❌ $$name exited before becoming ready$(NC)"; \
+					return 1; \
+				fi; \
+				if curl -fsS "$$url" >/dev/null 2>&1; then \
+					echo "$(GREEN)✅ $$name ready$(NC)"; \
+					return 0; \
+				fi; \
+				sleep 1; \
+				elapsed=$$((elapsed + 1)); \
+			done; \
+			echo "$(RED)❌ $$name did not become ready within $$timeout seconds ($$url)$(NC)"; \
+			return 1; \
+		}; \
+		wait_for_workers() { \
+			expected="$$1"; timeout="$$2"; elapsed=0; \
+			while [ $$elapsed -lt $$timeout ]; do \
+				running=0; \
+				for pidfile in $(TMP_DIR)/worker-*.pid; do \
+					[ -f "$$pidfile" ] || continue; \
+					pid=$$(cat "$$pidfile"); \
+					if pid_is_worker "$$pid"; then \
+						running=$$((running + 1)); \
+					fi; \
+				done; \
+				if [ $$running -eq $$expected ]; then \
+					echo "$(GREEN)✅ Workers ready ($$running/$$expected)$(NC)"; \
+					return 0; \
+				fi; \
+				sleep 1; \
+				elapsed=$$((elapsed + 1)); \
+			done; \
+			echo "$(RED)❌ Workers did not stabilize at $$expected process(es) within $$timeout seconds$(NC)"; \
+			return 1; \
+		}; \
+		wait_for_http "Console" "$(TMP_DIR)/console.pid" "http://localhost:5173" 30 && \
+		wait_for_http "API Service" "$(TMP_DIR)/api.pid" "http://localhost:8080/actuator/health" 60 && \
+		wait_for_workers "$$expected_workers" 20 || { \
+			echo "$(RED)❌ Startup verification failed. Use 'make logs' to inspect the service logs.$(NC)"; \
+			$(MAKE) stop >/dev/null 2>&1 || true; \
+			exit 1; \
+		}; \
+		echo "$(GREEN)✅ All services started in background and passed startup checks. Use 'make logs' to watch output.$(NC)"; \
+	fi
 
 stop: stop-console stop-api stop-worker
 	@echo "$(GREEN)🛑 All services stopped$(NC)"
@@ -227,6 +289,23 @@ scale-worker:
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
 		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
 	}; \
+	stop_worker_pid() { \
+		pid="$$1"; \
+		if ! pid_is_worker "$$pid"; then \
+			return 1; \
+		fi; \
+		kill -TERM "$$pid" 2>/dev/null || true; \
+		attempts=0; \
+		while pid_is_worker "$$pid"; do \
+			attempts=$$((attempts + 1)); \
+			if [ $$attempts -ge 20 ]; then \
+				kill -9 "$$pid" 2>/dev/null || true; \
+				break; \
+			fi; \
+			sleep 1; \
+		done; \
+		return 0; \
+	}; \
 	current=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
 		[ -f "$$pidfile" ] || continue; \
@@ -256,17 +335,16 @@ scale-worker:
 		excess=$$((current - target)); \
 		echo "$(YELLOW)Scaling down: stopping $$excess worker(s) ($$current → $$target)...$(NC)"; \
 		stopped=0; \
-		for pidfile in $$(ls -r $(TMP_DIR)/worker-*.pid 2>/dev/null); do \
-			[ $$stopped -ge $$excess ] && break; \
-			if [ -f "$$pidfile" ]; then \
-				pid=$$(cat "$$pidfile"); \
-				if pid_is_worker $$pid; then kill -9 $$pid 2>/dev/null || true; fi; \
-				rm -f "$$pidfile"; \
-				stopped=$$((stopped + 1)); \
-			fi; \
-		done; \
-		echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
-	fi
+			for pidfile in $$(ls -r $(TMP_DIR)/worker-*.pid 2>/dev/null); do \
+				[ $$stopped -ge $$excess ] && break; \
+				if [ -f "$$pidfile" ]; then \
+					pid=$$(cat "$$pidfile"); \
+					if stop_worker_pid "$$pid"; then stopped=$$((stopped + 1)); fi; \
+					rm -f "$$pidfile"; \
+				fi; \
+			done; \
+			echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
+		fi
 
 stop-console:
 	@echo "$(YELLOW)Stopping Console...$(NC)"
@@ -289,11 +367,28 @@ stop-worker:
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
 		printf '%s\n' "$$command" | grep -Eiq '(^|.*/)(python|python3(\.[0-9]+)?) .*main\.py([[:space:]]|$$)'; \
 	}; \
+	stop_worker_pid() { \
+		pid="$$1"; \
+		if ! pid_is_worker "$$pid"; then \
+			return 1; \
+		fi; \
+		kill -TERM "$$pid" 2>/dev/null || true; \
+		attempts=0; \
+		while pid_is_worker "$$pid"; do \
+			attempts=$$((attempts + 1)); \
+			if [ $$attempts -ge 20 ]; then \
+				kill -9 "$$pid" 2>/dev/null || true; \
+				break; \
+			fi; \
+			sleep 1; \
+		done; \
+		return 0; \
+	}; \
 	count=0; \
 	for pidfile in $(TMP_DIR)/worker-*.pid; do \
 		[ -f "$$pidfile" ] || continue; \
 		pid=$$(cat "$$pidfile"); \
-		if pid_is_worker $$pid; then kill -9 $$pid 2>/dev/null || true; count=$$((count + 1)); fi; \
+		if stop_worker_pid "$$pid"; then count=$$((count + 1)); fi; \
 		rm -f "$$pidfile"; \
 	done; \
 	if [ $$count -gt 0 ]; then \
@@ -343,16 +438,20 @@ status:
 db-up:
 	@echo "$(YELLOW)🐳 Ensuring Database Container is running...$(NC)"
 	@docker info >/dev/null 2>&1 || (echo "$(RED)❌ Docker daemon is not running. Please start Docker Desktop.$(NC)" && exit 1)
+	@if [ "$(DB_HOST)" != "localhost" ] && [ "$(DB_HOST)" != "127.0.0.1" ]; then \
+		echo "$(RED)❌ db-up only manages a Docker PostgreSQL instance on localhost. Current DB_DSN host is '$(DB_HOST)'. Start that database manually instead.$(NC)"; \
+		exit 1; \
+	fi
 	@if ! docker ps -a --format '{{.Names}}' | grep -Eq "^$(DB_CONTAINER_NAME)$$"; then \
 		echo "$(YELLOW)Container $(DB_CONTAINER_NAME) does not exist. Creating it...$(NC)"; \
-		docker run -d --name $(DB_CONTAINER_NAME) -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=persistent_agent_runtime -p 55432:5432 postgres:16 postgres -c log_statement=all >/dev/null; \
+		docker run -d --name $(DB_CONTAINER_NAME) -e POSTGRES_USER="$(DB_USER)" -e POSTGRES_PASSWORD="$(DB_PASSWORD)" -e POSTGRES_DB="$(DB_NAME)" -p $(DB_PORT):5432 postgres:16 postgres -c log_statement=all >/dev/null; \
 	fi
 	@if [ "$$(docker inspect -f '{{.State.Running}}' $(DB_CONTAINER_NAME) 2>/dev/null)" != "true" ]; then \
 		docker start $(DB_CONTAINER_NAME) >/dev/null 2>&1 || (echo "$(RED)❌ Failed to start container $(DB_CONTAINER_NAME)$(NC)" && exit 1); \
 	fi
 	@echo "$(YELLOW)⏳ Waiting for PostgreSQL to accept connections...$(NC)"
 	@attempts=0; \
-	until docker exec $(DB_CONTAINER_NAME) pg_isready -U postgres -d persistent_agent_runtime >/dev/null 2>&1; do \
+	until docker exec $(DB_CONTAINER_NAME) env PGPASSWORD="$(DB_PASSWORD)" pg_isready -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" >/dev/null 2>&1; do \
 		attempts=$$((attempts + 1)); \
 		if [ $$attempts -ge 30 ]; then \
 			echo "$(RED)❌ PostgreSQL did not become ready within 30 seconds$(NC)"; \
@@ -372,26 +471,26 @@ db-status:
 
 db-migrate: db-up
 	@echo "$(YELLOW)🛠️  Applying migrations to Database...$(NC)"
-	@docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())" >/dev/null
+	@docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -c "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())" >/dev/null
 	@set -e; \
 	for file in $(MIGRATION_FILES); do \
 		name=$$(basename "$$file"); \
-		if docker exec -i $(DB_CONTAINER_NAME) psql -At -U postgres -d persistent_agent_runtime -c "SELECT 1 FROM schema_migrations WHERE filename = '$$name'" | grep -qx 1; then \
+		if docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -At -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -c "SELECT 1 FROM schema_migrations WHERE filename = '$$name'" | grep -qx 1; then \
 			echo "Skipping $$name (already applied)..."; \
 			continue; \
 		fi; \
 		echo "Applying $$name..."; \
-		docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -f - < "$$file"; \
-		docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "INSERT INTO schema_migrations (filename) VALUES ('$$name')"; \
+		docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -f - < "$$file"; \
+		docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -c "INSERT INTO schema_migrations (filename) VALUES ('$$name')"; \
 	done
 	@echo "$(GREEN)✅ Migrations applied successfully$(NC)"
 
 db-reset-verify: db-up
 	@echo "$(YELLOW)🧪 Running DB Schema Verification (⚠️ DROPS schema)$(NC)"
-	@docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO postgres; GRANT ALL ON SCHEMA public TO public;"
+	@docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;"
 	@$(MAKE) db-migrate
 	@echo "$(YELLOW)🧪 Running verification queries...$(NC)"
-	@docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -f - < $(ROOT_DIR)/infrastructure/database/tests/verification.sql
+	@docker exec -i -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" -f - < $(ROOT_DIR)/infrastructure/database/tests/verification.sql
 	@echo "$(GREEN)✅ Schema verification passed$(NC)"
 
 

@@ -31,6 +31,7 @@ make start
 - expects dependencies to already be installed via `make install`
 - runs model discovery before starting services
 - starts the console, API service, and worker in the background
+- waits for the console, API health endpoint, and requested worker count before reporting success
 - writes PID and log files to `.tmp/`
 - works with `make stop`, `make status`, and `make logs`
 
@@ -100,6 +101,8 @@ If you want to inspect what a target would do without running it, use `make -n <
 ## Database Bootstrap
 
 This is a host-based development workflow, not a Docker Compose stack. The quick start's `make init` creates a named PostgreSQL container (`persistent-agent-runtime-postgres`) with the schema applied. On subsequent runs, `make start` will start that container if it's stopped.
+
+If `DB_DSN` still points at `localhost` or `127.0.0.1`, the `db-up`, `db-migrate`, and `db-reset-verify` targets will derive the Docker-managed database name, user, password, and published port from that DSN. If `DB_DSN` points at a non-local host, those targets intentionally fail fast instead of trying to manage the wrong database; in that case, start your PostgreSQL instance manually and apply the migrations yourself.
 
 If you already have your own PostgreSQL instance, skip the script and apply the migrations manually:
 
