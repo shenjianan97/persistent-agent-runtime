@@ -182,10 +182,10 @@ async def test_worker_core_primitives_integration():
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO tasks (
-                    task_id, tenant_id, agent_id, agent_config_snapshot, 
+                    task_id, tenant_id, agent_id, agent_config_snapshot,
                     status, input, max_retries, max_steps, task_timeout_seconds,
-                    created_at, worker_pool_id
-                ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test', 3, 5, 10, NOW() - INTERVAL '20 seconds', 'test_pool')
+                    created_at, timeout_reference_at, worker_pool_id
+                ) VALUES ($1, 'default', 'test_agent', $2, 'queued', 'Test', 3, 5, 10, NOW() - INTERVAL '20 seconds', NOW() - INTERVAL '20 seconds', 'test_pool')
             """, t4, json.dumps(agent_config))
 
         await asyncio.sleep(3)
