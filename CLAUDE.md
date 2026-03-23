@@ -40,6 +40,10 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | docs/implementation_plan/phase-1/agent_tasks/*.md | 8 parallelizable, single-responsibility execution templates for agents |
 | experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
+## Local Validation Notes
+
+- When validating background `Makefile` targets such as `make start`, `make status`, and `make stop`, prefer an interactive shell / PTY. Some non-interactive command runners reap or detach child processes when the parent command exits, which can make background-service checks look broken even when the `Makefile` logic is correct.
+
 ## Project Stages
 
 ### Stage 1 — Problem & Scope [DONE]

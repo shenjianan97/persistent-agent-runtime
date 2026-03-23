@@ -39,7 +39,7 @@ The API Service acts as the ingest and query interface between external clients 
 - Expected local port mapping: `55432 -> 5432`
 - Before running integration tests, use Docker to confirm the actual host port for the retained container rather than assuming it blindly. Preferred check: `docker ps --filter name=persistent-agent-runtime-postgres` or `docker port persistent-agent-runtime-postgres`.
 - Expected default database settings: database `persistent_agent_runtime`, user `postgres`, password `postgres`
-- Assume the Task 1 schema has already been applied in that container. If a clean reset is needed, rerun `make db-verify`.
+- Assume the Task 1 schema has already been applied in that container. If a clean reset is needed, rerun `make db-reset-verify`.
 - Prefer targeting this local PostgreSQL instance for API integration tests and manual endpoint validation.
 
 ## Implementation Specification

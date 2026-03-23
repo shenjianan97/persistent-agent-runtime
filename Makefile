@@ -16,6 +16,7 @@ API_DIR := $(ROOT_DIR)/services/api-service
 CONSOLE_DIR := $(ROOT_DIR)/services/console
 TMP_DIR := $(ROOT_DIR)/.tmp
 WORKER_COUNT ?= 1
+MIGRATION_FILES := $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql))
 
 WORKER_VENV_DIR := $(WORKER_DIR)/.venv
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
@@ -24,6 +25,7 @@ DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
 DB_DSN ?= postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
+VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
 
 PYTHON ?= $(shell command -v python3.11 || command -v python3 || command -v python)
 
@@ -37,7 +39,7 @@ NC := \033[0m
 .PHONY: help init install install-api install-console install-worker \
         start stop restart start-console start-api start-worker stop-console stop-api stop-worker \
         scale-worker \
-        status check check-env check-python db-up db-down db-status db-migrate db-verify \
+        status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
         test api-test worker-test console-test e2e-test local-ci clean logs
 
 
@@ -66,7 +68,7 @@ help:
 	@echo "  $(YELLOW)make db-down$(NC)        - 🛑 Stop PostgreSQL container"
 	@echo "  $(YELLOW)make db-status$(NC)      - 📊 Show DB container status"
 	@echo "  $(YELLOW)make db-migrate$(NC)     - 🛠️  Apply SQL migrations safely"
-	@echo "  $(YELLOW)make db-verify$(NC)      - 🧪 Verify DB schema (⚠️ DROPS DATA)"
+	@echo "  $(YELLOW)make db-reset-verify$(NC) - 🧪 Reset and verify DB schema (⚠️ DROPS DATA)"
 	@echo ""
 	@echo "$(CYAN)[Testing]$(NC)"
 	@echo "  $(YELLOW)make test$(NC)           - 🧪 Run all tests (API, Worker, Console, E2E)"
@@ -153,7 +155,7 @@ start: check
 	@$(WORKER_VENV_PYTHON) services/model-discovery/main.py || (echo "$(RED)❌ Model discovery failed (is the database running?)$(NC)" && exit 1)
 	@$(MAKE) start-console
 	@$(MAKE) start-api
-	@$(MAKE) start-worker N=$(WORKER_COUNT)
+	@$(MAKE) start-worker N=$(if $(N),$(N),$(WORKER_COUNT))
 	@echo "$(GREEN)✅ All services started in background. Use 'make logs' to watch output.$(NC)"
 
 stop: stop-console stop-api stop-worker
@@ -312,10 +314,20 @@ db-up:
 	@if ! docker ps -a --format '{{.Names}}' | grep -Eq "^$(DB_CONTAINER_NAME)$$"; then \
 		echo "$(YELLOW)Container $(DB_CONTAINER_NAME) does not exist. Creating it...$(NC)"; \
 		docker run -d --name $(DB_CONTAINER_NAME) -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=persistent_agent_runtime -p 55432:5432 postgres:16 postgres -c log_statement=all >/dev/null; \
-		echo "$(YELLOW)⏳ Waiting for PostgreSQL to be ready...$(NC)"; \
-		sleep 3; \
 	fi
-	@docker start $(DB_CONTAINER_NAME) >/dev/null 2>&1 || (echo "$(RED)❌ Failed to start container $(DB_CONTAINER_NAME)$(NC)" && exit 1)
+	@if [ "$$(docker inspect -f '{{.State.Running}}' $(DB_CONTAINER_NAME) 2>/dev/null)" != "true" ]; then \
+		docker start $(DB_CONTAINER_NAME) >/dev/null 2>&1 || (echo "$(RED)❌ Failed to start container $(DB_CONTAINER_NAME)$(NC)" && exit 1); \
+	fi
+	@echo "$(YELLOW)⏳ Waiting for PostgreSQL to accept connections...$(NC)"
+	@attempts=0; \
+	until docker exec $(DB_CONTAINER_NAME) pg_isready -U postgres -d persistent_agent_runtime >/dev/null 2>&1; do \
+		attempts=$$((attempts + 1)); \
+		if [ $$attempts -ge 30 ]; then \
+			echo "$(RED)❌ PostgreSQL did not become ready within 30 seconds$(NC)"; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
 	@echo "$(GREEN)✅ DB is up$(NC)"
 
 db-down:
@@ -328,13 +340,21 @@ db-status:
 
 db-migrate: db-up
 	@echo "$(YELLOW)🛠️  Applying migrations to Database...$(NC)"
-	@$(foreach file, $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrations/*.sql)), \
-		echo "Applying $(notdir $(file))..."; \
-		docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -f - < $(file); \
-	)
+	@docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "CREATE TABLE IF NOT EXISTS schema_migrations (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW())" >/dev/null
+	@set -e; \
+	for file in $(MIGRATION_FILES); do \
+		name=$$(basename "$$file"); \
+		if docker exec -i $(DB_CONTAINER_NAME) psql -At -U postgres -d persistent_agent_runtime -c "SELECT 1 FROM schema_migrations WHERE filename = '$$name'" | grep -qx 1; then \
+			echo "Skipping $$name (already applied)..."; \
+			continue; \
+		fi; \
+		echo "Applying $$name..."; \
+		docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -f - < "$$file"; \
+		docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "INSERT INTO schema_migrations (filename) VALUES ('$$name')"; \
+	done
 	@echo "$(GREEN)✅ Migrations applied successfully$(NC)"
 
-db-verify: db-up
+db-reset-verify: db-up
 	@echo "$(YELLOW)🧪 Running DB Schema Verification (⚠️ DROPS schema)$(NC)"
 	@docker exec -i $(DB_CONTAINER_NAME) psql -v ON_ERROR_STOP=1 -U postgres -d persistent_agent_runtime -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO postgres; GRANT ALL ON SCHEMA public TO public;"
 	@$(MAKE) db-migrate

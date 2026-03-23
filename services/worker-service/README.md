@@ -20,10 +20,10 @@ For normal local development from the repo root, prefer:
 
 ```bash
 make install
-make dev
+make start
 ```
 
-That root workflow installs console and worker dependencies first, then starts the console, API, and worker in one terminal and ensures the local PostgreSQL container is running.
+That root workflow installs console and worker dependencies first, then starts the console, API, and worker in the background and ensures the local PostgreSQL container is running.
 
 ### Prerequisites
 

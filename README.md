@@ -84,14 +84,16 @@ make start N=3           # start all services with 3 workers
 make scale-worker N=5    # scale workers up or down to N
 make stop                # stop all services
 make status              # show service statuses
-make dev                 # foreground mode (single terminal, hot reload)
-make dev-check           # verify prerequisites without starting
+make check               # verify prerequisites without starting services
+make logs                # tail background service logs
 make api-test            # API service tests
 make worker-test         # worker service tests
 make e2e-test            # backend integration tests
-make db-verify           # reset and verify database schema (destructive)
+make db-reset-verify     # reset and verify database schema (destructive)
 make clean               # remove build artifacts
 ```
+
+Tip: use `make -n <target>` to preview the shell commands for a target without executing them. For example, `make -n start N=3` shows the full startup flow for three workers.
 
 ## Development Status
 

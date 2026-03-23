@@ -206,7 +206,7 @@ This is the most important page. It must clearly demonstrate the value of durabl
 After implementation is complete, run a full end-to-end test with all three services running locally. This is a **required** step — the task is not done until this passes.
 
 **8a. Start the stack:**
-1. PostgreSQL — ensure the local container is running: `docker ps --filter name=persistent-agent-runtime-postgres`. If not running, start it and apply the schema via `make init` or `make db-verify`.
+1. PostgreSQL — ensure the local container is running: `docker ps --filter name=persistent-agent-runtime-postgres`. If not running, start it and apply the schema via `make init` or `make db-reset-verify`.
 2. API Service — start Spring Boot on port 8080 (`./gradlew bootRun` or equivalent from `services/api-service/`).
 3. Worker Service — start the Python worker (`python -m worker` or equivalent from `services/worker-service/`).
 4. Console — start Vite dev server (`npm run dev` from `services/console/`).
