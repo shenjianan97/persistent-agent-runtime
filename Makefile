@@ -30,6 +30,7 @@ DB_PORT ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; 
 DB_NAME ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).path.lstrip("/") or "persistent_agent_runtime")' "$(DB_DSN)")
 DB_USER ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).username or "postgres"))' "$(DB_DSN)")
 DB_PASSWORD ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).password or "postgres"))' "$(DB_DSN)")
+SERVER_PORT ?= 8080
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
 VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
@@ -222,7 +223,7 @@ start: check
 			return 1; \
 		}; \
 		wait_for_http "Console" "$(TMP_DIR)/console.pid" "http://localhost:5173" 30 && \
-		wait_for_http "API Service" "$(TMP_DIR)/api.pid" "http://localhost:8080/actuator/health" 60 && \
+		wait_for_http "API Service" "$(TMP_DIR)/api.pid" "http://localhost:$(SERVER_PORT)/actuator/health" 60 && \
 		wait_for_workers "$$expected_workers" 20 || { \
 			echo "$(RED)❌ Startup verification failed. Use 'make logs' to inspect the service logs.$(NC)"; \
 			$(MAKE) stop >/dev/null 2>&1 || true; \
@@ -237,20 +238,33 @@ stop: stop-console stop-api stop-worker
 restart: stop start
 
 start-console:
-	@if [ -f $(TMP_DIR)/console.pid ] && ps -p $$(cat $(TMP_DIR)/console.pid) > /dev/null 2>&1; then \
+	@pid_is_console() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+	}; \
+	if [ -f $(TMP_DIR)/console.pid ] && pid_is_console $$(cat $(TMP_DIR)/console.pid); then \
 		echo "$(GREEN)✅ Console already running$(NC)"; \
 	else \
+		rm -f $(TMP_DIR)/console.pid; \
 		echo "$(CYAN)Starting Console...$(NC)"; \
-		cd $(CONSOLE_DIR) && nohup npm run dev > $(TMP_DIR)/console.log 2>&1 & echo $$! > $(TMP_DIR)/console.pid; \
+		nohup bash -lc "cd '$(CONSOLE_DIR)' && export PATH='$(CONSOLE_DIR)/node_modules/.bin':\$$PATH && exec node '$(CONSOLE_DIR)/scripts/dev.mjs'" > $(TMP_DIR)/console.log 2>&1 & echo $$! > $(TMP_DIR)/console.pid; \
 		echo "$(GREEN)✅ Console started (Frontend bound to http://localhost:5173)$(NC)"; \
 	fi
 
 start-api:
-	@if [ -f $(TMP_DIR)/api.pid ] && ps -p $$(cat $(TMP_DIR)/api.pid) > /dev/null 2>&1; then \
+	@pid_is_api() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
+			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
+	}; \
+	if [ -f $(TMP_DIR)/api.pid ] && pid_is_api $$(cat $(TMP_DIR)/api.pid); then \
 		echo "$(GREEN)✅ API Service already running$(NC)"; \
 	else \
+		rm -f $(TMP_DIR)/api.pid; \
 		echo "$(CYAN)Starting API...$(NC)"; \
-		cd $(API_DIR) && nohup ./gradlew bootRun > $(TMP_DIR)/api.log 2>&1 & echo $$! > $(TMP_DIR)/api.pid; \
+		nohup bash -lc "cd '$(API_DIR)' && exec '$(API_DIR)/gradlew' bootRun" > $(TMP_DIR)/api.log 2>&1 & echo $$! > $(TMP_DIR)/api.pid; \
 		echo "$(GREEN)✅ API Service started$(NC)"; \
 	fi
 
@@ -348,16 +362,31 @@ scale-worker:
 
 stop-console:
 	@echo "$(YELLOW)Stopping Console...$(NC)"
-	@-if [ -f $(TMP_DIR)/console.pid ]; then kill -9 $$(cat $(TMP_DIR)/console.pid) 2>/dev/null || true; rm -f $(TMP_DIR)/console.pid; fi
-	@-pkill -f "npm run dev" || true
-	@-pkill -f "vite" || true
+	@-pid_is_console() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+	}; \
+	if [ -f $(TMP_DIR)/console.pid ]; then \
+		pid=$$(cat $(TMP_DIR)/console.pid); \
+		if pid_is_console "$$pid"; then kill -9 "$$pid" 2>/dev/null || true; fi; \
+		rm -f $(TMP_DIR)/console.pid; \
+	fi
 	@echo "$(GREEN)✅ Console stopped$(NC)"
 
 stop-api:
 	@echo "$(YELLOW)Stopping API...$(NC)"
-	@-if [ -f $(TMP_DIR)/api.pid ]; then kill -9 $$(cat $(TMP_DIR)/api.pid) 2>/dev/null || true; rm -f $(TMP_DIR)/api.pid; fi
-	@-pkill -f "bootRun" || true
-	@-lsof -t -i :8080 | xargs kill -9 2>/dev/null || true
+	@-pid_is_api() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
+			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
+	}; \
+	if [ -f $(TMP_DIR)/api.pid ]; then \
+		pid=$$(cat $(TMP_DIR)/api.pid); \
+		if pid_is_api "$$pid"; then kill -9 "$$pid" 2>/dev/null || true; fi; \
+		rm -f $(TMP_DIR)/api.pid; \
+	fi
 	@echo "$(GREEN)✅ API Service stopped$(NC)"
 
 stop-worker:
@@ -402,8 +431,41 @@ status:
 	@echo "$(CYAN)Database Container:$(NC)"
 	@docker ps --filter "name=$(DB_CONTAINER_NAME)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | tail -n+2 || echo "  $(RED)Not running$(NC)"
 	@echo "$(CYAN)Background Processes:$(NC)"
-	@if [ -f $(TMP_DIR)/console.pid ] && ps -p `cat $(TMP_DIR)/console.pid` >/dev/null; then echo "  Console: $(GREEN)Running$(NC) (PID: `cat $(TMP_DIR)/console.pid`)"; else echo "  Console: $(RED)Stopped$(NC)"; fi
-	@if [ -f $(TMP_DIR)/api.pid ] && ps -p `cat $(TMP_DIR)/api.pid` >/dev/null; then echo "  API:     $(GREEN)Running$(NC) (PID: `cat $(TMP_DIR)/api.pid`)"; else echo "  API:     $(RED)Stopped$(NC)"; fi
+	@pid_is_console() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(CONSOLE_DIR)/scripts/dev.mjs"; \
+	}; \
+	if [ -f $(TMP_DIR)/console.pid ]; then \
+		pid=$$(cat $(TMP_DIR)/console.pid); \
+		if pid_is_console "$$pid"; then \
+			echo "  Console: $(GREEN)Running$(NC) (PID: $$pid)"; \
+		elif ps -p "$$pid" >/dev/null 2>&1; then \
+			echo "  Console: $(RED)Stale$(NC) (PID reused by another process: $$pid)"; \
+		else \
+			echo "  Console: $(RED)Stopped$(NC) (stale PID: $$pid)"; \
+		fi; \
+	else \
+		echo "  Console: $(RED)Stopped$(NC)"; \
+	fi
+	@pid_is_api() { \
+		pid="$$1"; \
+		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
+		printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradle/wrapper/gradle-wrapper.jar bootRun" || \
+			printf '%s\n' "$$command" | grep -Fq "$(API_DIR)/gradlew bootRun"; \
+	}; \
+	if [ -f $(TMP_DIR)/api.pid ]; then \
+		pid=$$(cat $(TMP_DIR)/api.pid); \
+		if pid_is_api "$$pid"; then \
+			echo "  API:     $(GREEN)Running$(NC) (PID: $$pid)"; \
+		elif ps -p "$$pid" >/dev/null 2>&1; then \
+			echo "  API:     $(RED)Stale$(NC) (PID reused by another process: $$pid)"; \
+		else \
+			echo "  API:     $(RED)Stopped$(NC) (stale PID: $$pid)"; \
+		fi; \
+	else \
+		echo "  API:     $(RED)Stopped$(NC)"; \
+	fi
 	@pid_is_worker() { \
 		pid="$$1"; \
 		command=$$(ps -p "$$pid" -o command= 2>/dev/null || true); \
