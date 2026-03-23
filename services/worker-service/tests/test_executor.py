@@ -98,7 +98,7 @@ async def test_completion_path(mock_worker, task_data):
                            lease_expiry=NULL
                        WHERE task_id=$2::uuid
                          AND status='running'
-                         AND lease_owner=$3::uuid
+                         AND lease_owner=$3
                        RETURNING task_id''',
                 json.dumps({"result": "Final Answer: 4"}),
                 task_data["task_id"],
@@ -327,7 +327,7 @@ async def test_timeout_dead_letter(mock_worker, task_data):
                        lease_expiry=NULL
                    WHERE task_id=$5::uuid
                      AND status='running'
-                     AND lease_owner=$6::uuid
+                     AND lease_owner=$6
                    RETURNING task_id''',
                 "task_timeout",
                 "Execution exceeded task logic timeout",
@@ -401,7 +401,7 @@ async def test_non_retryable_error(mock_worker, task_data):
                        lease_expiry=NULL
                    WHERE task_id=$5::uuid
                      AND status='running'
-                     AND lease_owner=$6::uuid
+                     AND lease_owner=$6
                    RETURNING task_id''',
                 "non_retryable_error",
                 "pydantic validation error: invalid property",
@@ -447,7 +447,7 @@ async def test_graph_recursion_error(mock_worker, task_data):
                        lease_expiry=NULL
                    WHERE task_id=$5::uuid
                      AND status='running'
-                     AND lease_owner=$6::uuid
+                     AND lease_owner=$6
                    RETURNING task_id''',
                 "max_steps_exceeded",
                 "Execution exceeded max_steps (5)",
@@ -495,7 +495,7 @@ async def test_retries_exhausted(mock_worker, task_data):
                        lease_expiry=NULL
                    WHERE task_id=$5::uuid
                      AND status='running'
-                     AND lease_owner=$6::uuid
+                     AND lease_owner=$6
                    RETURNING task_id''',
                 "retries_exhausted",
                 "Max retries reached. Last error: 503 Service Unavailable",
@@ -576,7 +576,7 @@ async def test_read_url_failure_preserves_failing_url_on_retryable_requeue(mock_
                        lease_expiry=NULL
                    WHERE task_id=$4::uuid
                      AND status='running'
-                     AND lease_owner=$5::uuid
+                     AND lease_owner=$5
                    RETURNING task_id''',
         1,
         ANY,

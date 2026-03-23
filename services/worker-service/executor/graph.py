@@ -243,7 +243,7 @@ class GraphExecutor:
                            lease_expiry=NULL
                        WHERE task_id=$2::uuid
                          AND status='running'
-                         AND lease_owner=$3::uuid
+                         AND lease_owner=$3
                        RETURNING task_id''',
                     json.dumps({"result": output_content}),
                     task_id,
@@ -518,7 +518,7 @@ class GraphExecutor:
                        lease_expiry=NULL
                    WHERE task_id=$4::uuid
                      AND status='running'
-                     AND lease_owner=$5::uuid
+                     AND lease_owner=$5
                    RETURNING task_id''',
                 new_retry_count,
                 retry_after,
@@ -552,7 +552,7 @@ class GraphExecutor:
                        lease_expiry=NULL
                    WHERE task_id=$5::uuid
                      AND status='running'
-                     AND lease_owner=$6::uuid
+                     AND lease_owner=$6
                    RETURNING task_id''',
                 reason,
                 error_msg,
