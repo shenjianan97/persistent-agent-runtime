@@ -189,6 +189,7 @@ public class TaskRepository {
                         last_worker_id = NULL,
                         dead_letter_reason = NULL,
                         dead_lettered_at = NULL,
+                        timeout_reference_at = NOW(),
                         version = version + 1,
                         updated_at = NOW()
                     WHERE task_id = ? AND tenant_id = ?

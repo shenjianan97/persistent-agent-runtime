@@ -95,6 +95,17 @@ class TaskPoller:
         self._poll_task = asyncio.create_task(self._poll_loop())
         await self._log.ainfo("poller_started", pool_id=self._config.worker_pool_id)
 
+    async def drain(self, timeout: float) -> bool:
+        """Wait for all in-flight tasks to finish. Returns True if fully drained before timeout."""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while self._active_tasks_count > 0:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.5, remaining))
+        return True
+
     async def stop(self) -> None:
         """Gracefully stop the poller."""
         self._running = False
