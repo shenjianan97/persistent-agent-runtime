@@ -592,3 +592,85 @@ def test_tool_transport_error_is_retryable(mock_worker):
     assert executor._is_retryable_error(
         ToolTransportError("URL fetch request failed for https://bad.example/fail: network down")
     ) is True
+
+
+def test_rate_limit_with_invalid_in_message_is_retryable(mock_worker):
+    """Issue #14: 'invalid request rate exceeded' was previously dead-lettered because
+    the 'invalid' string check ran before the 429/rate-limit check."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    assert executor._is_retryable_error(Exception("invalid request rate exceeded")) is True
+    assert executor._is_retryable_error(Exception("429 Too Many Requests")) is True
+    assert executor._is_retryable_error(Exception("rate limit reached")) is True
+
+
+def test_real_validation_errors_are_not_retryable(mock_worker):
+    """Ensure the retryable-first ordering doesn't accidentally make validation errors retryable."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    assert executor._is_retryable_error(ValueError("pydantic validation error")) is False
+    assert executor._is_retryable_error(ValueError("invalid schema property")) is False
+    assert executor._is_retryable_error(ValueError("unsupported model")) is False
+
+
+@pytest.mark.asyncio
+async def test_completion_stolen_lease_does_not_crash(mock_worker, task_data):
+    """Issue #12: if the lease was stolen before completion, fetchval returns None.
+    The executor must log a warning and return cleanly instead of crashing."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    # Simulate lease stolen: fetchval returns None (0 rows updated)
+    mock_worker.pool.fetchval = AsyncMock(return_value=None)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def mock_astream(*args, **kwargs):
+                yield {"mock": "event"}
+            mock_compiled.astream = mock_astream
+
+            mock_state = MagicMock()
+            mock_state.values = {"messages": [MagicMock(content="Answer")]}
+            mock_compiled.aget_state.return_value = mock_state
+
+            # Should not raise
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+        # fetchval was called (attempted the update) but returned None — no exception
+        mock_worker.pool.fetchval.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_dead_letter_stolen_lease_does_not_crash(mock_worker, task_data):
+    """Issue #12: if the lease was stolen before dead-lettering, fetchval returns None.
+    The executor must log a warning and return cleanly."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval = AsyncMock(return_value=None)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def failing_astream(*args, **kwargs):
+                raise ValueError("unsupported model type")
+                yield {}
+            mock_compiled.astream = failing_astream
+
+            # Should not raise even though fetchval returns None
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+        mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_once()

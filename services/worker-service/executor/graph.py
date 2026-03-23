@@ -472,7 +472,7 @@ class GraphExecutor:
 
         # 429 and 5xx are retryable — checked before string heuristics to avoid
         # false negatives (e.g. "invalid request rate exceeded" contains "invalid")
-        if "429" in error_str or "rate limit" in error_str:
+        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         if re.search(r'\b50[0234]\b', error_str):
             return True
