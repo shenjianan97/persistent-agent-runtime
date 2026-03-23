@@ -674,3 +674,43 @@ async def test_dead_letter_stolen_lease_does_not_crash(mock_worker, task_data):
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
         mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_retry_requeue_stolen_lease_skips_notify(mock_worker, task_data):
+    """Issue #12: if the lease was stolen before retry-requeue, fetchval returns None.
+    The executor must skip the pg_notify and return cleanly."""
+    task_data["retry_count"] = 0
+    task_data["max_retries"] = 3
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    # Simulate lease stolen on the retry-requeue UPDATE
+    mock_conn = AsyncMock()
+    mock_conn.fetchval = AsyncMock(return_value=None)
+    mock_conn.execute = AsyncMock()
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value = mock_conn
+    mock_worker.pool.acquire.return_value = mock_ctx
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def failing_astream(*args, **kwargs):
+                raise ConnectionError("connection reset")
+                yield {}
+            mock_compiled.astream = failing_astream
+
+            # Should not raise
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+    # fetchval was called (retry-requeue UPDATE) but returned None
+    mock_conn.fetchval.assert_called_once()
+    # pg_notify should NOT have been called since the update was skipped
+    mock_conn.execute.assert_not_called()

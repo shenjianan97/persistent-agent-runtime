@@ -97,7 +97,7 @@ class TaskPoller:
 
     async def drain(self, timeout: float) -> bool:
         """Wait for all in-flight tasks to finish. Returns True if fully drained before timeout."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while self._active_tasks_count > 0:
             remaining = deadline - loop.time()
