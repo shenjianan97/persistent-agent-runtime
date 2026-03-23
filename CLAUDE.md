@@ -42,6 +42,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ## Local Validation Notes
 
+- For local testing, follow the repo's documented local development and validation workflow in `README.md` unless it is not feasible in the current environment.
 - When validating background `Makefile` targets such as `make start`, `make status`, and `make stop`, prefer an interactive shell / PTY. Some non-interactive command runners reap or detach child processes when the parent command exits, which can make background-service checks look broken even when the `Makefile` logic is correct.
 
 ## Project Stages

@@ -153,6 +153,19 @@ The integration suite is the best place to validate the intended runtime lifecyc
 - crash recovery and checkpoint resume
 - multi-worker coordination
 
+### Local Validation Workflow
+
+For local end-to-end validation of the `Makefile` workflow:
+
+1. Run `make check` to confirm prerequisites and local dependencies.
+2. Use `make db-migrate` for safe schema setup, or `make db-reset-verify` if you explicitly want a destructive reset plus schema verification.
+3. Start the stack with `make start` or `make start N=3`.
+4. Confirm the stack is healthy with `make status`, `curl http://localhost:8080/actuator/health`, and optionally `curl -I http://localhost:5173`.
+5. Tail logs with `make logs` if startup looks suspicious.
+6. Stop the stack with `make stop` when finished.
+
+When validating background service management, prefer running `make start`, `make status`, and `make stop` from a real interactive terminal. Some non-interactive runners can reap child processes when the parent command exits, which makes background-service checks look misleading.
+
 ## Notes
 
 - `CLAUDE.md` remains at the repo root for tool-facing project context.
