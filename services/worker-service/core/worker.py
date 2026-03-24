@@ -130,9 +130,9 @@ class WorkerService:
             except asyncio.CancelledError:
                 pass
 
-        # Stop accepting new tasks first.
+        # Quiesce the poller so no new tasks are claimed during shutdown.
         if self.poller:
-            await self.poller.stop()
+            await self.poller.quiesce()
 
         # Drain in-flight tasks before revoking heartbeats so workers don't burn
         # retry attempts on every ECS deployment.
@@ -143,6 +143,9 @@ class WorkerService:
                     "drain_timeout",
                     shutdown_drain_seconds=self._config.shutdown_drain_seconds,
                 )
+
+        if self.poller:
+            await self.poller.stop()
 
         if self.heartbeat:
             await self.heartbeat.stop_all()

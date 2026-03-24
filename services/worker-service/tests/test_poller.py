@@ -241,3 +241,29 @@ class TestPollerDrain:
 
         result = await poller.drain(timeout=0.2)
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_quiesce_waits_for_inflight_claim_attempt(self):
+        """Issue #17: quiesce should not cancel claim attempt mid-flight."""
+        poller = self._make_poller()
+        poller._running = True
+        poller._notify_event.set()
+        entered_try_claim = asyncio.Event()
+        release_try_claim = asyncio.Event()
+
+        async def blocking_try_claim() -> bool:
+            entered_try_claim.set()
+            await release_try_claim.wait()
+            return False
+
+        poller._try_claim = blocking_try_claim  # type: ignore[method-assign]
+        poller._poll_task = asyncio.create_task(poller._poll_loop())
+
+        await entered_try_claim.wait()
+        quiesce_task = asyncio.create_task(poller.quiesce())
+        await asyncio.sleep(0.05)
+        assert not quiesce_task.done()
+
+        release_try_claim.set()
+        await quiesce_task
+        assert poller._poll_task.done()

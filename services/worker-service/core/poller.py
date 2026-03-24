@@ -106,16 +106,19 @@ class TaskPoller:
             await asyncio.sleep(min(0.5, remaining))
         return True
 
-    async def stop(self) -> None:
-        """Gracefully stop the poller."""
+    async def quiesce(self) -> None:
+        """Stop accepting new tasks and let in-flight claim attempts finish."""
         self._running = False
         self._notify_event.set()  # Wake up any sleeping poll
         if self._poll_task:
-            self._poll_task.cancel()
             try:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+
+    async def stop(self) -> None:
+        """Gracefully stop the poller."""
+        await self.quiesce()
         if self._listen_task:
             self._listen_task.cancel()
             try:
