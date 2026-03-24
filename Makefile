@@ -22,20 +22,21 @@ WORKER_VENV_DIR := $(WORKER_DIR)/.venv
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
 
 PYTHON ?= $(shell \
-	for py in python3.13 python3.12 python3.11 python3 python; do \
-		if command -v $$py >/dev/null 2>&1 && $$py -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then \
-			command -v $$py; \
+	candidates=$$(ls /opt/homebrew/bin/python3.* /usr/local/bin/python3.* 2>/dev/null | grep -E 'python3\.[0-9]+$$' | sort -t. -k2 -rn); \
+	for py in $$candidates python3 python; do \
+		if "$$py" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then \
+			echo "$$py"; \
 			break; \
 		fi; \
 	done)
 
 DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
 DB_DSN ?= postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
-DB_HOST ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "localhost")' "$(DB_DSN)")
-DB_PORT ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 55432)' "$(DB_DSN)")
-DB_NAME ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).path.lstrip("/") or "persistent_agent_runtime")' "$(DB_DSN)")
-DB_USER ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).username or "postgres"))' "$(DB_DSN)")
-DB_PASSWORD ?= $(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).password or "postgres"))' "$(DB_DSN)")
+DB_HOST ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "localhost")' "$(DB_DSN)"),localhost)
+DB_PORT ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 55432)' "$(DB_DSN)"),55432)
+DB_NAME ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).path.lstrip("/") or "persistent_agent_runtime")' "$(DB_DSN)"),persistent_agent_runtime)
+DB_USER ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).username or "postgres"))' "$(DB_DSN)"),postgres)
+DB_PASSWORD ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).password or "postgres"))' "$(DB_DSN)"),postgres)
 SERVER_PORT ?= 8080
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
@@ -72,7 +73,7 @@ help:
 	@echo "  $(YELLOW)make start N=3$(NC)      - 🚀 Start all services with 3 workers"
 	@echo "  $(YELLOW)make start-worker N=3$(NC) - 👷 Start 3 worker processes only"
 	@echo "  $(YELLOW)make scale-worker N=5$(NC) - ⚖️  Scale workers up or down to 5"
-	@echo "  $(YELLOW)make stop$(NC)           - 🛑 Stop all background services"
+	@echo "  $(YELLOW)make stop$(NC)           - 🛑 Stop all background services (DB container kept running; use 'make db-down' to stop it)"
 	@echo "  $(YELLOW)make restart$(NC)        - 🔄 Restart all stack services"
 	@echo "  $(YELLOW)make status$(NC)         - 📊 Show process and DB statuses"
 	@echo "  $(YELLOW)make check$(NC)          - 🔍 Verify environment prerequisites"
@@ -242,6 +243,7 @@ start: check
 
 stop: stop-console stop-api stop-worker
 	@echo "$(GREEN)🛑 All services stopped$(NC)"
+	@echo "$(YELLOW)ℹ️  DB container is still running. Run 'make db-down' to stop it.$(NC)"
 
 restart: stop start
 
