@@ -232,20 +232,27 @@ class GraphExecutor:
                 output_content = messages[-1].content if messages else ""
                 
                 # Step 5: Completion Path
-                await self.pool.execute(
-                    '''UPDATE tasks 
-                       SET status='completed', 
-                           output=$1, 
+                updated = await self.pool.fetchval(
+                    '''UPDATE tasks
+                       SET status='completed',
+                           output=$1,
                            last_error_code=NULL,
                            last_error_message=NULL,
                            version=version+1,
                            lease_owner=NULL,
                            lease_expiry=NULL
-                       WHERE task_id=$2::uuid''',
+                       WHERE task_id=$2::uuid
+                         AND status='running'
+                         AND lease_owner=$3
+                       RETURNING task_id''',
                     json.dumps({"result": output_content}),
-                    task_id
+                    task_id,
+                    worker_id,
                 )
-                logger.info("Task %s completed successfully.", task_id)
+                if updated is None:
+                    logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
+                else:
+                    logger.info("Task %s completed successfully.", task_id)
 
             # Step 2: Wrap execution in timeout
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
@@ -455,27 +462,30 @@ class GraphExecutor:
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
-        error_str = str(e).lower()
-        if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
-            return False
-        
-        # 4xx HTTP responses (usually fatal)
-        if re.search(r'\b40[0-4]\b', error_str):
-            return False
+        # Check exception type first (most reliable signal)
+        if isinstance(e, ToolTransportError):
+            return True
+        if isinstance(e, (ConnectionError, TimeoutError)):
+            return True
 
-        # 429 and 5xx are retryable
-        if "429" in error_str or "rate limit" in error_str:
+        error_str = str(e).lower()
+
+        # 429 and 5xx are retryable — checked before string heuristics to avoid
+        # false negatives (e.g. "invalid request rate exceeded" contains "invalid")
+        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         if re.search(r'\b50[0234]\b', error_str):
             return True
 
-        if isinstance(e, ToolTransportError):
-            return True
-            
-        if isinstance(e, (ConnectionError, TimeoutError)):
-            return True
-            
-        # For Phase 1, default unknown exceptions to non-retryable 
+        # Non-retryable validation and client errors
+        if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
+            return False
+
+        # 4xx HTTP responses (usually fatal)
+        if re.search(r'\b40[0-4]\b', error_str):
+            return False
+
+        # For Phase 1, default unknown exceptions to non-retryable
         return False
 
     async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
@@ -492,39 +502,47 @@ class GraphExecutor:
         backoff_seconds = min(300, 2 ** new_retry_count)
         retry_after = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
         
+        worker_id = self.config.worker_id
         error_msg = str(e)[:1024]
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                '''UPDATE tasks 
-                   SET status='queued', 
-                       retry_count=$1, 
-                       retry_after=$2, 
+            updated = await conn.fetchval(
+                '''UPDATE tasks
+                   SET status='queued',
+                       retry_count=$1,
+                       retry_after=$2,
                        retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
-                       last_error_code='retryable_error', 
-                       last_error_message=$3, 
+                       last_error_code='retryable_error',
+                       last_error_message=$3,
                        version=version+1,
                        lease_owner=NULL,
                        lease_expiry=NULL
-                   WHERE task_id=$4::uuid''',
+                   WHERE task_id=$4::uuid
+                     AND status='running'
+                     AND lease_owner=$5
+                   RETURNING task_id''',
                 new_retry_count,
                 retry_after,
                 error_msg,
-                task_id
+                task_id,
+                worker_id,
             )
+            if updated is None:
+                logger.warning("Task %s retry-requeue skipped: lease no longer owned by this worker.", task_id)
+                return
             # Re-queue notification
             await conn.execute("SELECT pg_notify('new_task', $1)", worker_pool_id)
-        
+
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
     async def _handle_dead_letter(self, task_id: str, reason: str, error_msg: str, error_code: str | None = None):
         worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
-        
+
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                '''UPDATE tasks 
-                   SET status='dead_letter', 
-                       dead_letter_reason=$1, 
+            updated = await conn.fetchval(
+                '''UPDATE tasks
+                   SET status='dead_letter',
+                       dead_letter_reason=$1,
                        last_error_message=$2,
                        last_error_code=$3,
                        last_worker_id=$4,
@@ -532,12 +550,19 @@ class GraphExecutor:
                        version=version+1,
                        lease_owner=NULL,
                        lease_expiry=NULL
-                   WHERE task_id=$5::uuid''',
+                   WHERE task_id=$5::uuid
+                     AND status='running'
+                     AND lease_owner=$6
+                   RETURNING task_id''',
                 reason,
                 error_msg,
                 error_code or reason,
                 worker_id,
-                task_id
+                task_id,
+                worker_id,
             )
-        
-        logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+
+        if updated is None:
+            logger.warning("Task %s dead-letter skipped: lease no longer owned by this worker.", task_id)
+        else:
+            logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)

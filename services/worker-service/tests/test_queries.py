@@ -157,3 +157,12 @@ class TestReaperTimeoutQueryContract:
 
     def test_checks_task_timeout(self):
         assert "task_timeout_seconds * INTERVAL '1 second'" in REAPER_TIMEOUT_QUERY
+
+    def test_uses_timeout_reference_at_not_created_at(self):
+        """Reaper must use timeout_reference_at so redriven tasks get a fresh window.
+
+        Issue #13: using created_at caused redriven tasks to be immediately
+        dead-lettered again because created_at is never reset on redrive.
+        """
+        assert "timeout_reference_at" in REAPER_TIMEOUT_QUERY
+        assert "created_at" not in REAPER_TIMEOUT_QUERY

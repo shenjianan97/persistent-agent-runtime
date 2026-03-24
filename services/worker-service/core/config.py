@@ -60,4 +60,8 @@ class WorkerConfig:
     reaper_interval_seconds: int = field(default_factory=lambda: _env_int("REAPER_INTERVAL_SECONDS", 30))
     reaper_jitter_seconds: int = field(default_factory=lambda: _env_int("REAPER_JITTER_SECONDS", 10))
 
+    # Shutdown drain — seconds to wait for in-flight tasks to finish before
+    # stopping heartbeats. Default fits within ECS's 30-second SIGTERM window.
+    shutdown_drain_seconds: int = field(default_factory=lambda: _env_int("SHUTDOWN_DRAIN_SECONDS", 25))
+
 

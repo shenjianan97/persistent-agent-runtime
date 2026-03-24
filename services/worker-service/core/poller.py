@@ -95,16 +95,30 @@ class TaskPoller:
         self._poll_task = asyncio.create_task(self._poll_loop())
         await self._log.ainfo("poller_started", pool_id=self._config.worker_pool_id)
 
-    async def stop(self) -> None:
-        """Gracefully stop the poller."""
+    async def drain(self, timeout: float) -> bool:
+        """Wait for all in-flight tasks to finish. Returns True if fully drained before timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._active_tasks_count > 0:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.5, remaining))
+        return True
+
+    async def quiesce(self) -> None:
+        """Stop accepting new tasks and let in-flight claim attempts finish."""
         self._running = False
         self._notify_event.set()  # Wake up any sleeping poll
         if self._poll_task:
-            self._poll_task.cancel()
             try:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+
+    async def stop(self) -> None:
+        """Gracefully stop the poller."""
+        await self.quiesce()
         if self._listen_task:
             self._listen_task.cancel()
             try:

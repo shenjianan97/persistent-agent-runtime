@@ -45,16 +45,16 @@ async def test_3_20_crash_between_last_checkpoint_and_completion(e2e):
     e2e.use_llm(simple_response("done"))
 
     pool = e2e.db.pool
-    original_execute = pool.__class__.execute
+    original_fetchval = pool.__class__.fetchval
     state = {"swallowed_once": False}
 
-    async def flaky_execute(self, query, *args, **kwargs):
+    async def flaky_fetchval(self, query, *args, **kwargs):
         if (not state["swallowed_once"]) and "SET status='completed'" in query:
             state["swallowed_once"] = True
-            return "UPDATE 0"
-        return await original_execute(self, query, *args, **kwargs)
+            return None  # simulate 0 rows updated (lease guard returns None)
+        return await original_fetchval(self, query, *args, **kwargs)
 
-    with patch.object(pool.__class__, "execute", new=flaky_execute):
+    with patch.object(pool.__class__, "fetchval", new=flaky_fetchval):
         await e2e.start_worker("e2e-post-checkpoint-crash")
         task_id = e2e.submit_task(allowed_tools=[], input="single step")
 

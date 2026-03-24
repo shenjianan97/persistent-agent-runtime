@@ -201,3 +201,69 @@ class TestPollerTryClaim:
         await asyncio.sleep(0.05)
         assert len(callback_received) == 1
         assert callback_received[0]["task_id"] == task_id
+
+
+class TestPollerDrain:
+    """Issue #15: drain() should wait for in-flight tasks before returning."""
+
+    def _make_poller(self, config=None) -> "TaskPoller":
+        config = config or WorkerConfig(worker_id="test-poller")
+        pool = MagicMock()
+        pool.acquire = MagicMock()
+        metrics = MetricsCollector()
+        heartbeat = MagicMock()
+        return TaskPoller(config, pool, metrics, heartbeat, None)
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_true_when_no_inflight_tasks(self):
+        poller = self._make_poller()
+        assert poller._active_tasks_count == 0
+        result = await poller.drain(timeout=1.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_drain_waits_until_tasks_finish(self):
+        poller = self._make_poller()
+        poller._active_tasks_count = 1
+
+        async def finish_after_delay():
+            await asyncio.sleep(0.1)
+            poller._active_tasks_count = 0
+
+        asyncio.create_task(finish_after_delay())
+        result = await poller.drain(timeout=2.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_drain_returns_false_on_timeout(self):
+        poller = self._make_poller()
+        poller._active_tasks_count = 1  # never cleared
+
+        result = await poller.drain(timeout=0.2)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_quiesce_waits_for_inflight_claim_attempt(self):
+        """Issue #17: quiesce should not cancel claim attempt mid-flight."""
+        poller = self._make_poller()
+        poller._running = True
+        poller._notify_event.set()
+        entered_try_claim = asyncio.Event()
+        release_try_claim = asyncio.Event()
+
+        async def blocking_try_claim() -> bool:
+            entered_try_claim.set()
+            await release_try_claim.wait()
+            return False
+
+        poller._try_claim = blocking_try_claim  # type: ignore[method-assign]
+        poller._poll_task = asyncio.create_task(poller._poll_loop())
+
+        await entered_try_claim.wait()
+        quiesce_task = asyncio.create_task(poller.quiesce())
+        await asyncio.sleep(0.05)
+        assert not quiesce_task.done()
+
+        release_try_claim.set()
+        await quiesce_task
+        assert poller._poll_task.done()

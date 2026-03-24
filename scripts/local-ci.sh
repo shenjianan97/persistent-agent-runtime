@@ -94,14 +94,13 @@ SQL
 apply_migrations() {
     log "Applying database migrations"
 
+    local migrations_dir="$ROOT_DIR/infrastructure/database/migrations"
     local sql_file
-    for sql_file in \
-        "$ROOT_DIR/infrastructure/database/migrations/0001_phase1_durable_execution.sql" \
-        "$ROOT_DIR/infrastructure/database/migrations/0002_worker_registry.sql" \
-        "$ROOT_DIR/infrastructure/database/migrations/0003_dynamic_models.sql" \
-        "$ROOT_DIR/infrastructure/database/migrations/test_seed.sql"; do
+    for sql_file in "$migrations_dir"/[0-9][0-9][0-9][0-9]_*.sql; do
         docker_psql <"$sql_file"
     done
+
+    docker_psql <"$migrations_dir/test_seed.sql"
 }
 
 assert_no_pytest_skips() {

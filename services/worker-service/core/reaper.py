@@ -83,7 +83,7 @@ SET status = 'dead_letter',
     version = version + 1,
     updated_at = NOW()
 WHERE status IN ('running', 'queued')
-  AND created_at + (task_timeout_seconds * INTERVAL '1 second') < NOW()
+  AND timeout_reference_at + (task_timeout_seconds * INTERVAL '1 second') < NOW()
 RETURNING task_id;
 """
 
