@@ -24,7 +24,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - PostgreSQL (Aurora Serverless v2) — Phase 1 state store + queue
 - SQS FIFO — Phase 2 queue (transactional outbox)
 - ECS Fargate — workers
-- OpenTelemetry → CloudWatch — observability
+- Langfuse (self-hosted) — LLM execution tracing, cost/token tracking, customer-facing observability
+- CloudWatch — platform health metrics, structured logs, alerts (operator-facing)
 - LangChain `init_chat_model` — LLM integration (Anthropic, OpenAI, Google, Bedrock; providers auto-discovered from configured API keys)
 
 ## Documents

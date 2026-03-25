@@ -122,7 +122,8 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 | Queue (Phase 2) | **SQS FIFO** | Per-agent ordering via message group ID. Transactional outbox from PostgreSQL. |
 | Compute | **ECS Fargate** | Horizontally scalable, no cluster management. |
 | Agent Execution | **LangGraph + Bedrock/Anthropic/OpenAI** | LangGraph provides the orchestration primitives; native APIs handle generation. |
-| Observability | **OpenTelemetry → CloudWatch** | Vendor-neutral instrumentation, low-ops backend. |
+| Observability (LLM execution) | **Langfuse (self-hosted)** | Auto-instruments LangChain/LangGraph via callback; captures per-call traces, token usage, cost, and latency. Customer-facing execution telemetry served through the Console via Langfuse REST API. |
+| Observability (platform health) | **CloudWatch** | Structured logs, platform metrics (queue depth, lease expiry, worker saturation), and alerts. Operator-facing only. |
 | IaC | **CDK (TypeScript)** | Entire stack defined in one repo. |
 
 ---
@@ -138,8 +139,8 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 - LangGraph-based execution engine with lease-based ownership and heartbeats
 - Custom `PostgresDurableCheckpointer` for durable graph state
 - Reaper for expired leases and dead letter handling
-- Per-node cost tracking via LangGraph event streaming
-- OpenTelemetry traces and key metrics
+- Per-node cost and token tracking via Langfuse auto-instrumentation of LangGraph
+- Two-layer observability: Langfuse for customer-facing LLM execution traces, CloudWatch for operator-facing platform health
 - Single top-level graph only (no subgraphs in Phase 1)
 
 **Demo scenario:**

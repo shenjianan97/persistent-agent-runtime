@@ -12,6 +12,7 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 | [Task 6](./agent_tasks/task-6-graph-executor.md) | Graph Executor | Done | Graph assembly, failure classification, retryable/non-retryable handling, cost tracking, unit/integration testing. |
 | [Task 7](./agent_tasks/task-7-console.md) | Console | Done | Dashboard, task list, task dispatcher, execution telemetry, dead letter queue. Brutalist dark-mode UI with IBM Plex Mono + Syne fonts. |
 | [Task 8](./agent_tasks/task-8-aws-infrastructure.md) | AWS Cloud Infrastructure | Done | Added CDK network/data/compute stacks, service container packaging, schema bootstrap + model discovery deployment hooks, and infrastructure deployment docs. |
+| [Task 9](./agent_tasks/task-9-langfuse-observability.md) | Langfuse Integration & Observability Split | Not Started | Replace manual cost tracking with Langfuse auto-instrumentation. Deploy self-hosted Langfuse. Split customer-facing (Langfuse → Console) vs operator-facing (CloudWatch) observability. Remove cost columns from checkpoints. Export platform metrics to CloudWatch. |
 
 ## Notes
 - Task 1 must be completed before downstream components that rely on the schema can be fully tested.
@@ -20,6 +21,7 @@ This document tracks the execution status of the Agent Tasks defined in the Impl
 - Task 6 depends on 3, 4, and 5.
 - Task 7 (Demo Dashboard) depends on Task 2 (API Service) for endpoint consumption.
 - Task 8 can be worked on in parallel with all other tasks but is required for cloud deployment.
+- Task 9 depends on all Tasks 1–8 being complete. It modifies Worker (Task 6), API (Task 2), Console (Task 7), and Infrastructure (Task 8).
 
 ## Task 8 — CDK Test Fix (Post-Completion)
 - **Issue:** `npm test` in `infrastructure/cdk/` failed during synth-time with `CannotFindFile: api-image.Dockerfile`.
