@@ -60,7 +60,7 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
   Component: Langfuse Integration and Observability Split
   Change type: modification + new code
   Path: `services/worker-service/executor/`, `services/api-service/`, `services/console/`, `infrastructure/cdk/`, `infrastructure/database/migrations/`
-  Description: Replace manual cost tracking with Langfuse auto-instrumentation of LangGraph. Deploy self-hosted Langfuse (ECS + own database) behind the internal ALB. Add API Service proxy endpoints for Langfuse trace data. Update the Console to source cost/trace visualization from Langfuse. Separate customer-facing observability (Langfuse via Console) from operator-facing observability (CloudWatch metrics, dashboards, alarms). Remove `cost_microdollars` and `execution_metadata` from the checkpoints table. Export worker platform metrics to CloudWatch.
+  Description: Replace manual cost tracking with Langfuse auto-instrumentation of LangGraph. Deploy self-hosted Langfuse workloads plus the required backing services (PostgreSQL, Redis/Valkey, ClickHouse, or managed equivalents supported by Langfuse) behind the internal ALB. Add API Service proxy endpoints for Langfuse trace data. Update the Console to source cost/trace visualization from Langfuse. Separate customer-facing observability (Langfuse via Console) from operator-facing observability (CloudWatch metrics, dashboards, alarms). Remove `cost_microdollars` and `execution_metadata` from the checkpoints table. Export worker platform metrics to CloudWatch.
 
 #### A3. Dependency Graph
 All tasks are mostly independent except where schema or runtime contracts are shared:
@@ -108,7 +108,7 @@ Each task should leave explicit artifacts for downstream consumers:
   Deployable CDK stacks (Network, Data, Compute), API/Worker/Console container build assets (Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, Console deployment behind the shared ALB, Model Discovery scheduled Lambda plus initial invocation, imported Secrets Manager references, schema bootstrap with migration tracking, and clear instructions for deploy/destroy workflow.
 
   Task 9 output
-  Self-hosted Langfuse ECS service with its own database. Worker Service using Langfuse callback handler instead of manual cost tracking (~150 lines removed from graph.py). API Service proxy endpoints for Langfuse trace/cost data. Console updated to source execution telemetry from Langfuse and stripped of platform health internals. Database migration removing cost columns from checkpoints. CloudWatch metric export, dashboard, and alarms for operator-facing platform health.
+  Self-hosted Langfuse web/worker workloads plus the required PostgreSQL, Redis/Valkey, and ClickHouse backing services (or compatible managed equivalents). Worker Service using Langfuse callback handler instead of manual cost tracking (~150 lines removed from graph.py). API Service proxy endpoints for Langfuse trace/cost data using Langfuse Basic Auth. Console updated to source execution telemetry from Langfuse and stripped of platform health internals. Database migration removing cost columns from checkpoints. CloudWatch metric export, dashboard, and alarms for operator-facing platform health.
 
 #### A5. Integration Points
   Caller: API Service

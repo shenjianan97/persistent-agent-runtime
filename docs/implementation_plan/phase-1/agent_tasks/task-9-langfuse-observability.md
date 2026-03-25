@@ -33,7 +33,7 @@ This task replaces the manual cost tracking with Langfuse auto-instrumentation a
   - `services/worker-service/requirements.txt` or `pyproject.toml` — add `langfuse` dependency
   - `services/api-service/` — add Langfuse REST API proxy endpoints
   - `services/console/src/features/task-detail/` — update cost/trace visualization to use Langfuse data
-  - `infrastructure/cdk/` — add Langfuse ECS service and its PostgreSQL database
+  - `infrastructure/cdk/` — add Langfuse workloads and required backing services
   - `infrastructure/database/migrations/` — migration to drop `cost_microdollars` and `execution_metadata` from `checkpoints`
 - **Change type:** modification (Worker, API, Console), new code (Langfuse infrastructure)
 
@@ -46,22 +46,23 @@ This task replaces the manual cost tracking with Langfuse auto-instrumentation a
 
 ### Step 1: Deploy Self-Hosted Langfuse (CDK Infrastructure)
 
-**1a. Langfuse database (Data stack — `infrastructure/cdk/lib/data-stack.ts`):**
-- Create a dedicated database named `langfuse` within the existing Aurora Serverless v2 cluster. This avoids provisioning a second Aurora cluster. The schema bootstrap Lambda can execute `CREATE DATABASE IF NOT EXISTS langfuse` as a pre-migration step, or a separate CDK custom resource can handle it.
-- Alternatively, if Aurora instance sharing is problematic, create a lightweight standalone RDS PostgreSQL instance (not Aurora) for Langfuse to minimize cost.
+**1a. Langfuse backing stores (Data stack — `infrastructure/cdk/lib/data-stack.ts`):**
+- Provision the backing services required by the pinned Langfuse release: PostgreSQL, Redis/Valkey, and ClickHouse (or managed equivalents supported by Langfuse). Do not assume PostgreSQL alone is sufficient.
+- If reusing the existing Aurora Serverless v2 cluster for Langfuse's PostgreSQL catalog, create a dedicated database named `langfuse` via a non-transactional existence-check/create flow (for example: query `pg_database`, then issue `CREATE DATABASE langfuse` only when absent).
+- Do not use `CREATE DATABASE IF NOT EXISTS`, and do not run `CREATE DATABASE` inside the schema bootstrap transaction wrapper. If Aurora reuse becomes awkward, provision a dedicated PostgreSQL instance for Langfuse instead.
 
 **1b. Langfuse secrets (Data stack or Compute stack):**
 - Create a new Secrets Manager secret (e.g., `langfuse-credentials`) containing: `NEXTAUTH_SECRET`, `SALT`, `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`, `LANGFUSE_INIT_PROJECT_SECRET_KEY`.
 - These are generated once at stack creation time (use `secretsmanager.Secret` with `generateSecretString`).
 
-**1c. Langfuse ECS Fargate service (Compute stack — `infrastructure/cdk/lib/compute-stack.ts`):**
-- Add a new ECS Fargate service for Langfuse using the public `langfuse/langfuse` Docker image (pin to a specific release tag, not `latest`).
-- Task definition environment variables:
-  - `DATABASE_URL` — constructed from the Aurora cluster endpoint + `langfuse` database name + credentials from the existing DB secret
+**1c. Langfuse ECS workloads (Compute stack — `infrastructure/cdk/lib/compute-stack.ts`):**
+- Add the Langfuse web workload and the required background worker workload using a pinned Langfuse release (not `latest`).
+- Task definition environment variables must include the exact PostgreSQL, Redis/Valkey, and ClickHouse connection settings required by the pinned Langfuse release, plus:
   - `NEXTAUTH_URL` — internal ALB URL with `/langfuse` path
   - `NEXTAUTH_SECRET`, `SALT` — from the new Langfuse Secrets Manager secret
   - `LANGFUSE_INIT_PROJECT_NAME` — hardcoded (e.g., `persistent-agent-runtime`)
   - `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`, `LANGFUSE_INIT_PROJECT_SECRET_KEY` — from the Langfuse secret
+- If the Langfuse migration user cannot create databases, also configure the shadow/direct migration database URLs Langfuse expects for Prisma migrations.
 - Container port 3000, health check on `/api/public/health`.
 - Security group: allow inbound from the ALB and from Worker/API service security groups.
 
@@ -76,6 +77,7 @@ This task replaces the manual cost tracking with Langfuse auto-instrumentation a
   - `LANGFUSE_HOST` — internal ALB URL (e.g., `http://<alb-dns>/langfuse`)
 - Add to the API Service ECS task definition:
   - `LANGFUSE_PUBLIC_KEY` — from Langfuse Secrets Manager secret
+  - `LANGFUSE_SECRET_KEY` — from Langfuse Secrets Manager secret
   - `LANGFUSE_HOST` — internal ALB URL
 
 **1f. IAM permissions:**
@@ -125,10 +127,10 @@ result = await graph.ainvoke(input, config={
 
 ### Step 4: API Service — Add Langfuse Trace Proxy Endpoints
 4a. Add endpoints that proxy trace data from Langfuse to the Console. The Console should never call Langfuse directly — the API Service mediates all access:
-- `GET /v1/tasks/{task_id}/traces` — returns the Langfuse trace tree for a task (using `session_id = task_id` as the lookup key)
+- `GET /v1/tasks/{task_id}/traces` — returns the Langfuse trace tree for a task (using Langfuse `sessionId = task_id` as the lookup key)
 - `GET /v1/tasks/{task_id}/cost` — returns aggregated cost and token usage for a task from Langfuse
 
-4b. The API Service calls the Langfuse REST API (`GET /api/public/traces`, `GET /api/public/sessions/{session_id}`) using the Langfuse public key for authentication.
+4b. The API Service calls the Langfuse REST API (`GET /api/public/traces?sessionId={task_id}`, `GET /api/public/sessions/{sessionId}`) using HTTP Basic Auth with both credentials (username = `LANGFUSE_PUBLIC_KEY`, password = `LANGFUSE_SECRET_KEY`).
 
 4c. Update the existing `GET /v1/tasks/{task_id}` response: the `total_cost_microdollars` field should now be populated by querying Langfuse (or returned as `null` with a separate `/cost` endpoint). Choose the approach that minimizes latency on the main status endpoint.
 
@@ -239,8 +241,8 @@ Add `cloudwatch.Alarm` constructs for:
 
 ## Acceptance Criteria
 The implementation is complete when:
-- [ ] Langfuse runs as a self-hosted ECS service behind the internal ALB (CDK Compute stack)
-- [ ] Langfuse database is provisioned within the existing Aurora cluster (CDK Data stack)
+- [ ] Langfuse runs as self-hosted ECS workloads behind the internal ALB (CDK Compute stack)
+- [ ] Langfuse's required backing services (PostgreSQL, Redis/Valkey, ClickHouse, or managed equivalents supported by Langfuse) are provisioned and wired correctly
 - [ ] Langfuse secrets are stored in AWS Secrets Manager and injected into Worker/API task definitions
 - [ ] Worker Service uses `langfuse.callback.CallbackHandler` instead of manual `CostTrackingCallback`
 - [ ] All manual cost extraction/calculation/backfill code is removed from `graph.py`
@@ -251,13 +253,13 @@ The implementation is complete when:
 - [ ] Console no longer shows platform health internals (DB status, worker count, queue depth)
 - [ ] Worker platform metrics are exported to CloudWatch via EMF
 - [ ] CloudWatch dashboard and alarms are deployed via CDK
-- [ ] `cdk deploy` succeeds with all new resources (Langfuse service, ALB rule, dashboard, alarms)
+- [ ] `cdk deploy` succeeds with all new resources (Langfuse workloads, backing services, ALB rule, dashboard, alarms)
 - [ ] Existing CDK tests pass with the new Compute stack resources
 - [ ] Checkpoint-resume and crash recovery behavior is unaffected (existing tests pass)
 - [ ] End-to-end task execution on AWS produces correct Langfuse traces and Console visualization
 
 ## Testing Requirements
-- **CDK tests:** Verify Compute stack synthesizes with the new Langfuse ECS service, ALB rule, dashboard, and alarms. Verify Data stack still synthesizes cleanly (migration bundling picks up `0005`).
+- **CDK tests:** Verify Compute stack synthesizes with the new Langfuse workloads, ALB rule, dashboard, and alarms. Verify Data stack still synthesizes cleanly with the required Langfuse backing-store resources and migration bundling picks up `0005`.
 - **Worker Service unit tests:** Verify Langfuse callback is registered during graph invocation. Verify manual cost functions are removed (no import, no call).
 - **Worker Service integration tests:** Run a task against a real LLM (or mock) and verify Langfuse receives trace data. Verify checkpoint rows no longer contain cost columns.
 - **API Service tests:** Verify `/v1/tasks/{task_id}/traces` and `/v1/tasks/{task_id}/cost` return data from Langfuse. Verify checkpoint response no longer includes cost fields.
@@ -273,9 +275,11 @@ The implementation is complete when:
 - Keep the `models` table and its pricing columns — the same pricing data seeds Langfuse's model registry.
 
 ## Assumptions / Open Questions for This Task
-- ASSUMPTION: Langfuse can run as a single ECS Fargate task behind the internal ALB with its own database in the existing Aurora cluster.
+- RESOLVED: Langfuse public REST API uses HTTP Basic Auth (public key as username, secret key as password). The API Service therefore needs both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`.
+- RESOLVED: `CREATE DATABASE` must be handled outside transactional migration SQL and without `IF NOT EXISTS`.
+- RESOLVED: The official Langfuse self-hosting distributions include additional backing services beyond PostgreSQL (at minimum Redis/Valkey and ClickHouse), so the CDK design must account for them or compatible managed equivalents.
 - ASSUMPTION: The `langfuse` Python SDK supports `asyncio` via `ainvoke` / `astream` callback handlers.
-- ASSUMPTION: The existing Aurora cluster supports creating a second database (`langfuse`) alongside the main application database. If not, a separate lightweight RDS instance is the fallback.
+- OPEN QUESTION: Reuse the existing Aurora cluster for Langfuse's PostgreSQL catalog, or provision a dedicated PostgreSQL instance for cleaner isolation?
 - ASSUMPTION: The CDK schema bootstrap Lambda's migration bundling (`infrastructure/database/migrations/`) automatically picks up `0005_remove_checkpoint_cost.sql` on the next `cdk deploy` — no handler changes needed.
 - OPEN QUESTION: Should `total_cost_microdollars` on the task status response be populated lazily from Langfuse on each API call, or cached/aggregated periodically? Lazy is simpler but adds latency; caching adds complexity. Start with lazy and optimize if needed.
 - OPEN QUESTION: Langfuse container version pinning — use a specific release tag rather than `latest` for reproducibility. Check the latest stable release at deploy time and pin it in CDK.

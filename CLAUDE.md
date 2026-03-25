@@ -38,7 +38,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | docs/design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
 | docs/implementation_plan/phase-1/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
 | docs/implementation_plan/phase-1/progress.md | Live tracking board for agent execution of Phase 1 |
-| docs/implementation_plan/phase-1/agent_tasks/*.md | 8 parallelizable, single-responsibility execution templates for agents |
+| docs/implementation_plan/phase-1/agent_tasks/*.md | 9 single-responsibility execution templates for agents (Tasks 1-8 implementation, Task 9 observability follow-up) |
 | experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
 ## Local Validation Notes
@@ -60,7 +60,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 
 ### Stage 3 — Implementation Plan [DONE]
 - Hand-off: Translate Phase 1 design into `docs/implementation_plan/phase-1/plan.md` Orchestrator Plan
-- Splitting Prompts: Generate and split explicit constraints into 8 parallelizable agent task spec files (`task-1` through `task-8`) 
+- Splitting Prompts: Generated 8 initial implementation task spec files (`task-1` through `task-8`) plus the follow-up Task 9 observability refinement spec
 - Tracking: Created `docs/implementation_plan/phase-1/progress.md` for orchestrator execution tracking
 - POC logic: Created LangGraph POC validation tasks in `experiments/langgraph/` to test assumptions
 

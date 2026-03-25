@@ -1095,7 +1095,7 @@ By moving the loop to LangGraph, the Worker Service is dramatically simplified. 
 Cost tracking and execution metadata are collected via **Langfuse auto-instrumentation**, not through the checkpointer or manual callback handlers:
 
 1. A Langfuse `CallbackHandler` is registered with the LangGraph invocation. It automatically captures per-LLM-call traces including model, prompt, completion, tool call inputs/outputs, token usage (`input_tokens`, `output_tokens`), cost (calculated from Langfuse's configurable model pricing registry), and latency.
-2. Trace data is sent to a self-hosted Langfuse instance (ECS + its own PostgreSQL) running within the same AWS environment. No third-party SaaS dependency, no data egress.
+2. Trace data is sent to a self-hosted Langfuse deployment (ECS workloads plus the required backing services such as PostgreSQL, Redis/Valkey, and ClickHouse, or compatible managed equivalents) running within the same AWS environment. No third-party SaaS dependency, no data egress.
 3. The Console fetches trace data from Langfuse via its REST API through the API Service, and renders it natively in the task detail view. Langfuse is a backend data source, not a UI the customer is redirected to.
 4. The checkpointer's `put()` method only writes the LangGraph state — it does not handle cost or metadata. This keeps the checkpointer implementation clean and compatible with the `BaseCheckpointSaver` interface.
 
@@ -1186,7 +1186,7 @@ Phase 1 observability is split into two layers with distinct audiences:
 
 **Customer-facing: Langfuse (LLM execution tracing)**
 
-Langfuse auto-instruments LangChain/LangGraph via a callback handler registered at graph invocation time. It captures per-LLM-call traces (model, prompt, completion, tool call inputs/outputs), token usage, cost, and latency — all without manual extraction code. Trace data stays within the AWS environment (self-hosted Langfuse on ECS + its own PostgreSQL). The Console renders execution telemetry by querying the Langfuse REST API through the API Service. Customers see task-level cost breakdown, per-node traces, and tool call sequences. They do not see platform internals.
+Langfuse auto-instruments LangChain/LangGraph via a callback handler registered at graph invocation time. It captures per-LLM-call traces (model, prompt, completion, tool call inputs/outputs), token usage, cost, and latency — all without manual extraction code. Trace data stays within the AWS environment (self-hosted Langfuse on ECS workloads plus the required backing services such as PostgreSQL, Redis/Valkey, and ClickHouse, or compatible managed equivalents). The Console renders execution telemetry by querying the Langfuse REST API through the API Service. Customers see task-level cost breakdown, per-node traces, and tool call sequences. They do not see platform internals.
 
 **Operator-facing: CloudWatch (platform health)**
 
