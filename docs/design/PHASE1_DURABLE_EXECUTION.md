@@ -2,7 +2,7 @@
 
 **Goal:** Prove that tasks survive worker crashes and resume correctly from the last checkpoint.
 
-**Scope:** Task submission API, LangGraph-based execution engine with lease-based ownership, custom `PostgresDurableCheckpointer` for durable graph state, distributed reaper for expired leases, dead letter handling, per-node cost tracking via LangGraph event streaming, structured logging with task/worker correlation. Phase 1 supports a single top-level graph only; subgraphs are explicitly out of scope.
+**Scope:** Task submission API, LangGraph-based execution engine with lease-based ownership, custom `PostgresDurableCheckpointer` for durable graph state, distributed reaper for expired leases, dead letter handling, per-node cost and token tracking via Langfuse auto-instrumentation of LangGraph, two-layer observability (Langfuse for customer-facing LLM execution traces, CloudWatch for operator-facing platform health), structured logging with task/worker correlation. Phase 1 supports a single top-level graph only; subgraphs are explicitly out of scope.
 
 **Out of scope:** Agent as first-class entity (config is inline on Task), multi-agent scheduling, memory compaction, approval workflows, UI (except minimal demo dashboard), multi-tenancy, Custom Tool Runtime (BYOT — customer-provided MCP servers).
 
@@ -129,8 +129,7 @@ thread_ts:              TEXT (LangGraph version string, e.g. "2026-03-05T10:00:0
 parent_ts:              TEXT (previous checkpoint version, nullable)
 checkpoint_payload:     JSONB (serialized LangGraph Checkpoint: channel_values, channel_versions, versions_seen, pending_sends)
 metadata_payload:       JSONB (LangGraph CheckpointMetadata: source, step, writes, parents)
-cost_microdollars:      int (default 0, populated by cost-tracking callback)
-execution_metadata:     JSONB (latency_ms, token_counts, model_used — populated by event streaming callback)
+-- cost and execution metadata (token usage, latency, model) are captured by Langfuse, not stored in checkpoints
 created_at:             timestamp
 ```
 
@@ -245,7 +244,7 @@ GET /v1/tasks/{task_id}
   "retry_count": 0,
   "retry_history": [],
   "checkpoint_count": 5,
-  "total_cost_microdollars": 12500,
+  "total_cost_microdollars": 12500,  // aggregated from Langfuse traces via API
   "lease_owner": "worker-abc-123",
   "last_error_code": null,
   "last_error_message": null,
@@ -295,26 +294,26 @@ Returns the ordered list of root-namespace LangGraph checkpoints for a task. Eac
       "step_number": 1,
       "node_name": "agent",
       "worker_id": "worker-a-123",
-      "cost_microdollars": 5200,
-      "execution_metadata": {
+      "created_at": "2026-03-05T10:00:01Z",
+      "trace": {
+        "cost_microdollars": 5200,
         "latency_ms": 2340,
         "input_tokens": 1250,
         "output_tokens": 340,
         "model": "claude-sonnet-4-6"
-      },
-      "created_at": "2026-03-05T10:00:01Z"
+      }
     },
     {
       "checkpoint_id": "...",
       "step_number": 2,
       "node_name": "tools",
       "worker_id": "worker-a-123",
-      "cost_microdollars": 0,
-      "execution_metadata": {
+      "created_at": "2026-03-05T10:00:03Z",
+      "trace": {
+        "cost_microdollars": 0,
         "latency_ms": 450,
         "tools_called": ["web_search"]
-      },
-      "created_at": "2026-03-05T10:00:03Z"
+      }
     }
   ]
 }
@@ -642,7 +641,7 @@ Phase 1 has five deployable components. Understanding their boundaries is essent
 |---------|---------|---------------|-----------|
 | **API Service** | Java (Spring Boot) on ECS Fargate | REST API — accepts task submissions, serves status/history queries, handles cancellation and redrive | No (all state in PostgreSQL) |
 | **Worker Service** | Python on ECS Fargate | Polls for queued tasks, executes LangGraph (LLM calls + tool calls via co-located MCP server), heartbeats, runs distributed reaper | No (all state in PostgreSQL) |
-| **Console** | React SPA packaged as a container on ECS Fargate behind the shared internal ALB | Demo dashboard — task submission, checkpoint timeline, cost visualization, dead letter management | No (static files; all data via API) |
+| **Console** | React SPA packaged as a container on ECS Fargate behind the shared internal ALB | Customer-facing execution console — task submission, checkpoint timeline, cost and trace visualization (via Langfuse API), dead letter management. Platform health (worker counts, queue depth, DB status) is operator-only and lives in CloudWatch. | No (static files; all data via API) |
 | **Model Discovery** | Python on AWS Lambda (scheduled + one deploy-time initialization run) | Discovers available LLM models from configured API keys and syncs to database with pricing | No (writes to PostgreSQL) |
 | **PostgreSQL** | Aurora Serverless v2 | State store, task queue, LangGraph checkpoints, conversation history | Yes (source of truth) |
 
@@ -851,12 +850,16 @@ Because the runtime treats tool execution conservatively (re-executing the entir
 │                   │ HTTPS                                    │
 │                   ▼                                          │
 │  ┌─────────────────────────┐  ┌──────────────────────────┐  │
-│  │  Bedrock (LLM calls)    │  │  CloudWatch (logs +      │  │
-│  │                          │  │  metrics via OTel)       │  │
+│  │  Bedrock (LLM calls)    │  │  CloudWatch (platform    │  │
+│  │                          │  │  logs + operator metrics) │  │
 │  ├─────────────────────────┤  └──────────────────────────┘  │
-│  │  External APIs (Tavily,  │                                │
-│  │  web search backends)    │                                │
-│  └─────────────────────────┘                                │
+│  │  External APIs (Tavily,  │  ┌──────────────────────────┐  │
+│  │  web search backends)    │  │  Langfuse (self-hosted,   │  │
+│  └─────────────────────────┘  │  ECS + own Postgres)       │  │
+│                                │  LLM execution traces,     │  │
+│                                │  token usage, cost —       │  │
+│                                │  customer-facing via API   │  │
+│                                └──────────────────────────┘  │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -1070,12 +1073,15 @@ The following diagram illustrates how the Worker Service integrates LangGraph wi
  │  │ worker_id             │          │ status transitions   │      │
  │  │ checkpoint_payload    │          │ version++            │      │
  │  │ metadata_payload      │          │ updated_at = NOW()   │      │
- │  │ cost_microdollars     │          │                      │      │
- │  │ execution_metadata:   │          │ (if final node:      │      │
- │  │   latency_ms,         │          │  status='completed', │      │
- │  │   token_counts,       │          │  output=last_state)  │      │
- │  │   model_used          │          └──────────────────────┘      │
- │  │ created_at = NOW()    │                                        │
+ │  │ created_at = NOW()    │          │                      │      │
+ │  └───────────────────────┘          │ (if final node:      │      │
+ │                                     │  status='completed', │      │
+ │  Langfuse (via callback)            │  output=last_state)  │      │
+ │  ┌───────────────────────┐          └──────────────────────┘      │
+ │  │ cost, token usage,    │                                        │
+ │  │ latency, model,       │                                        │
+ │  │ prompt/completion,    │                                        │
+ │  │ tool call I/O         │                                        │
  │  └───────────────────────┘                                        │
  │                                                                   │
  │  The 3-phase execution cycle repeats until LangGraph completes.   │
@@ -1086,13 +1092,14 @@ By moving the loop to LangGraph, the Worker Service is dramatically simplified. 
 
 #### Cost & Execution Metadata Tracking
 
-Cost tracking and execution metadata are collected via **LangGraph callback handlers**, not through the checkpointer:
+Cost tracking and execution metadata are collected via **Langfuse auto-instrumentation**, not through the checkpointer or manual callback handlers:
 
-1. A custom `CostTrackingCallback` is registered with the LangGraph invocation. It subscribes to `on_llm_end` events to capture token usage (`input_tokens`, `output_tokens`, `model`), calculates `cost_microdollars` from a static price-per-model config map, and records `latency_ms`.
-2. After each super-step completes (detected via the `astream()` loop), the Worker Service writes the accumulated cost and metadata to the checkpoint row for that super-step via a separate `UPDATE checkpoints SET cost_microdollars = ..., execution_metadata = ... WHERE checkpoint_id = ...` statement.
-3. The checkpointer's `put()` method itself only writes the LangGraph state — it does not handle cost or metadata. This keeps the checkpointer implementation clean and compatible with the `BaseCheckpointSaver` interface.
+1. A Langfuse `CallbackHandler` is registered with the LangGraph invocation. It automatically captures per-LLM-call traces including model, prompt, completion, tool call inputs/outputs, token usage (`input_tokens`, `output_tokens`), cost (calculated from Langfuse's configurable model pricing registry), and latency.
+2. Trace data is sent to a self-hosted Langfuse deployment (ECS workloads plus the required backing services such as PostgreSQL, Redis/Valkey, and ClickHouse, or compatible managed equivalents) running within the same AWS environment. No third-party SaaS dependency, no data egress.
+3. The Console fetches trace data from Langfuse via its REST API through the API Service, and renders it natively in the task detail view. Langfuse is a backend data source, not a UI the customer is redirected to.
+4. The checkpointer's `put()` method only writes the LangGraph state — it does not handle cost or metadata. This keeps the checkpointer implementation clean and compatible with the `BaseCheckpointSaver` interface.
 
-This metadata write is intentionally decoupled from checkpoint persistence. Recovery correctness depends only on the checkpoint row itself; cost and execution metadata are observability fields. If a worker crashes after the checkpoint commit but before the metadata update, the task still resumes correctly, but the most recent completed step may show missing or undercounted cost in Phase 1.
+This approach eliminates the need for manual cost extraction, per-model pricing lookups in the `models` table, and post-execution backfill logic. The `cost_microdollars` column in the `checkpoints` table is removed; cost data lives in Langfuse instead, queried by the API Service when serving task detail to the Console. Recovery correctness depends only on the checkpoint row itself and is unaffected by this change.
 
 #### Zombie Worker Protection in the Checkpointer
 
@@ -1175,10 +1182,18 @@ See LLD §6.3 for enforcement details (allowed_tools checks, argument schema val
 
 > **Covers:** O1, O2, O3, O4
 
-Every Worker Service instance emits structured logs and metrics to support debugging, alerting, and capacity planning:
+Phase 1 observability is split into two layers with distinct audiences:
+
+**Customer-facing: Langfuse (LLM execution tracing)**
+
+Langfuse auto-instruments LangChain/LangGraph via a callback handler registered at graph invocation time. It captures per-LLM-call traces (model, prompt, completion, tool call inputs/outputs), token usage, cost, and latency — all without manual extraction code. Trace data stays within the AWS environment (self-hosted Langfuse on ECS workloads plus the required backing services such as PostgreSQL, Redis/Valkey, and ClickHouse, or compatible managed equivalents). The Console renders execution telemetry by querying the Langfuse REST API through the API Service. Customers see task-level cost breakdown, per-node traces, and tool call sequences. They do not see platform internals.
+
+**Operator-facing: CloudWatch (platform health)**
+
+Every Worker Service instance emits structured logs and platform metrics to CloudWatch for debugging, alerting, and capacity planning:
 
 - **Structured logging:** Every log line includes `task_id`, `worker_id`, and `node_name` for correlation. Key lifecycle events (task claimed, node started/completed, checkpoint saved, graph resumed, lease revoked, task completed/dead-lettered) are logged as named events.
-- **Metrics:** Counters and gauges for queue depth, active tasks, node latency, cost, lease expiry rate, and empty poll frequency. Emitted via OpenTelemetry and exported to CloudWatch in Phase 1.
+- **Platform metrics:** Counters and gauges for queue depth, active tasks, lease expiry rate, empty poll frequency, and worker saturation. Exported to CloudWatch. These are operator-only — not surfaced in the customer Console.
 - **Alerts:** Fire on dead letter accumulation, lease expiry spikes, worker saturation, and task age outliers. Thresholds are tuned to catch systemic issues (not individual task failures).
 
 See LLD §6.4 for the full metrics catalog, event list, and alert thresholds.
@@ -1255,8 +1270,8 @@ CREATE TABLE checkpoints (
     parent_ts           TEXT,           -- Previous checkpoint version string
     checkpoint_payload  JSONB NOT NULL, -- Serialized LangGraph Checkpoint (channel_values, channel_versions, etc.)
     metadata_payload    JSONB NOT NULL DEFAULT '{}'::jsonb, -- LangGraph CheckpointMetadata
-    cost_microdollars   INT NOT NULL DEFAULT 0, -- Populated by cost-tracking callback after super-step
-    execution_metadata  JSONB, -- Populated by cost-tracking callback (latency_ms, token_counts, model)
+    -- cost_microdollars and execution_metadata removed: cost/token/latency data is now captured
+    -- by Langfuse auto-instrumentation and queried via Langfuse REST API, not stored in checkpoints.
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     PRIMARY KEY (task_id, checkpoint_ns, checkpoint_id)
@@ -1359,15 +1374,7 @@ ON CONFLICT (task_id, checkpoint_ns, checkpoint_id, task_path, idx)
 DO UPDATE SET channel = EXCLUDED.channel, type = EXCLUDED.type, blob = EXCLUDED.blob;
 ```
 
-**Post-super-step cost update (executed by Worker Service after each `astream()` yield):**
-```sql
-UPDATE checkpoints
-SET cost_microdollars = :cost,
-    execution_metadata = :execution_metadata
-WHERE task_id = :task_id
-  AND checkpoint_ns = :checkpoint_ns
-  AND checkpoint_id = :checkpoint_id;
-```
+**Note:** The post-super-step cost update query previously here has been removed. Cost and execution metadata (token usage, latency, model) are now captured automatically by Langfuse via its LangChain callback handler and queried via the Langfuse REST API. No per-checkpoint cost writes are needed.
 
 **Task completion (after `astream()` is exhausted):**
 ```sql
@@ -1640,7 +1647,17 @@ To guarantee correct crash recovery and minimize duplicate side-effects, the sys
 
 > **Covers:** O1, O2, O3, O4
 
-#### Metrics (OpenTelemetry -> CloudWatch in Phase 1)
+#### Customer-Facing Execution Telemetry (Langfuse)
+
+Langfuse auto-captures per-LLM-call traces via its LangChain callback handler. The following data is available to customers through the Console (which queries the Langfuse REST API via the API Service):
+
+- Per-LLM-call: model, prompt, completion, tool call inputs/outputs, token usage (input + output), cost, latency
+- Per-task: full trace tree, total cost, total tokens, node-by-node breakdown
+- Per-node: duration, cost, tool call sequences
+
+Cost is calculated by Langfuse from its configurable model pricing registry (seeded from the same pricing data in the `models` table).
+
+#### Operator Platform Metrics (CloudWatch)
 
 ```
 tasks.submitted         -- counter, by agent_id
@@ -1648,7 +1665,6 @@ tasks.completed         -- counter, by agent_id
 tasks.dead_letter       -- counter, by agent_id, by error_type
 tasks.active            -- gauge, by agent_id
 nodes.duration_ms       -- histogram, by node_name
-nodes.cost_microdollars -- counter, by agent_id, by model
 workers.active_tasks    -- gauge, by worker_id
 queue.depth             -- gauge (count of status='queued')
 poll.empty              -- counter, by worker_id (empty poll frequency)
@@ -1656,18 +1672,20 @@ leases.expired          -- counter
 heartbeats.missed       -- counter, by worker_id
 ```
 
+These metrics are operator-only. They are not surfaced in the customer Console.
+
 #### Logging
 
 Structured logs with `task_id`, `worker_id`, and `node_name` correlation on every log line. Key events logged:
 
 - `TASK_CLAIMED`: Worker Service claimed task, includes retry_count
 - `NODE_STARTED`: LangGraph node execution beginning, includes node_name
-- `NODE_COMPLETED`: node done, includes node_name, latency_ms, and cost
+- `NODE_COMPLETED`: node done, includes node_name, latency_ms
 - `CHECKPOINT_SAVED`: checkpoint written to DB after super-step
 - `GRAPH_RESUMED`: task resumed from existing checkpoint on recovery, includes checkpoint_id
 - `NODE_REEXECUTED`: node re-executed after crash recovery (no prior checkpoint for this node)
 - `LEASE_REVOKED`: heartbeat returned 0 rows, Worker Service stopping execution
-- `TASK_COMPLETED`: task finished, includes total checkpoints and total cost
+- `TASK_COMPLETED`: task finished, includes total checkpoints (cost data available via Langfuse traces)
 - `TASK_DEAD_LETTERED`: task moved to dead letter, includes reason
 
 Checkpoint provenance is also queryable directly because each checkpoint row stores `worker_id`.
@@ -1698,16 +1716,17 @@ Checkpoint provenance is also queryable directly because each checkpoint row sto
 9. Query `GET /v1/tasks/{task_id}/checkpoints` (via API Service) — full checkpoint history with timing and cost breakdown; each checkpoint row shows which Worker Service instance produced it via `worker_id`
 10. Display cost comparison: "Cost without checkpointing: $0.045 (10 LLM calls). Cost with checkpointing: $0.023 (5 re-used after crash). Savings: 49%."
 
-### Demo Dashboard (stretch goal)
+### Console (Customer-Facing Execution Console)
 
-A single-page HTML dashboard that polls `GET /v1/tasks/{id}` and displays:
+A React SPA that polls `GET /v1/tasks/{id}` and fetches execution traces from Langfuse via the API Service. Displays:
 - Checkpoint timeline with live progress updates
-- Per-node cost and latency
+- Per-node cost, token usage, and latency (from Langfuse traces)
+- Tool call sequences and LLM prompt/completion details
 - Crash event marker (gap in timeline where lease expired)
 - Resume event marker (new Worker Service instance picks up)
 - Running cost total vs. estimated cost without checkpointing
 
-This makes the crash-recovery story visually compelling for a demo video, compared to raw API responses.
+Platform health (worker counts, queue depth, DB status) is not shown in the Console — it is operator-only and lives in CloudWatch dashboards.
 
 ---
 

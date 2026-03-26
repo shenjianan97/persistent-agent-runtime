@@ -45,17 +45,22 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
   Component: Worker Service Graph Executor
   Change type: new code
   Path: `services/worker-service/executor/`
-  Description: Embed LangGraph `astream()` inside the Worker Service to translate API payloads into workflow states, manage tool dispatches, and calculate cycle cost.
+  Description: Embed LangGraph `astream()` inside the Worker Service to translate API payloads into workflow states and manage tool dispatches. Cost and execution metadata are captured by Langfuse auto-instrumentation via its LangChain callback handler.
 
   Component: Demo Dashboard
   Change type: new code
   Path: `services/console/`
-  Description: Build a React 19 + TypeScript SPA with Tailwind CSS/shadcn/ui that consumes the Phase 1 API endpoints. Provides task submission, live checkpoint timeline, cost visualization, and dead letter queue management for demo purposes.
+  Description: Build a React 19 + TypeScript SPA with Tailwind CSS/shadcn/ui that consumes the Phase 1 API endpoints. Customer-facing execution console providing task submission, live checkpoint timeline, cost and trace visualization (via Langfuse API), and dead letter queue management. Platform health is operator-only (CloudWatch).
 
   Component: AWS Cloud Infrastructure
   Change type: new code
   Path: `infrastructure/cdk/`, `services/api-service/`, `services/worker-service/`, `services/console/`, and `services/model-discovery/`
   Description: Provision foundational AWS resources using AWS CDK in TypeScript and implement application containerization assets required for deployment. This includes Docker build contexts for the API, Worker, and Console services, image packaging/publication strategy, a VPC, Aurora Serverless v2 PostgreSQL cluster, ECS Fargate services (API with CPU autoscaling, Console behind the same ALB, Worker with fixed instance count), an internal ALB reached through an SSM-managed access host, Model Discovery as a scheduled-and-initialized Lambda, imported Secrets Manager references, IAM execution/task roles, schema bootstrap with migration tracking, and CloudWatch integration. The edge layer should be structured so moving to a future public/customer-facing ALB is a contained change.
+
+  Component: Langfuse Integration and Observability Split
+  Change type: modification + new code
+  Path: `services/worker-service/executor/`, `services/api-service/`, `services/console/`, `infrastructure/cdk/`, `infrastructure/database/migrations/`
+  Description: Replace manual cost tracking with Langfuse auto-instrumentation of LangGraph. Deploy self-hosted Langfuse workloads plus the required backing services (PostgreSQL, Redis/Valkey, ClickHouse, or managed equivalents supported by Langfuse) behind the internal ALB. Add API Service proxy endpoints for Langfuse trace data. Update the Console to source cost/trace visualization from Langfuse. Separate customer-facing observability (Langfuse via Console) from operator-facing observability (CloudWatch metrics, dashboards, alarms). Remove `cost_microdollars` and `execution_metadata` from the checkpoints table. Export worker platform metrics to CloudWatch.
 
 #### A3. Dependency Graph
 All tasks are mostly independent except where schema or runtime contracts are shared:
@@ -67,6 +72,7 @@ All tasks are mostly independent except where schema or runtime contracts are sh
   Task 6 (Worker Service Graph Executor) → depends on → Task 3, Task 4, Task 5
   Task 7 (Demo Dashboard) → depends on → Task 2 (API Service REST endpoints for data consumption)
   Task 8 (AWS Infrastructure and Containerization) → can run in parallel with all other tasks, but blocks final integration testing and deployment.
+  Task 9 (Langfuse Integration and Observability Split) → depends on → Tasks 1–8 (all existing Phase 1 tasks must be complete). Modifies Worker (Task 6), API (Task 2), Console (Task 7), and Infrastructure (Task 8).
 
 #### A4. Data / API / Schema Changes
   Change: Foundation PostgreSQL Schema setup
@@ -93,13 +99,16 @@ Each task should leave explicit artifacts for downstream consumers:
   MCP `listTools` definitions and argument schemas that Task 2 and Task 6 can consume.
 
   Task 6 output
-  A task execution entrypoint that accepts a claimed task record and performs graph execution, retry/dead-letter classification, and checkpoint cost updates.
+  A task execution entrypoint that accepts a claimed task record and performs graph execution and retry/dead-letter classification. Cost and execution metadata are captured by Langfuse auto-instrumentation.
 
   Task 7 output
-  A production-ready React SPA with typed API client, live-polling checkpoint timeline, cost charts, and dead letter management, plus CORS configuration in the API Service.
+  A production-ready React SPA with typed API client, live-polling checkpoint timeline, cost and trace visualization (via Langfuse API), and dead letter management, plus CORS configuration in the API Service.
 
   Task 8 output
   Deployable CDK stacks (Network, Data, Compute), API/Worker/Console container build assets (Dockerfiles and `.dockerignore` files), image publication wiring for ECS consumption, Console deployment behind the shared ALB, Model Discovery scheduled Lambda plus initial invocation, imported Secrets Manager references, schema bootstrap with migration tracking, and clear instructions for deploy/destroy workflow.
+
+  Task 9 output
+  Self-hosted Langfuse web/worker workloads plus the required PostgreSQL, Redis/Valkey, and ClickHouse backing services (or compatible managed equivalents). Worker Service using Langfuse callback handler instead of manual cost tracking (~150 lines removed from graph.py). API Service proxy endpoints for Langfuse trace/cost data using Langfuse Basic Auth. Console updated to source execution telemetry from Langfuse and stripped of platform health internals. Database migration removing cost columns from checkpoints. CloudWatch metric export, dashboard, and alarms for operator-facing platform health.
 
 #### A5. Integration Points
   Caller: API Service
@@ -152,9 +161,9 @@ Before implementation begins in earnest, the repo should pin or explicitly docum
 
 #### A7. Observability
   Logs: All logs mandate structural labels `task_id`, `worker_id`, and `node_name`. Key events logged MUST include `TASK_CLAIMED`, `NODE_STARTED`, `CHECKPOINT_SAVED`, `GRAPH_RESUMED`, `LEASE_REVOKED`, `TASK_COMPLETED`, and `TASK_DEAD_LETTERED`.
-  Metrics: `tasks.submitted`, `tasks.active`, `tasks.dead_letter`, `workers.active_tasks`, `queue.depth`, `nodes.cost_microdollars`, `nodes.duration_ms`, `poll.empty`, `leases.expired`.
+  Metrics (operator/CloudWatch): `tasks.submitted`, `tasks.active`, `tasks.dead_letter`, `workers.active_tasks`, `queue.depth`, `nodes.duration_ms`, `poll.empty`, `leases.expired`. Customer-facing cost and token metrics are captured by Langfuse and served via its REST API.
   Alerts: Trigger on dead letter accumulation (`tasks.dead_letter.count > 0` for > 5 min), lease expiry spikes (`leases.expired.rate > 10/min`).
-  Dashboards: CloudWatch board mapping the captured OpenTelemetry statistics.
+  Dashboards: Customer-facing execution telemetry via Langfuse (cost, tokens, latency, traces) rendered in the Console. Operator-facing platform health via CloudWatch dashboards.
 
 #### A8. Risks and Open Questions
   Technical risks: Divergent timeline state/billing artifacts if split-brain worker re-processes nodes simultaneously. Mitigated securely by Checkpointer verifying `lease_owner` before flushing payloads.
@@ -196,6 +205,7 @@ Please refer to the following tasks in the `agent_tasks/` directory:
 - [Task 6: Graph Executor Assembly](./agent_tasks/task-6-graph-executor.md)
 - [Task 7: Console](./agent_tasks/task-7-console.md)
 - [Task 8: AWS Cloud Infrastructure](./agent_tasks/task-8-aws-infrastructure.md)
+- [Task 9: Langfuse Integration and Observability Split](./agent_tasks/task-9-langfuse-observability.md)
 
 Tracking of these tasks can be found in [progress.md](./progress.md).
 

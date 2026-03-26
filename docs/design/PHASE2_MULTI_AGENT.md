@@ -76,7 +76,7 @@ Phase 2 adds scheduler behavior that reasons about agent fairness and budget, no
 
 - Track cumulative task cost across checkpoints and completed tasks
 - Prefer claimable tasks from agents that are under concurrency and budget limits
-- Surface paused state clearly in status APIs and dashboards
+- Surface paused state clearly in status APIs and the customer-facing Console
 
 ---
 
@@ -226,7 +226,7 @@ created_at:           timestamp
 
 ### Platform-owns-keys (decided)
 
-The platform holds all LLM provider API keys centrally. Users never provide their own provider credentials. The platform bills users based on per-checkpoint cost data tracked in the `models` database table, enforced through the budget model in Section 2.
+The platform holds all LLM provider API keys centrally. Users never provide their own provider credentials. The platform bills users based on per-call cost data captured by Langfuse (self-hosted LLM observability) and the pricing registry in the `models` database table, enforced through the budget model in Section 2.
 
 This decision aligns with the cost-aware scheduling design: the platform must control LLM spending to enforce `budget_max_per_task` and `budget_max_per_hour`. Platform-owned keys also enable centralized rate-limit management and negotiated enterprise pricing with providers.
 
