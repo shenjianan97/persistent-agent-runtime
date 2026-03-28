@@ -119,6 +119,7 @@ def _start_api_process() -> subprocess.Popen[str]:
             "DB_PASSWORD": DB_PASSWORD,
             "SERVER_PORT": str(API_PORT),
             "APP_DEV_TASK_CONTROLS_ENABLED": "true",
+            "LANGFUSE_ENABLED": "false",
         }
     )
     log_file = REPO_ROOT / ".tmp" / "e2e-api-service.log"
