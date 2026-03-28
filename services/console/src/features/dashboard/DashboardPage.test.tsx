@@ -63,7 +63,7 @@ describe('DashboardPage', () => {
             },
         });
 
-        render(
+        const { container } = render(
             <MemoryRouter>
                 <DashboardPage />
             </MemoryRouter>,
@@ -73,11 +73,120 @@ describe('DashboardPage', () => {
         expect(screen.getByRole('link', { name: /submit task/i })).toHaveAttribute('href', '/tasks/new');
         expect(screen.getAllByRole('link', { name: /view all tasks/i })).toHaveLength(2);
         expect(screen.getByText('Needs Attention')).toBeInTheDocument();
-        expect(screen.getAllByText('In Progress')).toHaveLength(2);
+        expect(screen.getByText('Queued + Running')).toBeInTheDocument();
         expect(screen.getByText('Recent Runs')).toBeInTheDocument();
         expect(screen.getByText('retries_exhausted')).toBeInTheDocument();
         expect(screen.getAllByText(/support-agent/i).length).toBeGreaterThan(0);
         expect(screen.getAllByText('$0.0052').length).toBeGreaterThan(0);
+        expect(screen.queryByText('No tasks are currently running.')).not.toBeInTheDocument();
+        expect(container.querySelector('.tabular-nums')).not.toBeNull();
+    });
+
+    it('uses restrained metric sizing in summary cards', () => {
+        overviewMock.mockReturnValue({
+            isLoading: false,
+            isError: false,
+            deadLetters: [],
+            inProgress: [],
+            recentRuns: [],
+            summary: {
+                inProgressCount: 0,
+                deadLetterCount: 0,
+                completedCount: 0,
+                recentCostMicrodollars: 0,
+            },
+        });
+
+        render(
+            <MemoryRouter>
+                <DashboardPage />
+            </MemoryRouter>,
+        );
+
+        const metricValue = screen.getAllByText('0')[0];
+        expect(metricValue.className).toContain('text-3xl');
+        expect(metricValue.className).not.toContain('text-4xl');
+        expect(metricValue.parentElement?.className).not.toContain('bg-black/10');
+    });
+
+    it('keeps summary cards visually flat instead of nesting pill containers', () => {
+        overviewMock.mockReturnValue({
+            isLoading: false,
+            isError: false,
+            deadLetters: [],
+            inProgress: [],
+            recentRuns: [],
+            summary: {
+                inProgressCount: 0,
+                deadLetterCount: 0,
+                completedCount: 0,
+                recentCostMicrodollars: 0,
+            },
+        });
+
+        render(
+            <MemoryRouter>
+                <DashboardPage />
+            </MemoryRouter>,
+        );
+
+        const title = screen.getByText('Queued + Running');
+        const summaryCard = title.closest('.console-surface');
+
+        expect(summaryCard).not.toBeNull();
+        expect(summaryCard?.querySelector('.rounded-full')).toBeNull();
+    });
+
+    it('uses a consistent non-display font treatment for dashboard headings', () => {
+        overviewMock.mockReturnValue({
+            isLoading: false,
+            isError: false,
+            deadLetters: [],
+            inProgress: [],
+            recentRuns: [],
+            summary: {
+                inProgressCount: 0,
+                deadLetterCount: 0,
+                completedCount: 0,
+                recentCostMicrodollars: 0,
+            },
+        });
+
+        render(
+            <MemoryRouter>
+                <DashboardPage />
+            </MemoryRouter>,
+        );
+
+        expect(screen.getByRole('heading', { name: 'Home' }).className).not.toContain('font-display');
+        expect(screen.getByRole('heading', { name: 'Recent Runs' }).className).not.toContain('font-display');
+    });
+
+    it('uses the same readable body style for summary and section descriptions', () => {
+        overviewMock.mockReturnValue({
+            isLoading: false,
+            isError: false,
+            deadLetters: [],
+            inProgress: [],
+            recentRuns: [],
+            summary: {
+                inProgressCount: 0,
+                deadLetterCount: 0,
+                completedCount: 0,
+                recentCostMicrodollars: 0,
+            },
+        });
+
+        render(
+            <MemoryRouter>
+                <DashboardPage />
+            </MemoryRouter>,
+        );
+
+        const summaryCopy = screen.getByText('Active tasks are shown as a quick signal, not as a separate empty panel.');
+        expect(summaryCopy.className).toContain('text-sm');
+        expect(summaryCopy.className).not.toContain('text-[11px]');
+        expect(summaryCopy.className).not.toContain('tracking-[0.04em]');
     });
 
     it('renders encouraging empty states when no runs are available', () => {
@@ -102,11 +211,10 @@ describe('DashboardPage', () => {
         );
 
         expect(screen.getByText('No runs need attention right now.')).toBeInTheDocument();
-        expect(screen.getByText('No tasks are currently running.')).toBeInTheDocument();
         expect(screen.getByText('Submit your first task to start building execution history.')).toBeInTheDocument();
     });
 
-    it('shows Home in the primary navigation', () => {
+    it('shows Home and Failed in the primary navigation', () => {
         render(
             <MemoryRouter>
                 <Sidebar />
@@ -114,6 +222,8 @@ describe('DashboardPage', () => {
         );
 
         expect(screen.getByRole('link', { name: /home/i })).toHaveAttribute('href', '/');
+        expect(screen.getByRole('link', { name: /failed/i })).toHaveAttribute('href', '/dead-letter');
         expect(screen.queryByRole('link', { name: /overview/i })).not.toBeInTheDocument();
+        expect(screen.queryByRole('link', { name: /dead letters/i })).not.toBeInTheDocument();
     });
 });

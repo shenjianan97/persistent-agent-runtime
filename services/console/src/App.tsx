@@ -37,11 +37,12 @@ function App() {
                 theme="dark"
                 toastOptions={{
                     style: {
-                        borderRadius: '0px',
-                        border: '1px solid var(--border)',
-                        background: 'var(--background)',
+                        borderRadius: '18px',
+                        border: '1px solid rgba(104, 145, 190, 0.16)',
+                        background: 'linear-gradient(180deg, rgba(18, 27, 42, 0.94), rgba(12, 19, 31, 0.92))',
                         color: 'var(--foreground)',
-                        fontFamily: 'var(--font-mono)'
+                        fontFamily: 'var(--font-mono)',
+                        boxShadow: '0 18px 48px rgba(0, 0, 0, 0.24)'
                     }
                 }}
             />

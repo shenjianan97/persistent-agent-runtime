@@ -264,8 +264,8 @@ function DurableProgressItem({ item }: { item: TaskObservabilityItemResponse }) 
 export function ObservabilityTrace({ observability }: ObservabilityTraceProps) {
     if (!observability) {
         return (
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                <CardHeader className="border-b border-border/40">
+            <Card className="console-surface border-white/10">
+                <CardHeader className="border-b border-white/8">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-muted-foreground">
                         Execution
                     </CardTitle>
@@ -288,8 +288,8 @@ export function ObservabilityTrace({ observability }: ObservabilityTraceProps) {
     const headline = summaryLine(items);
 
     return (
-        <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-            <CardHeader className="border-b border-border/40">
+            <Card className="console-surface border-white/10">
+            <CardHeader className="border-b border-white/8">
                 <CardTitle className="text-sm font-display uppercase tracking-widest text-muted-foreground">
                     Execution
                 </CardTitle>

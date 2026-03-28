@@ -26,7 +26,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
 
     return (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+            <Card className="console-surface border-white/10">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-success">Total Cost</CardTitle>
                     <DollarSign className="h-4 w-4 text-success" />
@@ -39,7 +39,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                 </CardContent>
             </Card>
 
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+            <Card className="console-surface border-white/10">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Checkpoints</CardTitle>
                     <Cpu className="h-4 w-4 text-primary" />
@@ -52,7 +52,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                 </CardContent>
             </Card>
 
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+            <Card className="console-surface border-white/10">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Tokens</CardTitle>
                     <Coins className="h-4 w-4 text-primary" />
@@ -65,7 +65,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                 </CardContent>
             </Card>
 
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+            <Card className="console-surface border-white/10">
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Duration</CardTitle>
                     <Timer className="h-4 w-4 text-primary" />
@@ -80,7 +80,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                 </CardContent>
             </Card>
 
-            <Card className="md:col-span-2 xl:col-span-4 rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+            <Card className="md:col-span-2 xl:col-span-4 console-surface border-white/10">
                 <CardHeader className="pb-2">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-muted-foreground">Cost Per Model/Tool Call</CardTitle>
                 </CardHeader>

@@ -14,7 +14,7 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
     { value: 'running', label: 'Running' },
     { value: 'completed', label: 'Completed' },
     { value: 'cancelled', label: 'Cancelled' },
-    { value: 'dead_letter', label: 'Dead Letter' },
+    { value: 'dead_letter', label: 'Failed' },
 ];
 
 export function TaskListPage() {
@@ -33,10 +33,11 @@ export function TaskListPage() {
 
     return (
         <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 flex flex-col md:flex-row md:items-end justify-between gap-4">
                 <div>
-                    <h2 className="text-2xl font-display font-medium uppercase tracking-wider mb-2 flex items-center gap-2">
-                        <List className="w-6 h-6 text-primary" />
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Task Browser</div>
+                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
+                        <List className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
                         Tasks
                     </h2>
                     <p className="text-muted-foreground">
@@ -50,7 +51,7 @@ export function TaskListPage() {
                             Status
                         </label>
                         <select
-                            className="flex h-9 w-40 border border-border bg-black/50 px-3 py-1 text-sm font-mono rounded-none appearance-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                            className="flex h-10 w-40 rounded-xl border border-white/10 bg-white/5 px-3 py-1 text-sm font-mono backdrop-blur-xl appearance-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                             value={status}
                             onChange={(e) => setStatus(e.target.value)}
                         >
@@ -73,10 +74,10 @@ export function TaskListPage() {
                 </div>
             </div>
 
-            <div className="border border-border/40 bg-black/40 backdrop-blur rounded-none overflow-hidden">
+            <div className="console-surface rounded-[28px] overflow-hidden">
                 <Table>
-                    <TableHeader className="bg-black/60 sticky top-0">
-                        <TableRow className="border-border/40 hover:bg-transparent">
+                    <TableHeader className="sticky top-0 bg-[#0f1727]/90 backdrop-blur-xl">
+                        <TableRow className="border-white/8 hover:bg-transparent">
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Task ID</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Agent</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Status</TableHead>

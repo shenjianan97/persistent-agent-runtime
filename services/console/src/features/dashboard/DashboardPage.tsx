@@ -31,14 +31,16 @@ function SummaryCard({
     icon: typeof Zap;
 }) {
     return (
-        <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
+        <Card className="console-surface overflow-hidden border-white/10">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium tracking-wide text-muted-foreground uppercase">{title}</CardTitle>
-                <Icon className="h-4 w-4 text-primary" />
+                <CardTitle className="text-[10px] font-medium tracking-[0.24em] text-muted-foreground uppercase">{title}</CardTitle>
+                <Icon className="h-4 w-4 text-primary/80 drop-shadow-[0_0_10px_var(--color-primary)]" />
             </CardHeader>
-            <CardContent>
-                <div className="text-2xl font-bold uppercase tracking-widest text-foreground">{value}</div>
-                <p className="mt-1 text-[10px] uppercase tracking-wider text-muted-foreground">{subtitle}</p>
+            <CardContent className="space-y-3">
+                <div className="text-3xl font-semibold tracking-[-0.02em] tabular-nums text-foreground">{value}</div>
+                <div className="border-t border-white/8 pt-3">
+                    <p className="text-sm leading-6 text-muted-foreground">{subtitle}</p>
+                </div>
             </CardContent>
         </Card>
     );
@@ -58,13 +60,13 @@ function SectionHeader({
     return (
         <div className="flex items-center justify-between gap-4">
             <div>
-                <h3 className="text-sm font-display uppercase tracking-widest text-foreground">{title}</h3>
-                <p className="mt-1 text-xs text-muted-foreground">{description}</p>
+                <h3 className="text-sm font-semibold uppercase tracking-[0.2em] text-foreground">{title}</h3>
+                <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">{description}</p>
             </div>
             {actionLabel && actionTo && (
                 <Link
                     to={actionTo}
-                    className="inline-flex items-center gap-2 text-xs uppercase tracking-widest text-primary hover:text-primary/80"
+                    className="inline-flex items-center gap-2 rounded-full border border-primary/15 bg-primary/8 px-3 py-2 text-xs uppercase tracking-[0.2em] text-primary hover:text-primary/80"
                 >
                     {actionLabel}
                     <ArrowRight className="h-3 w-3" />
@@ -76,10 +78,17 @@ function SectionHeader({
 
 export function DashboardPage() {
     const { isLoading, isError, deadLetters, inProgress, recentRuns, summary } = useDashboardOverview();
+    const activityItems = [...inProgress, ...recentRuns]
+        .sort((left, right) => {
+            const leftTime = new Date(left.updated_at || left.created_at).getTime();
+            const rightTime = new Date(right.updated_at || right.created_at).getTime();
+            return rightTime - leftTime;
+        })
+        .slice(0, 6);
 
     if (isError) {
         return (
-            <div className="border border-destructive/50 bg-destructive/10 p-6 text-sm uppercase tracking-widest text-destructive">
+            <div className="console-danger-surface rounded-3xl p-6 text-sm uppercase tracking-[0.2em] text-destructive">
                 Unable to load the home dashboard.
             </div>
         );
@@ -87,17 +96,18 @@ export function DashboardPage() {
 
     return (
         <div className="space-y-8 animate-in fade-in duration-500">
-            <div className="flex flex-col gap-4 border border-border/40 bg-black/40 p-6 backdrop-blur md:flex-row md:items-end md:justify-between">
+            <div className="console-surface-strong flex flex-col gap-4 rounded-[28px] p-6 md:flex-row md:items-end md:justify-between md:p-8">
                 <div className="space-y-2">
-                    <h2 className="text-2xl font-display font-medium uppercase tracking-wider">Home</h2>
-                    <p className="max-w-2xl text-muted-foreground">
-                        Track what needs attention, what is currently running, and what completed most recently.
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.26em] text-primary">Customer Home</div>
+                    <h2 className="text-3xl font-semibold tracking-tight text-foreground">Home</h2>
+                    <p className="max-w-2xl text-sm text-muted-foreground md:text-base">
+                        Track what needs attention first, then review recent agent activity and completed work.
                     </p>
                 </div>
                 <div className="flex flex-wrap gap-3">
                     <Button
                         asChild
-                        className="rounded-none uppercase tracking-widest text-xs font-bold"
+                        className="uppercase tracking-[0.18em] text-xs font-bold"
                     >
                         <Link to="/tasks/new">
                             <PlaySquare className="mr-2 h-4 w-4" />
@@ -107,7 +117,7 @@ export function DashboardPage() {
                     <Button
                         asChild
                         variant="outline"
-                        className="rounded-none border-border uppercase tracking-widest text-xs font-bold"
+                        className="uppercase tracking-[0.18em] text-xs font-bold"
                     >
                         <Link to="/tasks">
                             View All Tasks
@@ -118,15 +128,15 @@ export function DashboardPage() {
 
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                 <SummaryCard
-                    title="In Progress"
+                    title="Queued + Running"
                     value={String(summary.inProgressCount)}
-                    subtitle="Queued or running right now"
+                    subtitle="Active tasks are shown as a quick signal, not as a separate empty panel."
                     icon={Clock3}
                 />
                 <SummaryCard
-                    title="Dead Letters"
+                    title="Failed"
                     value={String(summary.deadLetterCount)}
-                    subtitle="Runs needing review or redrive"
+                    subtitle="Tasks needing review or redrive"
                     icon={AlertCircle}
                 />
                 <SummaryCard
@@ -143,23 +153,23 @@ export function DashboardPage() {
                 />
             </div>
 
-            <div className="grid gap-6 xl:grid-cols-[1.1fr_1fr]">
-                <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                    <CardHeader className="border-b border-border/40">
+            <div className="grid gap-6 xl:grid-cols-[1.15fr_1fr]">
+                <Card className="console-surface border-white/10">
+                    <CardHeader className="border-b border-white/8">
                         <SectionHeader
                             title="Needs Attention"
-                            description="Recent dead-letter runs that may need inspection or redrive."
-                            actionLabel="Open Dead Letters"
+                            description="Recent failed tasks that may need inspection or redrive."
+                            actionLabel="Open Failed"
                             actionTo="/dead-letter"
                         />
                     </CardHeader>
-                    <CardContent className="pt-4">
+                    <CardContent className="pt-5">
                         {isLoading ? (
-                            <div className="border border-dashed border-border/40 p-4 text-xs uppercase tracking-widest text-muted-foreground">
+                            <div className="border-t border-white/8 pt-4 text-xs uppercase tracking-[0.2em] text-muted-foreground">
                                 Loading recent issues...
                             </div>
                         ) : deadLetters.length === 0 ? (
-                            <div className="border border-dashed border-border/40 p-5 text-sm text-muted-foreground">
+                            <div className="border-t border-white/8 pt-4 text-sm text-muted-foreground">
                                 No runs need attention right now.
                             </div>
                         ) : (
@@ -169,18 +179,18 @@ export function DashboardPage() {
                                     return (
                                         <div
                                             key={task.task_id}
-                                            className="border border-destructive/30 bg-destructive/5 p-4"
+                                            className="console-danger-surface rounded-2xl p-4"
                                         >
                                             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                                                 <div className="space-y-2">
                                                     <div className="flex flex-wrap items-center gap-2">
                                                         <Link
                                                             to={`/tasks/${task.task_id}`}
-                                                            className="text-sm font-semibold uppercase tracking-widest text-foreground hover:text-primary"
+                                                            className="text-sm font-semibold uppercase tracking-[0.18em] text-foreground hover:text-primary"
                                                         >
                                                             {formatTaskId(task.task_id)}
                                                         </Link>
-                                                        <span className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                                                        <span className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
                                                             Agent {task.agent_id}
                                                         </span>
                                                     </div>
@@ -204,43 +214,43 @@ export function DashboardPage() {
                     </CardContent>
                 </Card>
 
-                <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                    <CardHeader className="border-b border-border/40">
+                <Card className="console-surface border-white/10">
+                    <CardHeader className="border-b border-white/8">
                         <SectionHeader
-                            title="In Progress"
-                            description="Runs that are currently queued or executing."
-                            actionLabel="Open Tasks"
+                            title="Recent Runs"
+                            description="Recent history plus any currently active tasks, without a separate empty running panel."
+                            actionLabel="View All Tasks"
                             actionTo="/tasks"
                         />
                     </CardHeader>
-                    <CardContent className="pt-4">
+                    <CardContent className="pt-5">
                         {isLoading ? (
-                            <div className="border border-dashed border-border/40 p-4 text-xs uppercase tracking-widest text-muted-foreground">
-                                Loading active runs...
+                            <div className="border-t border-white/8 pt-4 text-xs uppercase tracking-[0.2em] text-muted-foreground">
+                                Loading activity...
                             </div>
-                        ) : inProgress.length === 0 ? (
-                            <div className="border border-dashed border-border/40 p-5 text-sm text-muted-foreground">
-                                No tasks are currently running.
+                        ) : activityItems.length === 0 ? (
+                            <div className="border-t border-white/8 pt-4 text-sm text-muted-foreground">
+                                Submit your first task to start building execution history.
                             </div>
                         ) : (
                             <div className="space-y-3">
-                                {inProgress.map((task) => {
+                                {activityItems.map((task) => {
                                     const timestamp = formatDateTime(task.updated_at || task.created_at);
                                     return (
                                         <Link
                                             key={task.task_id}
                                             to={`/tasks/${task.task_id}`}
-                                            className="block border border-border/40 bg-black/30 p-4 transition-colors hover:border-primary/40 hover:bg-white/5"
+                                            className="block rounded-2xl border border-white/8 bg-white/[0.03] p-4 transition-colors hover:border-primary/30 hover:bg-white/[0.06]"
                                         >
                                             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                                                 <div className="space-y-2">
                                                     <div className="flex flex-wrap items-center gap-2">
-                                                        <span className="text-sm font-semibold uppercase tracking-widest text-foreground">
+                                                        <span className="text-sm font-semibold uppercase tracking-[0.18em] text-foreground">
                                                             {formatTaskId(task.task_id)}
                                                         </span>
                                                         <TaskStatusBadge status={task.status} className="text-[10px] px-2 py-0.5" />
                                                     </div>
-                                                    <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
+                                                    <div className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
                                                         Agent {task.agent_id}
                                                     </div>
                                                     <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
@@ -261,63 +271,6 @@ export function DashboardPage() {
                     </CardContent>
                 </Card>
             </div>
-
-            <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                <CardHeader className="border-b border-border/40">
-                    <SectionHeader
-                        title="Recent Runs"
-                        description="The latest completed runs from your current task history slice."
-                        actionLabel="View all tasks"
-                        actionTo="/tasks"
-                    />
-                </CardHeader>
-                <CardContent className="pt-4">
-                    {isLoading ? (
-                        <div className="border border-dashed border-border/40 p-4 text-xs uppercase tracking-widest text-muted-foreground">
-                            Loading recent runs...
-                        </div>
-                    ) : recentRuns.length === 0 ? (
-                        <div className="border border-dashed border-border/40 p-5 text-sm text-muted-foreground">
-                            Submit your first task to start building execution history.
-                        </div>
-                    ) : (
-                        <div className="space-y-3">
-                            {recentRuns.map((task) => {
-                                const timestamp = formatDateTime(task.created_at);
-                                return (
-                                    <Link
-                                        key={task.task_id}
-                                        to={`/tasks/${task.task_id}`}
-                                        className="grid gap-3 border border-border/40 bg-black/30 p-4 transition-colors hover:border-primary/40 hover:bg-white/5 md:grid-cols-[1.4fr_1fr_auto_auto]"
-                                    >
-                                        <div className="space-y-2">
-                                            <div className="flex flex-wrap items-center gap-2">
-                                                <span className="text-sm font-semibold uppercase tracking-widest text-foreground">
-                                                    {formatTaskId(task.task_id)}
-                                                </span>
-                                                <TaskStatusBadge status={task.status} className="text-[10px] px-2 py-0.5" />
-                                            </div>
-                                            <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
-                                                Agent {task.agent_id}
-                                            </div>
-                                        </div>
-                                        <div className="text-xs text-muted-foreground">
-                                            <div>{task.checkpoint_count} checkpoints</div>
-                                        </div>
-                                        <div className="text-xs font-medium text-success">
-                                            ${formatUsd(task.total_cost_microdollars)}
-                                        </div>
-                                        <div className="text-right text-[10px] uppercase tracking-widest text-muted-foreground">
-                                            <div>{timestamp.date}</div>
-                                            <div>{timestamp.time}</div>
-                                        </div>
-                                    </Link>
-                                );
-                            })}
-                        </div>
-                    )}
-                </CardContent>
-            </Card>
         </div>
     );
 }
