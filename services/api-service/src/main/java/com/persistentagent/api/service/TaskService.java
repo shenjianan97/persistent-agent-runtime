@@ -254,20 +254,13 @@ public class TaskService {
 
         List<TaskSummaryResponse> items = rows.stream()
                 .map(row -> {
-                    UUID taskId = (UUID) row.get("task_id");
-                    String agentIdValue = (String) row.get("agent_id");
-                    String statusValue = (String) row.get("status");
-                    TaskObservabilityTotals totals = taskObservabilityService.getTaskTotals(
-                            taskId,
-                            agentIdValue,
-                            statusValue);
                     return new TaskSummaryResponse(
-                            taskId,
-                            agentIdValue,
-                            statusValue,
+                            (UUID) row.get("task_id"),
+                            (String) row.get("agent_id"),
+                            (String) row.get("status"),
                             ((Number) row.get("retry_count")).intValue(),
                             ((Number) row.get("checkpoint_count")).intValue(),
-                            totals.totalCostMicrodollars(),
+                            asLong(row.get("total_cost_microdollars")),
                             toOffsetDateTime(row.get("created_at")),
                             toOffsetDateTime(row.get("updated_at")));
                 })
@@ -352,6 +345,13 @@ public class TaskService {
         if (value instanceof java.util.Date d)
             return d.toInstant().atOffset(ZoneOffset.UTC);
         return null;
+    }
+
+    private long asLong(Object value) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        return 0L;
     }
 
     private Object parseJson(Object value) {

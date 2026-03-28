@@ -75,13 +75,6 @@ def _format_db_endpoint(dsn: str) -> str:
     return dsn
 
 
-def _apply_langfuse_defaults() -> None:
-    os.environ.setdefault("LANGFUSE_ENABLED", "true")
-    os.environ.setdefault("LANGFUSE_HOST", "http://127.0.0.1:3300")
-    os.environ.setdefault("LANGFUSE_PUBLIC_KEY", "pk-lf-local")
-    os.environ.setdefault("LANGFUSE_SECRET_KEY", "sk-lf-local")
-
-
 def _assert_langfuse_ready(config: WorkerConfig) -> None:
     if not config.langfuse_enabled or not config.langfuse_host:
         return
@@ -113,7 +106,6 @@ async def main():
 
     logging.getLogger(__name__).info("Worker DB endpoint: %s", _format_db_endpoint(dsn))
 
-    _apply_langfuse_defaults()
     config = WorkerConfig(db_dsn=dsn)
     try:
         _assert_langfuse_ready(config)

@@ -43,6 +43,7 @@ Langfuse is part of the default local development stack.
 - `make start` always runs `make langfuse-up`.
 - `make check` and local startup fail fast if `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, or `LANGFUSE_SECRET_KEY` are missing.
 - Use `make langfuse-status` to inspect the local Langfuse containers and `make langfuse-down` to stop them.
+- Direct `bootRun` / `python main.py` startup paths do not force local Langfuse defaults; the supported default-on path is `make start`.
 
 The checked-in local stack initializes a local Langfuse organization, project, and API keys automatically with the credentials from `.env.localdev.example`:
 

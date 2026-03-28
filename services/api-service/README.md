@@ -40,7 +40,7 @@ When `app.dev-task-controls.enabled=true`, task submission also allows the dev-o
 ### GET /v1/tasks
 
 List tasks with optional filters. Supports `status`, `agent_id`, and `limit` query parameters.
-`total_cost_microdollars` is resolved from Langfuse-backed execution observability, not from checkpoint-row cost summation.
+`total_cost_microdollars` is a cheap fallback value on this list endpoint. Accurate Langfuse-backed totals are available from `GET /v1/tasks/{task_id}` and `GET /v1/tasks/{task_id}/observability`.
 
 **Query Parameters:**
 - `status` (optional) — Filter by task status: `queued`, `running`, `completed`, `dead_letter`. Returns 400 for invalid values.

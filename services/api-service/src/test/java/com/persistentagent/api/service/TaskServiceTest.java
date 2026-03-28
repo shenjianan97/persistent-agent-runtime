@@ -584,7 +584,7 @@ class TaskServiceTest {
     }
 
     @Test
-    void listTasks_enrichesCostsFromObservability() {
+    void listTasks_usesCheapFallbackCostWithoutObservabilityFanout() {
         Timestamp now = Timestamp.from(Instant.now());
         UUID taskId = UUID.randomUUID();
         List<Map<String, Object>> rows = List.of(Map.of(
@@ -593,19 +593,17 @@ class TaskServiceTest {
                 "status", "completed",
                 "retry_count", 0,
                 "checkpoint_count", 2L,
-                "total_cost_microdollars", 999L,
                 "created_at", now,
                 "updated_at", now
         ));
 
         when(taskRepository.listTasks("default", null, null, 50)).thenReturn(rows);
-        when(taskObservabilityService.getTaskTotals(taskId, "agent1", "completed"))
-                .thenReturn(new TaskObservabilityTotals(7500L, 100, 20, 120, 1500L, "trace-1"));
 
         TaskListResponse response = taskService.listTasks(null, null, null);
 
         assertEquals(1, response.items().size());
-        assertEquals(7500L, response.items().get(0).totalCostMicrodollars());
+        assertEquals(0L, response.items().get(0).totalCostMicrodollars());
+        verifyNoInteractions(taskObservabilityService);
     }
 
     // --- getHealth tests ---

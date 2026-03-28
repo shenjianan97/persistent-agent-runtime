@@ -24,7 +24,7 @@ app:
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:3000}
   langfuse:
-    enabled: ${LANGFUSE_ENABLED:true}
+    enabled: ${LANGFUSE_ENABLED:false}
     host: ${LANGFUSE_HOST:http://127.0.0.1:3300}
     public-key: ${LANGFUSE_PUBLIC_KEY:pk-lf-local}
     secret-key: ${LANGFUSE_SECRET_KEY:sk-lf-local}

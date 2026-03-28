@@ -5,19 +5,13 @@ import os
 import pytest
 
 from core.config import WorkerConfig
-from main import _apply_langfuse_defaults, _assert_langfuse_ready
+from main import _assert_langfuse_ready
 
 
-def test_apply_langfuse_defaults_sets_local_required_values(monkeypatch):
-    for name in ("LANGFUSE_ENABLED", "LANGFUSE_HOST", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
-        monkeypatch.delenv(name, raising=False)
+def test_langfuse_startup_check_is_noop_when_disabled():
+    config = WorkerConfig(langfuse_enabled=False)
 
-    _apply_langfuse_defaults()
-
-    assert os.environ["LANGFUSE_ENABLED"] == "true"
-    assert os.environ["LANGFUSE_HOST"] == "http://127.0.0.1:3300"
-    assert os.environ["LANGFUSE_PUBLIC_KEY"] == "pk-lf-local"
-    assert os.environ["LANGFUSE_SECRET_KEY"] == "sk-lf-local"
+    _assert_langfuse_ready(config)
 
 
 def test_langfuse_startup_check_raises_when_unreachable():
