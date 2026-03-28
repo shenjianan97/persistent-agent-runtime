@@ -11,6 +11,8 @@ import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
+import com.persistentagent.api.service.observability.TaskObservabilityService;
+import com.persistentagent.api.service.observability.TaskObservabilityTotals;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -26,6 +28,7 @@ public class TaskService {
 
     private final TaskRepository taskRepository;
     private final ModelRepository modelRepository;
+    private final TaskObservabilityService taskObservabilityService;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
     private final boolean devTaskControlsEnabled;
@@ -33,11 +36,13 @@ public class TaskService {
     public TaskService(
             TaskRepository taskRepository,
             ModelRepository modelRepository,
+            TaskObservabilityService taskObservabilityService,
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.taskRepository = taskRepository;
         this.modelRepository = modelRepository;
+        this.taskObservabilityService = taskObservabilityService;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
         this.devTaskControlsEnabled = devTaskControlsEnabled;
@@ -98,7 +103,10 @@ public class TaskService {
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
         int checkpointCount = ((Number) task.get("checkpoint_count")).intValue();
-        long totalCost = ((Number) task.get("total_cost_microdollars")).longValue();
+        TaskObservabilityTotals totals = taskObservabilityService.getTaskTotals(
+                taskId,
+                (String) task.get("agent_id"),
+                (String) task.get("status"));
 
         // Parse retry_history from JSONB
         List<Object> retryHistory = parseJsonList(task.get("retry_history"));
@@ -115,7 +123,7 @@ public class TaskService {
                 ((Number) task.get("retry_count")).intValue(),
                 retryHistory,
                 checkpointCount,
-                totalCost,
+                totals.totalCostMicrodollars(),
                 (String) task.get("lease_owner"),
                 (String) task.get("last_error_code"),
                 (String) task.get("last_error_message"),
@@ -156,6 +164,41 @@ public class TaskService {
                 .toList();
 
         return new CheckpointListResponse(checkpoints);
+    }
+
+    public TaskObservabilityResponse getTaskObservability(UUID taskId) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+        Map<String, Object> task = taskRepository.findByIdWithAggregates(taskId, tenantId)
+                .orElseThrow(() -> new TaskNotFoundException(taskId));
+
+        TaskObservabilityResponse base = taskObservabilityService.getTaskObservability(
+                taskId,
+                (String) task.get("agent_id"),
+                (String) task.get("status"));
+
+        List<TaskObservabilityItemResponse> items = new ArrayList<>(base.items());
+        items.addAll(buildRuntimeItems(taskId, task));
+        items.sort(Comparator
+                .comparingInt((TaskObservabilityItemResponse item) -> isTerminalMarker(item.kind()) ? 1 : 0)
+                .thenComparing(TaskObservabilityItemResponse::startedAt, Comparator.nullsLast(Comparator.naturalOrder()))
+                .thenComparingInt(item -> observabilitySortOrder(item.kind()))
+                .thenComparing(item -> Optional.ofNullable(item.stepNumber()).orElse(Integer.MAX_VALUE))
+                .thenComparing(TaskObservabilityItemResponse::itemId));
+
+        return new TaskObservabilityResponse(
+                base.enabled(),
+                base.taskId(),
+                base.agentId(),
+                base.status(),
+                base.traceId(),
+                base.totalCostMicrodollars(),
+                base.inputTokens(),
+                base.outputTokens(),
+                base.totalTokens(),
+                base.durationMs(),
+                base.spans(),
+                items
+        );
     }
 
     public TaskCancelResponse cancelTask(UUID taskId) {
@@ -210,15 +253,17 @@ public class TaskService {
         List<Map<String, Object>> rows = taskRepository.listTasks(tenantId, status, agentId, effectiveLimit);
 
         List<TaskSummaryResponse> items = rows.stream()
-                .map(row -> new TaskSummaryResponse(
-                        (UUID) row.get("task_id"),
-                        (String) row.get("agent_id"),
-                        (String) row.get("status"),
-                        ((Number) row.get("retry_count")).intValue(),
-                        ((Number) row.get("checkpoint_count")).intValue(),
-                        ((Number) row.get("total_cost_microdollars")).longValue(),
-                        toOffsetDateTime(row.get("created_at")),
-                        toOffsetDateTime(row.get("updated_at"))))
+                .map(row -> {
+                    return new TaskSummaryResponse(
+                            (UUID) row.get("task_id"),
+                            (String) row.get("agent_id"),
+                            (String) row.get("status"),
+                            ((Number) row.get("retry_count")).intValue(),
+                            ((Number) row.get("checkpoint_count")).intValue(),
+                            asLong(row.get("total_cost_microdollars")),
+                            toOffsetDateTime(row.get("created_at")),
+                            toOffsetDateTime(row.get("updated_at")));
+                })
                 .toList();
 
         return new TaskListResponse(items);
@@ -302,6 +347,13 @@ public class TaskService {
         return null;
     }
 
+    private long asLong(Object value) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        return 0L;
+    }
+
     private Object parseJson(Object value) {
         return JsonParseUtil.parseJson(objectMapper, value, "field", "n/a");
     }
@@ -312,5 +364,173 @@ public class TaskService {
             return new ArrayList<>(list);
         }
         return List.of();
+    }
+
+    private List<TaskObservabilityItemResponse> buildRuntimeItems(UUID taskId, Map<String, Object> task) {
+        List<TaskObservabilityItemResponse> items = new ArrayList<>();
+        String agentId = (String) task.get("agent_id");
+        String status = (String) task.get("status");
+
+        List<Map<String, Object>> checkpointRows = taskRepository.getCheckpoints(taskId, ValidationConstants.DEFAULT_TENANT_ID)
+                .orElse(List.of());
+        List<CheckpointMarker> checkpointMarkers = IntStream.range(0, checkpointRows.size())
+                .mapToObj(index -> checkpointMarker(taskId, agentId, index, checkpointRows.get(index)))
+                .toList();
+        items.addAll(checkpointMarkers.stream().map(CheckpointMarker::item).toList());
+
+        List<OffsetDateTime> retryTimes = parseRetryTimes(task.get("retry_history"));
+        for (int i = 0; i < retryTimes.size(); i++) {
+            final int retryIndex = i;
+            OffsetDateTime retryAt = retryTimes.get(i);
+            OffsetDateTime nextRetryAt = i + 1 < retryTimes.size() ? retryTimes.get(i + 1) : null;
+            checkpointMarkers.stream()
+                    .filter(marker -> marker.item().startedAt() != null && marker.item().startedAt().isAfter(retryAt))
+                    .filter(marker -> nextRetryAt == null || !marker.item().startedAt().isAfter(nextRetryAt))
+                    .findFirst()
+                    .ifPresent(marker -> items.add(new TaskObservabilityItemResponse(
+                            "resume-%d".formatted(retryIndex + 1),
+                            null,
+                            "resumed_after_retry",
+                            "Resumed from saved progress",
+                            "Execution continued from the checkpoint saved after step %d.".formatted(Math.max(1, marker.stepNumber() - 1)),
+                            Math.max(1, marker.stepNumber() - 1),
+                            marker.nodeName(),
+                            null,
+                            null,
+                            0L,
+                            0,
+                            0,
+                            0,
+                            null,
+                            null,
+                            null,
+                            marker.item().startedAt(),
+                            null
+                    )));
+        }
+
+        OffsetDateTime lastCheckpointAt = checkpointMarkers.isEmpty()
+                ? null
+                : checkpointMarkers.get(checkpointMarkers.size() - 1).item().startedAt();
+        OffsetDateTime terminalAt = switch (status) {
+            case "completed" -> toOffsetDateTime(task.get("updated_at"));
+            case "dead_letter" -> toOffsetDateTime(task.get("dead_lettered_at"));
+            default -> null;
+        };
+        if (terminalAt != null && lastCheckpointAt != null && terminalAt.isBefore(lastCheckpointAt)) {
+            terminalAt = lastCheckpointAt;
+        }
+        if (terminalAt != null) {
+            String kind = "completed".equals(status) ? "completed" : "dead_lettered";
+            String title = "completed".equals(status) ? "Execution completed" : "Execution failed";
+            String summary = "completed".equals(status)
+                    ? "Task execution finished successfully."
+                    : buildDeadLetterSummary(task, checkpointMarkers);
+            Integer lastStep = checkpointMarkers.isEmpty() ? null : checkpointMarkers.get(checkpointMarkers.size() - 1).stepNumber();
+            String lastNode = checkpointMarkers.isEmpty() ? null : checkpointMarkers.get(checkpointMarkers.size() - 1).nodeName();
+            items.add(new TaskObservabilityItemResponse(
+                    "terminal-%s".formatted(kind),
+                    null,
+                    kind,
+                    title,
+                    summary,
+                    lastStep,
+                    lastNode,
+                    null,
+                    null,
+                    0L,
+                    0,
+                    0,
+                    0,
+                    null,
+                    null,
+                    null,
+                    terminalAt,
+                    null
+            ));
+        }
+
+        return items;
+    }
+
+    private CheckpointMarker checkpointMarker(UUID taskId, String agentId, int index, Map<String, Object> row) {
+        String checkpointId = (String) row.get("checkpoint_id");
+        String nodeName = checkpointEventParser.extractNodeName(row.get("metadata_payload"), checkpointId);
+        OffsetDateTime createdAt = toOffsetDateTime(row.get("created_at"));
+        int stepNumber = index + 1;
+        return new CheckpointMarker(
+                stepNumber,
+                nodeName,
+                new TaskObservabilityItemResponse(
+                        "checkpoint-%s".formatted(checkpointId),
+                        null,
+                        "checkpoint_persisted",
+                        "Checkpoint saved",
+                        "Saved durable progress at step %d.".formatted(stepNumber),
+                        stepNumber,
+                        nodeName,
+                        null,
+                        null,
+                        0L,
+                        0,
+                        0,
+                        0,
+                        null,
+                        null,
+                        null,
+                        createdAt,
+                        null
+                )
+        );
+    }
+
+    private List<OffsetDateTime> parseRetryTimes(Object retryHistoryValue) {
+        return parseJsonList(retryHistoryValue).stream()
+                .map(Object::toString)
+                .map(value -> {
+                    try {
+                        return OffsetDateTime.parse(value);
+                    } catch (Exception e) {
+                        return null;
+                    }
+                })
+                .filter(Objects::nonNull)
+                .sorted()
+                .toList();
+    }
+
+    private String buildDeadLetterSummary(Map<String, Object> task, List<CheckpointMarker> checkpointMarkers) {
+        String reason = (String) task.get("dead_letter_reason");
+        String errorCode = (String) task.get("last_error_code");
+        Integer lastStep = checkpointMarkers.isEmpty() ? null : checkpointMarkers.get(checkpointMarkers.size() - 1).stepNumber();
+        String base = "Task moved to dead letter.";
+        if (reason != null && !reason.isBlank()) {
+            base = "Task moved to dead letter because %s.".formatted(reason.replace('_', ' '));
+        }
+        if (lastStep != null) {
+            base += " Last durable checkpoint: step %d.".formatted(lastStep);
+        }
+        if (errorCode != null && !errorCode.isBlank()) {
+            base += " Error code: %s.".formatted(errorCode);
+        }
+        return base;
+    }
+
+    private int observabilitySortOrder(String kind) {
+        return switch (kind) {
+            case "resumed_after_retry" -> 0;
+            case "llm_span", "tool_span" -> 1;
+            case "system_span" -> 2;
+            case "checkpoint_persisted" -> 3;
+            case "completed", "dead_lettered" -> 4;
+            default -> 5;
+        };
+    }
+
+    private boolean isTerminalMarker(String kind) {
+        return "completed".equals(kind) || "dead_lettered".equals(kind);
+    }
+
+    private record CheckpointMarker(int stepNumber, String nodeName, TaskObservabilityItemResponse item) {
     }
 }

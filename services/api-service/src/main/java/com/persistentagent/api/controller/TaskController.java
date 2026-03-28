@@ -48,6 +48,12 @@ public class TaskController {
         return ResponseEntity.ok(response);
     }
 
+    @GetMapping("/{taskId}/observability")
+    public ResponseEntity<TaskObservabilityResponse> getTaskObservability(@PathVariable UUID taskId) {
+        TaskObservabilityResponse response = taskService.getTaskObservability(taskId);
+        return ResponseEntity.ok(response);
+    }
+
     @PostMapping("/{taskId}/cancel")
     public ResponseEntity<TaskCancelResponse> cancelTask(@PathVariable UUID taskId) {
         TaskCancelResponse response = taskService.cancelTask(taskId);

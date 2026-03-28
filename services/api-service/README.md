@@ -40,6 +40,7 @@ When `app.dev-task-controls.enabled=true`, task submission also allows the dev-o
 ### GET /v1/tasks
 
 List tasks with optional filters. Supports `status`, `agent_id`, and `limit` query parameters.
+`total_cost_microdollars` is a cheap fallback value on this list endpoint. Accurate Langfuse-backed totals are available from `GET /v1/tasks/{task_id}` and `GET /v1/tasks/{task_id}/observability`.
 
 **Query Parameters:**
 - `status` (optional) — Filter by task status: `queued`, `running`, `completed`, `dead_letter`. Returns 400 for invalid values.
@@ -66,7 +67,7 @@ List tasks with optional filters. Supports `status`, `agent_id`, and `limit` que
 
 ### GET /v1/tasks/{task_id}
 
-Get task status with checkpoint aggregates.
+Get task status with checkpoint counts plus Langfuse-backed execution totals.
 
 **Response (200 OK):**
 ```json
@@ -91,9 +92,94 @@ Get task status with checkpoint aggregates.
 }
 ```
 
+### GET /v1/tasks/{task_id}/observability
+
+Get the normalized task-execution observability payload for a task run. This is the canonical customer-facing telemetry surface for cost, tokens, duration, trace spans, and durable runtime markers used by the task-detail Execution view.
+
+**Response (200 OK):**
+```json
+{
+  "enabled": true,
+  "task_id": "...",
+  "agent_id": "support_agent_v1",
+  "status": "completed",
+  "trace_id": "99128520cd7378c5aee33ce6c1db0f9b",
+  "total_cost_microdollars": 5241,
+  "input_tokens": 1322,
+  "output_tokens": 85,
+  "total_tokens": 1407,
+  "duration_ms": 3862,
+  "spans": [
+    {
+      "span_id": "obs-llm",
+      "parent_span_id": null,
+      "task_id": "...",
+      "agent_id": "support_agent_v1",
+      "actor_id": null,
+      "type": "llm",
+      "node_name": "ChatAnthropic",
+      "model_name": "claude-sonnet-4-6",
+      "tool_name": null,
+      "cost_microdollars": 2793,
+      "input_tokens": 616,
+      "output_tokens": 63,
+      "total_tokens": 679,
+      "duration_ms": 2537,
+      "input": [{"role": "user", "content": "What is 63 * 14?"}],
+      "output": {"role": "assistant", "content": "Let me calculate that for you!"},
+      "started_at": "2026-03-27T20:21:59.881Z",
+      "ended_at": "2026-03-27T20:22:02.418Z"
+    }
+  ],
+  "items": [
+    {
+      "item_id": "checkpoint-cp-1",
+      "parent_item_id": null,
+      "kind": "checkpoint_persisted",
+      "title": "Checkpoint saved",
+      "summary": "Saved durable progress at step 1.",
+      "step_number": 1,
+      "node_name": "agent",
+      "tool_name": null,
+      "model_name": null,
+      "cost_microdollars": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0,
+      "duration_ms": null,
+      "input": null,
+      "output": null,
+      "started_at": "2026-03-27T20:21:58.500Z",
+      "ended_at": null
+    },
+    {
+      "item_id": "obs-llm",
+      "parent_item_id": null,
+      "kind": "llm_span",
+      "title": "ChatAnthropic",
+      "summary": "LLM generation completed.",
+      "step_number": null,
+      "node_name": "ChatAnthropic",
+      "tool_name": null,
+      "model_name": "claude-sonnet-4-6",
+      "cost_microdollars": 2793,
+      "input_tokens": 616,
+      "output_tokens": 63,
+      "total_tokens": 679,
+      "duration_ms": 2537,
+      "input": [{"role": "user", "content": "What is 63 * 14?"}],
+      "output": {"role": "assistant", "content": "Let me calculate that for you!"},
+      "started_at": "2026-03-27T20:21:59.881Z",
+      "ended_at": "2026-03-27T20:22:02.418Z"
+    }
+  ]
+}
+```
+
 ### GET /v1/tasks/{task_id}/checkpoints
 
 Get checkpoint history for a task. Returns root-namespace checkpoints ordered by creation time.
+These checkpoint cost and execution fields are legacy compatibility data; the primary execution telemetry contract is `GET /v1/tasks/{task_id}/observability`.
 
 **Response (200 OK):**
 ```json

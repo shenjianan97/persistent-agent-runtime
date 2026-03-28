@@ -11,10 +11,13 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable
 
 import asyncpg
+import executor.providers as providers
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
 
 from langchain_core.tools import StructuredTool
+from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError
@@ -47,6 +50,20 @@ class GraphExecutor:
         self.config = config
         self.pool = pool
         self.deps = create_default_dependencies()
+        self._langfuse_client = self._initialize_langfuse_client()
+
+    def _initialize_langfuse_client(self) -> Langfuse | None:
+        if not self.config.langfuse_enabled:
+            return None
+
+        client = Langfuse(
+            public_key=self.config.langfuse_public_key,
+            secret_key=self.config.langfuse_secret_key,
+            host=self.config.langfuse_host,
+        )
+        if not client.auth_check():
+            raise RuntimeError("Langfuse auth check failed for the configured local credentials")
+        return client
 
     def _get_tools(
         self,
@@ -130,8 +147,7 @@ class GraphExecutor:
         allowed_tools = agent_config.get("allowed_tools", [])
         system_prompt = agent_config.get("system_prompt", "")
 
-        from executor.providers import create_llm
-        llm = await create_llm(self.pool, provider, model_name, temperature)
+        llm = await providers.create_llm(self.pool, provider, model_name, temperature)
             
         # Register the local MCP tools with the LLM 
         tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id)
@@ -178,6 +194,7 @@ class GraphExecutor:
         max_steps = task_data.get("max_steps", 100)
         task_timeout_seconds = task_data.get("task_timeout_seconds", 3600)
         worker_id = self.config.worker_id
+        agent_id = task_data.get("agent_id") or "unknown"
 
         try:
             # 2. Init checkpointer
@@ -192,19 +209,12 @@ class GraphExecutor:
             compiled_graph = graph.compile(checkpointer=checkpointer)
             
             # 4. Config map
-            provider = agent_config.get("provider", "anthropic")
-            model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
-            pricing = await self.pool.fetchrow(
-                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE provider_id = $1 AND model_id = $2",
-                provider, model_name
+            config = self._build_runnable_config(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                max_steps=max_steps,
             )
-
-            config = {
-                "configurable": {
-                    "thread_id": task_id,
-                },
-                "recursion_limit": max_steps,
-            }
             
             async def run_astream():
                 # For first run, inject HumanMessage based on initial input
@@ -217,14 +227,10 @@ class GraphExecutor:
                     # Step 6: Cancellation Awareness
                     if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
-                        await self._backfill_checkpoint_costs(task_id, model_name, pricing)
                         return
 
                 if cancel_event.is_set():
-                    await self._backfill_checkpoint_costs(task_id, model_name, pricing)
                     return
-
-                await self._backfill_checkpoint_costs(task_id, model_name, pricing)
 
                 # Execution Finished successfully. Compute final output.
                 final_state = await compiled_graph.aget_state(config)
@@ -271,160 +277,53 @@ class GraphExecutor:
                 await self._handle_retryable_error(task_data, e)
             else:
                 await self._handle_dead_letter(task_id, "non_retryable_error", str(e), error_code="fatal_error")
+        finally:
+            if self._langfuse_client is not None:
+                self._langfuse_client.flush()
 
-    def _extract_cost_from_stream_event(self, event: Any, model_name: str, pricing: Any) -> int:
-        usage = self._extract_usage_from_stream_event(event)
-        if usage is None:
-            return 0
-        return self._calculate_cost_microdollars(model_name, usage, pricing)
-
-    def _extract_cost_from_checkpoint_payload(
+    def _build_runnable_config(
         self,
-        checkpoint_payload: Any,
-        model_name: str,
-        pricing: Any,
-    ) -> int:
-        if checkpoint_payload is None:
-            return 0
-
-        if isinstance(checkpoint_payload, str):
-            try:
-                checkpoint_payload = json.loads(checkpoint_payload)
-            except json.JSONDecodeError:
-                logger.warning("Unable to parse checkpoint payload while calculating cost.")
-                return 0
-
-        if not isinstance(checkpoint_payload, dict):
-            return 0
-
-        channel_values = checkpoint_payload.get("channel_values")
-        if not isinstance(channel_values, dict):
-            return 0
-
-        messages = channel_values.get("messages")
-        if not isinstance(messages, list) or not messages:
-            return 0
-
-        usage = self._extract_usage_from_message(messages[-1])
-        if usage is None:
-            return 0
-
-        return self._calculate_cost_microdollars(model_name, usage, pricing)
-
-    def _extract_usage_from_stream_event(self, event: Any) -> dict[str, int] | None:
-        if not isinstance(event, dict):
-            return None
-
-        for update in event.values():
-            usage = self._extract_usage_from_update(update)
-            if usage is not None:
-                return usage
-
-        return None
-
-    def _extract_usage_from_update(self, update: Any) -> dict[str, int] | None:
-        if not isinstance(update, dict):
-            return None
-
-        messages = update.get("messages")
-        if not isinstance(messages, list):
-            return None
-
-        for message in reversed(messages):
-            usage = self._extract_usage_from_message(message)
-            if usage is not None:
-                return usage
-
-        return None
-
-    def _extract_usage_from_message(self, message: Any) -> dict[str, int] | None:
-        usage = getattr(message, "usage_metadata", None)
-        if usage is None and isinstance(message, dict):
-            usage = message.get("usage_metadata")
-            if usage is None:
-                kwargs = message.get("kwargs")
-                if isinstance(kwargs, dict):
-                    usage = kwargs.get("usage_metadata")
-
-        if not isinstance(usage, dict):
-            return None
-
-        input_tokens = self._coerce_usage_value(usage, "input_tokens", "prompt_tokens", "inputTokens")
-        output_tokens = self._coerce_usage_value(usage, "output_tokens", "completion_tokens", "outputTokens")
-        if input_tokens is None and output_tokens is None:
-            return None
-
-        return {
-            "input_tokens": input_tokens or 0,
-            "output_tokens": output_tokens or 0,
+        *,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        max_steps: int,
+    ) -> dict[str, Any]:
+        config: dict[str, Any] = {
+            "configurable": {
+                "thread_id": task_id,
+            },
+            "recursion_limit": max_steps,
         }
 
-    def _coerce_usage_value(self, usage: dict[str, Any], *keys: str) -> int | None:
-        for key in keys:
-            value = usage.get(key)
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                return int(value)
-        return None
+        if not self.config.langfuse_enabled:
+            return config
 
-    def _calculate_cost_microdollars(self, model_name: str, usage: dict[str, int], pricing: Any) -> int:
-        if not pricing:
-            logger.warning("No pricing configured for model %s; checkpoint cost will remain zero.", model_name)
-            return 0
+        callback = self._build_langfuse_callback(task_id=task_id, tenant_id=tenant_id, agent_id=agent_id)
+        config["callbacks"] = [callback]
+        config["metadata"] = {
+            "langfuse_session_id": task_id,
+            "langfuse_user_id": tenant_id,
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+        }
+        return config
 
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
-        input_cost = self._cost_from_tokens(input_tokens, pricing["input_microdollars_per_million"])
-        output_cost = self._cost_from_tokens(output_tokens, pricing["output_microdollars_per_million"])
-        return input_cost + output_cost
-
-    def _cost_from_tokens(self, tokens: int, microdollars_per_million: int) -> int:
-        return (tokens * microdollars_per_million + 500_000) // 1_000_000
-
-    async def _persist_checkpoint_cost(self, task_id: str, checkpoint_id: str, pending_cost: int) -> None:
-        await self.pool.execute(
-            '''
-            UPDATE checkpoints
-            SET cost_microdollars = cost_microdollars + $1::int,
-                metadata_payload = jsonb_set(
-                    COALESCE(metadata_payload, '{}'::jsonb),
-                    '{cost_microdollars}',
-                    to_jsonb(COALESCE((metadata_payload->>'cost_microdollars')::bigint, 0) + $1::bigint),
-                    true
-                )
-            WHERE task_id = $2::uuid AND checkpoint_id = $3
-            ''',
-            pending_cost,
-            task_id,
-            checkpoint_id,
+    def _build_langfuse_callback(self, *, task_id: str, tenant_id: str, agent_id: str) -> CallbackHandler:
+        return CallbackHandler(
+            public_key=self.config.langfuse_public_key,
+            trace_context={
+                "name": f"task:{task_id}",
+                "session_id": task_id,
+                "user_id": tenant_id,
+                "metadata": {
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "tenant_id": tenant_id,
+                },
+            },
         )
-
-    async def _backfill_checkpoint_costs(self, task_id: str, model_name: str, pricing: Any) -> None:
-        rows = await self.pool.fetch(
-            '''
-            SELECT checkpoint_id, checkpoint_payload, cost_microdollars
-            FROM checkpoints
-            WHERE task_id = $1::uuid
-              AND checkpoint_ns = ''
-              AND cost_microdollars = 0
-            ORDER BY thread_ts ASC
-            ''',
-            task_id,
-        )
-
-        if not rows:
-            return
-
-        for row in rows:
-            pending_cost = self._extract_cost_from_checkpoint_payload(
-                row["checkpoint_payload"],
-                model_name,
-                pricing,
-            )
-            if pending_cost <= 0:
-                continue
-            await self._persist_checkpoint_cost(task_id, row["checkpoint_id"], pending_cost)
 
     async def _await_or_cancel(
         self,

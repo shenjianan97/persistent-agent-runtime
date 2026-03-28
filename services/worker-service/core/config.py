@@ -32,6 +32,18 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class WorkerConfig:
     """Immutable configuration for a worker service instance."""
@@ -64,4 +76,19 @@ class WorkerConfig:
     # stopping heartbeats. Default fits within ECS's 30-second SIGTERM window.
     shutdown_drain_seconds: int = field(default_factory=lambda: _env_int("SHUTDOWN_DRAIN_SECONDS", 25))
 
+    # Customer-facing execution observability (Langfuse)
+    langfuse_enabled: bool = field(default_factory=lambda: _env_bool("LANGFUSE_ENABLED", False))
+    langfuse_host: str | None = field(default_factory=lambda: os.environ.get("LANGFUSE_HOST") or None)
+    langfuse_public_key: str | None = field(default_factory=lambda: os.environ.get("LANGFUSE_PUBLIC_KEY") or None)
+    langfuse_secret_key: str | None = field(default_factory=lambda: os.environ.get("LANGFUSE_SECRET_KEY") or None)
+
+    def __post_init__(self) -> None:
+        if self.langfuse_enabled and (
+            not self.langfuse_host
+            or not self.langfuse_public_key
+            or not self.langfuse_secret_key
+        ):
+            raise ValueError(
+                "LANGFUSE_ENABLED requires LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY"
+            )
 

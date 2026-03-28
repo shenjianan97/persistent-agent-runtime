@@ -1,21 +1,20 @@
 import { useNavigate, useParams } from 'react-router';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
-import { useCheckpoints } from './useCheckpoints';
+import { useTaskObservability } from './useTaskObservability';
 import { useRedriveTask } from '@/features/dead-letter/useDeadLetter';
 import { TaskStatusBadge } from './TaskStatusBadge';
-import { CheckpointTimeline } from './CheckpointTimeline';
 import { CostSummary } from './CostSummary';
+import { ObservabilityTrace } from './ObservabilityTrace';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { AlertCircle, Terminal, Ban, RotateCcw } from 'lucide-react';
 import { toast } from 'sonner';
-import { CheckpointResponse } from '@/types';
 
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
     const navigate = useNavigate();
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
-    const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
+    const { data: observability } = useTaskObservability(taskId!, task?.status);
 
     const cancelMutation = useCancelTask();
     const redriveMutation = useRedriveTask();
@@ -36,7 +35,6 @@ export function TaskDetailPage() {
         );
     }
 
-    const checkpoints: CheckpointResponse[] = checkpointsData?.checkpoints || [];
     const isRunning = task.status === 'running' || task.status === 'queued';
     const isDeadLetter = task.status === 'dead_letter';
 
@@ -113,13 +111,14 @@ export function TaskDetailPage() {
                 </div>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Left Column: Cost Summary and I/O */}
-                <div className="lg:col-span-2 space-y-6">
+            <div className="space-y-6">
                     <CostSummary
-                        checkpoints={checkpoints}
+                        observability={observability}
+                        checkpointCount={task.checkpoint_count}
                         totalCostMicrodollars={task.total_cost_microdollars}
                     />
+
+                    <ObservabilityTrace observability={observability} />
 
                     {isDeadLetter && (
                         <div className="border border-destructive/50 bg-destructive/10 p-6 space-y-3 relative overflow-hidden">
@@ -171,21 +170,6 @@ export function TaskDetailPage() {
                             </CardContent>
                         </Card>
                     )}
-                </div>
-
-                {/* Right Column: Timeline */}
-                <div className="lg:col-span-1">
-                    <CheckpointTimeline
-                        checkpoints={checkpoints}
-                        isRunning={isRunning}
-                        retryHistory={task.retry_history}
-                        status={task.status}
-                        deadLetterReason={task.dead_letter_reason}
-                        lastErrorCode={task.last_error_code}
-                        lastErrorMessage={task.last_error_message}
-                        deadLetteredAt={task.dead_lettered_at}
-                    />
-                </div>
             </div>
         </div>
     );

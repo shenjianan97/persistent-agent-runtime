@@ -1,7 +1,6 @@
 import asyncio
 import json
 import pytest
-from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 from core.worker import WorkerService
@@ -44,6 +43,7 @@ def task_data():
     return {
         "task_id": "00000000-0000-0000-0000-000000000000",
         "tenant_id": "test-tenant",
+        "agent_id": "test-agent",
         "agent_config_snapshot": json.dumps({
             "model": "claude-3-5-sonnet-latest",
             "temperature": 0.5,
@@ -106,68 +106,67 @@ async def test_completion_path(mock_worker, task_data):
             )
 
 
-def test_extract_cost_from_stream_event_uses_local_model_pricing(mock_worker):
-    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
-    event = {
-        "agent": {
-            "messages": [
-                SimpleNamespace(
-                    usage_metadata={
-                        "input_tokens": 428,
-                        "output_tokens": 53,
-                    }
-                )
-            ]
-        }
-    }
-
-    cost = executor._extract_cost_from_stream_event(event, "claude-sonnet-4-20250514", pricing)
-
-    assert cost == 2079
-
-
-def test_extract_cost_from_checkpoint_payload_uses_latest_ai_usage(mock_worker):
-    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
-    checkpoint_payload = {
-        "channel_values": {
-            "messages": [
-                {"kwargs": {"type": "human", "content": "What is 2+2?"}},
-                {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}},
-            ]
-        }
-    }
-
-    cost = executor._extract_cost_from_checkpoint_payload(
-        checkpoint_payload,
-        "claude-sonnet-4-20250514",
-        pricing,
+@pytest.mark.asyncio
+async def test_execute_task_adds_langfuse_callback_and_metadata(mock_worker, task_data):
+    mock_worker.config = WorkerConfig(
+        worker_id="test-worker",
+        worker_pool_id="shared",
+        langfuse_enabled=True,
+        langfuse_host="http://localhost:3300",
+        langfuse_public_key="pk-lf-test",
+        langfuse_secret_key="sk-lf-test",
     )
+    captured = {}
 
-    assert cost == 2079
+    with patch("executor.graph.Langfuse") as MockLangfuse:
+        mock_langfuse_client = MagicMock(name="langfuse-client")
+        mock_langfuse_client.auth_check.return_value = True
+        MockLangfuse.return_value = mock_langfuse_client
 
+        executor = GraphExecutor(mock_worker.config, mock_worker.pool)
 
-def test_extract_cost_from_checkpoint_payload_ignores_prior_ai_usage_when_latest_message_is_tool(mock_worker):
-    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    pricing = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
-    checkpoint_payload = {
-        "channel_values": {
-            "messages": [
-                {"kwargs": {"type": "human", "content": "What is 2+2?"}},
-                {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}},
-                {"kwargs": {"type": "tool", "content": '{"result": 4}'}},
-            ]
-        }
-    }
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = MagicMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
 
-    cost = executor._extract_cost_from_checkpoint_payload(
-        checkpoint_payload,
-        "claude-sonnet-4-20250514",
-        pricing,
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer, \
+                 patch("executor.graph.CallbackHandler") as MockCallbackHandler:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+                callback = MagicMock(name="langfuse-callback")
+                MockCallbackHandler.return_value = callback
+
+                async def mock_astream(initial_input, config=None, stream_mode=None):
+                    captured["initial_input"] = initial_input
+                    captured["config"] = config
+                    captured["stream_mode"] = stream_mode
+                    yield {"mock": "event"}
+
+                mock_compiled.astream = mock_astream
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
+                mock_compiled.aget_state.return_value = mock_state
+
+                await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+    MockLangfuse.assert_called_once_with(
+        public_key="pk-lf-test",
+        secret_key="sk-lf-test",
+        host="http://localhost:3300",
     )
-
-    assert cost == 0
+    MockCallbackHandler.assert_called_once()
+    assert captured["config"]["callbacks"] == [callback]
+    assert captured["config"]["metadata"] == {
+        "langfuse_session_id": str(task_data["task_id"]),
+        "langfuse_user_id": task_data["tenant_id"],
+        "task_id": str(task_data["task_id"]),
+        "agent_id": task_data["agent_id"],
+        "tenant_id": task_data["tenant_id"],
+    }
+    mock_langfuse_client.flush.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -220,13 +219,8 @@ async def test_await_or_cancel_interrupts_long_running_operation(mock_worker):
 
 
 @pytest.mark.asyncio
-async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
+async def test_execute_task_does_not_persist_legacy_checkpoint_cost(mock_worker, task_data):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    task_data["agent_config_snapshot"] = json.dumps({
-        "model": "claude-sonnet-4-20250514",
-        "temperature": 0.5,
-        "allowed_tools": ["calculator"]
-    })
 
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -240,52 +234,17 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
             MockCheckpointer.return_value = mock_ckpt
 
             async def mock_astream(*args, **kwargs):
-                yield {
-                    "agent": {
-                        "messages": [
-                            SimpleNamespace(
-                                usage_metadata={
-                                    "input_tokens": 428,
-                                    "output_tokens": 53,
-                                }
-                            )
-                        ]
-                    }
-                }
+                yield {"mock": "event"}
             mock_compiled.astream = mock_astream
 
             mock_state = MagicMock()
             mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
             mock_compiled.aget_state.return_value = mock_state
-            mock_worker.pool.fetch.side_effect = [
-                [
-                    {
-                        "checkpoint_id": "checkpoint-003",
-                        "checkpoint_payload": {
-                            "channel_values": {
-                                "messages": [
-                                    {"kwargs": {"type": "ai", "usage_metadata": {"input_tokens": 428, "output_tokens": 53}}}
-                                ]
-                            }
-                        },
-                        "cost_microdollars": 0,
-                    }
-                ],
-                [],
-            ]
-
-            mock_worker.pool.fetchrow.return_value = {"input_microdollars_per_million": 3_000_000, "output_microdollars_per_million": 15_000_000}
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
-            # Cost update uses pool.execute; completion uses pool.fetchval (with lease guard)
-            assert mock_worker.pool.execute.call_count == 1
-            cost_args, _ = mock_worker.pool.execute.call_args_list[0]
-            assert "UPDATE checkpoints" in cost_args[0]
-            assert "cost_microdollars = cost_microdollars + $1::int" in cost_args[0]
-            assert cost_args[1] == 2079
-            assert cost_args[2] == task_data["task_id"]
-            assert cost_args[3] == "checkpoint-003"
-            # Completion UPDATE
+            mock_worker.pool.execute.assert_not_called()
+            mock_worker.pool.fetch.assert_not_called()
+            mock_worker.pool.fetchrow.assert_not_called()
             completion_args, _ = mock_worker.pool.fetchval.call_args
             assert "UPDATE tasks" in completion_args[0]
             assert "status='completed'" in completion_args[0]
