@@ -251,3 +251,96 @@ jobs:
           set -o pipefail
           python -m pytest tests/backend-integration -ra -q | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
+
+  observability-smoke-tests:
+    name: Observability Smoke Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: persistent_agent_runtime
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y postgresql-client
+
+      - name: Install worker and E2E dependencies
+        run: pip install -e 'services/worker-service[dev]'
+
+      - name: Apply database migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0002_worker_registry.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0003_dynamic_models.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0004_timeout_reference.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/test_seed.sql
+
+      - name: Start Langfuse
+        env:
+          LANGFUSE_HOST: http://127.0.0.1:3300
+          LANGFUSE_PUBLIC_KEY: pk-lf-local
+          LANGFUSE_SECRET_KEY: sk-lf-local
+        run: docker compose -p persistent-agent-runtime-langfuse -f infrastructure/local/langfuse/docker-compose.yml up -d
+
+      - name: Wait for Langfuse
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3300 >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Langfuse did not become ready in time" >&2
+          exit 1
+
+      - name: Run Langfuse observability smoke test
+        env:
+          E2E_DB_HOST: localhost
+          E2E_DB_PORT: "55432"
+          E2E_DB_NAME: persistent_agent_runtime
+          E2E_DB_USER: postgres
+          E2E_DB_PASSWORD: postgres
+          APP_DEV_TASK_CONTROLS_ENABLED: "true"
+          E2E_LANGFUSE_ENABLED: "true"
+          LANGFUSE_ENABLED: "true"
+          LANGFUSE_HOST: http://127.0.0.1:3300
+          LANGFUSE_PUBLIC_KEY: pk-lf-local
+          LANGFUSE_SECRET_KEY: sk-lf-local
+        run: |
+          set -o pipefail
+          python -m pytest tests/backend-integration/test_observability_langfuse.py -ra -q | tee /tmp/observability-smoke.log
+          ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/observability-smoke.log
+
+      - name: Stop Langfuse
+        if: always()
+        run: docker compose -p persistent-agent-runtime-langfuse -f infrastructure/local/langfuse/docker-compose.yml down -v

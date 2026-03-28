@@ -3,6 +3,7 @@ from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.messages import AIMessage, ToolCall
 
 
@@ -46,6 +47,10 @@ def simple_response(content: str = "Hello!") -> MagicMock:
     mock = _new_mock()
     mock.ainvoke = AsyncMock(return_value=AIMessage(content=content))
     return mock
+
+
+def callback_friendly_response(content: str = "Hello!") -> FakeListChatModel:
+    return FakeListChatModel(responses=[content])
 
 
 def calculator_tool_call(expression: str = "2 + 2", final_answer: str = "The answer is 4.") -> MagicMock:

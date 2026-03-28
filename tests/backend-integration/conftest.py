@@ -110,6 +110,7 @@ def _apply_migrations() -> None:
 
 def _start_api_process() -> subprocess.Popen[str]:
     env = os.environ.copy()
+    langfuse_enabled = os.getenv("E2E_LANGFUSE_ENABLED", os.getenv("LANGFUSE_ENABLED", "false"))
     env.update(
         {
             "DB_HOST": DB_HOST,
@@ -119,7 +120,10 @@ def _start_api_process() -> subprocess.Popen[str]:
             "DB_PASSWORD": DB_PASSWORD,
             "SERVER_PORT": str(API_PORT),
             "APP_DEV_TASK_CONTROLS_ENABLED": "true",
-            "LANGFUSE_ENABLED": "false",
+            "LANGFUSE_ENABLED": langfuse_enabled,
+            "LANGFUSE_HOST": os.getenv("E2E_LANGFUSE_HOST", os.getenv("LANGFUSE_HOST", "http://127.0.0.1:3300")),
+            "LANGFUSE_PUBLIC_KEY": os.getenv("E2E_LANGFUSE_PUBLIC_KEY", os.getenv("LANGFUSE_PUBLIC_KEY", "pk-lf-local")),
+            "LANGFUSE_SECRET_KEY": os.getenv("E2E_LANGFUSE_SECRET_KEY", os.getenv("LANGFUSE_SECRET_KEY", "sk-lf-local")),
         }
     )
     log_file = REPO_ROOT / ".tmp" / "e2e-api-service.log"

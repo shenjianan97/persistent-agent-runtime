@@ -85,6 +85,8 @@ services/worker-service/.venv/bin/python -m pytest -q tests/backend-integration/
 - `E2E_PG_CONTAINER` (default: `par-e2e-postgres`)
 - `E2E_PG_IMAGE` (default: `postgres:16`)
 - `E2E_SKIP_AUTO_INFRA=1` (disable auto start/reuse logic)
+- `E2E_LANGFUSE_ENABLED=true` (start the API with Langfuse enabled when the suite boots it)
+- `E2E_LANGFUSE_HOST`, `E2E_LANGFUSE_PUBLIC_KEY`, `E2E_LANGFUSE_SECRET_KEY` (override Langfuse settings for suite-managed API startup)
 
 The suite enables API dev task controls automatically for any API instance it starts itself.
 
