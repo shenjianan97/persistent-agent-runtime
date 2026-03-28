@@ -249,7 +249,9 @@ jobs:
           # conftest will auto-start the API via ./gradlew bootRun
         run: |
           set -o pipefail
-          python -m pytest tests/backend-integration -ra -q | tee /tmp/e2e.log
+          python -m pytest tests/backend-integration \
+            --ignore=tests/backend-integration/test_observability_langfuse.py \
+            -ra -q | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
 
   observability-smoke-tests:
