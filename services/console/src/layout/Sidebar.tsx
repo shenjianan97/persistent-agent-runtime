@@ -1,22 +1,15 @@
 import { NavLink } from 'react-router';
 import { AlertTriangle, PlaySquare, LayoutDashboard, List } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { useHealth } from '@/features/dashboard/useHealth';
 
 const NAV_ITEMS = [
-    { path: '/', label: 'Overview', icon: LayoutDashboard },
+    { path: '/', label: 'Home', icon: LayoutDashboard },
     { path: '/tasks', label: 'Tasks', icon: List, end: true },
     { path: '/tasks/new', label: 'Submit Task', icon: PlaySquare },
     { path: '/dead-letter', label: 'Dead Letters', icon: AlertTriangle },
 ];
 
 export function Sidebar() {
-    const { data: health, isError, isLoading } = useHealth();
-
-    const sysStatus = isLoading ? 'SYNC' : isError || !health ? 'DOWN' : health.status === 'healthy' ? 'STABLE' : 'DEGRADED';
-    const dbStatus = isLoading ? '...' : health?.database === 'connected' ? 'OK' : 'ERR';
-    const workerCount = isLoading ? '...' : String(health?.active_workers ?? 0);
-
     return (
         <aside className="w-64 flex flex-col border-r border-border/40 bg-background/95 backdrop-blur shrink-0 z-20">
             <div className="h-16 flex items-center px-6 border-b border-border/40">
@@ -44,14 +37,6 @@ export function Sidebar() {
                     );
                 })}
             </nav>
-
-            <div className="p-4 border-t border-border/40">
-                <div className="text-[10px] uppercase text-muted-foreground tracking-widest bg-black/50 p-3 border border-border/40 flex flex-col gap-1 rounded-none">
-                    <div><span className="text-primary opacity-50">SYS //</span> {sysStatus}</div>
-                    <div><span className="text-primary opacity-50">DB //</span> {dbStatus}</div>
-                    <div><span className="text-primary opacity-50">WRK //</span> {workerCount}</div>
-                </div>
-            </div>
         </aside>
     );
 }

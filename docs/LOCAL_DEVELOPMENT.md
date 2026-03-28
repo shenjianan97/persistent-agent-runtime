@@ -26,6 +26,7 @@ make start
 
 - loads local overrides from `.env.localdev`
 - uses sensible local defaults for `DB_DSN` and `VITE_API_BASE_URL`
+- starts the local Langfuse Docker stack automatically
 - forwards `APP_DEV_TASK_CONTROLS_ENABLED` to the API, worker, and console when set
 - checks the existing `persistent-agent-runtime-postgres` container and starts it if needed
 - expects dependencies to already be installed via `make install`
@@ -34,6 +35,20 @@ make start
 - waits for the console, API health endpoint, and requested worker count before reporting success
 - writes PID and log files to `.tmp/`
 - works with `make stop`, `make status`, and `make logs`
+
+## Local Langfuse Observability
+
+Langfuse is part of the default local development stack.
+
+- `make start` always runs `make langfuse-up`.
+- `make check` and local startup fail fast if `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, or `LANGFUSE_SECRET_KEY` are missing.
+- Use `make langfuse-status` to inspect the local Langfuse containers and `make langfuse-down` to stop them.
+
+The checked-in local stack initializes a local Langfuse organization, project, and API keys automatically with the credentials from `.env.localdev.example`:
+
+- Langfuse UI: `http://127.0.0.1:3300`
+- Default login: `local@example.com` / `LocalDevPass123!`
+- Default project keys: `pk-lf-local` / `sk-lf-local`
 
 On startup, `make start` runs `services/model-discovery/main.py` to auto-discover available LLM providers from configured API keys and populate the `provider_keys` and `models` tables in PostgreSQL. The API service validates task submissions against these tables, and the console model selector is populated from `GET /v1/models`. Set `ANTHROPIC_API_KEY` for Claude models, `OPENAI_API_KEY` for GPT models, or both.
 

@@ -72,6 +72,63 @@ export interface CheckpointListResponse {
     total_cost_microdollars: number;
 }
 
+export interface TaskObservabilitySpanResponse {
+    span_id: string;
+    parent_span_id?: string | null;
+    task_id: string;
+    agent_id: string;
+    actor_id?: string | null;
+    type: 'llm' | 'tool' | 'system';
+    node_name?: string | null;
+    model_name?: string | null;
+    tool_name?: string | null;
+    cost_microdollars: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    duration_ms?: number | null;
+    input?: unknown;
+    output?: unknown;
+    started_at?: string | null;
+    ended_at?: string | null;
+}
+
+export interface TaskObservabilityItemResponse {
+    item_id: string;
+    parent_item_id?: string | null;
+    kind: 'llm_span' | 'tool_span' | 'system_span' | 'checkpoint_persisted' | 'resumed_after_retry' | 'completed' | 'dead_lettered';
+    title: string;
+    summary: string;
+    step_number?: number | null;
+    node_name?: string | null;
+    tool_name?: string | null;
+    model_name?: string | null;
+    cost_microdollars: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    duration_ms?: number | null;
+    input?: unknown;
+    output?: unknown;
+    started_at?: string | null;
+    ended_at?: string | null;
+}
+
+export interface TaskObservabilityResponse {
+    enabled: boolean;
+    task_id: string;
+    agent_id: string;
+    status: string;
+    trace_id?: string | null;
+    total_cost_microdollars: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    duration_ms?: number | null;
+    spans: TaskObservabilitySpanResponse[];
+    items: TaskObservabilityItemResponse[];
+}
+
 export interface DeadLetterItemResponse {
     task_id: string;
     agent_id: string;
@@ -101,13 +158,6 @@ export interface TaskSummaryResponse {
 export interface TaskListResponse {
     items: TaskSummaryResponse[];
     total: number;
-}
-
-export interface HealthResponse {
-    status: string;
-    database: string;
-    active_workers: number;
-    queued_tasks: number;
 }
 
 export interface TaskCancelResponse {

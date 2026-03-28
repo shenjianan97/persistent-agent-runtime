@@ -7,8 +7,8 @@ Since the frontend is a React 19 SPA running in the browser, testing requires a 
 - Worker Service running (with mock LLM as described in Section 2)
 - Vite Dev Server or Production Build running (`localhost:5173`)
 
-### 1. E2E-UI-1: Happy Path Task Submission & Live Timeline
-**What it validates:** The user can fill out the task submission form, submit it successfully, navigate to the detail view, and watch the execution timeline populate live as the worker processes the task.
+### 1. E2E-UI-1: Happy Path Task Submission & Live Execution View
+**What it validates:** The user can fill out the task submission form, submit it successfully, navigate to the detail view, and watch the unified execution view populate live as the worker processes the task.
 
 **Test Steps:**
 1. Navigate to `http://localhost:5173/tasks/new`.
@@ -21,7 +21,7 @@ Since the frontend is a React 19 SPA running in the browser, testing requires a 
    - Toast notification appears: "Task [...uuid...] submitted".
    - URL changes to `/tasks/[...uuid...]`.
    - The status badge reads `QUEUED` then changes to `RUNNING` (Neon Cyan).
-   - "Execution Timeline" panel appears and begins rendering checkpoints.
+   - The `Execution` panel appears and begins rendering trace spans and runtime markers.
    - Wait for status badge to change to `COMPLETED` (Acid Green).
    - Verify the `Cost Tracker` chart renders a bar.
    - Verify the `Output` panel displays "20".

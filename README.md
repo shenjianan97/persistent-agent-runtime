@@ -12,7 +12,7 @@ Running AI agents in production — not as chatbots, but as long-running multi-s
 
 - **Failure management:** At scale, agent task failures need to be inspectable and actionable — structured dead-letter queues with redrive, not just a stack trace in logs.
 
-This project is a portfolio implementation that tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, per-node cost tracking, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
+This project is a portfolio implementation that tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, Langfuse-backed execution observability, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
 
 ## Current Architecture
 
@@ -84,6 +84,9 @@ make start N=3           # start all services with 3 workers
 make scale-worker N=5    # scale workers up or down to N
 make stop                # stop all services
 make status              # show service statuses
+make langfuse-up         # start local Langfuse only
+make langfuse-down       # stop local Langfuse only
+make langfuse-status     # inspect local Langfuse containers
 make check               # verify prerequisites without starting services
 make logs                # tail background service logs
 make api-test            # API service tests

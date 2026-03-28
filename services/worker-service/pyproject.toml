@@ -16,6 +16,7 @@ dependencies = [
     "langchain-anthropic>=0.3.0",
     "langchain-openai>=0.3.0",
     "langchain-aws>=0.2.0",
+    "langfuse==4.0.1",
     "langgraph==1.0.5",
     "langgraph-checkpoint==3.0.1",
     "langgraph-checkpoint-postgres==3.0.4",

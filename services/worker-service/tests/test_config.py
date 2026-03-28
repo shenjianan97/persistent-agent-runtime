@@ -68,3 +68,33 @@ class TestWorkerConfig:
 
         with pytest.raises(ValueError, match="LEASE_DURATION_SECONDS must be an integer"):
             WorkerConfig()
+
+    def test_langfuse_defaults_disabled(self):
+        config = WorkerConfig()
+
+        assert config.langfuse_enabled is False
+        assert config.langfuse_host is None
+        assert config.langfuse_public_key is None
+        assert config.langfuse_secret_key is None
+
+    def test_langfuse_values_can_be_loaded_from_environment(self, monkeypatch):
+        monkeypatch.setenv("LANGFUSE_ENABLED", "true")
+        monkeypatch.setenv("LANGFUSE_HOST", "http://localhost:3300")
+        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+
+        config = WorkerConfig()
+
+        assert config.langfuse_enabled is True
+        assert config.langfuse_host == "http://localhost:3300"
+        assert config.langfuse_public_key == "pk-lf-test"
+        assert config.langfuse_secret_key == "sk-lf-test"
+
+    def test_langfuse_enabled_requires_host_and_keys(self, monkeypatch):
+        monkeypatch.setenv("LANGFUSE_ENABLED", "true")
+        monkeypatch.delenv("LANGFUSE_HOST", raising=False)
+        monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+        monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+
+        with pytest.raises(ValueError, match="LANGFUSE_ENABLED requires LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY"):
+            WorkerConfig()

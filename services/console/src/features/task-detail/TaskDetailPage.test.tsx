@@ -114,9 +114,136 @@ vi.mock('./useCheckpoints', () => ({
     }),
 }));
 
+vi.mock('./useTaskObservability', () => ({
+    useTaskObservability: () => ({
+        data: {
+            enabled: true,
+            task_id: 'task-1',
+            agent_id: 'agent-1',
+            status: 'dead_letter',
+            trace_id: 'trace-1',
+            total_cost_microdollars: 1500,
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            duration_ms: 2200,
+            spans: [
+                {
+                    span_id: 'span-1',
+                    parent_span_id: null,
+                    task_id: 'task-1',
+                    agent_id: 'agent-1',
+                    actor_id: null,
+                    type: 'tool',
+                    node_name: 'loop',
+                    model_name: null,
+                    tool_name: 'read_url',
+                    cost_microdollars: 1500,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: 500,
+                    input: { url: 'https://example.com' },
+                    output: { title: 'Example Domain' },
+                    started_at: '2026-03-11T00:00:02Z',
+                    ended_at: '2026-03-11T00:00:02.500Z',
+                },
+            ],
+            items: [
+                {
+                    item_id: 'checkpoint-1',
+                    parent_item_id: null,
+                    kind: 'checkpoint_persisted',
+                    title: 'Checkpoint saved',
+                    summary: 'Saved durable progress at step 1.',
+                    step_number: 1,
+                    node_name: 'input',
+                    tool_name: null,
+                    model_name: null,
+                    cost_microdollars: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: null,
+                    input: null,
+                    output: null,
+                    started_at: '2026-03-11T00:00:01Z',
+                    ended_at: null,
+                },
+                {
+                    item_id: 'span-1',
+                    parent_item_id: null,
+                    kind: 'tool_span',
+                    title: 'Tool: read_url',
+                    summary: 'read_url returned content',
+                    step_number: 2,
+                    node_name: 'loop',
+                    tool_name: 'read_url',
+                    model_name: null,
+                    cost_microdollars: 1500,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: 500,
+                    input: { url: 'https://example.com' },
+                    output: { title: 'Example Domain' },
+                    started_at: '2026-03-11T00:00:02Z',
+                    ended_at: '2026-03-11T00:00:02.500Z',
+                },
+                {
+                    item_id: 'resume-1',
+                    parent_item_id: null,
+                    kind: 'resumed_after_retry',
+                    title: 'Resumed from saved progress',
+                    summary: 'Execution continued from the checkpoint saved after step 2.',
+                    step_number: 2,
+                    node_name: 'loop',
+                    tool_name: null,
+                    model_name: null,
+                    cost_microdollars: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: null,
+                    input: null,
+                    output: null,
+                    started_at: '2026-03-11T00:00:04Z',
+                    ended_at: null,
+                },
+                {
+                    item_id: 'dead-letter-1',
+                    parent_item_id: null,
+                    kind: 'dead_lettered',
+                    title: 'Execution failed',
+                    summary: 'A later attempt failed before another checkpoint could be saved.',
+                    step_number: 3,
+                    node_name: 'loop',
+                    tool_name: null,
+                    model_name: null,
+                    cost_microdollars: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    total_tokens: 0,
+                    duration_ms: null,
+                    input: null,
+                    output: null,
+                    started_at: '2026-03-11T00:00:06Z',
+                    ended_at: null,
+                },
+            ],
+        },
+    }),
+}));
+
 vi.mock('./CostSummary', () => ({
-    CostSummary: ({ checkpoints }: { checkpoints: Array<{ checkpoint_id: string }> }) => (
-        <div>CostSummary checkpoints={checkpoints.length}</div>
+    CostSummary: ({ checkpointCount }: { checkpointCount: number }) => (
+        <div>CostSummary checkpoints={checkpointCount}</div>
+    ),
+}));
+
+vi.mock('./ObservabilityTrace', () => ({
+    ObservabilityTrace: ({ observability }: { observability?: { items: Array<{ item_id: string }> } }) => (
+        <div>Execution items={observability?.items.length ?? 0}</div>
     ),
 }));
 
@@ -170,13 +297,9 @@ describe('TaskDetailPage', () => {
 
         expect(screen.getByText('Execution Failure')).toBeInTheDocument();
         expect(screen.getByText('CostSummary checkpoints=3')).toBeInTheDocument();
-        expect(screen.getByText('Tool Call: read_url')).toBeInTheDocument();
-        expect(screen.getByText('Resumed From Saved Progress')).toBeInTheDocument();
-        expect(screen.getByText('Execution continued from the checkpoint saved after step 2, so earlier progress was preserved.')).toBeInTheDocument();
-        expect(screen.getByText('Execution Failed')).toBeInTheDocument();
-        expect(screen.getByText('A later attempt failed before another checkpoint could be saved, so the timeline ends at the last durable step below.')).toBeInTheDocument();
-        expect(screen.getByText('Last durable checkpoint: step 3')).toBeInTheDocument();
-        expect(screen.getByText('Error code: retryable_error')).toBeInTheDocument();
+        expect(screen.getByText('Execution items=4')).toBeInTheDocument();
+        expect(screen.queryByText('Tool Call: read_url')).not.toBeInTheDocument();
+        expect(screen.queryByText('Resumed From Saved Progress')).not.toBeInTheDocument();
         expect(screen.queryByText('Waiting for checkpoints...')).not.toBeInTheDocument();
     });
 });

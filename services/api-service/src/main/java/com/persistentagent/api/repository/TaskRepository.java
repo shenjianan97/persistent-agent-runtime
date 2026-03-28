@@ -61,7 +61,8 @@ public class TaskRepository {
     }
 
     /**
-     * Finds a task by ID scoped to tenant, including checkpoint aggregates.
+     * Finds a task by ID scoped to tenant, including checkpoint counts.
+     * Cost totals are resolved from the observability service in TaskService.
      */
     public Optional<Map<String, Object>> findByIdWithAggregates(UUID taskId, String tenantId) {
         String sql = """
@@ -69,8 +70,7 @@ public class TaskRepository {
                        t.retry_count, t.retry_history, t.lease_owner,
                        t.last_error_code, t.last_error_message, t.last_worker_id,
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
-                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
-                       (SELECT COALESCE(SUM(cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
+                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count
                 FROM tasks t
                 WHERE t.task_id = ? AND t.tenant_id = ?
                 """;
@@ -276,8 +276,7 @@ public class TaskRepository {
     public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
-                       COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count,
-                       COALESCE(SUM(c.cost_microdollars), 0) AS total_cost_microdollars
+                       COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count
                 FROM tasks t
                 LEFT JOIN checkpoints c ON c.task_id = t.task_id AND c.checkpoint_ns = ''
                 WHERE t.tenant_id = ?

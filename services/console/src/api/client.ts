@@ -4,8 +4,8 @@ import {
     TaskSubmissionResponse,
     TaskListResponse,
     CheckpointListResponse,
+    TaskObservabilityResponse,
     DeadLetterListResponse,
-    HealthResponse,
     TaskCancelResponse,
     RedriveResponse,
     ModelResponse
@@ -92,6 +92,9 @@ export const api = {
     getCheckpoints: (taskId: string) =>
         fetchApi<CheckpointListResponse>(`/v1/tasks/${taskId}/checkpoints`),
 
+    getTaskObservability: (taskId: string) =>
+        fetchApi<TaskObservabilityResponse>(`/v1/tasks/${taskId}/observability`),
+
     cancelTask: (taskId: string) =>
         fetchApi<TaskCancelResponse>(`/v1/tasks/${taskId}/cancel`, {
             method: 'POST',
@@ -109,9 +112,6 @@ export const api = {
         fetchApi<RedriveResponse>(`/v1/tasks/${taskId}/redrive`, {
             method: 'POST',
         }),
-
-    getHealth: () =>
-        fetchApi<HealthResponse>('/v1/health'),
 
     getModels: () =>
         fetchApi<ModelResponse[]>('/v1/models'),

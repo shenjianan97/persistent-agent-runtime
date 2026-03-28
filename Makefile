@@ -17,6 +17,8 @@ CONSOLE_DIR := $(ROOT_DIR)/services/console
 TMP_DIR := $(ROOT_DIR)/.tmp
 WORKER_COUNT ?= 1
 MIGRATION_FILES := $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql))
+LANGFUSE_COMPOSE_FILE := $(ROOT_DIR)/infrastructure/local/langfuse/docker-compose.yml
+LANGFUSE_DOCKER_PROJECT ?= persistent-agent-runtime-langfuse
 
 WORKER_VENV_DIR := $(WORKER_DIR)/.venv
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
@@ -41,6 +43,11 @@ SERVER_PORT ?= 8080
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
 VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
+LANGFUSE_ENABLED ?= true
+LANGFUSE_HOST ?= http://127.0.0.1:3300
+LANGFUSE_PUBLIC_KEY ?= pk-lf-local
+LANGFUSE_SECRET_KEY ?= sk-lf-local
+LANGFUSE_WEB_PORT ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 80)' "$(LANGFUSE_HOST)"),3300)
 
 # Color Output
 GREEN := \033[0;32m
@@ -50,9 +57,10 @@ CYAN := \033[0;36m
 NC := \033[0m
 
 .PHONY: help init install install-api install-console install-worker \
-        start stop restart start-console start-api start-worker stop-console stop-api stop-worker \
+        start start-with-observability stop restart start-console start-api start-worker stop-console stop-api stop-worker \
         scale-worker \
         status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
+        langfuse-up langfuse-down langfuse-status \
         test api-test worker-test console-test e2e-test local-ci clean logs
 
 
@@ -73,7 +81,7 @@ help:
 	@echo "  $(YELLOW)make start N=3$(NC)      - 🚀 Start all services with 3 workers"
 	@echo "  $(YELLOW)make start-worker N=3$(NC) - 👷 Start 3 worker processes only"
 	@echo "  $(YELLOW)make scale-worker N=5$(NC) - ⚖️  Scale workers up or down to 5"
-	@echo "  $(YELLOW)make stop$(NC)           - 🛑 Stop all background services (DB container kept running; use 'make db-down' to stop it)"
+	@echo "  $(YELLOW)make stop$(NC)           - 🛑 Stop app services only (DB/Langfuse kept running; use 'make db-down' and 'make langfuse-down' to stop them)"
 	@echo "  $(YELLOW)make restart$(NC)        - 🔄 Restart all stack services"
 	@echo "  $(YELLOW)make status$(NC)         - 📊 Show process and DB statuses"
 	@echo "  $(YELLOW)make check$(NC)          - 🔍 Verify environment prerequisites"
@@ -84,6 +92,9 @@ help:
 	@echo "  $(YELLOW)make db-status$(NC)      - 📊 Show DB container status"
 	@echo "  $(YELLOW)make db-migrate$(NC)     - 🛠️  Apply SQL migrations safely"
 	@echo "  $(YELLOW)make db-reset-verify$(NC) - 🧪 Reset and verify DB schema (⚠️ DROPS DATA)"
+	@echo "  $(YELLOW)make langfuse-up$(NC)    - 🔭 Start the local Langfuse stack"
+	@echo "  $(YELLOW)make langfuse-down$(NC)  - 🛑 Stop the local Langfuse stack"
+	@echo "  $(YELLOW)make langfuse-status$(NC) - 📊 Show local Langfuse container status"
 	@echo ""
 	@echo "$(CYAN)[Testing]$(NC)"
 	@echo "  $(YELLOW)make test$(NC)           - 🧪 Run all tests (API, Worker, Console, E2E)"
@@ -141,6 +152,10 @@ check-env:
 		echo "$(RED)❌ At least one LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY) must be set$(NC)"; \
 		exit 1; \
 	fi
+	@if [ -z "$(LANGFUSE_HOST)" ] || [ -z "$(LANGFUSE_PUBLIC_KEY)" ] || [ -z "$(LANGFUSE_SECRET_KEY)" ]; then \
+		echo "$(RED)❌ Local startup requires LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY, and LANGFUSE_SECRET_KEY$(NC)"; \
+		exit 1; \
+	fi
 
 
 # ============================================================
@@ -173,6 +188,7 @@ start: check
 	@mkdir -p $(TMP_DIR)
 	@echo "$(YELLOW)🚀 Starting local stack...$(NC)"
 	@$(MAKE) db-up
+	@$(MAKE) langfuse-up
 	@echo "$(YELLOW)🔍 Discovering models...$(NC)"
 	@$(WORKER_VENV_PYTHON) services/model-discovery/main.py || echo "$(YELLOW)⚠️ Model discovery failed; continuing startup with existing models$(NC)"
 	@$(MAKE) start-console
@@ -191,12 +207,16 @@ start: check
 		wait_for_http() { \
 			name="$$1"; pidfile="$$2"; url="$$3"; timeout="$$4"; elapsed=0; \
 			while [ $$elapsed -lt $$timeout ]; do \
-				if [ ! -f "$$pidfile" ]; then \
+				if [ -n "$$pidfile" ] && [ ! -f "$$pidfile" ]; then \
 					echo "$(RED)❌ $$name failed to create a PID file$(NC)"; \
 					return 1; \
 				fi; \
-				pid=$$(cat "$$pidfile"); \
-				if ! ps -p "$$pid" >/dev/null 2>&1; then \
+				if [ -n "$$pidfile" ]; then \
+					pid=$$(cat "$$pidfile"); \
+				else \
+					pid=""; \
+				fi; \
+				if [ -n "$$pid" ] && ! ps -p "$$pid" >/dev/null 2>&1; then \
 					echo "$(RED)❌ $$name exited before becoming ready$(NC)"; \
 					return 1; \
 				fi; \
@@ -232,6 +252,7 @@ start: check
 			return 1; \
 		}; \
 		wait_for_http "Console" "$(TMP_DIR)/console.pid" "http://localhost:5173" 30 && \
+		wait_for_http "Langfuse" "" "$(LANGFUSE_HOST)" 90 && \
 		wait_for_http "API Service" "$(TMP_DIR)/api.pid" "http://localhost:$(SERVER_PORT)/actuator/health" 60 && \
 		wait_for_workers "$$expected_workers" 20 || { \
 			echo "$(RED)❌ Startup verification failed. Use 'make logs' to inspect the service logs.$(NC)"; \
@@ -241,11 +262,42 @@ start: check
 		echo "$(GREEN)✅ All services started in background and passed startup checks. Use 'make logs' to watch output.$(NC)"; \
 	fi
 
+start-with-observability:
+	@echo "$(YELLOW)ℹ️ Local observability is now part of the default startup flow; delegating to 'make start'.$(NC)"
+	@$(MAKE) start N=$(if $(N),$(N),$(WORKER_COUNT))
+
 stop: stop-console stop-api stop-worker
 	@echo "$(GREEN)🛑 All services stopped$(NC)"
 	@echo "$(YELLOW)ℹ️  DB container is still running. Run 'make db-down' to stop it.$(NC)"
+	@echo "$(YELLOW)ℹ️  Langfuse stack is still running. Run 'make langfuse-down' to stop it.$(NC)"
 
 restart: stop start
+
+langfuse-up:
+	@if [ ! -f "$(LANGFUSE_COMPOSE_FILE)" ]; then \
+		echo "$(RED)❌ Langfuse compose file not found: $(LANGFUSE_COMPOSE_FILE)$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(CYAN)Starting local Langfuse stack...$(NC)"
+	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" -p "$(LANGFUSE_DOCKER_PROJECT)" up -d
+	@echo "$(GREEN)✅ Langfuse containers launched$(NC)"
+
+langfuse-down:
+	@if [ -f "$(LANGFUSE_COMPOSE_FILE)" ]; then \
+		echo "$(YELLOW)Stopping local Langfuse stack...$(NC)"; \
+		docker compose -f "$(LANGFUSE_COMPOSE_FILE)" -p "$(LANGFUSE_DOCKER_PROJECT)" down; \
+		echo "$(GREEN)✅ Langfuse stack stopped$(NC)"; \
+	else \
+		echo "$(YELLOW)ℹ️ No Langfuse compose file found; nothing to stop$(NC)"; \
+	fi
+
+langfuse-status:
+	@if [ ! -f "$(LANGFUSE_COMPOSE_FILE)" ]; then \
+		echo "$(RED)❌ Langfuse compose file not found: $(LANGFUSE_COMPOSE_FILE)$(NC)"; \
+		exit 1; \
+	fi
+	@echo "$(CYAN)Langfuse Stack:$(NC)"
+	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" -p "$(LANGFUSE_DOCKER_PROJECT)" ps
 
 start-console:
 	@pid_is_console() { \
@@ -495,6 +547,8 @@ status:
 	@echo "$(YELLOW)📊 System Status:$(NC)"
 	@echo "$(CYAN)Database Container:$(NC)"
 	@docker ps --filter "name=$(DB_CONTAINER_NAME)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | tail -n+2 || echo "  $(RED)Not running$(NC)"
+	@echo "$(CYAN)Langfuse Containers:$(NC)"
+	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" -p "$(LANGFUSE_DOCKER_PROJECT)" ps 2>/dev/null || echo "  $(YELLOW)Langfuse stack not running$(NC)"
 	@echo "$(CYAN)Background Processes:$(NC)"
 	@pid_is_console() { \
 		pid="$$1"; \
