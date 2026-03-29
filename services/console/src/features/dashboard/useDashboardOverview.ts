@@ -69,7 +69,7 @@ export function useDashboardOverview() {
 
     return {
         isLoading: tasksQuery.isLoading || deadLettersQuery.isLoading,
-        isError: tasksQuery.isError || deadLettersQuery.isError || recentCompletedQueries.some((query) => query.isError),
+        isError: tasksQuery.isError || deadLettersQuery.isError,
         inProgress: derived.inProgress,
         recentRuns,
         deadLetters,

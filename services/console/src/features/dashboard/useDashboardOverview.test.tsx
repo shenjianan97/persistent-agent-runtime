@@ -95,4 +95,45 @@ describe('useDashboardOverview', () => {
 
         expect(result.current.recentRuns[0]?.total_cost_microdollars).toBe(2144);
     });
+
+    it('does not fail the whole dashboard when a recent-run cost enrichment request fails', async () => {
+        useTaskListMock.mockReturnValue({
+            data: {
+                items: [
+                    {
+                        task_id: 'fa705825-14bf-434b-a969-e94510186376',
+                        agent_id: 'testttttt',
+                        status: 'completed',
+                        retry_count: 0,
+                        checkpoint_count: 5,
+                        total_cost_microdollars: 0,
+                        created_at: '2026-03-28T04:47:59.29891Z',
+                        updated_at: '2026-03-28T04:47:59.304002Z',
+                    },
+                ],
+            },
+            isLoading: false,
+            isError: false,
+        });
+
+        useDeadLettersMock.mockReturnValue({
+            data: { items: [] },
+            isLoading: false,
+            isError: false,
+        });
+
+        getTaskStatusMock.mockRejectedValue(new Error('detail fetch failed'));
+
+        const { result } = renderHook(() => useDashboardOverview(), {
+            wrapper: createWrapper(),
+        });
+
+        await waitFor(() => {
+            expect(getTaskStatusMock).toHaveBeenCalledWith('fa705825-14bf-434b-a969-e94510186376');
+        });
+
+        expect(result.current.isError).toBe(false);
+        expect(result.current.summary.recentCostMicrodollars).toBe(0);
+        expect(result.current.recentRuns[0]?.total_cost_microdollars).toBe(0);
+    });
 });
