@@ -86,9 +86,10 @@ export function SubmitTaskPage() {
 
     return (
         <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
-            <div className="mb-8">
-                    <h2 className="text-2xl font-display font-medium uppercase tracking-wider mb-2 flex items-center gap-2">
-                        <PlaySquare className="w-6 h-6 text-primary" />
+            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 mb-8">
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Create Execution</div>
+                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
+                        <PlaySquare className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
                         Submit Task
                     </h2>
                 <p className="text-muted-foreground w-full md:w-2/3">
@@ -98,8 +99,8 @@ export function SubmitTaskPage() {
 
             <Form {...form}>
                 <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-                    <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                        <CardHeader className="border-b border-border/40 pb-4">
+                    <Card className="console-surface border-white/10">
+                        <CardHeader className="border-b border-white/8 pb-4">
                             <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Identity & Prompt</CardTitle>
                         </CardHeader>
                         <CardContent className="pt-6 space-y-6">
@@ -199,8 +200,8 @@ export function SubmitTaskPage() {
                         </CardContent>
                     </Card>
 
-                    <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none">
-                        <CardHeader className="border-b border-border/40 pb-4">
+                    <Card className="console-surface border-white/10">
+                        <CardHeader className="border-b border-white/8 pb-4">
                             <CardTitle className="text-sm font-display uppercase tracking-widest">Execution Parameters</CardTitle>
                         </CardHeader>
                         <CardContent className="pt-6">

@@ -1,4 +1,7 @@
 import { useMemo } from 'react';
+import { useQueries } from '@tanstack/react-query';
+
+import { api } from '@/api/client';
 import { useTaskList } from '@/features/task-list/useTaskList';
 import { useDeadLetters } from '@/features/dead-letter/useDeadLetter';
 import { TaskSummaryResponse } from '@/types';
@@ -25,33 +28,56 @@ export function useDashboardOverview() {
             .filter((task) => task.status === 'completed')
             .sort(byNewest);
         const inProgress = inProgressTasks.slice(0, RECENT_RUN_LIMIT);
-        const completed = completedTasks.slice(0, RECENT_RUN_LIMIT);
-        const recentCostMicrodollars = completedTasks.reduce(
-            (total, task) => total + task.total_cost_microdollars,
-            0,
-        );
+        const recentCompleted = completedTasks.slice(0, RECENT_RUN_LIMIT);
 
         return {
             inProgress,
-            completed,
-            recentCostMicrodollars,
+            recentCompleted,
             inProgressCount: inProgressTasks.length,
             deadLetterCount: deadLetters.length,
             completedCount: completedTasks.length,
         };
     }, [deadLetters.length, tasks]);
 
+    const recentCompletedQueries = useQueries({
+        queries: derived.recentCompleted.map((task) => ({
+            queryKey: ['task', task.task_id, 'dashboard-cost'],
+            queryFn: () => api.getTaskStatus(task.task_id),
+            enabled: task.status === 'completed',
+            staleTime: 30_000,
+        })),
+    });
+
+    const recentRuns = useMemo(() => {
+        return derived.recentCompleted.map((task, index) => {
+            const detail = recentCompletedQueries[index]?.data;
+            if (!detail) {
+                return task;
+            }
+
+            return {
+                ...task,
+                total_cost_microdollars: detail.total_cost_microdollars,
+            };
+        });
+    }, [derived.recentCompleted, recentCompletedQueries]);
+
+    const recentCostMicrodollars = useMemo(
+        () => recentRuns.reduce((total, task) => total + task.total_cost_microdollars, 0),
+        [recentRuns],
+    );
+
     return {
         isLoading: tasksQuery.isLoading || deadLettersQuery.isLoading,
         isError: tasksQuery.isError || deadLettersQuery.isError,
         inProgress: derived.inProgress,
-        recentRuns: derived.completed,
+        recentRuns,
         deadLetters,
         summary: {
             inProgressCount: derived.inProgressCount,
             deadLetterCount: derived.deadLetterCount,
             completedCount: derived.completedCount,
-            recentCostMicrodollars: derived.recentCostMicrodollars,
+            recentCostMicrodollars,
         },
     };
 }

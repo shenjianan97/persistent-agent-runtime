@@ -72,15 +72,15 @@ export function TaskDetailPage() {
     return (
         <div className="space-y-6 animate-in fade-in duration-500 pb-20">
             {/* Header Panel */}
-            <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 border border-border/40 bg-black/40 backdrop-blur p-6">
+            <div className="console-surface-strong rounded-[28px] p-6 flex flex-col md:flex-row md:items-start justify-between gap-4">
                 <div className="space-y-2">
                     <div className="flex items-center gap-3">
-                        <h2 className="text-xl font-display font-medium uppercase tracking-wider">
+                        <h2 className="text-2xl font-display font-semibold tracking-tight">
                             {task.task_id}
                         </h2>
                         <TaskStatusBadge status={task.status} />
                     </div>
-                    <div className="flex gap-4 text-xs font-mono text-muted-foreground uppercase tracking-widest">
+                    <div className="flex flex-wrap gap-4 text-xs font-mono text-muted-foreground uppercase tracking-[0.18em]">
                         <span>Agent: <span className="text-foreground">{task.agent_id}</span></span>
                         <span>Retries: <span className="text-foreground">{task.retry_count}</span></span>
                         <span>Created: {new Date(task.created_at).toLocaleString()}</span>
@@ -91,7 +91,7 @@ export function TaskDetailPage() {
                     {isRunning && (
                         <Button
                             variant="outline"
-                            className="rounded-none border-border hover:bg-destructive hover:text-white uppercase tracking-widest font-bold text-xs h-9"
+                            className="uppercase tracking-[0.18em] font-bold text-xs h-9"
                             onClick={handleCancel}
                             disabled={cancelMutation.isPending}
                         >
@@ -101,7 +101,7 @@ export function TaskDetailPage() {
                     {isDeadLetter && (
                         <Button
                             variant="outline"
-                            className="rounded-none border-primary text-primary hover:bg-primary hover:text-black uppercase tracking-widest font-bold text-xs h-9"
+                            className="uppercase tracking-[0.18em] font-bold text-xs h-9"
                             onClick={handleRedrive}
                             disabled={redriveMutation.isPending}
                         >
@@ -121,7 +121,7 @@ export function TaskDetailPage() {
                     <ObservabilityTrace observability={observability} />
 
                     {isDeadLetter && (
-                        <div className="border border-destructive/50 bg-destructive/10 p-6 space-y-3 relative overflow-hidden">
+                        <div className="console-danger-surface rounded-[24px] p-6 space-y-3 relative overflow-hidden">
                             <div className="absolute top-0 left-0 w-1 h-full bg-destructive" />
                             <h3 className="text-destructive font-bold uppercase tracking-widest flex items-center gap-2">
                                 <AlertCircle className="w-4 h-4" /> Execution Failure
@@ -143,8 +143,8 @@ export function TaskDetailPage() {
                         </div>
                     )}
 
-                    <Card className="rounded-none border-border/40 bg-black/40 backdrop-blur shadow-none h-[400px] flex flex-col">
-                        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-border/40 shrink-0">
+                    <Card className="console-surface border-white/10 h-[400px] flex flex-col">
+                        <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-white/8 shrink-0">
                             <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-muted-foreground">
                                 <Terminal className="w-4 h-4" /> Input Payload
                             </CardTitle>
@@ -157,8 +157,8 @@ export function TaskDetailPage() {
                     </Card>
 
                     {task.status === 'completed' && !!task.output && (
-                        <Card className="rounded-none border-success/40 bg-black/40 backdrop-blur shadow-none h-[400px] flex flex-col">
-                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/40 shrink-0 bg-success/5">
+                        <Card className="console-surface border-success/30 h-[400px] flex flex-col">
+                            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5">
                                 <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-success">
                                     <Terminal className="w-4 h-4" /> Execution Result
                                 </CardTitle>

@@ -36,14 +36,15 @@ export function DeadLetterPage() {
 
     return (
         <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 flex flex-col md:flex-row md:items-end justify-between gap-4">
                 <div>
-                    <h2 className="text-2xl font-display font-medium uppercase tracking-wider mb-2 flex items-center gap-2 text-destructive">
-                        <AlertCircle className="w-6 h-6" />
-                        Dead Letter Queue
+                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-destructive">Task Recovery</div>
+                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2 text-destructive">
+                        <AlertCircle className="w-6 h-6 drop-shadow-[0_0_12px_var(--color-destructive)]" />
+                        Failed
                     </h2>
                     <p className="text-muted-foreground">
-                        Tasks that have exhausted their retry limit or critically failed.
+                        Tasks that exhausted retries or ended in a terminal failure.
                     </p>
                 </div>
 
@@ -60,10 +61,10 @@ export function DeadLetterPage() {
                 </div>
             </div>
 
-            <div className="border border-border/40 bg-black/40 backdrop-blur rounded-none overflow-hidden">
+            <div className="console-surface rounded-[28px] overflow-hidden">
                 <Table>
-                    <TableHeader className="bg-black/60 sticky top-0">
-                        <TableRow className="border-border/40 hover:bg-transparent">
+                    <TableHeader className="sticky top-0 bg-[#0f1727]/90 backdrop-blur-xl">
+                        <TableRow className="border-white/8 hover:bg-transparent">
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Task ID</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Agent</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Error / Reason</TableHead>
@@ -86,7 +87,7 @@ export function DeadLetterPage() {
                                 <TableCell colSpan={6} className="h-48 text-center text-muted-foreground hover:bg-transparent">
                                     <div className="flex flex-col items-center justify-center gap-2">
                                         <Ghost className="w-8 h-8 opacity-20 mb-2" />
-                                        <span className="uppercase tracking-widest text-xs">Queue is empty</span>
+                                        <span className="uppercase tracking-widest text-xs">No failed tasks</span>
                                         <span className="text-[10px] opacity-50">All tasks executing nominally</span>
                                     </div>
                                 </TableCell>

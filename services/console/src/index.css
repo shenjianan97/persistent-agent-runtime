@@ -1,3 +1,4 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap");
 @import "tailwindcss";
 
 @plugin "tailwindcss-animate";
@@ -5,9 +6,9 @@
 @custom-variant dark (&:is(.dark *));
 
 @theme {
-  --font-sans: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-  --font-display: "Syne", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -40,35 +41,35 @@
 }
 
 :root {
-  --background: #0A0A0A;
-  --foreground: #E2E8F0;
-  --card: #0A0A0A;
-  --card-foreground: #E2E8F0;
-  --popover: #0A0A0A;
-  --popover-foreground: #E2E8F0;
+  --background: #08111d;
+  --foreground: #e8f2ff;
+  --card: #0f1828;
+  --card-foreground: #eef6ff;
+  --popover: #111b2d;
+  --popover-foreground: #eef6ff;
 
-  /* Cyber accents */
-  --primary: #00F0FF;
-  --primary-foreground: #0A0A0A;
+  /* Aurora cyan accents */
+  --primary: #63d7ff;
+  --primary-foreground: #07111b;
 
-  --secondary: #27272a;
-  --secondary-foreground: #fafafa;
-  --muted: #27272a;
-  --muted-foreground: #a1a1aa;
-  --accent: #27272a;
-  --accent-foreground: #fafafa;
+  --secondary: #132032;
+  --secondary-foreground: #eef6ff;
+  --muted: #0f1a29;
+  --muted-foreground: #8ea1be;
+  --accent: #162235;
+  --accent-foreground: #eef6ff;
 
-  --destructive: #FF3366;
-  --destructive-foreground: #fafafa;
+  --destructive: #ff7f9f;
+  --destructive-foreground: #fff4f7;
 
-  --success: #ccff00;
-  --warning: #FFB000;
+  --success: #79e0ad;
+  --warning: #ffd166;
 
-  --border: #27272a;
-  --input: #27272a;
-  --ring: #00F0FF;
+  --border: #22344d;
+  --input: #132032;
+  --ring: #63d7ff;
 
-  --radius: 0px;
+  --radius: 20px;
 }
 
 @layer base {
@@ -79,5 +80,42 @@
   body {
     @apply bg-background text-foreground;
     font-feature-settings: "rlig" 1, "calt" 1;
+    min-height: 100vh;
+    background-image:
+      radial-gradient(circle at 12% 0%, rgba(97, 215, 255, 0.18), transparent 28%),
+      radial-gradient(circle at 100% 18%, rgba(92, 141, 255, 0.10), transparent 24%),
+      linear-gradient(180deg, #09121f 0%, #08111d 42%, #060c15 100%);
+    background-attachment: fixed;
   }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: rgba(99, 215, 255, 0.22);
+    color: var(--foreground);
+  }
+}
+
+.console-surface {
+  background: linear-gradient(180deg, rgba(18, 27, 42, 0.92), rgba(12, 19, 31, 0.88));
+  border: 1px solid rgba(104, 145, 190, 0.16);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  backdrop-filter: blur(18px);
+}
+
+.console-surface-strong {
+  background:
+    radial-gradient(circle at 0% 0%, rgba(99, 215, 255, 0.12), transparent 32%),
+    linear-gradient(180deg, rgba(18, 27, 42, 0.96), rgba(12, 19, 31, 0.92));
+  border: 1px solid rgba(104, 145, 190, 0.18);
+  box-shadow: 0 22px 56px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  backdrop-filter: blur(20px);
+}
+
+.console-danger-surface {
+  background: linear-gradient(180deg, rgba(54, 28, 38, 0.72), rgba(34, 21, 29, 0.76));
+  border: 1px solid rgba(179, 94, 124, 0.34);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
 }
