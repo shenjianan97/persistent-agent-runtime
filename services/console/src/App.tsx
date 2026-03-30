@@ -6,6 +6,7 @@ import { SubmitTaskPage } from './features/submit/SubmitTaskPage';
 import { TaskDetailPage } from './features/task-detail/TaskDetailPage';
 import { TaskListPage } from './features/task-list/TaskListPage';
 import { DeadLetterPage } from './features/dead-letter/DeadLetterPage';
+import { SettingsPage } from './features/settings/SettingsPage';
 import { Toaster } from 'sonner';
 
 const queryClient = new QueryClient({
@@ -28,6 +29,7 @@ function App() {
                         <Route path="/tasks/new" element={<SubmitTaskPage />} />
                         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                         <Route path="/dead-letter" element={<DeadLetterPage />} />
+                        <Route path="/settings" element={<SettingsPage />} />
                         <Route path="*" element={<Navigate to="/" replace />} />
                     </Route>
                 </Routes>

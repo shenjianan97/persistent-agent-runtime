@@ -116,6 +116,7 @@ export function TaskDetailPage() {
                         observability={observability}
                         checkpointCount={task.checkpoint_count}
                         totalCostMicrodollars={task.total_cost_microdollars}
+                        task={task}
                     />
 
                     <ObservabilityTrace observability={observability} />

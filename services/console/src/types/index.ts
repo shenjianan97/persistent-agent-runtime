@@ -16,6 +16,7 @@ export interface TaskStatusResponse {
     last_worker_id?: string;
     dead_letter_reason?: string;
     dead_lettered_at?: string;
+    langfuse_endpoint_id?: string;
     created_at: string;
     updated_at: string;
 }
@@ -31,6 +32,7 @@ export interface TaskSubmissionRequest {
     max_steps?: number;
     max_retries?: number;
     task_timeout_seconds?: number;
+    langfuse_endpoint_id?: string;
 }
 
 export interface TaskSubmissionResponse {
@@ -72,31 +74,10 @@ export interface CheckpointListResponse {
     total_cost_microdollars: number;
 }
 
-export interface TaskObservabilitySpanResponse {
-    span_id: string;
-    parent_span_id?: string | null;
-    task_id: string;
-    agent_id: string;
-    actor_id?: string | null;
-    type: 'llm' | 'tool' | 'system';
-    node_name?: string | null;
-    model_name?: string | null;
-    tool_name?: string | null;
-    cost_microdollars: number;
-    input_tokens: number;
-    output_tokens: number;
-    total_tokens: number;
-    duration_ms?: number | null;
-    input?: unknown;
-    output?: unknown;
-    started_at?: string | null;
-    ended_at?: string | null;
-}
-
 export interface TaskObservabilityItemResponse {
     item_id: string;
     parent_item_id?: string | null;
-    kind: 'llm_span' | 'tool_span' | 'system_span' | 'checkpoint_persisted' | 'resumed_after_retry' | 'completed' | 'dead_lettered';
+    kind: 'checkpoint_persisted' | 'resumed_after_retry' | 'completed' | 'dead_lettered';
     title: string;
     summary: string;
     step_number?: number | null;
@@ -119,13 +100,11 @@ export interface TaskObservabilityResponse {
     task_id: string;
     agent_id: string;
     status: string;
-    trace_id?: string | null;
     total_cost_microdollars: number;
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
     duration_ms?: number | null;
-    spans: TaskObservabilitySpanResponse[];
     items: TaskObservabilityItemResponse[];
 }
 
@@ -176,4 +155,25 @@ export interface ModelResponse {
     provider: string;
     model_id: string;
     display_name: string;
+}
+
+export interface LangfuseEndpoint {
+    endpoint_id: string;
+    tenant_id: string;
+    name: string;
+    host: string;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface LangfuseEndpointRequest {
+    name: string;
+    host: string;
+    public_key: string;
+    secret_key: string;
+}
+
+export interface LangfuseEndpointTestResponse {
+    reachable: boolean;
+    message: string;
 }
