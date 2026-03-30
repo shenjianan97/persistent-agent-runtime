@@ -23,12 +23,12 @@ public class TaskRepository {
      */
     public Map<String, Object> insertTask(String tenantId, String agentId, String agentConfigJson,
             String workerPoolId, String input,
-            int maxRetries, int maxSteps, int taskTimeoutSeconds) {
+            int maxRetries, int maxSteps, int taskTimeoutSeconds, UUID langfuseEndpointId) {
         String sql = """
                 WITH inserted AS (
                     INSERT INTO tasks (tenant_id, agent_id, agent_config_snapshot, worker_pool_id,
-                                       input, max_retries, max_steps, task_timeout_seconds, status)
-                    VALUES (?, ?, ?::jsonb, ?, ?, ?, ?, ?, 'queued')
+                                       input, max_retries, max_steps, task_timeout_seconds, status, langfuse_endpoint_id)
+                    VALUES (?, ?, ?::jsonb, ?, ?, ?, ?, ?, 'queued', ?)
                     RETURNING task_id, created_at
                 )
                 , notified AS (
@@ -39,7 +39,7 @@ public class TaskRepository {
 
         return jdbcTemplate.queryForMap(sql,
                 tenantId, agentId, agentConfigJson, workerPoolId,
-                input, maxRetries, maxSteps, taskTimeoutSeconds,
+                input, maxRetries, maxSteps, taskTimeoutSeconds, langfuseEndpointId,
                 workerPoolId);
     }
 
@@ -51,7 +51,8 @@ public class TaskRepository {
                 SELECT task_id, tenant_id, agent_id, status, input, output,
                        retry_count, retry_history, lease_owner,
                        last_error_code, last_error_message, last_worker_id,
-                       dead_letter_reason, dead_lettered_at, created_at, updated_at
+                       dead_letter_reason, dead_lettered_at, created_at, updated_at,
+                       langfuse_endpoint_id
                 FROM tasks
                 WHERE task_id = ? AND tenant_id = ?
                 """;
@@ -70,6 +71,7 @@ public class TaskRepository {
                        t.retry_count, t.retry_history, t.lease_owner,
                        t.last_error_code, t.last_error_message, t.last_worker_id,
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
+                       t.langfuse_endpoint_id,
                        (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count
                 FROM tasks t
                 WHERE t.task_id = ? AND t.tenant_id = ?
@@ -276,6 +278,7 @@ public class TaskRepository {
     public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
+                       t.langfuse_endpoint_id,
                        COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count
                 FROM tasks t
                 LEFT JOIN checkpoints c ON c.task_id = t.task_id AND c.checkpoint_ns = ''
@@ -292,7 +295,7 @@ public class TaskRepository {
             sql.append(" AND t.agent_id = ?");
             params.add(agentId);
         }
-        sql.append(" GROUP BY t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at");
+        sql.append(" GROUP BY t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at, t.langfuse_endpoint_id");
         sql.append(" ORDER BY t.created_at DESC LIMIT ?");
         params.add(limit);
 

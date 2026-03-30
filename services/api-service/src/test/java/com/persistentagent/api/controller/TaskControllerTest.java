@@ -278,7 +278,7 @@ class TaskControllerTest {
                 TaskStatusResponse response = new TaskStatusResponse(
                                 taskId, "agent1", "running", "test input", null,
                                 0, List.of(), 5, 12500L, "worker-abc-123",
-                                null, null, null, null, null, now, now);
+                                null, null, null, null, null, now, now, null);
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId))
