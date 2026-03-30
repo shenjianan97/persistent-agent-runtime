@@ -1,5 +1,20 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+-- Langfuse endpoints table (customer-owned Langfuse integration)
+CREATE TABLE langfuse_endpoints (
+    endpoint_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    host          TEXT NOT NULL,
+    public_key    TEXT NOT NULL,
+    secret_key    TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, name)
+);
+
+CREATE INDEX idx_langfuse_endpoints_tenant ON langfuse_endpoints (tenant_id);
+
 -- Tasks table (also serves as the queue in Phase 1)
 CREATE TABLE tasks (
     task_id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -9,6 +24,7 @@ CREATE TABLE tasks (
     status                TEXT NOT NULL DEFAULT 'queued'
                           CHECK (status IN ('queued', 'running', 'completed', 'dead_letter')),
     worker_pool_id        TEXT NOT NULL DEFAULT 'shared',
+    langfuse_endpoint_id  UUID REFERENCES langfuse_endpoints(endpoint_id) ON DELETE SET NULL,
     version               INT NOT NULL DEFAULT 1,
     input                 TEXT NOT NULL,
     output                JSONB,
