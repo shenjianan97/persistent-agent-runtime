@@ -332,56 +332,35 @@ class TaskControllerTest {
         @Test
         void getTaskObservability_existingTask_returns200() throws Exception {
                 UUID taskId = UUID.randomUUID();
-                TaskObservabilitySpanResponse span = new TaskObservabilitySpanResponse(
-                                "obs-1",
-                                null,
-                                taskId.toString(),
-                                "agent1",
-                                null,
-                                "llm",
-                                "agent",
-                                "claude-sonnet-4-6",
-                                null,
-                                5200L,
-                                120,
-                                40,
-                                160,
-                                2300L,
-                                "prompt",
-                                "response",
-                                OffsetDateTime.parse("2026-03-27T17:00:00Z"),
-                                OffsetDateTime.parse("2026-03-27T17:00:02.300Z"));
                 TaskObservabilityItemResponse item = new TaskObservabilityItemResponse(
-                                "obs-1",
+                                "checkpoint-cp-1",
                                 null,
-                                "llm_span",
-                                "ChatAnthropic",
-                                "LLM generation completed",
-                                null,
+                                "checkpoint_persisted",
+                                "Checkpoint saved",
+                                "Saved durable progress at step 1.",
+                                1,
                                 "agent",
                                 null,
-                                "claude-sonnet-4-6",
+                                null,
                                 5200L,
                                 120,
                                 40,
                                 160,
                                 2300L,
-                                "prompt",
-                                "response",
+                                null,
+                                null,
                                 OffsetDateTime.parse("2026-03-27T17:00:00Z"),
-                                OffsetDateTime.parse("2026-03-27T17:00:02.300Z"));
+                                null);
                 TaskObservabilityResponse response = new TaskObservabilityResponse(
                                 true,
                                 taskId,
                                 "agent1",
                                 "completed",
-                                "trace-1",
                                 5200L,
                                 120,
                                 40,
                                 160,
                                 2300L,
-                                List.of(span),
                                 List.of(item));
                 when(taskService.getTaskObservability(taskId)).thenReturn(response);
 
@@ -389,11 +368,9 @@ class TaskControllerTest {
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.enabled").value(true))
                                 .andExpect(jsonPath("$.task_id").value(taskId.toString()))
-                                .andExpect(jsonPath("$.trace_id").value("trace-1"))
-                                .andExpect(jsonPath("$.items[0].item_id").value("obs-1"))
-                                .andExpect(jsonPath("$.items[0].kind").value("llm_span"))
-                                .andExpect(jsonPath("$.spans[0].span_id").value("obs-1"))
-                                .andExpect(jsonPath("$.spans[0].type").value("llm"));
+                                .andExpect(jsonPath("$.total_cost_microdollars").value(5200))
+                                .andExpect(jsonPath("$.items[0].item_id").value("checkpoint-cp-1"))
+                                .andExpect(jsonPath("$.items[0].kind").value("checkpoint_persisted"));
         }
 
         // --- POST /v1/tasks/{taskId}/cancel ---

@@ -13,8 +13,8 @@ import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
+import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
-import com.persistentagent.api.service.observability.TaskObservabilityTotals;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -182,8 +182,8 @@ class TaskServiceTest {
         taskRow.put("langfuse_endpoint_id", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskObservabilityService.getTaskTotals(taskId, "agent1", "queued"))
-                .thenReturn(new TaskObservabilityTotals(5000L, 120, 40, 160, 2300L, null));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(5000L, 120, 40, 160, 2300L));
 
         TaskStatusResponse response = taskService.getTaskStatus(taskId);
 
@@ -195,7 +195,7 @@ class TaskServiceTest {
     }
 
     @Test
-    void getTaskObservability_existingTask_returnsNormalizedResponse() {
+    void getTaskObservability_existingTask_returnsCheckpointBasedResponse() {
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> taskRow = new LinkedHashMap<>();
@@ -217,84 +217,31 @@ class TaskServiceTest {
         taskRow.put("checkpoint_count", 2L);
         taskRow.put("langfuse_endpoint_id", null);
 
-        TaskObservabilitySpanResponse span = new TaskObservabilitySpanResponse(
-                "obs-1",
-                null,
-                "task-id",
-                "agent1",
-                null,
-                "llm",
-                "agent",
-                "claude-sonnet-4-6",
-                null,
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                "prompt",
-                "response",
-                OffsetDateTime.parse("2026-03-27T17:00:02Z"),
-                OffsetDateTime.parse("2026-03-27T17:00:02.300Z")
-        );
-        TaskObservabilityItemResponse spanItem = new TaskObservabilityItemResponse(
-                "obs-1",
-                null,
-                "tool_span",
-                "Tool: calculator",
-                "calculator completed successfully",
-                2,
-                "loop",
-                "calculator",
-                null,
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                "prompt",
-                "response",
-                OffsetDateTime.parse("2026-03-27T17:00:02Z"),
-                OffsetDateTime.parse("2026-03-27T17:00:02.300Z")
-        );
-        TaskObservabilityResponse observability = new TaskObservabilityResponse(
-                true,
-                taskId,
-                "agent1",
-                "dead_letter",
-                "trace-1",
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                List.of(span),
-                List.of(spanItem)
-        );
-
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(List.of(
                 checkpointRow("cp-1", "input", "worker-1", "2026-03-27T17:00:01Z"),
                 checkpointRow("cp-2", "loop", "worker-1", "2026-03-27T17:00:04Z")
         )));
-        when(taskObservabilityService.getTaskObservability(taskId, "agent1", "dead_letter"))
-                .thenReturn(observability);
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(5200L, 120, 40, 160, 3000L));
 
         TaskObservabilityResponse response = taskService.getTaskObservability(taskId);
 
         assertTrue(response.enabled());
         assertEquals(taskId, response.taskId());
         assertEquals("agent1", response.agentId());
-        assertEquals("trace-1", response.traceId());
-        assertEquals(1, response.spans().size());
-        assertEquals("obs-1", response.spans().get(0).spanId());
-        assertEquals("llm", response.spans().get(0).type());
-        assertEquals(5, response.items().size());
+        assertEquals("dead_letter", response.status());
+        assertEquals(5200L, response.totalCostMicrodollars());
+        assertEquals(120, response.inputTokens());
+        assertEquals(40, response.outputTokens());
+        assertEquals(160, response.totalTokens());
+        assertEquals(3000L, response.durationMs());
+        // Expect: 2 checkpoint items + 1 resumed_after_retry + 1 dead_lettered = 4
+        assertEquals(4, response.items().size());
         assertEquals("checkpoint_persisted", response.items().get(0).kind());
-        assertEquals("tool_span", response.items().get(1).kind());
-        assertEquals("resumed_after_retry", response.items().get(2).kind());
-        assertEquals("checkpoint_persisted", response.items().get(3).kind());
-        assertEquals("dead_lettered", response.items().get(4).kind());
+        assertEquals("resumed_after_retry", response.items().get(1).kind());
+        assertEquals("checkpoint_persisted", response.items().get(2).kind());
+        assertEquals("dead_lettered", response.items().get(3).kind());
     }
 
     private Map<String, Object> checkpointRow(String checkpointId, String nodeName, String workerId, String createdAtIso) {

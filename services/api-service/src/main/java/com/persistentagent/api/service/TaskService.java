@@ -12,8 +12,8 @@ import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
+import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
-import com.persistentagent.api.service.observability.TaskObservabilityTotals;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -115,10 +115,7 @@ public class TaskService {
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
         int checkpointCount = ((Number) task.get("checkpoint_count")).intValue();
-        TaskObservabilityTotals totals = taskObservabilityService.getTaskTotals(
-                taskId,
-                (String) task.get("agent_id"),
-                (String) task.get("status"));
+        CheckpointCostTotals totals = taskObservabilityService.getTaskCostTotals(taskId, tenantId);
 
         // Parse retry_history from JSONB
         List<Object> retryHistory = parseJsonList(task.get("retry_history"));
@@ -184,13 +181,12 @@ public class TaskService {
         Map<String, Object> task = taskRepository.findByIdWithAggregates(taskId, tenantId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
-        TaskObservabilityResponse base = taskObservabilityService.getTaskObservability(
-                taskId,
-                (String) task.get("agent_id"),
-                (String) task.get("status"));
+        String agentId = (String) task.get("agent_id");
+        String status = (String) task.get("status");
 
-        List<TaskObservabilityItemResponse> items = new ArrayList<>(base.items());
-        items.addAll(buildRuntimeItems(taskId, task));
+        CheckpointCostTotals totals = taskObservabilityService.getTaskCostTotals(taskId, tenantId);
+
+        List<TaskObservabilityItemResponse> items = new ArrayList<>(buildRuntimeItems(taskId, task));
         items.sort(Comparator
                 .comparingInt((TaskObservabilityItemResponse item) -> isTerminalMarker(item.kind()) ? 1 : 0)
                 .thenComparing(TaskObservabilityItemResponse::startedAt, Comparator.nullsLast(Comparator.naturalOrder()))
@@ -199,17 +195,15 @@ public class TaskService {
                 .thenComparing(TaskObservabilityItemResponse::itemId));
 
         return new TaskObservabilityResponse(
-                base.enabled(),
-                base.taskId(),
-                base.agentId(),
-                base.status(),
-                base.traceId(),
-                base.totalCostMicrodollars(),
-                base.inputTokens(),
-                base.outputTokens(),
-                base.totalTokens(),
-                base.durationMs(),
-                base.spans(),
+                true,
+                taskId,
+                agentId,
+                status,
+                totals.totalCostMicrodollars(),
+                totals.inputTokens(),
+                totals.outputTokens(),
+                totals.totalTokens(),
+                totals.durationMs(),
                 items
         );
     }
@@ -532,11 +526,9 @@ public class TaskService {
     private int observabilitySortOrder(String kind) {
         return switch (kind) {
             case "resumed_after_retry" -> 0;
-            case "llm_span", "tool_span" -> 1;
-            case "system_span" -> 2;
-            case "checkpoint_persisted" -> 3;
-            case "completed", "dead_lettered" -> 4;
-            default -> 5;
+            case "checkpoint_persisted" -> 1;
+            case "completed", "dead_lettered" -> 2;
+            default -> 3;
         };
     }
 
