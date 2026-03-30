@@ -9,6 +9,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
@@ -28,6 +29,7 @@ public class TaskService {
 
     private final TaskRepository taskRepository;
     private final ModelRepository modelRepository;
+    private final LangfuseEndpointRepository langfuseEndpointRepository;
     private final TaskObservabilityService taskObservabilityService;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
@@ -36,12 +38,14 @@ public class TaskService {
     public TaskService(
             TaskRepository taskRepository,
             ModelRepository modelRepository,
+            LangfuseEndpointRepository langfuseEndpointRepository,
             TaskObservabilityService taskObservabilityService,
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.taskRepository = taskRepository;
         this.modelRepository = modelRepository;
+        this.langfuseEndpointRepository = langfuseEndpointRepository;
         this.taskObservabilityService = taskObservabilityService;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
@@ -56,6 +60,13 @@ public class TaskService {
 
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String workerPoolId = ValidationConstants.DEFAULT_WORKER_POOL_ID;
+
+        // Validate langfuse_endpoint_id if provided
+        if (request.langfuseEndpointId() != null) {
+            langfuseEndpointRepository.findByIdAndTenant(request.langfuseEndpointId(), tenantId)
+                    .orElseThrow(() -> new ValidationException(
+                            "langfuse_endpoint_id not found: " + request.langfuseEndpointId()));
+        }
 
         // Build agent_config_snapshot
         AgentConfigRequest agentConfigSnapshot = new AgentConfigRequest(
@@ -88,7 +99,8 @@ public class TaskService {
 
         Map<String, Object> result = taskRepository.insertTask(
                 tenantId, request.agentId(), agentConfigJson, workerPoolId,
-                request.input(), maxRetries, maxSteps, taskTimeoutSeconds);
+                request.input(), maxRetries, maxSteps, taskTimeoutSeconds,
+                request.langfuseEndpointId());
 
         UUID taskId = (UUID) result.get("task_id");
         OffsetDateTime createdAt = toOffsetDateTime(result.get("created_at"));
@@ -131,7 +143,8 @@ public class TaskService {
                 (String) task.get("dead_letter_reason"),
                 toOffsetDateTime(task.get("dead_lettered_at")),
                 toOffsetDateTime(task.get("created_at")),
-                toOffsetDateTime(task.get("updated_at")));
+                toOffsetDateTime(task.get("updated_at")),
+                (UUID) task.get("langfuse_endpoint_id"));
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {

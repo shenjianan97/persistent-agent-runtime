@@ -9,6 +9,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
@@ -39,6 +40,9 @@ class TaskServiceTest {
     private ModelRepository modelRepository;
 
     @Mock
+    private LangfuseEndpointRepository langfuseEndpointRepository;
+
+    @Mock
     private TaskObservabilityService taskObservabilityService;
 
     private TaskService taskService;
@@ -52,6 +56,7 @@ class TaskServiceTest {
         taskService = new TaskService(
                 taskRepository,
                 modelRepository,
+                langfuseEndpointRepository,
                 taskObservabilityService,
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
@@ -66,14 +71,14 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of("web_search"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "do something", 3, 100, 3600);
+                null, "agent1", config, "do something", 3, 100, 3600, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> inserted = Map.of("task_id", taskId, "created_at", now);
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt())).thenReturn(inserted);
+                anyString(), anyInt(), anyInt(), anyInt(), isNull())).thenReturn(inserted);
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
@@ -89,7 +94,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "unsupported-model", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -99,7 +104,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -111,7 +116,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -123,7 +128,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, 30);
+                null, "agent1", config, "input", null, null, 30, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -135,19 +140,19 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", null, null);
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600)))
+                eq("input"), eq(3), eq(100), eq(3600), isNull()))
                 .thenReturn(Map.of("task_id", taskId, "created_at", now));
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600));
+                eq("input"), eq(3), eq(100), eq(3600), isNull());
     }
 
     // --- getTaskStatus tests ---
@@ -174,6 +179,7 @@ class TaskServiceTest {
         taskRow.put("updated_at", now);
         taskRow.put("checkpoint_count", 3L);
         taskRow.put("total_cost_microdollars", 999L);
+        taskRow.put("langfuse_endpoint_id", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskObservabilityService.getTaskTotals(taskId, "agent1", "queued"))
@@ -209,6 +215,7 @@ class TaskServiceTest {
         taskRow.put("created_at", now);
         taskRow.put("updated_at", now);
         taskRow.put("checkpoint_count", 2L);
+        taskRow.put("langfuse_endpoint_id", null);
 
         TaskObservabilitySpanResponse span = new TaskObservabilitySpanResponse(
                 "obs-1",
