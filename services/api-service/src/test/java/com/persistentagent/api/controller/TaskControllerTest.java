@@ -64,6 +64,35 @@ class TaskControllerTest {
         }
 
         @Test
+        void submitTask_withLangfuseEndpointId_returns201() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                UUID endpointId = UUID.randomUUID();
+                OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "queued", now);
+                when(taskService.submitTask(any())).thenReturn(response);
+
+                String body = """
+                                {
+                                  "agent_id": "agent1",
+                                  "agent_config": {
+                                    "system_prompt": "You are a helper",
+                                    "provider": "anthropic",
+                                    "model": "claude-sonnet-4-6"
+                                  },
+                                  "input": "test input",
+                                  "langfuse_endpoint_id": "%s"
+                                }
+                                """.formatted(endpointId);
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andExpect(jsonPath("$.task_id").value(taskId.toString()))
+                                .andExpect(jsonPath("$.status").value("queued"));
+        }
+
+        @Test
         void submitTask_missingAgentId_returns400() throws Exception {
                 String body = """
                                 {

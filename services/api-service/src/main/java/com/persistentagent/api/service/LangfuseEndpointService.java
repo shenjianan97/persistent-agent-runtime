@@ -32,10 +32,15 @@ public class LangfuseEndpointService {
     private final HttpClient httpClient;
 
     public LangfuseEndpointService(LangfuseEndpointRepository langfuseEndpointRepository) {
-        this.langfuseEndpointRepository = langfuseEndpointRepository;
-        this.httpClient = HttpClient.newBuilder()
+        this(langfuseEndpointRepository, HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
-                .build();
+                .build());
+    }
+
+    // Package-visible constructor for testing
+    LangfuseEndpointService(LangfuseEndpointRepository langfuseEndpointRepository, HttpClient httpClient) {
+        this.langfuseEndpointRepository = langfuseEndpointRepository;
+        this.httpClient = httpClient;
     }
 
     public LangfuseEndpointResponse create(String tenantId, LangfuseEndpointRequest request) {

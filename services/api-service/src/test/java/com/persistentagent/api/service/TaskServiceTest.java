@@ -90,6 +90,45 @@ class TaskServiceTest {
     }
 
     @Test
+    void submitTask_withValidLangfuseEndpointId_succeeds() {
+        UUID endpointId = UUID.randomUUID();
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> endpointRow = Map.of("endpoint_id", endpointId);
+        when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
+                .thenReturn(Optional.of(endpointRow));
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), eq(endpointId)))
+                .thenReturn(Map.of("task_id", taskId, "created_at", now));
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertNotNull(response);
+        assertEquals(taskId, response.taskId());
+    }
+
+    @Test
+    void submitTask_withInvalidLangfuseEndpointId_throwsValidation() {
+        UUID endpointId = UUID.randomUUID();
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
+                .thenReturn(Optional.empty());
+
+        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+    }
+
+    @Test
     void submitTask_unsupportedModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "unsupported-model", 0.5, List.of());
