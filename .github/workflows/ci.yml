@@ -250,7 +250,6 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/backend-integration \
-            --ignore=tests/backend-integration/test_observability_langfuse.py \
             -ra -q | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
 
@@ -321,7 +320,7 @@ jobs:
           echo "Langfuse did not become ready in time" >&2
           exit 1
 
-      - name: Run Langfuse observability smoke test
+      - name: Run Langfuse E2E tests
         env:
           E2E_DB_HOST: localhost
           E2E_DB_PORT: "55432"
@@ -334,7 +333,7 @@ jobs:
           LANGFUSE_SECRET_KEY: sk-lf-local
         run: |
           set -o pipefail
-          python -m pytest tests/backend-integration/test_observability_langfuse.py -ra -q | tee /tmp/observability-smoke.log
+          python -m pytest tests/e2e-langfuse -ra -q | tee /tmp/observability-smoke.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/observability-smoke.log
 
       - name: Stop Langfuse

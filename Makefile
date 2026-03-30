@@ -62,7 +62,7 @@ NC := \033[0m
         scale-worker \
         status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
         test-langfuse-up test-langfuse-down test-langfuse-status dev-langfuse-up \
-        test api-test worker-test console-test e2e-test local-ci clean logs
+        test api-test worker-test console-test e2e-test test-e2e-langfuse local-ci clean logs
 
 
 # ============================================================
@@ -103,6 +103,7 @@ help:
 	@echo "  $(YELLOW)make worker-test$(NC)    -    Run Worker unit tests (Pytest)"
 	@echo "  $(YELLOW)make console-test$(NC)   -    Run Console tests (Vitest)"
 	@echo "  $(YELLOW)make e2e-test$(NC)       -    Run Backend E2E tests"
+	@echo "  $(YELLOW)make test-e2e-langfuse$(NC) - Run Langfuse E2E tests (requires Langfuse + full stack)"
 	@echo "  $(YELLOW)make local-ci$(NC)       - ✅ Run local CI script"
 	@echo ""
 	@echo "$(CYAN)[Dependency Management]$(NC)"
@@ -726,6 +727,10 @@ console-test:
 e2e-test:
 	@echo "$(CYAN)🧪 Running E2E tests...$(NC)"
 	@$(WORKER_VENV_PYTHON) -m pytest tests/backend-integration -q
+
+test-e2e-langfuse: ## Run Langfuse E2E tests (requires: make test-langfuse-up && make start)
+	@echo "$(CYAN)🧪 Running Langfuse E2E tests...$(NC)"
+	@$(WORKER_VENV_PYTHON) -m pytest tests/e2e-langfuse -ra -q
 
 local-ci:
 	@echo "$(CYAN)🚀 Running Local CI checks...$(NC)"
