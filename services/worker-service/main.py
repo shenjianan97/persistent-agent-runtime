@@ -13,8 +13,6 @@ Environment:
 import asyncio
 import logging
 import os
-from urllib.error import URLError
-from urllib.request import urlopen
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from core.config import WorkerConfig
@@ -75,20 +73,6 @@ def _format_db_endpoint(dsn: str) -> str:
     return dsn
 
 
-def _assert_langfuse_ready(config: WorkerConfig) -> None:
-    if not config.langfuse_enabled or not config.langfuse_host:
-        return
-
-    try:
-        with urlopen(config.langfuse_host, timeout=5) as response:
-            if response.status >= 500:
-                raise RuntimeError(
-                    f"Unable to reach Langfuse at {config.langfuse_host} (status {response.status})"
-                )
-    except (URLError, OSError) as exc:
-        raise RuntimeError(f"Unable to reach Langfuse at {config.langfuse_host}") from exc
-
-
 async def main():
     # Configure stdlib logging so graph.py loggers are not silently swallowed
     logging.basicConfig(
@@ -107,11 +91,6 @@ async def main():
     logging.getLogger(__name__).info("Worker DB endpoint: %s", _format_db_endpoint(dsn))
 
     config = WorkerConfig(db_dsn=dsn)
-    try:
-        _assert_langfuse_ready(config)
-    except RuntimeError as exc:
-        logging.getLogger(__name__).error(str(exc))
-        raise SystemExit(1) from exc
 
     pool = await create_pool(config.db_dsn)
     try:
