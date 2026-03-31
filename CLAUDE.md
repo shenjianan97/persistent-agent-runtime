@@ -24,7 +24,7 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - PostgreSQL (Aurora Serverless v2) — Phase 1 state store + queue
 - SQS FIFO — Phase 2 queue (transactional outbox)
 - ECS Fargate — workers
-- Langfuse (self-hosted) — LLM execution tracing, cost/token tracking, customer-facing observability
+- Langfuse (customer-owned) — per-task LLM execution tracing, cost/token tracking, customer-facing observability; customers configure their own Langfuse endpoints via Settings page
 - CloudWatch — platform health metrics, structured logs, alerts (operator-facing)
 - LangChain `init_chat_model` — LLM integration (Anthropic, OpenAI, Google, Bedrock; providers auto-discovered from configured API keys)
 
@@ -39,6 +39,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | docs/implementation_plan/phase-1/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
 | docs/implementation_plan/phase-1/progress.md | Live tracking board for agent execution of Phase 1 |
 | docs/implementation_plan/phase-1/agent_tasks/*.md | 9 single-responsibility execution templates for agents (Tasks 1-8 implementation, Task 9 observability follow-up) |
+| docs/design/langfuse-customer-integration/ | Langfuse customer-owned integration design doc |
+| docs/implementation_plan/langfuse-customer-integration/ | Langfuse customer integration orchestrator plan and 5 task specs |
 | experiments/langgraph/plan.md | Proof of concept strategy to validate LangGraph checkpointer exceptions |
 
 ## Local Validation Notes
@@ -69,6 +71,8 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - Post-Task 7 additions: worker registry table (`0002_worker_registry.sql`), worker self-registration/heartbeat/deregistration, reaper stale-worker cleanup, `GET /v1/tasks` list endpoint, task list UI, multi-worker scaling (`make start-worker N=`, `make scale-worker N=`)
 - Task 8 additions: AWS CDK app (`infrastructure/cdk/`) with Network/Data/Compute stacks, schema bootstrap custom resource, internal ALB + SSM access host, ECS services, scheduled-and-initial model discovery, service-owned Dockerfiles, and GitHub Actions coverage for CDK build/tests
 - Follow-up fixes landed: canonical migration bundling from `infrastructure/database/migrations/`, initial model-discovery redeploy triggering, failure surfacing for the bootstrap invoke, access-host AMI architecture matching, Docker `platform: LINUX_AMD64` for ARM Mac cross-compilation, and CORS config disabled by default for same-origin ALB access
+- Task 9 (Langfuse observability): Refactored from platform-hosted to customer-owned integration — `langfuse_endpoints` table, per-task endpoint CRUD API, worker resolves credentials per-task, checkpoint-based cost/token aggregation, Console Settings page for endpoint management, E2E test suite
+- Console refresh: dashboard UX overhaul with action-oriented layout, scrollable panels, consistent dark-mode styling
 - Source of truth: `docs/implementation_plan/phase-1/progress.md`
 
 ### Stage 5 — Validation [IN PROGRESS]

@@ -34,6 +34,8 @@ Phase 1 uses a database-as-queue model:
 - [`services/console/`](./services/console/): React SPA for monitoring and controlling the runtime
 - [`services/worker-service/`](./services/worker-service/): Python worker, checkpointer, executor, and tools
 - [`tests/backend-integration/`](./tests/backend-integration/): cross-service integration tests (API + Worker + PostgreSQL, mocked LLMs)
+- [`tests/e2e-langfuse/`](./tests/e2e-langfuse/): Langfuse integration E2E tests (connectivity, trace publishing, cost tracking)
+- [`tests/fixtures/`](./tests/fixtures/): shared test infrastructure (Langfuse Docker Compose)
 - [`experiments/langgraph/`](./experiments/langgraph/): proof-of-concept and validation work
 - [`infrastructure/database/`](./infrastructure/database/): schema migrations and verification
 - [`infrastructure/cdk/`](./infrastructure/cdk/): AWS CDK infrastructure (Task 8)
@@ -84,9 +86,10 @@ make start N=3           # start all services with 3 workers
 make scale-worker N=5    # scale workers up or down to N
 make stop                # stop all services
 make status              # show service statuses
-make langfuse-up         # start local Langfuse only
-make langfuse-down       # stop local Langfuse only
-make langfuse-status     # inspect local Langfuse containers
+make test-langfuse-up    # start local Langfuse for testing
+make test-langfuse-down  # stop local Langfuse stack
+make test-langfuse-status # inspect local Langfuse containers
+make test-e2e-langfuse   # run Langfuse E2E tests (requires Langfuse + full stack)
 make check               # verify prerequisites without starting services
 make logs                # tail background service logs
 make api-test            # API service tests
@@ -113,7 +116,8 @@ Implemented or substantially defined already:
 - Dev-only task controls for forced lease expiry and dead-letter transitions
 - Dev-only `dev_sleep` tool for deterministic timeout and long-running-task testing
 - Dynamic model provider management: database-backed provider/model registry, auto-discovery from API keys, per-model cost tracking, and console model selector via `GET /v1/models`
-- Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
+- Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue, Langfuse endpoint settings
+- Customer-owned Langfuse integration: per-task Langfuse endpoint configuration, CRUD API, connectivity testing, checkpoint-based cost/token aggregation
 - End-to-end test coverage for crash recovery and lifecycle behavior
 
 AWS deployment (validated end-to-end):
@@ -141,11 +145,12 @@ For implementation planning:
 
 ## Testing
 
-There are three practical test layers in the repo:
+There are four practical test layers in the repo:
 
 - API service tests in `services/api-service`
 - worker service tests in `services/worker-service/tests`
 - backend integration tests in [`tests/backend-integration/`](./tests/backend-integration/)
+- Langfuse E2E tests in [`tests/e2e-langfuse/`](./tests/e2e-langfuse/) (requires local Langfuse via `make test-langfuse-up`)
 
 The integration suite is the best place to validate the intended runtime lifecycle:
 
