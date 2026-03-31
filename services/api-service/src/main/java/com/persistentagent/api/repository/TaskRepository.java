@@ -72,7 +72,8 @@ public class TaskRepository {
                        t.last_error_code, t.last_error_message, t.last_worker_id,
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
                        t.langfuse_endpoint_id,
-                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count
+                       (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
+                       (SELECT COALESCE(SUM(c.cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
                 FROM tasks t
                 WHERE t.task_id = ? AND t.tenant_id = ?
                 """;
@@ -279,7 +280,8 @@ public class TaskRepository {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
                        t.langfuse_endpoint_id,
-                       COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count
+                       COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count,
+                       COALESCE(SUM(c.cost_microdollars), 0) AS total_cost_microdollars
                 FROM tasks t
                 LEFT JOIN checkpoints c ON c.task_id = t.task_id AND c.checkpoint_ns = ''
                 WHERE t.tenant_id = ?

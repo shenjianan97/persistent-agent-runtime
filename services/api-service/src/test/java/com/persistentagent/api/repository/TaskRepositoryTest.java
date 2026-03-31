@@ -35,7 +35,7 @@ class TaskRepositoryTest {
     }
 
     @Test
-    void findByIdWithAggregates_queryDoesNotSelectLegacyCheckpointCostTotals() {
+    void findByIdWithAggregates_queryIncludesCheckpointCostTotals() {
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         when(jdbcTemplate.queryForList(anyString(), eq(taskId), eq("default")))
@@ -48,12 +48,12 @@ class TaskRepositoryTest {
         verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(taskId), eq("default"));
         String sql = sqlCaptor.getValue();
         assertTrue(sql.contains("checkpoint_count"));
-        assertFalse(sql.contains("SUM(cost_microdollars)"));
-        assertFalse(sql.contains("AS total_cost_microdollars"));
+        assertTrue(sql.contains("cost_microdollars"));
+        assertTrue(sql.contains("total_cost_microdollars"));
     }
 
     @Test
-    void listTasks_queryDoesNotSelectLegacyCheckpointCostTotals() {
+    void listTasks_queryIncludesCheckpointCostTotals() {
         Timestamp now = Timestamp.from(Instant.now());
         when(jdbcTemplate.queryForList(anyString(), any(Object[].class)))
                 .thenReturn(List.of(Map.ofEntries(
@@ -73,8 +73,8 @@ class TaskRepositoryTest {
         verify(jdbcTemplate).queryForList(sqlCaptor.capture(), any(Object[].class));
         String sql = sqlCaptor.getValue();
         assertTrue(sql.contains("checkpoint_count"));
-        assertFalse(sql.contains("SUM(c.cost_microdollars)"));
-        assertFalse(sql.contains("AS total_cost_microdollars"));
+        assertTrue(sql.contains("SUM(c.cost_microdollars)"));
+        assertTrue(sql.contains("total_cost_microdollars"));
     }
 
     private Map<String, Object> taskRow(UUID taskId, Timestamp now) {
