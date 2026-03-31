@@ -9,7 +9,7 @@ the "Affected Component" listed below, with one exception: you must add CORS con
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and API contract:
 1. `docs/PROJECT.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md` (Sections 3 and 10 for API contract and demo scenario)
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` (Sections 3 and 10 for API contract and demo scenario)
 3. `services/api-service/src/main/java/com/persistentagent/api/controller/TaskController.java` (exact endpoint signatures)
 4. `services/api-service/src/main/java/com/persistentagent/api/model/response/` (all response DTOs)
 5. `services/api-service/src/main/java/com/persistentagent/api/model/request/` (submission request shape)

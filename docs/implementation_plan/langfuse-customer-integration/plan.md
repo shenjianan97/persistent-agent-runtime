@@ -4,7 +4,7 @@
 
 **CRITICAL PRE-WORK:** Before delegating any tasks or making technical decisions, you MUST read the following context files:
 1. `docs/design/langfuse-customer-integration/design.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 Your responsibilities are to assign the individual tasks listed in Section B to specialized coding agents, track their progress, and resolve any dependencies or blockers.
 

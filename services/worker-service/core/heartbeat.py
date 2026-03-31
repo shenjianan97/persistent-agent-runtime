@@ -20,7 +20,7 @@ from core.logging import (
     get_logger,
 )
 
-# Exact heartbeat query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
+# Exact heartbeat query from docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1
 def build_heartbeat_query(lease_duration_seconds: int) -> str:
     return f"""
 UPDATE tasks

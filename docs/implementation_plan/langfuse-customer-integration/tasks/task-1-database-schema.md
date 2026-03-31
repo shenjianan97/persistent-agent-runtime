@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files:
 1. `docs/design/langfuse-customer-integration/design.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 3. `infrastructure/database/migrations/0001_phase1_durable_execution.sql` (existing schema patterns)
 
 ## Context

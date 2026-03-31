@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 The Worker Service acts as the scalable, active host environment executing AI workflows efficiently. It independently retrieves pending workflows via polling constraints, guarantees unique process lock ownership using an automated heartbeat, and proactively cycles hung processes using an overlapping distributed reaper algorithm. 
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical worker lifecycle contract. Do not invent alternate claim, heartbeat, retry, or reaper semantics.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical worker lifecycle contract. Do not invent alternate claim, heartbeat, retry, or reaper semantics.
 - Claim logic must use the documented `FOR UPDATE SKIP LOCKED` pattern and respect `retry_after`.
 - Heartbeat logic extends leases based on `task_id`, `tenant_id`, `status='running'`, and `lease_owner`; it must not depend on `tasks.version`.
 - Reaper logic must handle both expired leases and total task timeout. Lease expiry requeues or dead-letters based on `retry_count` versus `max_retries`; timeout transitions directly to `dead_letter`.

@@ -67,7 +67,7 @@ These ideas are later than the core Phase 2 BYOT runtime:
 
 ## 5. Bring Your Own Key (BYOK)
 
-Phase 2 uses platform-owned LLM API keys (see [PHASE2_MULTI_AGENT.md, Section 6](./PHASE2_MULTI_AGENT.md)). If customer demand arises for users to bring their own provider API keys, this would require:
+Phase 2 uses platform-owned LLM API keys (see [PHASE2_MULTI_AGENT.md, Section 6](../phase-2/PHASE2_MULTI_AGENT.md)). If customer demand arises for users to bring their own provider API keys, this would require:
 
 - per-tenant credential vaults in Secrets Manager
 - per-agent API key overrides in the Agent entity

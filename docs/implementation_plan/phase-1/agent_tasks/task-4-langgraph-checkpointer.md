@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 Non-deterministic LLM iterations mandate checkpoint-resume protocols over event replay paradigms efficiently. The persistence adapter connects explicit LangGraph structures alongside our core state isolation constraints seamlessly blocking zombie writes leveraging worker identities. 
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical checkpointer behavior contract. The important safety rule is lease-aware checkpoint writes, not speculative library redesign.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical checkpointer behavior contract. The important safety rule is lease-aware checkpoint writes, not speculative library redesign.
 - The checkpointer must validate active ownership using `task_id`, `tenant_id`, `status='running'`, and `lease_owner = worker_id` before persisting checkpoint state.
 - `tasks.version` is not part of checkpoint write ownership checks.
 - The implementation must follow the actual LangGraph/checkpoint package version pinned in the codebase. Do not guess or upgrade the contract inside this task.

@@ -10,7 +10,7 @@ the "Affected Component" listed below, except for small deployment-enabling chan
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -22,7 +22,7 @@ The Phase 1 Persistent Agent Runtime is designed as a cloud-native AWS deploymen
 This task also owns the container packaging assets needed to build runnable images for the API Service, Worker Service, and Console Service.
 
 ## Task-Specific Shared Contract
-- Treat `docs/PROJECT.md` and `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical infrastructure direction. This task should not reopen Phase 1 architecture choices already made.
+- Treat `docs/PROJECT.md` and `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical infrastructure direction. This task should not reopen Phase 1 architecture choices already made.
 - Phase 1 has **no application-layer authentication**. Do not add password filters, fake login flows, or browser-exposed shared secrets. Restrict access through private networking and the SSM-managed access host instead.
 - Infrastructure choices are fixed for this task: AWS CDK in TypeScript, Aurora Serverless v2 PostgreSQL, ECS Fargate, private subnets for compute, isolated subnets for Aurora, one internal ALB, one NAT gateway, one small SSM-managed access host, CloudWatch integration, and Secrets Manager for sensitive values.
 - Schema initialization must remain decoupled from service startup.

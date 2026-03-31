@@ -23,7 +23,7 @@ from core.logging import (
     get_logger,
 )
 
-# Exact reaper queries from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
+# Exact reaper queries from docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1
 
 # Reaper — expired leases, requeue (retry_count < max_retries)
 REAPER_REQUEUE_QUERY = """

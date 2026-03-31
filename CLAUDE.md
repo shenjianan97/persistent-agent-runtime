@@ -33,9 +33,9 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 | File | Purpose |
 |------|---------|
 | docs/PROJECT.md | High-level project overview: vision, user stories, phases, tradeoffs, tech stack |
-| docs/design/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
-| docs/design/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
-| docs/design/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
+| docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md | Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency, observability |
+| docs/design/phase-2/PHASE2_MULTI_AGENT.md | Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime / BYOT |
+| docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md | Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration |
 | docs/implementation_plan/phase-1/plan.md | Phase 1 Orchestrator Plan detailing dependencies, AWS integration, and execution breakdown |
 | docs/implementation_plan/phase-1/progress.md | Live tracking board for agent execution of Phase 1 |
 | docs/implementation_plan/phase-1/agent_tasks/*.md | 9 single-responsibility execution templates for agents (Tasks 1-8 implementation, Task 9 observability follow-up) |
@@ -55,9 +55,9 @@ Cloud-Native Persistent Agent Runtime — a cloud-native durable execution runti
 - Core concepts and tradeoff positions documented
 
 ### Stage 2 — Technical Design [DONE]
-- PHASE1_DURABLE_EXECUTION.md — Phase 1 architectural context, entity model, API contract, DB schema, sequence diagrams (done)
-- PHASE2_MULTI_AGENT.md — consolidated Phase 2 design doc (done)
-- DESIGN_NOTES_PHASE3_PLUS.md — Phase 3+ reference material extracted from former Phase 2+ notes (done)
+- `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` — Phase 1 architectural context, entity model, API contract, DB schema, sequence diagrams (done)
+- `docs/design/phase-2/PHASE2_MULTI_AGENT.md` — consolidated Phase 2 design doc (done)
+- `docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md` — Phase 3+ reference material extracted from former Phase 2+ notes (done)
 - Review and refine Phase 1 design before implementation (done)
 
 ### Stage 3 — Implementation Plan [DONE]

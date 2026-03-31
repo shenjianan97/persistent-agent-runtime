@@ -1,7 +1,7 @@
 # LangGraph Proof of Concept (POC) Plan
 
 ## Objective
-The goal of this POC is to validate the core assumptions made in the Phase 1 Design Document (`PHASE1_DURABLE_EXECUTION.md`) specifically regarding **LangGraph Checkpoint behavior** and its integration with a custom `BaseCheckpointSaver`. This POC ensures our technical foundation is solid before building the full Durable Execution machinery.
+The goal of this POC is to validate the core assumptions made in the Phase 1 Design Document (`docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`) specifically regarding **LangGraph Checkpoint behavior** and its integration with a custom `BaseCheckpointSaver`. This POC ensures our technical foundation is solid before building the full Durable Execution machinery.
 
 ## Core Assumptions to Validate 
 Based on the Phase 1 design, we are assuming the following behaviors which MUST be true for our architecture to succeed:

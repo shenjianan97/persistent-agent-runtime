@@ -203,8 +203,8 @@ In Phase 1, `agent_id` is a string field on Task with agent config stored inline
 
 ## 11. Related Documents
 
-- [docs/design/PHASE1_DURABLE_EXECUTION.md](./design/PHASE1_DURABLE_EXECUTION.md) — Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency
-- [docs/design/PHASE2_MULTI_AGENT.md](./design/PHASE2_MULTI_AGENT.md) — Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime (BYOT)
-- [docs/design/DESIGN_NOTES_PHASE3_PLUS.md](./design/DESIGN_NOTES_PHASE3_PLUS.md) — Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration
+- [docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md](./design/phase-1/PHASE1_DURABLE_EXECUTION.md) — Phase 1 design: architectural context, entity model, API contract, DB schema, sequence diagrams, lease protocol, idempotency
+- [docs/design/phase-2/PHASE2_MULTI_AGENT.md](./design/phase-2/PHASE2_MULTI_AGENT.md) — Phase 2 design: Agent entity, cost-aware scheduling, long-term memory, task event history, secret management hardening, Custom Tool Runtime (BYOT)
+- [docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md](./design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md) — Phase 3+ reference material: scaling analysis, queue/storage evolution options, DynamoDB design, future tool integration
 
 ---

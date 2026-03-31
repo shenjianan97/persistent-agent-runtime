@@ -134,9 +134,9 @@ Still evolving:
 
 Start here if you want the actual system contract rather than the repo overview:
 
-- [`docs/design/PHASE1_DURABLE_EXECUTION.md`](./docs/design/PHASE1_DURABLE_EXECUTION.md)
-- [`docs/design/PHASE2_MULTI_AGENT.md`](./docs/design/PHASE2_MULTI_AGENT.md)
-- [`docs/design/DESIGN_NOTES_PHASE3_PLUS.md`](./docs/design/DESIGN_NOTES_PHASE3_PLUS.md)
+- [`docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`](./docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md)
+- [`docs/design/phase-2/PHASE2_MULTI_AGENT.md`](./docs/design/phase-2/PHASE2_MULTI_AGENT.md)
+- [`docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md`](./docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md)
 
 For implementation planning:
 
