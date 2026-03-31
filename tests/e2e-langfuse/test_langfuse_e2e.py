@@ -221,7 +221,8 @@ async def test_crud_endpoints(e2e):
 
     # ── GET list ───────────────────────────────────────────────────────────
     list_body = api._request("GET", "/langfuse-endpoints", expected_status=200)["body"]
-    ids = [ep["endpoint_id"] for ep in list_body.get("endpoints", [])]
+    endpoints = list_body if isinstance(list_body, list) else list_body.get("endpoints", [])
+    ids = [ep["endpoint_id"] for ep in endpoints]
     assert endpoint_id in ids, f"New endpoint {endpoint_id} should appear in list"
 
     # ── GET by id ──────────────────────────────────────────────────────────
