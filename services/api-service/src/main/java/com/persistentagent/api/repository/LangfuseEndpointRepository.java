@@ -88,10 +88,9 @@ public class LangfuseEndpointRepository {
      */
     public boolean isReferencedByActiveTask(UUID endpointId) {
         String sql = """
-                SELECT COUNT(*) FROM tasks
-                WHERE langfuse_endpoint_id = ? AND status IN ('queued', 'running')
+                SELECT EXISTS(SELECT 1 FROM tasks
+                WHERE langfuse_endpoint_id = ? AND status IN ('queued', 'running'))
                 """;
-        Integer count = jdbcTemplate.queryForObject(sql, Integer.class, endpointId);
-        return count != null && count > 0;
+        return Boolean.TRUE.equals(jdbcTemplate.queryForObject(sql, Boolean.class, endpointId));
     }
 }

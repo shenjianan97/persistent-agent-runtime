@@ -257,12 +257,11 @@ class TaskServiceTest {
         taskRow.put("langfuse_endpoint_id", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(List.of(
-                checkpointRow("cp-1", "input", "worker-1", "2026-03-27T17:00:01Z"),
-                checkpointRow("cp-2", "loop", "worker-1", "2026-03-27T17:00:04Z")
-        )));
-        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
-                .thenReturn(new CheckpointCostTotals(5200L, 120, 40, 160, 3000L));
+        Map<String, Object> cp1 = checkpointRow("cp-1", "input", "worker-1", "2026-03-27T17:00:01Z");
+        Map<String, Object> cp2 = checkpointRow("cp-2", "loop", "worker-1", "2026-03-27T17:00:04Z");
+        cp2.put("cost_microdollars", 5200);
+        cp2.put("execution_metadata", "{\"input_tokens\":120,\"output_tokens\":40,\"model\":\"test-model\"}");
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(List.of(cp1, cp2)));
 
         TaskObservabilityResponse response = taskService.getTaskObservability(taskId);
 

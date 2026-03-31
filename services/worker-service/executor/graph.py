@@ -359,7 +359,7 @@ class GraphExecutor:
                 nonlocal per_task_langfuse_client
                 langfuse_status = "skipped"
                 if per_task_langfuse_client is not None:
-                    langfuse_status = self._flush_langfuse_with_retry(per_task_langfuse_client, task_id)
+                    langfuse_status = await self._flush_langfuse_with_retry(per_task_langfuse_client, task_id)
                     per_task_langfuse_client = None  # Prevent double-flush in finally
 
                 # Step 6: Completion Path
@@ -448,7 +448,7 @@ class GraphExecutor:
 
         return config
 
-    def _flush_langfuse_with_retry(self, client: Langfuse, task_id: str, max_retries: int = 3) -> str:
+    async def _flush_langfuse_with_retry(self, client: Langfuse, task_id: str, max_retries: int = 3) -> str:
         """Flush Langfuse client with retries. Returns 'sent' or 'failed'."""
         for attempt in range(1, max_retries + 1):
             try:
@@ -460,8 +460,7 @@ class GraphExecutor:
                         "Langfuse flush attempt %d/%d failed for task %s, retrying...",
                         attempt, max_retries, task_id, exc_info=True,
                     )
-                    import time
-                    time.sleep(attempt)  # Simple linear backoff: 1s, 2s
+                    await asyncio.sleep(attempt)  # Simple linear backoff: 1s, 2s
                 else:
                     logger.warning(
                         "Langfuse flush failed after %d attempts for task %s",

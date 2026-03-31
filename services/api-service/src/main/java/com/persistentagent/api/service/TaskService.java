@@ -184,9 +184,10 @@ public class TaskService {
         String agentId = (String) task.get("agent_id");
         String status = (String) task.get("status");
 
-        CheckpointCostTotals totals = taskObservabilityService.getTaskCostTotals(taskId, tenantId);
+        RuntimeItemsResult result = buildRuntimeItems(taskId, task);
+        CheckpointCostTotals totals = result.totals();
 
-        List<TaskObservabilityItemResponse> items = new ArrayList<>(buildRuntimeItems(taskId, task));
+        List<TaskObservabilityItemResponse> items = new ArrayList<>(result.items());
         items.sort(Comparator
                 .comparingInt((TaskObservabilityItemResponse item) -> isTerminalMarker(item.kind()) ? 1 : 0)
                 .thenComparing(TaskObservabilityItemResponse::startedAt, Comparator.nullsLast(Comparator.naturalOrder()))
@@ -373,7 +374,7 @@ public class TaskService {
         return List.of();
     }
 
-    private List<TaskObservabilityItemResponse> buildRuntimeItems(UUID taskId, Map<String, Object> task) {
+    private RuntimeItemsResult buildRuntimeItems(UUID taskId, Map<String, Object> task) {
         List<TaskObservabilityItemResponse> items = new ArrayList<>();
         String agentId = (String) task.get("agent_id");
         String status = (String) task.get("status");
@@ -384,6 +385,20 @@ public class TaskService {
                 .mapToObj(index -> checkpointMarker(taskId, agentId, index, checkpointRows.get(index)))
                 .toList();
         items.addAll(checkpointMarkers.stream().map(CheckpointMarker::item).toList());
+
+        // Aggregate cost totals from the same checkpoint data (avoids a second DB query)
+        long totalCost = checkpointMarkers.stream().mapToLong(m -> m.item().costMicrodollars()).sum();
+        int totalInput = checkpointMarkers.stream().mapToInt(m -> m.item().inputTokens()).sum();
+        int totalOutput = checkpointMarkers.stream().mapToInt(m -> m.item().outputTokens()).sum();
+        Long durationMs = null;
+        if (checkpointRows.size() >= 2) {
+            OffsetDateTime first = toOffsetDateTime(checkpointRows.get(0).get("created_at"));
+            OffsetDateTime last = toOffsetDateTime(checkpointRows.get(checkpointRows.size() - 1).get("created_at"));
+            if (first != null && last != null) {
+                durationMs = java.time.Duration.between(first, last).toMillis();
+            }
+        }
+        CheckpointCostTotals totals = new CheckpointCostTotals(totalCost, totalInput, totalOutput, totalInput + totalOutput, durationMs);
 
         List<OffsetDateTime> retryTimes = parseRetryTimes(task.get("retry_history"));
         for (int i = 0; i < retryTimes.size(); i++) {
@@ -457,7 +472,7 @@ public class TaskService {
             ));
         }
 
-        return items;
+        return new RuntimeItemsResult(items, totals);
     }
 
     private CheckpointMarker checkpointMarker(UUID taskId, String agentId, int index, Map<String, Object> row) {
@@ -561,5 +576,8 @@ public class TaskService {
     }
 
     private record CheckpointMarker(int stepNumber, String nodeName, TaskObservabilityItemResponse item) {
+    }
+
+    private record RuntimeItemsResult(List<TaskObservabilityItemResponse> items, CheckpointCostTotals totals) {
     }
 }
