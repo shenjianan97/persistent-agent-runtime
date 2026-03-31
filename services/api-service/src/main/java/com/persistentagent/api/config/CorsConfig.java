@@ -20,7 +20,7 @@ public class CorsConfig implements WebMvcConfigurer {
             // omitting the mapping means Spring won't activate its CORS interceptor at all.
             registry.addMapping("/v1/**")
                     .allowedOrigins(allowedOriginsRaw.split(","))
-                    .allowedMethods("GET", "POST", "OPTIONS")
+                    .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
                     .allowedHeaders("*");
         }
     }

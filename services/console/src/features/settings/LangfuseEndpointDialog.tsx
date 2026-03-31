@@ -2,26 +2,23 @@ import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { useTestLangfuseEndpoint } from './useLangfuseEndpoints';
 import type { LangfuseEndpoint, LangfuseEndpointRequest } from '@/types';
-import { X, Wifi, Loader2 } from 'lucide-react';
+import { X } from 'lucide-react';
 
 interface LangfuseEndpointDialogProps {
     open: boolean;
     onClose: () => void;
     onSubmit: (request: LangfuseEndpointRequest) => void;
     isPending: boolean;
+    submitError?: string | null;
     endpoint?: LangfuseEndpoint | null;
 }
 
-export function LangfuseEndpointDialog({ open, onClose, onSubmit, isPending, endpoint }: LangfuseEndpointDialogProps) {
+export function LangfuseEndpointDialog({ open, onClose, onSubmit, isPending, submitError, endpoint }: LangfuseEndpointDialogProps) {
     const [name, setName] = useState('');
     const [host, setHost] = useState('');
     const [publicKey, setPublicKey] = useState('');
     const [secretKey, setSecretKey] = useState('');
-    const [testResult, setTestResult] = useState<{ reachable: boolean; message: string } | null>(null);
-
-    const testMutation = useTestLangfuseEndpoint();
 
     const isEditMode = !!endpoint;
 
@@ -31,7 +28,6 @@ export function LangfuseEndpointDialog({ open, onClose, onSubmit, isPending, end
             setHost(endpoint?.host ?? '');
             setPublicKey('');
             setSecretKey('');
-            setTestResult(null);
         }
     }, [open, endpoint]);
 
@@ -40,15 +36,6 @@ export function LangfuseEndpointDialog({ open, onClose, onSubmit, isPending, end
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         onSubmit({ name, host, public_key: publicKey, secret_key: secretKey });
-    };
-
-    const handleTest = () => {
-        if (!endpoint) return;
-        setTestResult(null);
-        testMutation.mutate(endpoint.endpoint_id, {
-            onSuccess: (result) => setTestResult(result),
-            onError: (err: Error) => setTestResult({ reachable: false, message: err.message }),
-        });
     };
 
     return (
@@ -111,27 +98,9 @@ export function LangfuseEndpointDialog({ open, onClose, onSubmit, isPending, end
                         />
                     </div>
 
-                    {isEditMode && (
-                        <div className="space-y-2">
-                            <Button
-                                type="button"
-                                variant="outline"
-                                className="uppercase tracking-[0.18em] font-bold text-xs"
-                                onClick={handleTest}
-                                disabled={testMutation.isPending}
-                            >
-                                {testMutation.isPending ? (
-                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                ) : (
-                                    <Wifi className="w-4 h-4 mr-2" />
-                                )}
-                                Test Connection
-                            </Button>
-                            {testResult && (
-                                <div className={`text-xs uppercase tracking-widest px-3 py-2 border ${testResult.reachable ? 'border-success/40 text-success bg-success/10' : 'border-destructive/40 text-destructive bg-destructive/10'}`}>
-                                    {testResult.message}
-                                </div>
-                            )}
+                    {submitError && (
+                        <div className="text-xs uppercase tracking-widest px-3 py-2 border border-destructive/40 text-destructive bg-destructive/10">
+                            {submitError}
                         </div>
                     )}
 

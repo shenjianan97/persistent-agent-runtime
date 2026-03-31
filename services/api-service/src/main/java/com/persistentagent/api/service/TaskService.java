@@ -465,6 +465,30 @@ public class TaskService {
         String nodeName = checkpointEventParser.extractNodeName(row.get("metadata_payload"), checkpointId);
         OffsetDateTime createdAt = toOffsetDateTime(row.get("created_at"));
         int stepNumber = index + 1;
+
+        // Extract cost and token data from checkpoint row
+        long costMicrodollars = row.get("cost_microdollars") instanceof Number n ? n.longValue() : 0L;
+        int inputTokens = 0;
+        int outputTokens = 0;
+        String modelName = null;
+        Object execMeta = row.get("execution_metadata");
+        if (execMeta != null) {
+            try {
+                String json = execMeta.toString();
+                var node = objectMapper.readTree(json);
+                inputTokens = node.has("input_tokens") ? node.get("input_tokens").asInt(0) : 0;
+                outputTokens = node.has("output_tokens") ? node.get("output_tokens").asInt(0) : 0;
+                modelName = node.has("model") ? node.get("model").asText(null) : null;
+            } catch (Exception e) {
+                // Ignore parse errors — use defaults
+            }
+        }
+
+        String title = modelName != null ? modelName : "Checkpoint saved";
+        String summary = costMicrodollars > 0
+                ? "%d in / %d out tokens — $%.4f".formatted(inputTokens, outputTokens, costMicrodollars / 1_000_000.0)
+                : "Saved durable progress at step %d.".formatted(stepNumber);
+
         return new CheckpointMarker(
                 stepNumber,
                 nodeName,
@@ -472,16 +496,16 @@ public class TaskService {
                         "checkpoint-%s".formatted(checkpointId),
                         null,
                         "checkpoint_persisted",
-                        "Checkpoint saved",
-                        "Saved durable progress at step %d.".formatted(stepNumber),
+                        title,
+                        summary,
                         stepNumber,
                         nodeName,
                         null,
-                        null,
-                        0L,
-                        0,
-                        0,
-                        0,
+                        modelName,
+                        costMicrodollars,
+                        inputTokens,
+                        outputTokens,
+                        inputTokens + outputTokens,
                         null,
                         null,
                         null,

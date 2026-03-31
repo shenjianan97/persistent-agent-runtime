@@ -61,7 +61,7 @@ NC := \033[0m
         start start-with-observability stop restart start-console start-api start-worker stop-console stop-api stop-worker \
         scale-worker \
         status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
-        test-langfuse-up test-langfuse-down test-langfuse-status dev-langfuse-up \
+        test-langfuse-up test-langfuse-down test-langfuse-status \
         test api-test worker-test console-test e2e-test test-e2e-langfuse local-ci clean logs
 
 
@@ -93,7 +93,7 @@ help:
 	@echo "  $(YELLOW)make db-status$(NC)      - 📊 Show DB container status"
 	@echo "  $(YELLOW)make db-migrate$(NC)     - 🛠️  Apply SQL migrations safely"
 	@echo "  $(YELLOW)make db-reset-verify$(NC) - 🧪 Reset and verify DB schema (⚠️ DROPS DATA)"
-	@echo "  $(YELLOW)make dev-langfuse-up$(NC)     - 🔭 Start a local Langfuse instance for dev/testing"
+	@echo "  $(YELLOW)make test-langfuse-up$(NC)     - 🔭 Start a local Langfuse instance for testing"
 	@echo "  $(YELLOW)make test-langfuse-down$(NC)  - 🛑 Stop the local Langfuse stack"
 	@echo "  $(YELLOW)make test-langfuse-status$(NC) - 📊 Show local Langfuse container status"
 	@echo ""
@@ -186,6 +186,12 @@ start: check
 	@mkdir -p $(TMP_DIR)
 	@echo "$(YELLOW)🚀 Starting local stack...$(NC)"
 	@$(MAKE) db-up
+	@echo "$(YELLOW)🔍 Checking DB schema...$(NC)"
+	@if ! docker exec -e PGPASSWORD="$(DB_PASSWORD)" $(DB_CONTAINER_NAME) psql -At -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" \
+		-c "SELECT 1 FROM information_schema.tables WHERE table_name = 'tasks'" 2>/dev/null | grep -qx 1; then \
+		echo "$(RED)❌ DB schema not initialized. Run 'make db-migrate' first.$(NC)"; \
+		exit 1; \
+	fi
 	@echo "$(YELLOW)🔍 Discovering models...$(NC)"
 	@$(WORKER_VENV_PYTHON) services/model-discovery/main.py || echo "$(YELLOW)⚠️ Model discovery failed; continuing startup with existing models$(NC)"
 	@$(MAKE) start-console
@@ -295,8 +301,6 @@ test-langfuse-status:
 	@echo "$(CYAN)Langfuse Stack:$(NC)"
 	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" -p "$(LANGFUSE_DOCKER_PROJECT)" ps
 
-dev-langfuse-up: test-langfuse-up
-	@echo "$(GREEN)ℹ️  Dev Langfuse is running. Configure endpoints via the Console Settings page.$(NC)"
 
 start-console:
 	@pid_is_console() { \

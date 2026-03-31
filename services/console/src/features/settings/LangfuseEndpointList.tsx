@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { LangfuseEndpointDialog } from './LangfuseEndpointDialog';
@@ -11,7 +11,7 @@ import {
 } from './useLangfuseEndpoints';
 import type { LangfuseEndpoint, LangfuseEndpointRequest } from '@/types';
 import { toast } from 'sonner';
-import { Plus, Pencil, Trash2, Wifi, Loader2 } from 'lucide-react';
+import { Plus, Pencil, Trash2, Loader2 } from 'lucide-react';
 
 export function LangfuseEndpointList() {
     const { data: endpoints = [], isLoading } = useLangfuseEndpoints();
@@ -22,15 +22,39 @@ export function LangfuseEndpointList() {
 
     const [dialogOpen, setDialogOpen] = useState(false);
     const [editingEndpoint, setEditingEndpoint] = useState<LangfuseEndpoint | null>(null);
-    const [testingId, setTestingId] = useState<string | null>(null);
+    const [testingIds, setTestingIds] = useState<Set<string>>(new Set());
+    const [testResults, setTestResults] = useState<Record<string, boolean>>({});
+    const [dialogError, setDialogError] = useState<string | null>(null);
+
+    // Auto-test all endpoints on load
+    useEffect(() => {
+        if (endpoints.length === 0) return;
+        endpoints.forEach((ep) => {
+            if (testResults[ep.endpoint_id] !== undefined) return;
+            setTestingIds((prev) => new Set(prev).add(ep.endpoint_id));
+            testMutation.mutate(ep.endpoint_id, {
+                onSuccess: (result) => {
+                    setTestResults((prev) => ({ ...prev, [ep.endpoint_id]: result.reachable }));
+                    setTestingIds((prev) => { const next = new Set(prev); next.delete(ep.endpoint_id); return next; });
+                },
+                onError: () => {
+                    setTestResults((prev) => ({ ...prev, [ep.endpoint_id]: false }));
+                    setTestingIds((prev) => { const next = new Set(prev); next.delete(ep.endpoint_id); return next; });
+                },
+            });
+        });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [endpoints.length]);
 
     const handleCreate = () => {
         setEditingEndpoint(null);
+        setDialogError(null);
         setDialogOpen(true);
     };
 
     const handleEdit = (endpoint: LangfuseEndpoint) => {
         setEditingEndpoint(endpoint);
+        setDialogError(null);
         setDialogOpen(true);
     };
 
@@ -43,24 +67,28 @@ export function LangfuseEndpointList() {
     };
 
     const handleTest = (endpoint: LangfuseEndpoint) => {
-        setTestingId(endpoint.endpoint_id);
+        setTestingIds((prev) => new Set(prev).add(endpoint.endpoint_id));
+        setTestResults((prev) => { const next = { ...prev }; delete next[endpoint.endpoint_id]; return next; });
         testMutation.mutate(endpoint.endpoint_id, {
             onSuccess: (result) => {
+                setTestResults((prev) => ({ ...prev, [endpoint.endpoint_id]: result.reachable }));
                 if (result.reachable) {
                     toast.success(result.message);
                 } else {
                     toast.error(result.message);
                 }
-                setTestingId(null);
+                setTestingIds((prev) => { const next = new Set(prev); next.delete(endpoint.endpoint_id); return next; });
             },
             onError: (err: Error) => {
+                setTestResults((prev) => ({ ...prev, [endpoint.endpoint_id]: false }));
                 toast.error(err.message || 'Connection test failed');
-                setTestingId(null);
+                setTestingIds((prev) => { const next = new Set(prev); next.delete(endpoint.endpoint_id); return next; });
             },
         });
     };
 
     const handleDialogSubmit = (request: LangfuseEndpointRequest) => {
+        setDialogError(null);
         if (editingEndpoint) {
             updateMutation.mutate(
                 { endpointId: editingEndpoint.endpoint_id, request },
@@ -69,7 +97,11 @@ export function LangfuseEndpointList() {
                         toast.success(`Endpoint "${request.name}" updated`);
                         setDialogOpen(false);
                     },
-                    onError: (err: Error) => toast.error(err.message || 'Failed to update endpoint'),
+                    onError: (err: Error) => {
+                        const msg = err.message || 'Failed to update endpoint';
+                        setDialogError(msg);
+                        toast.error(msg);
+                    },
                 },
             );
         } else {
@@ -78,7 +110,11 @@ export function LangfuseEndpointList() {
                     toast.success(`Endpoint "${request.name}" created`);
                     setDialogOpen(false);
                 },
-                onError: (err: Error) => toast.error(err.message || 'Failed to create endpoint'),
+                onError: (err: Error) => {
+                    const msg = err.message || 'Failed to create endpoint';
+                    setDialogError(msg);
+                    toast.error(msg);
+                },
             });
         }
     };
@@ -130,15 +166,18 @@ export function LangfuseEndpointList() {
                                             <Button
                                                 variant="ghost"
                                                 size="sm"
-                                                className="h-8 w-8 p-0"
+                                                className={`h-auto px-2 py-1 text-xs font-mono ${testResults[endpoint.endpoint_id] === true ? 'text-green-500' : testResults[endpoint.endpoint_id] === false ? 'text-destructive' : ''}`}
                                                 onClick={() => handleTest(endpoint)}
-                                                disabled={testingId === endpoint.endpoint_id}
-                                                title="Test Connection"
+                                                disabled={testingIds.has(endpoint.endpoint_id)}
                                             >
-                                                {testingId === endpoint.endpoint_id ? (
-                                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                                {testingIds.has(endpoint.endpoint_id) ? (
+                                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                                ) : testResults[endpoint.endpoint_id] === true ? (
+                                                    'Connected'
+                                                ) : testResults[endpoint.endpoint_id] === false ? (
+                                                    'Failed'
                                                 ) : (
-                                                    <Wifi className="w-4 h-4" />
+                                                    'Test'
                                                 )}
                                             </Button>
                                             <Button
@@ -174,6 +213,7 @@ export function LangfuseEndpointList() {
                 onClose={() => setDialogOpen(false)}
                 onSubmit={handleDialogSubmit}
                 isPending={createMutation.isPending || updateMutation.isPending}
+                submitError={dialogError}
                 endpoint={editingEndpoint}
             />
         </div>

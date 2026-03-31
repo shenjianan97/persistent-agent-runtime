@@ -48,7 +48,7 @@ public class CheckpointObservabilityService implements TaskObservabilityService 
             Object execMeta = row.get("execution_metadata");
             if (execMeta != null) {
                 try {
-                    String json = execMeta instanceof String s ? s : objectMapper.writeValueAsString(execMeta);
+                    String json = execMeta.toString();
                     JsonNode node = objectMapper.readTree(json);
                     inputTokens += nodeInt(node, "input_tokens");
                     outputTokens += nodeInt(node, "output_tokens");

@@ -9,6 +9,7 @@ import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
@@ -31,8 +32,10 @@ public class LangfuseEndpointService {
     private final LangfuseEndpointRepository langfuseEndpointRepository;
     private final HttpClient httpClient;
 
+    @Autowired
     public LangfuseEndpointService(LangfuseEndpointRepository langfuseEndpointRepository) {
         this(langfuseEndpointRepository, HttpClient.newBuilder()
+                .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofSeconds(5))
                 .build());
     }
@@ -44,6 +47,10 @@ public class LangfuseEndpointService {
     }
 
     public LangfuseEndpointResponse create(String tenantId, LangfuseEndpointRequest request) {
+        LangfuseEndpointTestResponse testResult = doTestConnectivity(request.host(), request.publicKey(), request.secretKey());
+        if (!testResult.reachable()) {
+            throw new ConnectivityException(testResult.message());
+        }
         try {
             Map<String, Object> result = langfuseEndpointRepository.insert(
                     tenantId, request.name(), request.host(),
@@ -69,6 +76,10 @@ public class LangfuseEndpointService {
     }
 
     public LangfuseEndpointResponse update(UUID endpointId, String tenantId, LangfuseEndpointRequest request) {
+        LangfuseEndpointTestResponse testResult = doTestConnectivity(request.host(), request.publicKey(), request.secretKey());
+        if (!testResult.reachable()) {
+            throw new ConnectivityException(testResult.message());
+        }
         boolean updated = langfuseEndpointRepository.update(
                 endpointId, tenantId, request.name(), request.host(),
                 request.publicKey(), request.secretKey());
@@ -100,6 +111,10 @@ public class LangfuseEndpointService {
         String publicKey = (String) row.get("public_key");
         String secretKey = (String) row.get("secret_key");
 
+        return doTestConnectivity(host, publicKey, secretKey);
+    }
+
+    private LangfuseEndpointTestResponse doTestConnectivity(String host, String publicKey, String secretKey) {
         String url = host.endsWith("/") ? host + "api/public/health" : host + "/api/public/health";
         String credentials = Base64.getEncoder().encodeToString((publicKey + ":" + secretKey).getBytes());
 
@@ -124,7 +139,7 @@ public class LangfuseEndpointService {
         } catch (java.net.http.HttpTimeoutException | java.net.ConnectException e) {
             return new LangfuseEndpointTestResponse(false, "Cannot reach host — check URL");
         } catch (Exception e) {
-            log.warn("Connectivity test failed for endpoint {}: {}", endpointId, e.getMessage());
+            log.warn("Connectivity test failed for host {}: {}", host, e.getMessage());
             return new LangfuseEndpointTestResponse(false, "Cannot reach host — check URL");
         }
     }
@@ -159,6 +174,12 @@ public class LangfuseEndpointService {
 
     public static class ConflictException extends RuntimeException {
         public ConflictException(String message) {
+            super(message);
+        }
+    }
+
+    public static class ConnectivityException extends RuntimeException {
+        public ConnectivityException(String message) {
             super(message);
         }
     }

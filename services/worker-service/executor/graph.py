@@ -200,7 +200,7 @@ class GraphExecutor:
 
         try:
             row = await self.pool.fetchrow(
-                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE model_name = $1",
+                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE model_id = $1",
                 model_name,
             )
             if row is None:
@@ -339,10 +339,33 @@ class GraphExecutor:
                             cost, exec_meta = await self._calculate_step_cost(response_metadata, model_name)
                             total_cost_microdollars = cost
                             last_execution_metadata = exec_meta
+                            # Write cost to the latest checkpoint row
+                            await self.pool.execute(
+                                '''UPDATE checkpoints
+                                   SET cost_microdollars = $1,
+                                       execution_metadata = $2::jsonb
+                                   WHERE task_id = $3::uuid
+                                   AND created_at = (
+                                       SELECT MAX(created_at) FROM checkpoints WHERE task_id = $3::uuid
+                                   )''',
+                                cost,
+                                json.dumps(exec_meta),
+                                task_id,
+                            )
                         except Exception:
                             logger.warning("Cost calculation failed for task %s", task_id, exc_info=True)
 
-                # Step 5: Completion Path
+                # Step 5: Flush Langfuse traces before marking complete
+                nonlocal per_task_langfuse_client
+                langfuse_status = "skipped"
+                if per_task_langfuse_client is not None:
+                    langfuse_status = self._flush_langfuse_with_retry(per_task_langfuse_client, task_id)
+                    per_task_langfuse_client = None  # Prevent double-flush in finally
+
+                # Step 6: Completion Path
+                output_data = {"result": output_content}
+                if langfuse_endpoint_id:
+                    output_data["langfuse_status"] = langfuse_status
                 updated = await self.pool.fetchval(
                     '''UPDATE tasks
                        SET status='completed',
@@ -356,14 +379,14 @@ class GraphExecutor:
                          AND status='running'
                          AND lease_owner=$3
                        RETURNING task_id''',
-                    json.dumps({"result": output_content}),
+                    json.dumps(output_data),
                     task_id,
                     worker_id,
                 )
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
-                    logger.info("Task %s completed successfully (cost: %d microdollars).", task_id, total_cost_microdollars)
+                    logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, total_cost_microdollars, langfuse_status)
 
             # Step 2: Wrap execution in timeout
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
@@ -387,7 +410,7 @@ class GraphExecutor:
                 try:
                     per_task_langfuse_client.flush()
                 except Exception:
-                    logger.warning("Langfuse flush failed for task %s, continuing", task_id, exc_info=True)
+                    logger.warning("Langfuse flush failed for task %s in finally block", task_id, exc_info=True)
 
     def _build_runnable_config(
         self,
@@ -410,12 +433,7 @@ class GraphExecutor:
 
         try:
             callback = self._build_langfuse_callback(
-                task_id=task_id,
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                host=langfuse_credentials["host"],
                 public_key=langfuse_credentials["public_key"],
-                secret_key=langfuse_credentials["secret_key"],
             )
             config["callbacks"] = [callback]
             config["metadata"] = {
@@ -430,31 +448,31 @@ class GraphExecutor:
 
         return config
 
-    def _build_langfuse_callback(
-        self,
-        *,
-        task_id: str,
-        tenant_id: str,
-        agent_id: str,
-        host: str,
-        public_key: str,
-        secret_key: str,
-    ) -> CallbackHandler:
-        return CallbackHandler(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-            trace_context={
-                "name": f"task:{task_id}",
-                "session_id": task_id,
-                "user_id": tenant_id,
-                "metadata": {
-                    "task_id": task_id,
-                    "agent_id": agent_id,
-                    "tenant_id": tenant_id,
-                },
-            },
-        )
+    def _flush_langfuse_with_retry(self, client: Langfuse, task_id: str, max_retries: int = 3) -> str:
+        """Flush Langfuse client with retries. Returns 'sent' or 'failed'."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                client.flush()
+                return "sent"
+            except Exception:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Langfuse flush attempt %d/%d failed for task %s, retrying...",
+                        attempt, max_retries, task_id, exc_info=True,
+                    )
+                    import time
+                    time.sleep(attempt)  # Simple linear backoff: 1s, 2s
+                else:
+                    logger.warning(
+                        "Langfuse flush failed after %d attempts for task %s",
+                        max_retries, task_id, exc_info=True,
+                    )
+        return "failed"
+
+    def _build_langfuse_callback(self, *, public_key: str) -> CallbackHandler:
+        # Task metadata (task_id, agent_id, tenant_id) is propagated via LangChain
+        # config["metadata"] and automatically attached to the Langfuse trace.
+        return CallbackHandler(public_key=public_key)
 
     async def _await_or_cancel(
         self,

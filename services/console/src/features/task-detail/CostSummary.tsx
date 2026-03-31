@@ -1,5 +1,4 @@
 import { TaskObservabilityResponse, TaskStatusResponse } from '@/types';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DollarSign, Cpu, Timer, Coins } from 'lucide-react';
 import { formatUsd } from '@/lib/utils';
@@ -27,17 +26,6 @@ function computeDurationLabel(observability?: TaskObservabilityResponse, task?: 
 export function CostSummary({ observability, checkpointCount, totalCostMicrodollars, task }: CostSummaryProps) {
     const effectiveCost = observability?.total_cost_microdollars ?? totalCostMicrodollars;
     const formattedCost = formatUsd(effectiveCost);
-    const isTerminal = observability?.status === 'completed' || observability?.status === 'dead_letter' || observability?.status === 'cancelled';
-
-    const checkpointItems = (observability?.items ?? []).filter(
-        (item) => item.kind === 'checkpoint_persisted' && item.cost_microdollars > 0,
-    );
-
-    const chartData = checkpointItems.map((item, index) => ({
-        name: item.title || `Step ${item.step_number ?? index + 1}`,
-        step: item.step_number ?? index + 1,
-        cost: item.cost_microdollars / 1_000_000,
-    }));
 
     const durationLabel = computeDurationLabel(observability, task);
 
@@ -97,60 +85,6 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                 </CardContent>
             </Card>
 
-            <Card className="md:col-span-2 xl:col-span-4 console-surface border-white/10">
-                <CardHeader className="pb-2">
-                    <CardTitle className="text-sm font-display uppercase tracking-widest text-muted-foreground">Cost Per Step</CardTitle>
-                </CardHeader>
-                <CardContent>
-                    <div className="h-[200px] w-full mt-4">
-                        {chartData.length > 0 ? (
-                            <ResponsiveContainer width="100%" height="100%">
-                                <BarChart data={chartData} margin={{ top: 0, right: 0, left: -20, bottom: 0 }}>
-                                    <XAxis
-                                        dataKey="step"
-                                        stroke="#52525b"
-                                        fontSize={12}
-                                        tickLine={false}
-                                        axisLine={false}
-                                        tickFormatter={(val) => `Step ${val}`}
-                                    />
-                                    <YAxis
-                                        stroke="#52525b"
-                                        fontSize={12}
-                                        tickLine={false}
-                                        axisLine={false}
-                                        tickFormatter={(value) => `$${value.toFixed(4)}`}
-                                    />
-                                    <Tooltip
-                                        cursor={{ fill: 'rgba(255,255,255,0.05)' }}
-                                        content={({ active, payload }) => {
-                                            if (active && payload && payload.length) {
-                                                return (
-                                                    <div className="bg-black border border-primary p-2 text-xs font-mono shadow-[0_0_8px_rgba(0,240,255,0.2)]">
-                                                        <p className="text-primary font-bold">{payload[0].payload.name}</p>
-                                                        <p className="text-muted-foreground">Step: {payload[0].payload.step}</p>
-                                                        <p className="text-success">Cost: ${(payload[0].value as number).toFixed(4)}</p>
-                                                    </div>
-                                                );
-                                            }
-                                            return null;
-                                        }}
-                                    />
-                                    <Bar dataKey="cost" fill="#00F0FF" radius={[0, 0, 0, 0]} />
-                                </BarChart>
-                            </ResponsiveContainer>
-                        ) : isTerminal ? (
-                            <div className="w-full h-full flex items-center justify-center text-muted-foreground border border-dashed border-border/40">
-                                <span className="uppercase tracking-widest text-xs">No per-step cost data was recorded for this task.</span>
-                            </div>
-                        ) : (
-                            <div className="w-full h-full flex items-center justify-center text-muted-foreground border border-dashed border-border/40">
-                                <span className="uppercase tracking-widest text-xs">Awaiting checkpoint data...</span>
-                            </div>
-                        )}
-                    </div>
-                </CardContent>
-            </Card>
         </div>
     );
 }
