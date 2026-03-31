@@ -250,7 +250,6 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/backend-integration \
-            --ignore=tests/backend-integration/test_observability_langfuse.py \
             -ra -q | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
 
@@ -308,11 +307,7 @@ jobs:
             -f infrastructure/database/migrations/test_seed.sql
 
       - name: Start Langfuse
-        env:
-          LANGFUSE_HOST: http://127.0.0.1:3300
-          LANGFUSE_PUBLIC_KEY: pk-lf-local
-          LANGFUSE_SECRET_KEY: sk-lf-local
-        run: docker compose -p persistent-agent-runtime-langfuse -f infrastructure/local/langfuse/docker-compose.yml up -d
+        run: docker compose -p persistent-agent-runtime-langfuse -f tests/fixtures/langfuse/docker-compose.yml up -d
 
       - name: Wait for Langfuse
         run: |
@@ -325,7 +320,7 @@ jobs:
           echo "Langfuse did not become ready in time" >&2
           exit 1
 
-      - name: Run Langfuse observability smoke test
+      - name: Run Langfuse E2E tests
         env:
           E2E_DB_HOST: localhost
           E2E_DB_PORT: "55432"
@@ -333,16 +328,14 @@ jobs:
           E2E_DB_USER: postgres
           E2E_DB_PASSWORD: postgres
           APP_DEV_TASK_CONTROLS_ENABLED: "true"
-          E2E_LANGFUSE_ENABLED: "true"
-          LANGFUSE_ENABLED: "true"
           LANGFUSE_HOST: http://127.0.0.1:3300
           LANGFUSE_PUBLIC_KEY: pk-lf-local
           LANGFUSE_SECRET_KEY: sk-lf-local
         run: |
           set -o pipefail
-          python -m pytest tests/backend-integration/test_observability_langfuse.py -ra -q | tee /tmp/observability-smoke.log
+          python -m pytest tests/e2e-langfuse -ra -q | tee /tmp/observability-smoke.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/observability-smoke.log
 
       - name: Stop Langfuse
         if: always()
-        run: docker compose -p persistent-agent-runtime-langfuse -f infrastructure/local/langfuse/docker-compose.yml down -v
+        run: docker compose -p persistent-agent-runtime-langfuse -f tests/fixtures/langfuse/docker-compose.yml down -v

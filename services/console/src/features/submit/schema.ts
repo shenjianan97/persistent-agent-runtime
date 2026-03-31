@@ -13,6 +13,7 @@ export const submitTaskSchema = z.object({
     max_steps: z.number().int().min(1).max(1000).optional().default(100),
     max_retries: z.number().int().min(0).max(10).optional().default(3),
     task_timeout_seconds: z.number().int().min(devTaskControlsEnabled ? 1 : 60).max(86400).optional().default(3600),
+    langfuse_endpoint_id: z.string().optional(),
 });
 
 export type SubmitTaskFormValues = z.infer<typeof submitTaskSchema>;

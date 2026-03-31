@@ -8,7 +8,10 @@ import {
     DeadLetterListResponse,
     TaskCancelResponse,
     RedriveResponse,
-    ModelResponse
+    ModelResponse,
+    LangfuseEndpoint,
+    LangfuseEndpointRequest,
+    LangfuseEndpointTestResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -56,7 +59,7 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
 export const api = {
     submitTask: (request: TaskSubmissionRequest) => {
         // Map flat frontend form shape to Java backend nested shape
-        const payload = {
+        const payload: Record<string, unknown> = {
             agent_id: request.agent_id,
             input: request.input,
             max_steps: request.max_steps,
@@ -70,6 +73,9 @@ export const api = {
                 allowed_tools: request.allowed_tools
             }
         };
+        if (request.langfuse_endpoint_id) {
+            payload.langfuse_endpoint_id = request.langfuse_endpoint_id;
+        }
 
         return fetchApi<TaskSubmissionResponse>('/v1/tasks', {
             method: 'POST',
@@ -115,4 +121,33 @@ export const api = {
 
     getModels: () =>
         fetchApi<ModelResponse[]>('/v1/models'),
+
+    // Langfuse Endpoints
+    createLangfuseEndpoint: (request: LangfuseEndpointRequest) =>
+        fetchApi<LangfuseEndpoint>('/v1/langfuse-endpoints', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        }),
+
+    listLangfuseEndpoints: () =>
+        fetchApi<LangfuseEndpoint[]>('/v1/langfuse-endpoints'),
+
+    getLangfuseEndpoint: (endpointId: string) =>
+        fetchApi<LangfuseEndpoint>(`/v1/langfuse-endpoints/${endpointId}`),
+
+    updateLangfuseEndpoint: (endpointId: string, request: LangfuseEndpointRequest) =>
+        fetchApi<LangfuseEndpoint>(`/v1/langfuse-endpoints/${endpointId}`, {
+            method: 'PUT',
+            body: JSON.stringify(request),
+        }),
+
+    deleteLangfuseEndpoint: (endpointId: string) =>
+        fetchApi<void>(`/v1/langfuse-endpoints/${endpointId}`, {
+            method: 'DELETE',
+        }),
+
+    testLangfuseEndpoint: (endpointId: string) =>
+        fetchApi<LangfuseEndpointTestResponse>(`/v1/langfuse-endpoints/${endpointId}/test`, {
+            method: 'POST',
+        }),
 };

@@ -1,5 +1,6 @@
 package com.persistentagent.api.exception;
 
+import com.persistentagent.api.service.LangfuseEndpointService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -33,6 +34,21 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ValidationException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(ValidationException ex) {
         return buildErrorResponse(HttpStatus.BAD_REQUEST, ex.getMessage());
+    }
+
+    @ExceptionHandler(LangfuseEndpointService.NotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleLangfuseEndpointNotFound(LangfuseEndpointService.NotFoundException ex) {
+        return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
+    @ExceptionHandler(LangfuseEndpointService.ConflictException.class)
+    public ResponseEntity<Map<String, Object>> handleLangfuseEndpointConflict(LangfuseEndpointService.ConflictException ex) {
+        return buildErrorResponse(HttpStatus.CONFLICT, ex.getMessage());
+    }
+
+    @ExceptionHandler(LangfuseEndpointService.ConnectivityException.class)
+    public ResponseEntity<Map<String, Object>> handleLangfuseEndpointConnectivity(LangfuseEndpointService.ConnectivityException ex) {
+        return buildErrorResponse(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

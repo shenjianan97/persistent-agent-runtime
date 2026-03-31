@@ -163,7 +163,7 @@ export function DashboardPage() {
                             actionTo="/dead-letter"
                         />
                     </CardHeader>
-                    <CardContent className="pt-5">
+                    <CardContent className="pt-5 max-h-[420px] overflow-auto">
                         {isLoading ? (
                             <div className="border-t border-white/8 pt-4 text-xs uppercase tracking-[0.2em] text-muted-foreground">
                                 Loading recent issues...
@@ -223,7 +223,7 @@ export function DashboardPage() {
                             actionTo="/tasks"
                         />
                     </CardHeader>
-                    <CardContent className="pt-5">
+                    <CardContent className="pt-5 max-h-[420px] overflow-auto">
                         {isLoading ? (
                             <div className="border-t border-white/8 pt-4 text-xs uppercase tracking-[0.2em] text-muted-foreground">
                                 Loading activity...

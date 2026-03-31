@@ -9,11 +9,12 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
+import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
-import com.persistentagent.api.service.observability.TaskObservabilityTotals;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -39,6 +40,9 @@ class TaskServiceTest {
     private ModelRepository modelRepository;
 
     @Mock
+    private LangfuseEndpointRepository langfuseEndpointRepository;
+
+    @Mock
     private TaskObservabilityService taskObservabilityService;
 
     private TaskService taskService;
@@ -52,6 +56,7 @@ class TaskServiceTest {
         taskService = new TaskService(
                 taskRepository,
                 modelRepository,
+                langfuseEndpointRepository,
                 taskObservabilityService,
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
@@ -66,14 +71,14 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of("web_search"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "do something", 3, 100, 3600);
+                null, "agent1", config, "do something", 3, 100, 3600, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> inserted = Map.of("task_id", taskId, "created_at", now);
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt())).thenReturn(inserted);
+                anyString(), anyInt(), anyInt(), anyInt(), isNull())).thenReturn(inserted);
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
@@ -85,11 +90,50 @@ class TaskServiceTest {
     }
 
     @Test
+    void submitTask_withValidLangfuseEndpointId_succeeds() {
+        UUID endpointId = UUID.randomUUID();
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> endpointRow = Map.of("endpoint_id", endpointId);
+        when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
+                .thenReturn(Optional.of(endpointRow));
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), eq(endpointId)))
+                .thenReturn(Map.of("task_id", taskId, "created_at", now));
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertNotNull(response);
+        assertEquals(taskId, response.taskId());
+    }
+
+    @Test
+    void submitTask_withInvalidLangfuseEndpointId_throwsValidation() {
+        UUID endpointId = UUID.randomUUID();
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+
+        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
+                .thenReturn(Optional.empty());
+
+        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+    }
+
+    @Test
     void submitTask_unsupportedModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "unsupported-model", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -99,7 +143,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -111,7 +155,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -123,7 +167,7 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, 30);
+                null, "agent1", config, "input", null, null, 30, null);
 
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
 
@@ -135,19 +179,19 @@ class TaskServiceTest {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", null, null);
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null);
+                null, "agent1", config, "input", null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(taskRepository.insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600)))
+                eq("input"), eq(3), eq(100), eq(3600), isNull()))
                 .thenReturn(Map.of("task_id", taskId, "created_at", now));
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600));
+                eq("input"), eq(3), eq(100), eq(3600), isNull());
     }
 
     // --- getTaskStatus tests ---
@@ -174,10 +218,11 @@ class TaskServiceTest {
         taskRow.put("updated_at", now);
         taskRow.put("checkpoint_count", 3L);
         taskRow.put("total_cost_microdollars", 999L);
+        taskRow.put("langfuse_endpoint_id", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskObservabilityService.getTaskTotals(taskId, "agent1", "queued"))
-                .thenReturn(new TaskObservabilityTotals(5000L, 120, 40, 160, 2300L, null));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(5000L, 120, 40, 160, 2300L));
 
         TaskStatusResponse response = taskService.getTaskStatus(taskId);
 
@@ -189,7 +234,7 @@ class TaskServiceTest {
     }
 
     @Test
-    void getTaskObservability_existingTask_returnsNormalizedResponse() {
+    void getTaskObservability_existingTask_returnsCheckpointBasedResponse() {
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> taskRow = new LinkedHashMap<>();
@@ -209,85 +254,32 @@ class TaskServiceTest {
         taskRow.put("created_at", now);
         taskRow.put("updated_at", now);
         taskRow.put("checkpoint_count", 2L);
-
-        TaskObservabilitySpanResponse span = new TaskObservabilitySpanResponse(
-                "obs-1",
-                null,
-                "task-id",
-                "agent1",
-                null,
-                "llm",
-                "agent",
-                "claude-sonnet-4-6",
-                null,
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                "prompt",
-                "response",
-                OffsetDateTime.parse("2026-03-27T17:00:02Z"),
-                OffsetDateTime.parse("2026-03-27T17:00:02.300Z")
-        );
-        TaskObservabilityItemResponse spanItem = new TaskObservabilityItemResponse(
-                "obs-1",
-                null,
-                "tool_span",
-                "Tool: calculator",
-                "calculator completed successfully",
-                2,
-                "loop",
-                "calculator",
-                null,
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                "prompt",
-                "response",
-                OffsetDateTime.parse("2026-03-27T17:00:02Z"),
-                OffsetDateTime.parse("2026-03-27T17:00:02.300Z")
-        );
-        TaskObservabilityResponse observability = new TaskObservabilityResponse(
-                true,
-                taskId,
-                "agent1",
-                "dead_letter",
-                "trace-1",
-                5200L,
-                120,
-                40,
-                160,
-                2300L,
-                List.of(span),
-                List.of(spanItem)
-        );
+        taskRow.put("langfuse_endpoint_id", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
-        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(List.of(
-                checkpointRow("cp-1", "input", "worker-1", "2026-03-27T17:00:01Z"),
-                checkpointRow("cp-2", "loop", "worker-1", "2026-03-27T17:00:04Z")
-        )));
-        when(taskObservabilityService.getTaskObservability(taskId, "agent1", "dead_letter"))
-                .thenReturn(observability);
+        Map<String, Object> cp1 = checkpointRow("cp-1", "input", "worker-1", "2026-03-27T17:00:01Z");
+        Map<String, Object> cp2 = checkpointRow("cp-2", "loop", "worker-1", "2026-03-27T17:00:04Z");
+        cp2.put("cost_microdollars", 5200);
+        cp2.put("execution_metadata", "{\"input_tokens\":120,\"output_tokens\":40,\"model\":\"test-model\"}");
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(List.of(cp1, cp2)));
 
         TaskObservabilityResponse response = taskService.getTaskObservability(taskId);
 
         assertTrue(response.enabled());
         assertEquals(taskId, response.taskId());
         assertEquals("agent1", response.agentId());
-        assertEquals("trace-1", response.traceId());
-        assertEquals(1, response.spans().size());
-        assertEquals("obs-1", response.spans().get(0).spanId());
-        assertEquals("llm", response.spans().get(0).type());
-        assertEquals(5, response.items().size());
+        assertEquals("dead_letter", response.status());
+        assertEquals(5200L, response.totalCostMicrodollars());
+        assertEquals(120, response.inputTokens());
+        assertEquals(40, response.outputTokens());
+        assertEquals(160, response.totalTokens());
+        assertEquals(3000L, response.durationMs());
+        // Expect: 2 checkpoint items + 1 resumed_after_retry + 1 dead_lettered = 4
+        assertEquals(4, response.items().size());
         assertEquals("checkpoint_persisted", response.items().get(0).kind());
-        assertEquals("tool_span", response.items().get(1).kind());
-        assertEquals("resumed_after_retry", response.items().get(2).kind());
-        assertEquals("checkpoint_persisted", response.items().get(3).kind());
-        assertEquals("dead_lettered", response.items().get(4).kind());
+        assertEquals("resumed_after_retry", response.items().get(1).kind());
+        assertEquals("checkpoint_persisted", response.items().get(2).kind());
+        assertEquals("dead_lettered", response.items().get(3).kind());
     }
 
     private Map<String, Object> checkpointRow(String checkpointId, String nodeName, String workerId, String createdAtIso) {

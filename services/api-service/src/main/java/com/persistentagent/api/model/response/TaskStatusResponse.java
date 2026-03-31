@@ -23,6 +23,7 @@ public record TaskStatusResponse(
         @JsonProperty("dead_letter_reason") String deadLetterReason,
         @JsonProperty("dead_lettered_at") OffsetDateTime deadLetteredAt,
         @JsonProperty("created_at") OffsetDateTime createdAt,
-        @JsonProperty("updated_at") OffsetDateTime updatedAt
+        @JsonProperty("updated_at") OffsetDateTime updatedAt,
+        @JsonProperty("langfuse_endpoint_id") UUID langfuseEndpointId
 ) {
 }

@@ -8,6 +8,8 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
+import java.util.UUID;
+
 public record TaskSubmissionRequest(
         @JsonProperty("tenant_id")
         String tenantId,
@@ -39,6 +41,9 @@ public record TaskSubmissionRequest(
         @Min(value = 1, message = "task_timeout_seconds must be >= 1")
         @Max(value = 86400, message = "task_timeout_seconds must be <= 86400")
         @JsonProperty("task_timeout_seconds")
-        Integer taskTimeoutSeconds
+        Integer taskTimeoutSeconds,
+
+        @JsonProperty("langfuse_endpoint_id")
+        UUID langfuseEndpointId
 ) {
 }

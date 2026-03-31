@@ -107,69 +107,6 @@ async def test_completion_path(mock_worker, task_data):
 
 
 @pytest.mark.asyncio
-async def test_execute_task_adds_langfuse_callback_and_metadata(mock_worker, task_data):
-    mock_worker.config = WorkerConfig(
-        worker_id="test-worker",
-        worker_pool_id="shared",
-        langfuse_enabled=True,
-        langfuse_host="http://localhost:3300",
-        langfuse_public_key="pk-lf-test",
-        langfuse_secret_key="sk-lf-test",
-    )
-    captured = {}
-
-    with patch("executor.graph.Langfuse") as MockLangfuse:
-        mock_langfuse_client = MagicMock(name="langfuse-client")
-        mock_langfuse_client.auth_check.return_value = True
-        MockLangfuse.return_value = mock_langfuse_client
-
-        executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-
-        with patch.object(executor, "_build_graph") as mock_build:
-            mock_graph = MagicMock()
-            mock_compiled = MagicMock()
-            mock_graph.compile.return_value = mock_compiled
-            mock_build.return_value = mock_graph
-
-            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer, \
-                 patch("executor.graph.CallbackHandler") as MockCallbackHandler:
-                mock_ckpt = AsyncMock()
-                mock_ckpt.aget_tuple.return_value = None
-                MockCheckpointer.return_value = mock_ckpt
-                callback = MagicMock(name="langfuse-callback")
-                MockCallbackHandler.return_value = callback
-
-                async def mock_astream(initial_input, config=None, stream_mode=None):
-                    captured["initial_input"] = initial_input
-                    captured["config"] = config
-                    captured["stream_mode"] = stream_mode
-                    yield {"mock": "event"}
-
-                mock_compiled.astream = mock_astream
-                mock_state = MagicMock()
-                mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
-                mock_compiled.aget_state.return_value = mock_state
-
-                await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
-
-    MockLangfuse.assert_called_once_with(
-        public_key="pk-lf-test",
-        secret_key="sk-lf-test",
-        host="http://localhost:3300",
-    )
-    MockCallbackHandler.assert_called_once()
-    assert captured["config"]["callbacks"] == [callback]
-    assert captured["config"]["metadata"] == {
-        "langfuse_session_id": str(task_data["task_id"]),
-        "langfuse_user_id": task_data["tenant_id"],
-        "task_id": str(task_data["task_id"]),
-        "agent_id": task_data["agent_id"],
-        "tenant_id": task_data["tenant_id"],
-    }
-    mock_langfuse_client.flush.assert_called_once()
-
-
-@pytest.mark.asyncio
 async def test_build_graph_configures_tool_node_for_expected_tool_errors(mock_worker):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     cancel_event = asyncio.Event()
@@ -219,7 +156,7 @@ async def test_await_or_cancel_interrupts_long_running_operation(mock_worker):
 
 
 @pytest.mark.asyncio
-async def test_execute_task_does_not_persist_legacy_checkpoint_cost(mock_worker, task_data):
+async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
 
     with patch.object(executor, "_build_graph") as mock_build:
@@ -237,14 +174,21 @@ async def test_execute_task_does_not_persist_legacy_checkpoint_cost(mock_worker,
                 yield {"mock": "event"}
             mock_compiled.astream = mock_astream
 
+            mock_msg = MagicMock()
+            mock_msg.type = "ai"
+            mock_msg.content = "Final Answer: 4"
+            mock_msg.response_metadata = {
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+            }
             mock_state = MagicMock()
-            mock_state.values = {"messages": [MagicMock(content="Final Answer: 4")]}
+            mock_state.values = {"messages": [mock_msg]}
             mock_compiled.aget_state.return_value = mock_state
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
-            mock_worker.pool.execute.assert_not_called()
-            mock_worker.pool.fetch.assert_not_called()
-            mock_worker.pool.fetchrow.assert_not_called()
+            # The worker now writes cost to checkpoints via pool.execute
+            execute_calls = mock_worker.pool.execute.call_args_list
+            cost_update_calls = [c for c in execute_calls if "UPDATE checkpoints" in str(c) and "cost_microdollars" in str(c)]
+            assert len(cost_update_calls) > 0, "Expected checkpoint cost update via pool.execute"
             completion_args, _ = mock_worker.pool.fetchval.call_args
             assert "UPDATE tasks" in completion_args[0]
             assert "status='completed'" in completion_args[0]

@@ -26,13 +26,13 @@ from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedExcep
 from core.config import WorkerConfig
 
 from tools.definitions import (
-    create_default_dependencies, 
-    WEB_SEARCH_TOOL, 
-    READ_URL_TOOL, 
+    create_default_dependencies,
+    WEB_SEARCH_TOOL,
+    READ_URL_TOOL,
     CALCULATOR_TOOL,
     DEV_SLEEP_TOOL,
-    WebSearchArguments, 
-    ReadUrlArguments, 
+    WebSearchArguments,
+    ReadUrlArguments,
     CalculatorArguments,
     DevSleepArguments,
     dev_task_controls_enabled,
@@ -45,25 +45,32 @@ logger = logging.getLogger(__name__)
 
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
-    
+
     def __init__(self, config: WorkerConfig, pool: asyncpg.Pool):
         self.config = config
         self.pool = pool
         self.deps = create_default_dependencies()
-        self._langfuse_client = self._initialize_langfuse_client()
+        # Per-model cost rate cache: {model_name: (input_rate, output_rate)}
+        self._cost_rate_cache: dict[str, tuple[int, int]] = {}
 
-    def _initialize_langfuse_client(self) -> Langfuse | None:
-        if not self.config.langfuse_enabled:
+    async def _resolve_langfuse_credentials(self, endpoint_id: str) -> dict | None:
+        """Query langfuse_endpoints table for credentials. Returns {host, public_key, secret_key} or None."""
+        try:
+            row = await self.pool.fetchrow(
+                "SELECT host, public_key, secret_key FROM langfuse_endpoints WHERE endpoint_id = $1::uuid",
+                endpoint_id,
+            )
+            if row is None:
+                logger.warning("Langfuse endpoint %s not found in database", endpoint_id)
+                return None
+            return {
+                "host": row["host"],
+                "public_key": row["public_key"],
+                "secret_key": row["secret_key"],
+            }
+        except Exception:
+            logger.warning("Failed to resolve Langfuse credentials for endpoint %s", endpoint_id, exc_info=True)
             return None
-
-        client = Langfuse(
-            public_key=self.config.langfuse_public_key,
-            secret_key=self.config.langfuse_secret_key,
-            host=self.config.langfuse_host,
-        )
-        if not client.auth_check():
-            raise RuntimeError("Langfuse auth check failed for the configured local credentials")
-        return client
 
     def _get_tools(
         self,
@@ -104,7 +111,7 @@ class GraphExecutor:
                 description=READ_URL_TOOL.description,
                 args_schema=ReadUrlArguments
             ))
-            
+
         if "calculator" in allowed_tools:
             async def calculator(expression: str):
                 return {"expression": expression, "result": evaluate_expression(expression)}
@@ -130,7 +137,7 @@ class GraphExecutor:
                 description=DEV_SLEEP_TOOL.description,
                 args_schema=DevSleepArguments
             ))
-            
+
         return tools
 
     async def _build_graph(
@@ -148,8 +155,8 @@ class GraphExecutor:
         system_prompt = agent_config.get("system_prompt", "")
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
-            
-        # Register the local MCP tools with the LLM 
+
+        # Register the local MCP tools with the LLM
         tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id)
         if tools:
             llm_with_tools = llm.bind_tools(tools)
@@ -172,7 +179,7 @@ class GraphExecutor:
         # Define the Graph layout
         workflow = StateGraph(MessagesState)
         workflow.add_node("agent", agent_node)
-        
+
         if tools:
             # LangGraph handles routing the LLM's ToolCall directly to our python functions
             tool_node = ToolNode(tools, handle_tool_errors=ToolExecutionError)
@@ -181,9 +188,61 @@ class GraphExecutor:
             workflow.add_conditional_edges("agent", tools_condition)
         else:
             workflow.add_edge("agent", END)
-            
+
         workflow.add_edge(START, "agent")
         return workflow
+
+    async def _get_model_cost_rates(self, model_name: str) -> tuple[int, int]:
+        """Fetch input/output cost rates (microdollars per million tokens) from DB.
+        Returns (input_rate, output_rate). Caches per model within a task execution."""
+        if model_name in self._cost_rate_cache:
+            return self._cost_rate_cache[model_name]
+
+        try:
+            row = await self.pool.fetchrow(
+                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE model_id = $1",
+                model_name,
+            )
+            if row is None:
+                logger.warning("Model %s not found in models table; using zero cost rates", model_name)
+                rates = (0, 0)
+            else:
+                rates = (
+                    int(row["input_microdollars_per_million"] or 0),
+                    int(row["output_microdollars_per_million"] or 0),
+                )
+        except Exception:
+            logger.warning("Failed to fetch cost rates for model %s; using zero cost rates", model_name, exc_info=True)
+            rates = (0, 0)
+
+        self._cost_rate_cache[model_name] = rates
+        return rates
+
+    @staticmethod
+    def _extract_tokens(metadata: dict) -> tuple[int, int]:
+        """Returns (input_tokens, output_tokens). Falls back to (0, 0) if not found."""
+        usage = (
+            metadata.get("usage")              # Anthropic, Google
+            or metadata.get("token_usage")     # OpenAI via LangChain
+            or metadata.get("usage_metadata")  # Bedrock
+            or {}
+        )
+        input_t = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        return (int(input_t), int(output_t))
+
+    async def _calculate_step_cost(self, response_metadata: dict, model_name: str) -> tuple[int, dict]:
+        """Extract tokens from response metadata and calculate cost in microdollars.
+        Returns (cost_microdollars, execution_metadata_dict)."""
+        input_tokens, output_tokens = self._extract_tokens(response_metadata)
+        input_rate, output_rate = await self._get_model_cost_rates(model_name)
+        cost_microdollars = (input_tokens * input_rate + output_tokens * output_rate) // 1_000_000
+        execution_metadata = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "model": model_name,
+        }
+        return (cost_microdollars, execution_metadata)
 
     async def execute_task(self, task_data: dict[str, Any], cancel_event: asyncio.Event) -> None:
         """Main entrypoint from the executor router."""
@@ -196,6 +255,36 @@ class GraphExecutor:
         worker_id = self.config.worker_id
         agent_id = task_data.get("agent_id") or "unknown"
 
+        # Reset per-task cost rate cache
+        self._cost_rate_cache = {}
+
+        # Resolve per-task Langfuse credentials
+        langfuse_credentials: dict | None = None
+        per_task_langfuse_client: Langfuse | None = None
+        langfuse_endpoint_id = task_data.get("langfuse_endpoint_id")
+        if langfuse_endpoint_id:
+            try:
+                creds = await self._resolve_langfuse_credentials(str(langfuse_endpoint_id))
+                if creds:
+                    client = Langfuse(
+                        public_key=creds["public_key"],
+                        secret_key=creds["secret_key"],
+                        host=creds["host"],
+                    )
+                    if client.auth_check():
+                        per_task_langfuse_client = client
+                        langfuse_credentials = creds
+                    else:
+                        logger.warning(
+                            "Langfuse auth check failed for task %s endpoint %s, continuing without traces",
+                            task_id, langfuse_endpoint_id,
+                        )
+            except Exception:
+                logger.warning(
+                    "Langfuse initialization failed for task %s, continuing without traces",
+                    task_id, exc_info=True,
+                )
+
         try:
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(
@@ -203,25 +292,26 @@ class GraphExecutor:
                 worker_id=worker_id,
                 tenant_id=tenant_id
             )
-            
+
             # 3. Build & Compile graph
             graph = await self._build_graph(agent_config, cancel_event=cancel_event, task_id=task_id)
             compiled_graph = graph.compile(checkpointer=checkpointer)
-            
+
             # 4. Config map
             config = self._build_runnable_config(
                 task_id=task_id,
                 tenant_id=tenant_id,
                 agent_id=agent_id,
                 max_steps=max_steps,
+                langfuse_credentials=langfuse_credentials,
             )
-            
+
             async def run_astream():
                 # For first run, inject HumanMessage based on initial input
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
                 is_first_run = not checkpoint_tuple
                 initial_input = {"messages": [HumanMessage(content=task_input)]} if is_first_run else None
-                
+
                 # Executing super-steps via astream
                 async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates"):
                     # Step 6: Cancellation Awareness
@@ -236,8 +326,54 @@ class GraphExecutor:
                 final_state = await compiled_graph.aget_state(config)
                 messages = final_state.values.get("messages", [])
                 output_content = messages[-1].content if messages else ""
-                
-                # Step 5: Completion Path
+
+                # Aggregate cost across ALL AI messages (not just the last one)
+                total_cost_microdollars = 0
+                total_input_tokens = 0
+                total_output_tokens = 0
+                last_execution_metadata: dict | None = None
+                model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
+                if messages:
+                    try:
+                        for msg in messages:
+                            metadata = getattr(msg, "response_metadata", {}) or {}
+                            if metadata and getattr(msg, "type", None) == "ai":
+                                step_cost, step_meta = await self._calculate_step_cost(metadata, model_name)
+                                total_cost_microdollars += step_cost
+                                total_input_tokens += step_meta.get("input_tokens", 0)
+                                total_output_tokens += step_meta.get("output_tokens", 0)
+                        if total_cost_microdollars > 0 or total_input_tokens > 0:
+                            last_execution_metadata = {
+                                "input_tokens": total_input_tokens,
+                                "output_tokens": total_output_tokens,
+                                "model": model_name,
+                            }
+                            await self.pool.execute(
+                                '''UPDATE checkpoints
+                                   SET cost_microdollars = $1,
+                                       execution_metadata = $2::jsonb
+                                   WHERE task_id = $3::uuid
+                                   AND created_at = (
+                                       SELECT MAX(created_at) FROM checkpoints WHERE task_id = $3::uuid
+                                   )''',
+                                total_cost_microdollars,
+                                json.dumps(last_execution_metadata),
+                                task_id,
+                            )
+                    except Exception:
+                        logger.warning("Cost calculation failed for task %s", task_id, exc_info=True)
+
+                # Step 5: Flush Langfuse traces before marking complete
+                nonlocal per_task_langfuse_client
+                langfuse_status = "skipped"
+                if per_task_langfuse_client is not None:
+                    langfuse_status = await self._flush_langfuse_with_retry(per_task_langfuse_client, task_id)
+                    per_task_langfuse_client = None  # Prevent double-flush in finally
+
+                # Step 6: Completion Path
+                output_data = {"result": output_content}
+                if langfuse_endpoint_id:
+                    output_data["langfuse_status"] = langfuse_status
                 updated = await self.pool.fetchval(
                     '''UPDATE tasks
                        SET status='completed',
@@ -251,18 +387,18 @@ class GraphExecutor:
                          AND status='running'
                          AND lease_owner=$3
                        RETURNING task_id''',
-                    json.dumps({"result": output_content}),
+                    json.dumps(output_data),
                     task_id,
                     worker_id,
                 )
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
-                    logger.info("Task %s completed successfully.", task_id)
+                    logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, total_cost_microdollars, langfuse_status)
 
             # Step 2: Wrap execution in timeout
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
-            
+
         except asyncio.TimeoutError:
             await self._handle_dead_letter(task_id, "task_timeout", "Execution exceeded task logic timeout")
         except GraphRecursionError:
@@ -278,8 +414,11 @@ class GraphExecutor:
             else:
                 await self._handle_dead_letter(task_id, "non_retryable_error", str(e), error_code="fatal_error")
         finally:
-            if self._langfuse_client is not None:
-                self._langfuse_client.flush()
+            if per_task_langfuse_client is not None:
+                try:
+                    per_task_langfuse_client.flush()
+                except Exception:
+                    logger.warning("Langfuse flush failed for task %s in finally block", task_id, exc_info=True)
 
     def _build_runnable_config(
         self,
@@ -288,6 +427,7 @@ class GraphExecutor:
         tenant_id: str,
         agent_id: str,
         max_steps: int,
+        langfuse_credentials: dict | None = None,
     ) -> dict[str, Any]:
         config: dict[str, Any] = {
             "configurable": {
@@ -296,34 +436,50 @@ class GraphExecutor:
             "recursion_limit": max_steps,
         }
 
-        if not self.config.langfuse_enabled:
+        if langfuse_credentials is None:
             return config
 
-        callback = self._build_langfuse_callback(task_id=task_id, tenant_id=tenant_id, agent_id=agent_id)
-        config["callbacks"] = [callback]
-        config["metadata"] = {
-            "langfuse_session_id": task_id,
-            "langfuse_user_id": tenant_id,
-            "task_id": task_id,
-            "agent_id": agent_id,
-            "tenant_id": tenant_id,
-        }
+        try:
+            callback = self._build_langfuse_callback(
+                public_key=langfuse_credentials["public_key"],
+            )
+            config["callbacks"] = [callback]
+            config["metadata"] = {
+                "langfuse_session_id": task_id,
+                "langfuse_user_id": tenant_id,
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "tenant_id": tenant_id,
+            }
+        except Exception:
+            logger.warning("Failed to build Langfuse callback for task %s, continuing without traces", task_id, exc_info=True)
+
         return config
 
-    def _build_langfuse_callback(self, *, task_id: str, tenant_id: str, agent_id: str) -> CallbackHandler:
-        return CallbackHandler(
-            public_key=self.config.langfuse_public_key,
-            trace_context={
-                "name": f"task:{task_id}",
-                "session_id": task_id,
-                "user_id": tenant_id,
-                "metadata": {
-                    "task_id": task_id,
-                    "agent_id": agent_id,
-                    "tenant_id": tenant_id,
-                },
-            },
-        )
+    async def _flush_langfuse_with_retry(self, client: Langfuse, task_id: str, max_retries: int = 3) -> str:
+        """Flush Langfuse client with retries. Returns 'sent' or 'failed'."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                client.flush()
+                return "sent"
+            except Exception:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Langfuse flush attempt %d/%d failed for task %s, retrying...",
+                        attempt, max_retries, task_id, exc_info=True,
+                    )
+                    await asyncio.sleep(attempt)  # Simple linear backoff: 1s, 2s
+                else:
+                    logger.warning(
+                        "Langfuse flush failed after %d attempts for task %s",
+                        max_retries, task_id, exc_info=True,
+                    )
+        return "failed"
+
+    def _build_langfuse_callback(self, *, public_key: str) -> CallbackHandler:
+        # Task metadata (task_id, agent_id, tenant_id) is propagated via LangChain
+        # config["metadata"] and automatically attached to the Langfuse trace.
+        return CallbackHandler(public_key=public_key)
 
     async def _await_or_cancel(
         self,
@@ -392,15 +548,15 @@ class GraphExecutor:
         retry_count = task_data.get("retry_count", 0)
         max_retries = task_data.get("max_retries", 3)
         worker_pool_id = self.config.worker_pool_id
-        
+
         if retry_count >= max_retries:
             await self._handle_dead_letter(task_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
             return
-            
+
         new_retry_count = retry_count + 1
         backoff_seconds = min(300, 2 ** new_retry_count)
         retry_after = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
-        
+
         worker_id = self.config.worker_id
         error_msg = str(e)[:1024]
         async with self.pool.acquire() as conn:

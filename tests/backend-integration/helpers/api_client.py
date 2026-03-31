@@ -34,7 +34,8 @@ class ApiClient:
 
         try:
             with urllib.request.urlopen(req) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
+                body = json.loads(raw) if raw else None
                 result = {"status_code": resp.status, "body": body}
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8")
@@ -67,6 +68,8 @@ class ApiClient:
         }
         if "tenant_id" in overrides:
             payload["tenant_id"] = overrides["tenant_id"]
+        if "langfuse_endpoint_id" in overrides:
+            payload["langfuse_endpoint_id"] = overrides["langfuse_endpoint_id"]
         return self._request("POST", "/tasks", payload, expected_status, raise_for_status)
 
     def get_task(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:

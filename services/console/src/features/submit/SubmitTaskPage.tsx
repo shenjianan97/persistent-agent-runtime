@@ -3,6 +3,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useSubmitTask } from './useSubmitTask';
 import { useModels } from './useModels';
+import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { submitTaskSchema, SubmitTaskFormValues, ALLOWED_TOOLS } from './schema';
 import { toast } from 'sonner';
 
@@ -50,6 +51,7 @@ export function SubmitTaskPage() {
     const navigate = useNavigate();
     const mutation = useSubmitTask();
     const { data: models = [], isLoading: isLoadingModels } = useModels();
+    const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
     const modelGroups = groupModelsByProvider(models);
 
     const form = useForm<SubmitTaskFormValues>({
@@ -321,6 +323,43 @@ export function SubmitTaskPage() {
                                     )}
                                 />
                             </div>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="console-surface border-white/10">
+                        <CardHeader className="border-b border-white/8 pb-4">
+                            <CardTitle className="text-sm font-display uppercase tracking-widest">Observability</CardTitle>
+                        </CardHeader>
+                        <CardContent className="pt-6">
+                            <FormField
+                                control={form.control}
+                                name="langfuse_endpoint_id"
+                                render={({ field }) => (
+                                    <FormItem>
+                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Langfuse Endpoint</FormLabel>
+                                        <FormControl>
+                                            <select
+                                                className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
+                                                value={field.value ?? ''}
+                                                onChange={(e) => field.onChange(e.target.value || undefined)}
+                                            >
+                                                <option value="">None</option>
+                                                {langfuseEndpoints.map((ep) => (
+                                                    <option key={ep.endpoint_id} value={ep.endpoint_id}>
+                                                        {ep.name} ({ep.host})
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </FormControl>
+                                        <FormDescription className="text-xs text-muted-foreground mt-2">
+                                            {langfuseEndpoints.length === 0
+                                                ? 'No endpoints configured \u2014 set up in Settings'
+                                                : 'Optional: send execution traces to a Langfuse instance'}
+                                        </FormDescription>
+                                        <FormMessage className="text-destructive font-bold text-xs" />
+                                    </FormItem>
+                                )}
+                            />
                         </CardContent>
                     </Card>
 

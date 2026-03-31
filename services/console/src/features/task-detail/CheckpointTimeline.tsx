@@ -1,6 +1,7 @@
 import { CheckpointEvent, CheckpointResponse } from '@/types';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertCircle, CheckCircle2, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
+import { AlertCircle, BrainCircuit, CheckCircle2, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { TaskStatus } from '@/types';
@@ -116,7 +117,7 @@ const EVENT_STYLES: Record<CheckpointEvent['type'], { label: string; chipClassNa
         chipClassName: 'border-primary/30 bg-primary/10 text-primary',
     },
     tool_call: {
-        label: 'Tool Call',
+        label: 'Model → Tool',
         chipClassName: 'border-warning/30 bg-warning/10 text-warning',
     },
     tool_result: {
@@ -124,7 +125,7 @@ const EVENT_STYLES: Record<CheckpointEvent['type'], { label: string; chipClassNa
         chipClassName: 'border-success/30 bg-success/10 text-success',
     },
     output: {
-        label: 'Output',
+        label: 'Model Response',
         chipClassName: 'border-primary/30 bg-primary/10 text-primary',
     },
 };
@@ -154,10 +155,11 @@ function getEventIcon(event?: CheckpointEvent) {
         case 'input':
             return User;
         case 'tool_call':
+            return BrainCircuit;
         case 'tool_result':
             return Wrench;
         case 'output':
-            return CheckCircle2;
+            return BrainCircuit;
         default:
             return Zap;
     }
@@ -209,15 +211,12 @@ export function CheckpointTimeline({
     }, [checkpoints.length]);
 
     return (
-        <div className="border border-border/40 bg-black/40 backdrop-blur flex flex-col h-[720px]">
-            <div className="p-4 border-b border-border/40 bg-black/60 shrink-0">
-                <h3 className="font-display text-sm uppercase tracking-widest text-primary flex items-center gap-2">
-                    <Zap className="w-4 h-4" /> Execution Timeline
-                </h3>
-                <p className="mt-2 text-xs text-muted-foreground uppercase tracking-wider">
-                    Parsed execution events from durable checkpoints.
-                </p>
-            </div>
+        <Card className="console-surface border-white/10 flex flex-col h-[480px]">
+            <CardHeader className="border-b border-white/8 shrink-0">
+                <CardTitle className="text-sm font-display uppercase tracking-widest text-muted-foreground">
+                    Execution Timeline
+                </CardTitle>
+            </CardHeader>
 
             <ScrollArea className="flex-1" ref={scrollRef}>
                 <div className="p-6">
@@ -228,7 +227,7 @@ export function CheckpointTimeline({
                             </span>
                         </div>
                     ) : (
-                        <div className="relative border-l border-border/40 ml-4 space-y-8 pl-8 pb-8">
+                        <div className="relative border-l border-border/40 ml-10 space-y-8 pl-8 pb-8">
                             {checkpoints.map((cp, idx) => {
                                 const prevWorker = idx > 0 ? checkpoints[idx - 1].worker_id : null;
                                 const isHandoff = prevWorker && prevWorker !== cp.worker_id;
@@ -272,15 +271,19 @@ export function CheckpointTimeline({
                                                     <span className={`border px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.2em] ${style.chipClassName}`}>
                                                         {style.label}
                                                     </span>
-                                                    <span className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
-                                                        {cp.node_name}
-                                                    </span>
                                                 </div>
                                                 <div className="flex items-start justify-between gap-3">
                                                     <div>
                                                         <div className="text-sm font-display uppercase tracking-wide text-foreground">
-                                                            {event?.title ?? 'Checkpoint Saved'}
+                                                            {event?.type === 'tool_call'
+                                                                ? 'Model Called'
+                                                                : (event?.title ?? 'Checkpoint Saved')}
                                                         </div>
+                                                        {event?.type === 'tool_call' && event?.tool_name && (
+                                                            <p className="mt-1 text-xs text-warning tracking-wider">
+                                                                ↳ Requested tool: <span className="font-semibold">{event.tool_name}</span>
+                                                            </p>
+                                                        )}
                                                         {showSummary && (
                                                             <p className="mt-2 text-sm leading-6 text-muted-foreground whitespace-pre-wrap break-all">
                                                                 {event?.summary}
@@ -317,7 +320,7 @@ export function CheckpointTimeline({
                                             {!!toolArgs && (
                                                 <div className="border border-warning/20 bg-warning/5">
                                                     <div className="border-b border-warning/20 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.2em] text-warning">
-                                                        Tool Arguments
+                                                        Tool Arguments Sent
                                                     </div>
                                                     <pre className="overflow-auto p-3 text-xs font-mono text-warning whitespace-pre-wrap break-all">
                                                         {toolArgs}
@@ -353,7 +356,7 @@ export function CheckpointTimeline({
                                                 </div>
                                             )}
 
-                                            <div className="grid grid-cols-3 gap-3 text-xs font-mono bg-black/50 p-3 border border-border/20">
+                                            <div className="grid grid-cols-2 gap-3 text-xs font-mono bg-black/50 p-3 border border-border/20">
                                                 <div>
                                                     <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Worker</span>
                                                     <span className="break-all opacity-80">{cp.worker_id}</span>
@@ -361,10 +364,6 @@ export function CheckpointTimeline({
                                                 <div>
                                                     <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Cost Delta</span>
                                                     <span className="text-success">+${formatUsd(cp.cost_microdollars)}</span>
-                                                </div>
-                                                <div>
-                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Node</span>
-                                                    <span className="opacity-80">{cp.node_name}</span>
                                                 </div>
                                             </div>
                                         </div>
@@ -430,6 +429,6 @@ export function CheckpointTimeline({
                     )}
                 </div>
             </ScrollArea>
-        </div>
+        </Card>
     );
 }

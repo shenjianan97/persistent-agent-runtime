@@ -64,6 +64,35 @@ class TaskControllerTest {
         }
 
         @Test
+        void submitTask_withLangfuseEndpointId_returns201() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                UUID endpointId = UUID.randomUUID();
+                OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "queued", now);
+                when(taskService.submitTask(any())).thenReturn(response);
+
+                String body = """
+                                {
+                                  "agent_id": "agent1",
+                                  "agent_config": {
+                                    "system_prompt": "You are a helper",
+                                    "provider": "anthropic",
+                                    "model": "claude-sonnet-4-6"
+                                  },
+                                  "input": "test input",
+                                  "langfuse_endpoint_id": "%s"
+                                }
+                                """.formatted(endpointId);
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andExpect(jsonPath("$.task_id").value(taskId.toString()))
+                                .andExpect(jsonPath("$.status").value("queued"));
+        }
+
+        @Test
         void submitTask_missingAgentId_returns400() throws Exception {
                 String body = """
                                 {
@@ -278,7 +307,7 @@ class TaskControllerTest {
                 TaskStatusResponse response = new TaskStatusResponse(
                                 taskId, "agent1", "running", "test input", null,
                                 0, List.of(), 5, 12500L, "worker-abc-123",
-                                null, null, null, null, null, now, now);
+                                null, null, null, null, null, now, now, null);
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId))
@@ -332,56 +361,35 @@ class TaskControllerTest {
         @Test
         void getTaskObservability_existingTask_returns200() throws Exception {
                 UUID taskId = UUID.randomUUID();
-                TaskObservabilitySpanResponse span = new TaskObservabilitySpanResponse(
-                                "obs-1",
-                                null,
-                                taskId.toString(),
-                                "agent1",
-                                null,
-                                "llm",
-                                "agent",
-                                "claude-sonnet-4-6",
-                                null,
-                                5200L,
-                                120,
-                                40,
-                                160,
-                                2300L,
-                                "prompt",
-                                "response",
-                                OffsetDateTime.parse("2026-03-27T17:00:00Z"),
-                                OffsetDateTime.parse("2026-03-27T17:00:02.300Z"));
                 TaskObservabilityItemResponse item = new TaskObservabilityItemResponse(
-                                "obs-1",
+                                "checkpoint-cp-1",
                                 null,
-                                "llm_span",
-                                "ChatAnthropic",
-                                "LLM generation completed",
-                                null,
+                                "checkpoint_persisted",
+                                "Checkpoint saved",
+                                "Saved durable progress at step 1.",
+                                1,
                                 "agent",
                                 null,
-                                "claude-sonnet-4-6",
+                                null,
                                 5200L,
                                 120,
                                 40,
                                 160,
                                 2300L,
-                                "prompt",
-                                "response",
+                                null,
+                                null,
                                 OffsetDateTime.parse("2026-03-27T17:00:00Z"),
-                                OffsetDateTime.parse("2026-03-27T17:00:02.300Z"));
+                                null);
                 TaskObservabilityResponse response = new TaskObservabilityResponse(
                                 true,
                                 taskId,
                                 "agent1",
                                 "completed",
-                                "trace-1",
                                 5200L,
                                 120,
                                 40,
                                 160,
                                 2300L,
-                                List.of(span),
                                 List.of(item));
                 when(taskService.getTaskObservability(taskId)).thenReturn(response);
 
@@ -389,11 +397,9 @@ class TaskControllerTest {
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.enabled").value(true))
                                 .andExpect(jsonPath("$.task_id").value(taskId.toString()))
-                                .andExpect(jsonPath("$.trace_id").value("trace-1"))
-                                .andExpect(jsonPath("$.items[0].item_id").value("obs-1"))
-                                .andExpect(jsonPath("$.items[0].kind").value("llm_span"))
-                                .andExpect(jsonPath("$.spans[0].span_id").value("obs-1"))
-                                .andExpect(jsonPath("$.spans[0].type").value("llm"));
+                                .andExpect(jsonPath("$.total_cost_microdollars").value(5200))
+                                .andExpect(jsonPath("$.items[0].item_id").value("checkpoint-cp-1"))
+                                .andExpect(jsonPath("$.items[0].kind").value("checkpoint_persisted"));
         }
 
         // --- POST /v1/tasks/{taskId}/cancel ---
