@@ -236,7 +236,12 @@ async def test_crud_endpoints(e2e):
     api._request(
         "PUT",
         f"/langfuse-endpoints/{endpoint_id}",
-        payload={"name": "crud-test-endpoint-updated"},
+        payload={
+            "name": "crud-test-endpoint-updated",
+            "host": LANGFUSE_HOST,
+            "public_key": LANGFUSE_PUBLIC_KEY,
+            "secret_key": LANGFUSE_SECRET_KEY,
+        },
         expected_status=200,
     )
 
