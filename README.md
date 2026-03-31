@@ -169,6 +169,14 @@ For local end-to-end validation of the `Makefile` workflow:
 
 `make start` waits for the console, API, and requested worker count to come up before reporting success.
 
+For code changes during local development, `make start` is source-based rather than build-artifact-based:
+
+- Console runs the Vite dev server, so frontend edits hot-reload without a rebuild.
+- API runs `./gradlew bootRun`, so a separate `./gradlew build` is not required before startup, but you do need to restart the API process to pick up Java code changes.
+- Worker runs `python main.py` from source, so a separate build is not required, but you do need to restart worker processes to pick up Python code changes.
+
+If services are already running, re-running `make start` does not restart them. Use `make restart` or the service-specific stop/start targets when you want local code changes to take effect for the API or worker.
+
 When validating background service management, prefer running `make start`, `make status`, and `make stop` from a real interactive terminal. Some non-interactive runners can reap child processes when the parent command exits, which makes background-service checks look misleading.
 
 ## Notes

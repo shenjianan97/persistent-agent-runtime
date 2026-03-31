@@ -269,7 +269,7 @@ start-with-observability:
 	@$(MAKE) start N=$(if $(N),$(N),$(WORKER_COUNT))
 
 stop: stop-console stop-api stop-worker
-	@echo "$(GREEN)🛑 All services stopped$(NC)"
+	@echo "$(GREEN)✅ All services stopped$(NC)"
 	@echo "$(YELLOW)ℹ️  DB container is still running. Run 'make db-down' to stop it.$(NC)"
 	@echo "$(YELLOW)ℹ️  If Langfuse is running, stop it with 'make test-langfuse-down'.$(NC)"
 
