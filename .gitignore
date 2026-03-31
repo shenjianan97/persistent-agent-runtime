@@ -109,3 +109,4 @@ infrastructure/cdk/lib/schema-bootstrap/*.js.map
 infrastructure/cdk/lib/compute/
 
 .superpowers
+.playwright-mcp/
