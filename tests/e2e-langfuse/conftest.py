@@ -3,18 +3,22 @@ Shared fixtures for Langfuse E2E tests.
 
 These tests require:
   - A running Langfuse instance (make test-langfuse-up)
-  - The full platform stack (make start)
 
-The conftest reuses the same E2EContext / infrastructure helpers from
-tests/backend-integration so we don't duplicate worker/DB startup logic.
+The conftest auto-starts the API service (via gradlew bootRun) if it is not
+already running, mirroring backend-integration/conftest.py behaviour.
 """
 
+import asyncio
 import base64
 import json
 import os
+import socket
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -60,6 +64,106 @@ API_PORT = int(os.getenv("E2E_API_PORT", "8080"))
 API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
 
 os.environ.setdefault("APP_DEV_TASK_CONTROLS_ENABLED", "true")
+
+
+# ---------------------------------------------------------------------------
+# API service auto-start helpers (mirrors backend-integration/conftest.py)
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=check, text=True, capture_output=True)
+
+
+def _is_port_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _is_api_healthy(base_url: str) -> bool:
+    try:
+        client = ApiClient(base_url)
+        payload = client.health(raise_for_status=False)
+        return payload["status_code"] == 200 and payload["body"].get("status") == "healthy"
+    except Exception:
+        return False
+
+
+def _start_api_process() -> subprocess.Popen[str]:
+    env = os.environ.copy()
+    env.update({
+        "DB_HOST": DB_HOST,
+        "DB_PORT": str(DB_PORT),
+        "DB_NAME": DB_NAME,
+        "DB_USER": DB_USER,
+        "DB_PASSWORD": DB_PASSWORD,
+        "SERVER_PORT": str(API_PORT),
+        "APP_DEV_TASK_CONTROLS_ENABLED": "true",
+        "LANGFUSE_ENABLED": "false",
+        "LANGFUSE_HOST": LANGFUSE_HOST,
+        "LANGFUSE_PUBLIC_KEY": LANGFUSE_PUBLIC_KEY,
+        "LANGFUSE_SECRET_KEY": LANGFUSE_SECRET_KEY,
+    })
+    log_file = REPO_ROOT / ".tmp" / "e2e-langfuse-api-service.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(log_file, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        ["./gradlew", "bootRun"],
+        cwd=str(REPO_ROOT / "services" / "api-service"),
+        env=env,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    process._codex_log_handle = log_handle  # type: ignore[attr-defined]
+    return process
+
+
+def _wait_for_api(base_url: str, timeout_sec: float = 120.0) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if _is_api_healthy(base_url):
+            return
+        time.sleep(1.0)
+    raise TimeoutError("API service did not become healthy in time")
+
+
+@dataclass
+class RuntimeHandles:
+    started_api: bool = False
+    api_process: subprocess.Popen[str] | None = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def runtime_environment() -> RuntimeHandles:
+    handles = RuntimeHandles()
+
+    if not _is_api_healthy(API_BASE):
+        try:
+            handles.api_process = _start_api_process()
+            handles.started_api = True
+            _wait_for_api(API_BASE)
+        except Exception as exc:
+            _cleanup_runtime(handles)
+            pytest.skip(f"Failed to start API service: {exc}")
+
+    yield handles
+    _cleanup_runtime(handles)
+
+
+def _cleanup_runtime(handles: RuntimeHandles) -> None:
+    if handles.api_process and handles.started_api:
+        process = handles.api_process
+        process.terminate()
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+        log_handle = getattr(process, "_codex_log_handle", None)
+        if log_handle:
+            log_handle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +237,8 @@ def platform_api_base() -> str:
 
 
 @pytest.fixture
-def api_client(platform_api_base: str) -> ApiClient:
+def api_client(platform_api_base: str, runtime_environment: RuntimeHandles) -> ApiClient:
+    del runtime_environment
     return ApiClient(platform_api_base)
 
 

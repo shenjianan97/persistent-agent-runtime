@@ -50,8 +50,18 @@ class LangfuseEndpointServiceTest {
 
     // --- create tests ---
 
+    @SuppressWarnings("unchecked")
+    private void stubSuccessfulConnectivity() throws Exception {
+        HttpResponse<String> mockHttpResponse = mock(HttpResponse.class);
+        when(mockHttpResponse.statusCode()).thenReturn(200);
+        when(httpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenReturn(mockHttpResponse);
+    }
+
     @Test
-    void create_success() {
+    void create_success() throws Exception {
+        stubSuccessfulConnectivity();
+
         LangfuseEndpointRequest request = new LangfuseEndpointRequest(
                 "my-langfuse", "https://langfuse.example.com", "pk-123", "sk-456");
 
@@ -73,7 +83,9 @@ class LangfuseEndpointServiceTest {
     }
 
     @Test
-    void create_duplicateName_throws409() {
+    void create_duplicateName_throws409() throws Exception {
+        stubSuccessfulConnectivity();
+
         LangfuseEndpointRequest request = new LangfuseEndpointRequest(
                 "duplicate-name", "https://langfuse.example.com", "pk-123", "sk-456");
 
