@@ -34,7 +34,8 @@ class ApiClient:
 
         try:
             with urllib.request.urlopen(req) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
+                body = json.loads(raw) if raw else None
                 result = {"status_code": resp.status, "body": body}
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8")
