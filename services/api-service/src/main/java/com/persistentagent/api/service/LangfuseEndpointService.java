@@ -80,11 +80,15 @@ public class LangfuseEndpointService {
         if (!testResult.reachable()) {
             throw new ConnectivityException(testResult.message());
         }
-        boolean updated = langfuseEndpointRepository.update(
-                endpointId, tenantId, request.name(), request.host(),
-                request.publicKey(), request.secretKey());
-        if (!updated) {
-            throw new NotFoundException("Langfuse endpoint not found: " + endpointId);
+        try {
+            boolean updated = langfuseEndpointRepository.update(
+                    endpointId, tenantId, request.name(), request.host(),
+                    request.publicKey(), request.secretKey());
+            if (!updated) {
+                throw new NotFoundException("Langfuse endpoint not found: " + endpointId);
+            }
+        } catch (org.springframework.dao.DuplicateKeyException e) {
+            throw new ConflictException("A Langfuse endpoint with this name already exists for the tenant");
         }
         // Re-fetch to get updated_at
         return langfuseEndpointRepository.findByIdAndTenant(endpointId, tenantId)

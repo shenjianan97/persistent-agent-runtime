@@ -327,19 +327,27 @@ class GraphExecutor:
                 messages = final_state.values.get("messages", [])
                 output_content = messages[-1].content if messages else ""
 
-                # Extract cost from the last AI message metadata if available
+                # Aggregate cost across ALL AI messages (not just the last one)
                 total_cost_microdollars = 0
+                total_input_tokens = 0
+                total_output_tokens = 0
                 last_execution_metadata: dict | None = None
                 model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
                 if messages:
-                    last_msg = messages[-1]
-                    response_metadata = getattr(last_msg, "response_metadata", {}) or {}
-                    if response_metadata:
-                        try:
-                            cost, exec_meta = await self._calculate_step_cost(response_metadata, model_name)
-                            total_cost_microdollars = cost
-                            last_execution_metadata = exec_meta
-                            # Write cost to the latest checkpoint row
+                    try:
+                        for msg in messages:
+                            metadata = getattr(msg, "response_metadata", {}) or {}
+                            if metadata and getattr(msg, "type", None) == "ai":
+                                step_cost, step_meta = await self._calculate_step_cost(metadata, model_name)
+                                total_cost_microdollars += step_cost
+                                total_input_tokens += step_meta.get("input_tokens", 0)
+                                total_output_tokens += step_meta.get("output_tokens", 0)
+                        if total_cost_microdollars > 0 or total_input_tokens > 0:
+                            last_execution_metadata = {
+                                "input_tokens": total_input_tokens,
+                                "output_tokens": total_output_tokens,
+                                "model": model_name,
+                            }
                             await self.pool.execute(
                                 '''UPDATE checkpoints
                                    SET cost_microdollars = $1,
@@ -348,12 +356,12 @@ class GraphExecutor:
                                    AND created_at = (
                                        SELECT MAX(created_at) FROM checkpoints WHERE task_id = $3::uuid
                                    )''',
-                                cost,
-                                json.dumps(exec_meta),
+                                total_cost_microdollars,
+                                json.dumps(last_execution_metadata),
                                 task_id,
                             )
-                        except Exception:
-                            logger.warning("Cost calculation failed for task %s", task_id, exc_info=True)
+                    except Exception:
+                        logger.warning("Cost calculation failed for task %s", task_id, exc_info=True)
 
                 # Step 5: Flush Langfuse traces before marking complete
                 nonlocal per_task_langfuse_client

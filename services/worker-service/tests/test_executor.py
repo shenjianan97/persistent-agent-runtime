@@ -175,6 +175,7 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
             mock_compiled.astream = mock_astream
 
             mock_msg = MagicMock()
+            mock_msg.type = "ai"
             mock_msg.content = "Final Answer: 4"
             mock_msg.response_metadata = {
                 "usage": {"input_tokens": 100, "output_tokens": 50},
