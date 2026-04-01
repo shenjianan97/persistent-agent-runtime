@@ -25,7 +25,8 @@ async def test_3_26_zombie_checkpointer_protection(e2e):
     e2e.use_llm(mock_llm)
     await e2e.start_worker("e2e-lease-safety")
 
-    task_id = e2e.submit_task(allowed_tools=["calculator"], input="lease revoke")
+    e2e.ensure_agent()
+    task_id = e2e.submit_task(input="lease revoke")
 
     async def _first_checkpoint_written() -> bool:
         return (await e2e.db.checkpoint_count(task_id)) >= 1

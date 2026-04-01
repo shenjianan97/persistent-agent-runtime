@@ -12,6 +12,10 @@ import {
     LangfuseEndpoint,
     LangfuseEndpointRequest,
     LangfuseEndpointTestResponse,
+    AgentSummaryResponse,
+    AgentResponse,
+    AgentCreateRequest,
+    AgentUpdateRequest,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -57,31 +61,18 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-    submitTask: (request: TaskSubmissionRequest) => {
-        // Map flat frontend form shape to Java backend nested shape
-        const payload: Record<string, unknown> = {
-            agent_id: request.agent_id,
-            input: request.input,
-            max_steps: request.max_steps,
-            max_retries: request.max_retries,
-            task_timeout_seconds: request.task_timeout_seconds,
-            agent_config: {
-                system_prompt: request.system_prompt,
-                provider: request.provider,
-                model: request.model,
-                temperature: request.temperature,
-                allowed_tools: request.allowed_tools
-            }
-        };
-        if (request.langfuse_endpoint_id) {
-            payload.langfuse_endpoint_id = request.langfuse_endpoint_id;
-        }
-
-        return fetchApi<TaskSubmissionResponse>('/v1/tasks', {
+    submitTask: (request: TaskSubmissionRequest) =>
+        fetchApi<TaskSubmissionResponse>('/v1/tasks', {
             method: 'POST',
-            body: JSON.stringify(payload),
-        });
-    },
+            body: JSON.stringify({
+                agent_id: request.agent_id,
+                input: request.input,
+                max_steps: request.max_steps,
+                max_retries: request.max_retries,
+                task_timeout_seconds: request.task_timeout_seconds,
+                langfuse_endpoint_id: request.langfuse_endpoint_id,
+            }),
+        }),
 
     listTasks: (status?: string, agentId?: string, limit?: number) => {
         const params = new URLSearchParams();
@@ -149,5 +140,29 @@ export const api = {
     testLangfuseEndpoint: (endpointId: string) =>
         fetchApi<LangfuseEndpointTestResponse>(`/v1/langfuse-endpoints/${endpointId}/test`, {
             method: 'POST',
+        }),
+
+    // Agents
+    createAgent: (request: AgentCreateRequest) =>
+        fetchApi<AgentResponse>('/v1/agents', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        }),
+
+    listAgents: (status?: string, limit?: number) => {
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        if (limit) params.set('limit', limit.toString());
+        const query = params.toString();
+        return fetchApi<AgentSummaryResponse[]>(`/v1/agents${query ? '?' + query : ''}`);
+    },
+
+    getAgent: (agentId: string) =>
+        fetchApi<AgentResponse>(`/v1/agents/${encodeURIComponent(agentId)}`),
+
+    updateAgent: (agentId: string, request: AgentUpdateRequest) =>
+        fetchApi<AgentResponse>(`/v1/agents/${encodeURIComponent(agentId)}`, {
+            method: 'PUT',
+            body: JSON.stringify(request),
         }),
 };

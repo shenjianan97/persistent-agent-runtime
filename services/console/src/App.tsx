@@ -7,6 +7,8 @@ import { TaskDetailPage } from './features/task-detail/TaskDetailPage';
 import { TaskListPage } from './features/task-list/TaskListPage';
 import { DeadLetterPage } from './features/dead-letter/DeadLetterPage';
 import { SettingsPage } from './features/settings/SettingsPage';
+import { AgentsListPage } from './features/agents/AgentsListPage';
+import { AgentDetailPage } from './features/agents/AgentDetailPage';
 import { Toaster } from 'sonner';
 
 const queryClient = new QueryClient({
@@ -28,6 +30,8 @@ function App() {
                         <Route path="/tasks" element={<TaskListPage />} />
                         <Route path="/tasks/new" element={<SubmitTaskPage />} />
                         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+                        <Route path="/agents" element={<AgentsListPage />} />
+                        <Route path="/agents/:agentId" element={<AgentDetailPage />} />
                         <Route path="/dead-letter" element={<DeadLetterPage />} />
                         <Route path="/settings" element={<SettingsPage />} />
                         <Route path="*" element={<Navigate to="/" replace />} />

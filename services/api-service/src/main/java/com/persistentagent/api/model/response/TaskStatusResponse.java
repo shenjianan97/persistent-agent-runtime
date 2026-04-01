@@ -9,6 +9,7 @@ import java.util.UUID;
 public record TaskStatusResponse(
         @JsonProperty("task_id") UUID taskId,
         @JsonProperty("agent_id") String agentId,
+        @JsonProperty("agent_display_name") String agentDisplayName,
         String status,
         String input,
         Object output,

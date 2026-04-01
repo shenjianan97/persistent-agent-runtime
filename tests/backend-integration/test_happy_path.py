@@ -9,10 +9,8 @@ async def test_3_1_happy_path_submit_execute_complete(e2e):
     e2e.use_llm(calculator_tool_call(expression="5*5", final_answer="The result is 25"))
     await e2e.start_worker("e2e-happy-worker")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(
-        agent_id="e2e_agent",
-        model="claude-sonnet-4-6",
-        allowed_tools=["calculator"],
         input="What is 5*5?",
     )
 
@@ -38,7 +36,14 @@ async def test_3_2_simple_completion_no_tools(e2e):
     e2e.use_llm(simple_response("Hello there!"))
     await e2e.start_worker("e2e-simple-worker")
 
-    task_id = e2e.submit_task(allowed_tools=[], input="Say hello")
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": []
+    })
+    task_id = e2e.submit_task(input="Say hello")
     completed = await e2e.wait_for_status(task_id, "completed", timeout=20.0)
 
     assert completed["output"]["result"] == "Hello there!"

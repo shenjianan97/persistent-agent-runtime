@@ -9,6 +9,7 @@ async def test_3_5_worker_crash_lease_expiry_recovery(e2e):
     e2e.use_llm(slow_response(delay=3.0, content="recovered after reclaim"))
     await e2e.start_worker("e2e-recovery-worker")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="recover me")
 
     async def _running() -> bool:
@@ -38,6 +39,7 @@ async def test_3_6_retryable_error_with_backoff(e2e):
     e2e.use_llm(retryable_then_success("503 Service Unavailable", "recovered"))
     await e2e.start_worker("e2e-retry-worker")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(max_retries=3, input="transient failure")
 
     async def _failed_once() -> bool:
@@ -61,6 +63,7 @@ async def test_3_7_retries_exhausted_dead_letter(e2e):
     e2e.use_llm(always_fails("503 Service Unavailable"))
     await e2e.start_worker("e2e-retries-exhausted")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(max_retries=1, input="always fail 503")
     dead = await e2e.wait_for_status(task_id, "dead_letter", timeout=25.0)
 

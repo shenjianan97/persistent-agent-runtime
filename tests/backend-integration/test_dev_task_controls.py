@@ -9,7 +9,14 @@ async def test_dev_expire_lease_recovers_with_preserved_checkpoints(e2e):
     e2e.use_llm(slow_response(delay=8.0, content="recovered after dev lease expiry"))
     worker_a = await e2e.start_worker("e2e-dev-crash-a")
 
-    task_id = e2e.submit_task(allowed_tools=[], input="recover through dev task controls")
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": []
+    })
+    task_id = e2e.submit_task(input="recover through dev task controls")
 
     async def _checkpointed() -> bool:
         row = await e2e.db.fetch_task_columns(task_id, "status")
@@ -45,7 +52,14 @@ async def test_dev_force_dead_letter_redrive_preserves_checkpoints(e2e):
     e2e.use_llm(slow_response(delay=8.0, content="should not complete before redrive"))
     await e2e.start_worker("e2e-dev-redrive")
 
-    task_id = e2e.submit_task(allowed_tools=[], input="force dead letter after checkpoints")
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": []
+    })
+    task_id = e2e.submit_task(input="force dead letter after checkpoints")
 
     async def _checkpointed() -> bool:
         row = await e2e.db.fetch_task_columns(task_id, "status")
@@ -87,8 +101,14 @@ async def test_dev_sleep_tool_supports_short_timeout_testing(e2e):
     e2e.use_llm(dev_sleep_tool_call(seconds=3, final_answer="this should never be reached"))
     await e2e.start_worker("e2e-dev-sleep-timeout")
 
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": ["dev_sleep"]
+    })
     task_id = e2e.submit_task(
-        allowed_tools=["dev_sleep"],
         task_timeout_seconds=1,
         input="Call dev_sleep for 3 seconds, then answer.",
     )

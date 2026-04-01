@@ -8,6 +8,7 @@ import java.util.UUID;
 public record DeadLetterItemResponse(
         @JsonProperty("task_id") UUID taskId,
         @JsonProperty("agent_id") String agentId,
+        @JsonProperty("agent_display_name") String agentDisplayName,
         @JsonProperty("dead_letter_reason") String deadLetterReason,
         @JsonProperty("last_error_code") String lastErrorCode,
         @JsonProperty("last_error_message") String lastErrorMessage,

@@ -4,7 +4,7 @@ BEGIN;
 
 DO $$
 DECLARE
-    expected_tables TEXT[] := ARRAY['tasks', 'checkpoints', 'checkpoint_writes'];
+    expected_tables TEXT[] := ARRAY['tasks', 'checkpoints', 'checkpoint_writes', 'agents'];
     expected_indexes TEXT[] := ARRAY[
         'idx_tasks_claim',
         'idx_tasks_lease_expiry',
@@ -12,7 +12,8 @@ DECLARE
         'idx_tasks_tenant_agent',
         'idx_tasks_dead_letter',
         'idx_checkpoints_task_ts',
-        'idx_checkpoints_task_created'
+        'idx_checkpoints_task_created',
+        'idx_agents_tenant_status'
     ];
     item TEXT;
 BEGIN
@@ -61,6 +62,12 @@ BEGIN
         RAISE EXCEPTION 'missing tasks_dead_letter_reason_check';
     END IF;
 END $$;
+
+-- Insert test agent so FK constraint on tasks is satisfied
+INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+VALUES ('default', 'agent-1', 'Verification Agent',
+        '{"system_prompt":"test","provider":"anthropic","model":"claude","temperature":0.5,"allowed_tools":["web_search"]}'::jsonb,
+        'active');
 
 INSERT INTO tasks (task_id, tenant_id, agent_id, agent_config_snapshot, input)
 VALUES
@@ -526,6 +533,55 @@ BEGIN
         WHEN not_null_violation THEN NULL;
     END;
 
+END $$;
+
+-- Verify FK enforcement: task insert with unknown agent_id must fail
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO tasks (task_id, tenant_id, agent_id, agent_config_snapshot, input)
+        VALUES (
+            '00000000-0000-0000-0000-000000000010',
+            'default',
+            'nonexistent-agent',
+            '{"model":"claude"}',
+            'fk-violation-test'
+        );
+        RAISE EXCEPTION 'FK violation insert unexpectedly succeeded';
+    EXCEPTION
+        WHEN foreign_key_violation THEN NULL;
+    END;
+END $$;
+
+-- Verify agents CHECK constraints
+DO $$
+BEGIN
+    -- Invalid status value
+    BEGIN
+        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+        VALUES ('default', 'bad-status-agent', 'Bad', '{"model":"test"}'::jsonb, 'paused');
+        RAISE EXCEPTION 'invalid agent status insert unexpectedly succeeded';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- display_name exceeding 200 chars
+    BEGIN
+        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+        VALUES ('default', 'long-name-agent', repeat('x', 201), '{"model":"test"}'::jsonb, 'active');
+        RAISE EXCEPTION 'oversized display_name insert unexpectedly succeeded';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+
+    -- agent_id exceeding 64 chars
+    BEGIN
+        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+        VALUES ('default', repeat('a', 65), 'Long ID Agent', '{"model":"test"}'::jsonb, 'active');
+        RAISE EXCEPTION 'oversized agent_id insert unexpectedly succeeded';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
 END $$;
 
 ROLLBACK;

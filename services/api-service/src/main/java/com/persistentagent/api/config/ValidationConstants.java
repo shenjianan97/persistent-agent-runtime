@@ -53,4 +53,16 @@ public final class ValidationConstants {
     public static final Set<String> VALID_TASK_STATUSES = Set.of(
             "queued", "running", "completed", "dead_letter"
     );
+
+    // Agent listing defaults
+    public static final int DEFAULT_AGENT_LIST_LIMIT = 50;
+    public static final int MAX_AGENT_LIST_LIMIT = 200;
+
+    /** Agent status constants. */
+    public static final String AGENT_STATUS_ACTIVE = "active";
+    public static final String AGENT_STATUS_DISABLED = "disabled";
+
+    /** Valid agent statuses. */
+    public static final Set<String> VALID_AGENT_STATUSES = Set.of(AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED);
+
 }

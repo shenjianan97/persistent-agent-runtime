@@ -28,11 +28,36 @@ async def integration_pool():
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")
+        await conn.execute("DELETE FROM agents")
 
     try:
         yield pool
     finally:
         await pool.close()
+
+
+async def _ensure_agent(
+    pool: asyncpg.Pool,
+    *,
+    tenant_id: str = "default",
+    agent_id: str = "agent",
+) -> None:
+    """Insert agent row if it doesn't exist (FK compliance)."""
+    agent_config = json.dumps({
+        "system_prompt": "You are a test assistant.",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.1,
+        "allowed_tools": ["web_search"],
+    })
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+            VALUES ($1, $2, 'Test Agent', $3::jsonb, 'active')
+            ON CONFLICT (tenant_id, agent_id) DO NOTHING
+            """,
+            tenant_id, agent_id, agent_config,
+        )
 
 
 async def _insert_task(
@@ -45,6 +70,7 @@ async def _insert_task(
     version: int = 1,
     dead_letter_reason: str | None = None,
 ) -> None:
+    await _ensure_agent(pool, tenant_id=tenant_id)
     agent_config = {
         "system_prompt": "You are a test assistant.",
         "model": "claude-sonnet-4-6",

@@ -3,12 +3,13 @@ package com.persistentagent.api.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
-import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
@@ -37,6 +38,9 @@ class TaskServiceTest {
     private TaskRepository taskRepository;
 
     @Mock
+    private AgentRepository agentRepository;
+
+    @Mock
     private ModelRepository modelRepository;
 
     @Mock
@@ -44,6 +48,9 @@ class TaskServiceTest {
 
     @Mock
     private TaskObservabilityService taskObservabilityService;
+
+    @Mock
+    private ConfigValidationHelper configValidationHelper;
 
     private TaskService taskService;
     private ObjectMapper objectMapper;
@@ -55,11 +62,13 @@ class TaskServiceTest {
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
         taskService = new TaskService(
                 taskRepository,
+                agentRepository,
                 modelRepository,
                 langfuseEndpointRepository,
                 taskObservabilityService,
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
+                configValidationHelper,
                 false
         );
     }
@@ -68,23 +77,25 @@ class TaskServiceTest {
 
     @Test
     void submitTask_validRequest_returnsCreated() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of("web_search"));
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "do something", 3, 100, 3600, null);
+                null, "agent1", "do something", 3, 100, 3600, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
-        Map<String, Object> inserted = Map.of("task_id", taskId, "created_at", now);
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
-        when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), isNull())).thenReturn(inserted);
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
+                eq("do something"), eq(3), eq(100), eq(3600), isNull()))
+                .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
         assertNotNull(response);
         assertEquals(taskId, response.taskId());
         assertEquals("agent1", response.agentId());
+        assertEquals("Agent One", response.agentDisplayName());
         assertEquals("queued", response.status());
         assertNotNull(response.createdAt());
     }
@@ -92,20 +103,22 @@ class TaskServiceTest {
     @Test
     void submitTask_withValidLangfuseEndpointId_succeeds() {
         UUID endpointId = UUID.randomUUID();
-        AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+                null, "agent1", "do something", 3, 100, 3600, endpointId);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> endpointRow = Map.of("endpoint_id", endpointId);
         when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
                 .thenReturn(Optional.of(endpointRow));
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
-        when(taskRepository.insertTask(anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), eq(endpointId)))
-                .thenReturn(Map.of("task_id", taskId, "created_at", now));
+
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
+                eq("do something"), eq(3), eq(100), eq(3600), eq(endpointId)))
+                .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
@@ -116,12 +129,9 @@ class TaskServiceTest {
     @Test
     void submitTask_withInvalidLangfuseEndpointId_throwsValidation() {
         UUID endpointId = UUID.randomUUID();
-        AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helper", "anthropic", "claude-sonnet-4-6", 0.7, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "do something", 3, 100, 3600, endpointId);
+                null, "agent1", "do something", 3, 100, 3600, endpointId);
 
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
         when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
                 .thenReturn(Optional.empty());
 
@@ -129,68 +139,81 @@ class TaskServiceTest {
     }
 
     @Test
-    void submitTask_unsupportedModel_throwsValidation() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "anthropic", "unsupported-model", 0.5, List.of());
+    void submitTask_agentNotFound_throwsAgentNotFoundException() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null, null);
+                null, "agent-unknown", "input", null, null, null, null);
 
-        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+        when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-unknown"), anyString(),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                .thenReturn(Optional.empty());
+        when(agentRepository.findByIdAndTenant("default", "agent-unknown"))
+                .thenReturn(Optional.empty());
+
+        assertThrows(AgentNotFoundException.class, () -> taskService.submitTask(request));
     }
 
     @Test
-    void submitTask_unsupportedTool_throwsValidation() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("web_search", "hack_tool"));
+    void submitTask_disabledAgent_throwsValidation() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null, null);
+                null, "agent-disabled", "input", null, null, null, null);
 
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-disabled"), anyString(),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                .thenReturn(Optional.empty());
+        Map<String, Object> agentRow = new LinkedHashMap<>();
+        agentRow.put("agent_id", "agent-disabled");
+        agentRow.put("status", "disabled");
+        when(agentRepository.findByIdAndTenant("default", "agent-disabled"))
+                .thenReturn(Optional.of(agentRow));
 
-        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+        ValidationException ex = assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().contains("disabled"));
     }
 
     @Test
-    void submitTask_devOnlyToolRejectedWhenDevTaskControlsDisabled() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of("dev_sleep"));
+    void submitTask_modelDeactivated_throwsValidation() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null, null);
+                null, "agent1", "input", null, null, null, null);
 
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+        when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                .thenReturn(Optional.empty());
+        Map<String, Object> agentRow = new LinkedHashMap<>();
+        agentRow.put("agent_id", "agent1");
+        agentRow.put("status", "active");
+        when(agentRepository.findByIdAndTenant("default", "agent1"))
+                .thenReturn(Optional.of(agentRow));
 
-        assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+        ValidationException ex = assertThrows(ValidationException.class, () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().contains("model is no longer active"));
     }
 
     @Test
     void submitTask_shortTimeoutRejectedWhenDevTaskControlsDisabled() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "anthropic", "claude-sonnet-4-6", 0.5, List.of());
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, 30, null);
-
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
+                null, "agent1", "input", null, null, 30, null);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
 
     @Test
     void submitTask_defaultValues_usedWhenNull() {
-        AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", null, null);
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", config, "input", null, null, null, null);
+                null, "agent1", "input", null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
-        when(modelRepository.isModelActive(anyString(), anyString())).thenReturn(true);
-        when(taskRepository.insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
                 eq("input"), eq(3), eq(100), eq(3600), isNull()))
-                .thenReturn(Map.of("task_id", taskId, "created_at", now));
+                .thenReturn(Optional.of(inserted));
 
         taskService.submitTask(request);
 
-        verify(taskRepository).insertTask(eq("default"), eq("agent1"), anyString(), eq("shared"),
+        verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
                 eq("input"), eq(3), eq(100), eq(3600), isNull());
     }
 
@@ -203,6 +226,7 @@ class TaskServiceTest {
         Map<String, Object> taskRow = new LinkedHashMap<>();
         taskRow.put("task_id", taskId);
         taskRow.put("agent_id", "agent1");
+        taskRow.put("agent_display_name_snapshot", "Agent One");
         taskRow.put("status", "queued");
         taskRow.put("input", "test input");
         taskRow.put("output", null);
@@ -228,6 +252,7 @@ class TaskServiceTest {
 
         assertEquals(taskId, response.taskId());
         assertEquals("agent1", response.agentId());
+        assertEquals("Agent One", response.agentDisplayName());
         assertEquals("queued", response.status());
         assertEquals(3, response.checkpointCount());
         assertEquals(5000L, response.totalCostMicrodollars());
@@ -240,6 +265,7 @@ class TaskServiceTest {
         Map<String, Object> taskRow = new LinkedHashMap<>();
         taskRow.put("task_id", taskId);
         taskRow.put("agent_id", "agent1");
+        taskRow.put("agent_display_name_snapshot", "Agent One");
         taskRow.put("status", "dead_letter");
         taskRow.put("input", "test input");
         taskRow.put("output", "{\"result\":\"done\"}");
@@ -268,6 +294,7 @@ class TaskServiceTest {
         assertTrue(response.enabled());
         assertEquals(taskId, response.taskId());
         assertEquals("agent1", response.agentId());
+        assertEquals("Agent One", response.agentDisplayName());
         assertEquals("dead_letter", response.status());
         assertEquals(5200L, response.totalCostMicrodollars());
         assertEquals(120, response.inputTokens());
@@ -367,16 +394,17 @@ class TaskServiceTest {
     void listDeadLetterTasks_withAgentFilter_returnsFilteredList() {
         Timestamp now = Timestamp.from(Instant.now());
         UUID taskId = UUID.randomUUID();
-        List<Map<String, Object>> rows = List.of(Map.of(
-                "task_id", taskId,
-                "agent_id", "agent1",
-                "dead_letter_reason", "non_retryable_error",
-                "last_error_code", "tool_args_invalid",
-                "last_error_message", "validation failed",
-                "retry_count", 1,
-                "last_worker_id", "worker-1",
-                "dead_lettered_at", now));
-        when(taskRepository.listDeadLetterTasks("default", "agent1", 50)).thenReturn(rows);
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("task_id", taskId);
+        row.put("agent_id", "agent1");
+        row.put("agent_display_name_snapshot", "Agent One");
+        row.put("dead_letter_reason", "non_retryable_error");
+        row.put("last_error_code", "tool_args_invalid");
+        row.put("last_error_message", "validation failed");
+        row.put("retry_count", 1);
+        row.put("last_worker_id", "worker-1");
+        row.put("dead_lettered_at", now);
+        when(taskRepository.listDeadLetterTasks("default", "agent1", 50)).thenReturn(List.of(row));
 
         DeadLetterListResponse response = taskService.listDeadLetterTasks("agent1", null);
 
@@ -579,17 +607,18 @@ class TaskServiceTest {
     void listTasks_usesCheapFallbackCostWithoutObservabilityFanout() {
         Timestamp now = Timestamp.from(Instant.now());
         UUID taskId = UUID.randomUUID();
-        List<Map<String, Object>> rows = List.of(Map.of(
-                "task_id", taskId,
-                "agent_id", "agent1",
-                "status", "completed",
-                "retry_count", 0,
-                "checkpoint_count", 2L,
-                "created_at", now,
-                "updated_at", now
-        ));
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("task_id", taskId);
+        row.put("agent_id", "agent1");
+        row.put("agent_display_name_snapshot", "Agent One");
+        row.put("status", "completed");
+        row.put("retry_count", 0);
+        row.put("checkpoint_count", 2L);
+        row.put("total_cost_microdollars", 0L);
+        row.put("created_at", now);
+        row.put("updated_at", now);
 
-        when(taskRepository.listTasks("default", null, null, 50)).thenReturn(rows);
+        when(taskRepository.listTasks("default", null, null, 50)).thenReturn(List.of(row));
 
         TaskListResponse response = taskService.listTasks(null, null, null);
 

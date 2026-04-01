@@ -1,5 +1,6 @@
 package com.persistentagent.api.controller;
 
+import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
@@ -37,19 +38,12 @@ class TaskControllerTest {
         void submitTask_validRequest_returns201() throws Exception {
                 UUID taskId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "queued", now);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now);
                 when(taskService.submitTask(any())).thenReturn(response);
 
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "You are a helper",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6",
-                                    "temperature": 0.7,
-                                    "allowed_tools": ["web_search"]
-                                  },
                                   "input": "test input"
                                 }
                                 """;
@@ -60,6 +54,7 @@ class TaskControllerTest {
                                 .andExpect(status().isCreated())
                                 .andExpect(jsonPath("$.task_id").value(taskId.toString()))
                                 .andExpect(jsonPath("$.agent_id").value("agent1"))
+                                .andExpect(jsonPath("$.agent_display_name").value("Agent One"))
                                 .andExpect(jsonPath("$.status").value("queued"));
         }
 
@@ -68,17 +63,12 @@ class TaskControllerTest {
                 UUID taskId = UUID.randomUUID();
                 UUID endpointId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "queued", now);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now);
                 when(taskService.submitTask(any())).thenReturn(response);
 
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "You are a helper",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  },
                                   "input": "test input",
                                   "langfuse_endpoint_id": "%s"
                                 }
@@ -96,11 +86,6 @@ class TaskControllerTest {
         void submitTask_missingAgentId_returns400() throws Exception {
                 String body = """
                                 {
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  },
                                   "input": "test"
                                 }
                                 """;
@@ -115,12 +100,7 @@ class TaskControllerTest {
         void submitTask_missingInput_returns400() throws Exception {
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  }
+                                  "agent_id": "agent1"
                                 }
                                 """;
 
@@ -131,54 +111,32 @@ class TaskControllerTest {
         }
 
         @Test
-        void submitTask_missingSystemPrompt_returns400() throws Exception {
-                String body = """
-                                {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "model": "claude-sonnet-4-6"
-                                  },
-                                  "input": "test"
-                                }
-                                """;
-
-                mockMvc.perform(post("/v1/tasks")
-                                .contentType(MediaType.APPLICATION_JSON_VALUE)
-                                .content(body))
-                                .andExpect(status().isBadRequest());
-        }
-
-        @Test
-        void submitTask_missingModel_returns400() throws Exception {
-                String body = """
-                                {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt"
-                                  },
-                                  "input": "test"
-                                }
-                                """;
-
-                mockMvc.perform(post("/v1/tasks")
-                                .contentType(MediaType.APPLICATION_JSON_VALUE)
-                                .content(body))
-                                .andExpect(status().isBadRequest());
-        }
-
-        @Test
-        void submitTask_unsupportedModel_returns400() throws Exception {
+        void submitTask_agentNotFound_returns404() throws Exception {
                 when(taskService.submitTask(any()))
-                                .thenThrow(new ValidationException("Unsupported model: bad-model"));
+                                .thenThrow(new AgentNotFoundException("agent-unknown"));
 
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "bad-model"
-                                  },
+                                  "agent_id": "agent-unknown",
+                                  "input": "test"
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isNotFound())
+                                .andExpect(jsonPath("$.message").exists());
+        }
+
+        @Test
+        void submitTask_disabledAgent_returns400() throws Exception {
+                when(taskService.submitTask(any()))
+                                .thenThrow(new ValidationException("Agent is disabled and cannot be used for task submission: agent-disabled"));
+
+                String body = """
+                                {
+                                  "agent_id": "agent-disabled",
                                   "input": "test"
                                 }
                                 """;
@@ -191,19 +149,13 @@ class TaskControllerTest {
         }
 
         @Test
-        void submitTask_unsupportedTool_returns400() throws Exception {
+        void submitTask_modelDeactivated_returns400() throws Exception {
                 when(taskService.submitTask(any()))
-                                .thenThrow(new ValidationException("Unsupported tool: hack_tool"));
+                                .thenThrow(new ValidationException("Agent's model is no longer active. Update the agent's model before submitting tasks: agent1"));
 
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6",
-                                    "allowed_tools": ["web_search", "hack_tool"]
-                                  },
                                   "input": "test"
                                 }
                                 """;
@@ -211,28 +163,8 @@ class TaskControllerTest {
                 mockMvc.perform(post("/v1/tasks")
                                 .contentType(MediaType.APPLICATION_JSON_VALUE)
                                 .content(body))
-                                .andExpect(status().isBadRequest());
-        }
-
-        @Test
-        void submitTask_temperatureTooHigh_returns400() throws Exception {
-                String body = """
-                                {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6",
-                                    "temperature": 3.0
-                                  },
-                                  "input": "test"
-                                }
-                                """;
-
-                mockMvc.perform(post("/v1/tasks")
-                                .contentType(MediaType.APPLICATION_JSON_VALUE)
-                                .content(body))
-                                .andExpect(status().isBadRequest());
+                                .andExpect(status().isBadRequest())
+                                .andExpect(jsonPath("$.message").exists());
         }
 
         @Test
@@ -240,11 +172,6 @@ class TaskControllerTest {
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  },
                                   "input": "test",
                                   "max_retries": 15
                                 }
@@ -261,11 +188,6 @@ class TaskControllerTest {
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  },
                                   "input": "test",
                                   "max_steps": 0
                                 }
@@ -282,11 +204,6 @@ class TaskControllerTest {
                 String body = """
                                 {
                                   "agent_id": "agent1",
-                                  "agent_config": {
-                                    "system_prompt": "prompt",
-                                    "provider": "anthropic",
-                                    "model": "claude-sonnet-4-6"
-                                  },
                                   "input": "test",
                                   "task_timeout_seconds": 0
                                 }
@@ -305,7 +222,7 @@ class TaskControllerTest {
                 UUID taskId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
                 TaskStatusResponse response = new TaskStatusResponse(
-                                taskId, "agent1", "running", "test input", null,
+                                taskId, "agent1", "Agent One", "running", "test input", null,
                                 0, List.of(), 5, 12500L, "worker-abc-123",
                                 null, null, null, null, null, now, now, null);
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
@@ -384,6 +301,7 @@ class TaskControllerTest {
                                 true,
                                 taskId,
                                 "agent1",
+                                "Agent One",
                                 "completed",
                                 5200L,
                                 120,
@@ -433,7 +351,7 @@ class TaskControllerTest {
                 UUID taskId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
                 DeadLetterListResponse response = new DeadLetterListResponse(List.of(
-                                new DeadLetterItemResponse(taskId, "agent1", "non_retryable_error",
+                                new DeadLetterItemResponse(taskId, "agent1", "Agent One", "non_retryable_error",
                                                 "tool_args_invalid", "validation failed", 1, "worker-1", now)));
                 when(taskService.listDeadLetterTasks(eq("agent1"), eq(50))).thenReturn(response);
 

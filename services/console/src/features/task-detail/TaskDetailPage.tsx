@@ -1,4 +1,4 @@
-import { useNavigate, useParams } from 'react-router';
+import { useNavigate, useParams, Link } from 'react-router';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
 import { useTaskObservability } from './useTaskObservability';
 import { useCheckpoints } from './useCheckpoints';
@@ -107,7 +107,7 @@ export function TaskDetailPage() {
                         <TaskStatusBadge status={task.status} />
                     </div>
                     <div className="flex flex-wrap gap-4 text-xs font-mono text-muted-foreground uppercase tracking-[0.18em]">
-                        <span>Agent: <span className="text-foreground">{task.agent_id}</span></span>
+                        <span>Agent: <Link to={`/agents/${encodeURIComponent(task.agent_id)}`} className="text-foreground hover:text-primary hover:underline underline-offset-4 decoration-primary/50 transition-colors">{task.agent_display_name ? `${task.agent_display_name} (${task.agent_id})` : task.agent_id}</Link></span>
                         <span>Retries: <span className="text-foreground">{task.retry_count}</span></span>
                         <span>Created: {new Date(task.created_at).toLocaleString()}</span>
                     </div>

@@ -14,6 +14,31 @@ class DbHelper:
             await conn.execute("DELETE FROM checkpoint_writes")
             await conn.execute("DELETE FROM checkpoints")
             await conn.execute("DELETE FROM tasks")
+            await conn.execute("DELETE FROM agents")
+
+    async def ensure_agent(
+        self,
+        *,
+        tenant_id: str = "default",
+        agent_id: str = "e2e_agent",
+        display_name: str = "E2E Test Agent",
+    ) -> None:
+        """Insert agent row if it doesn't exist (for FK compliance)."""
+        agent_config = json.dumps({
+            "provider": "anthropic",
+            "system_prompt": "You are a test assistant.",
+            "model": "claude-sonnet-4-6",
+            "temperature": 0.5,
+            "allowed_tools": ["calculator"],
+        })
+        await self.execute(
+            """
+            INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+            VALUES ($1, $2, $3, $4::jsonb, 'active')
+            ON CONFLICT (tenant_id, agent_id) DO NOTHING
+            """,
+            tenant_id, agent_id, display_name, agent_config,
+        )
 
     async def fetch_task(self, task_id: str) -> dict[str, Any] | None:
         async with self.pool.acquire() as conn:
@@ -121,6 +146,8 @@ class DbHelper:
         dead_letter_reason: str | None = None,
         created_at_sql: str | None = None,
     ) -> str:
+        # Ensure the referenced agent exists (FK compliance)
+        await self.ensure_agent(tenant_id=tenant_id, agent_id=agent_id)
         task_id = str(uuid.uuid4())
         agent_config = {
             "provider": "anthropic",

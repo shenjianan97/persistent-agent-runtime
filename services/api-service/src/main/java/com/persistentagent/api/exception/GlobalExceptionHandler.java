@@ -36,6 +36,11 @@ public class GlobalExceptionHandler {
         return buildErrorResponse(HttpStatus.BAD_REQUEST, ex.getMessage());
     }
 
+    @ExceptionHandler(AgentNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleAgentNotFound(AgentNotFoundException ex) {
+        return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
     @ExceptionHandler(LangfuseEndpointService.NotFoundException.class)
     public ResponseEntity<Map<String, Object>> handleLangfuseEndpointNotFound(LangfuseEndpointService.NotFoundException ex) {
         return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());

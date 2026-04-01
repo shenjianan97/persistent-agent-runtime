@@ -3,6 +3,7 @@ export type TaskStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'dea
 export interface TaskStatusResponse {
     task_id: string;
     agent_id: string;
+    agent_display_name: string | null;
     status: TaskStatus;
     input: string;
     output?: unknown;
@@ -24,11 +25,6 @@ export interface TaskStatusResponse {
 export interface TaskSubmissionRequest {
     agent_id: string;
     input: string;
-    system_prompt: string;
-    provider: string;
-    model: string;
-    temperature?: number;
-    allowed_tools?: string[];
     max_steps?: number;
     max_retries?: number;
     task_timeout_seconds?: number;
@@ -38,6 +34,7 @@ export interface TaskSubmissionRequest {
 export interface TaskSubmissionResponse {
     task_id: string;
     status: string;
+    agent_display_name: string | null;
 }
 
 export interface CheckpointResponse {
@@ -111,6 +108,7 @@ export interface TaskObservabilityResponse {
 export interface DeadLetterItemResponse {
     task_id: string;
     agent_id: string;
+    agent_display_name: string | null;
     dead_letter_reason: string;
     last_error_code?: string;
     last_error_message?: string;
@@ -126,6 +124,7 @@ export interface DeadLetterListResponse {
 export interface TaskSummaryResponse {
     task_id: string;
     agent_id: string;
+    agent_display_name: string | null;
     status: TaskStatus;
     retry_count: number;
     checkpoint_count: number;
@@ -176,4 +175,48 @@ export interface LangfuseEndpointRequest {
 export interface LangfuseEndpointTestResponse {
     reachable: boolean;
     message: string;
+}
+
+export interface AgentSummaryResponse {
+    agent_id: string;
+    display_name: string;
+    provider: string;
+    model: string;
+    status: 'active' | 'disabled';
+    created_at: string;
+    updated_at: string;
+}
+
+export interface AgentConfig {
+    system_prompt: string;
+    provider: string;
+    model: string;
+    temperature: number;
+    allowed_tools: string[];
+}
+
+export interface AgentResponse {
+    agent_id: string;
+    display_name: string;
+    agent_config: AgentConfig;
+    status: 'active' | 'disabled';
+    created_at: string;
+    updated_at: string;
+}
+
+export interface AgentCreateRequest {
+    display_name: string;
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools'> & {
+        temperature?: number;
+        allowed_tools?: string[];
+    };
+}
+
+export interface AgentUpdateRequest {
+    display_name: string;
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools'> & {
+        temperature?: number;
+        allowed_tools?: string[];
+    };
+    status: 'active' | 'disabled';
 }

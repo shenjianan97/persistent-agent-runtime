@@ -101,7 +101,14 @@ export function DeadLetterPage() {
                                         {task.task_id.split('-')[0]}...{task.task_id.split('-').pop()}
                                     </Link>
                                 </TableCell>
-                                <TableCell>{task.agent_id}</TableCell>
+                                <TableCell>
+                                    <Link to={`/agents/${encodeURIComponent(task.agent_id)}`} className="hover:text-primary hover:underline underline-offset-4 decoration-primary/50 transition-colors">
+                                        {task.agent_display_name && (
+                                            <span className="block text-foreground">{task.agent_display_name}</span>
+                                        )}
+                                        <span className="block text-muted-foreground text-[10px]">{task.agent_id}</span>
+                                    </Link>
+                                </TableCell>
                                 <TableCell className="max-w-[300px]">
                                     <div className="truncate font-bold text-destructive mb-1">{task.dead_letter_reason}</div>
                                     <div className="truncate text-[10px] text-muted-foreground">{task.last_error_message || 'No extended error detail provided.'}</div>
