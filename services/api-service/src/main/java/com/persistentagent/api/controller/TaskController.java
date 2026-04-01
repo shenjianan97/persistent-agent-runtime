@@ -1,7 +1,11 @@
 package com.persistentagent.api.controller;
 
+import com.persistentagent.api.config.ValidationConstants;
+import com.persistentagent.api.model.request.TaskRejectRequest;
+import com.persistentagent.api.model.request.TaskRespondRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
@@ -15,9 +19,11 @@ import java.util.UUID;
 public class TaskController {
 
     private final TaskService taskService;
+    private final TaskEventService taskEventService;
 
-    public TaskController(TaskService taskService) {
+    public TaskController(TaskService taskService, TaskEventService taskEventService) {
         this.taskService = taskService;
+        this.taskEventService = taskEventService;
     }
 
     @PostMapping
@@ -72,5 +78,36 @@ public class TaskController {
     public ResponseEntity<RedriveResponse> redriveTask(@PathVariable UUID taskId) {
         RedriveResponse response = taskService.redriveTask(taskId);
         return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/approve")
+    public ResponseEntity<RedriveResponse> approveTask(@PathVariable UUID taskId) {
+        RedriveResponse response = taskService.approveTask(taskId);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/reject")
+    public ResponseEntity<RedriveResponse> rejectTask(
+            @PathVariable UUID taskId,
+            @Valid @RequestBody TaskRejectRequest request) {
+        RedriveResponse response = taskService.rejectTask(taskId, request.reason());
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/respond")
+    public ResponseEntity<RedriveResponse> respondToTask(
+            @PathVariable UUID taskId,
+            @Valid @RequestBody TaskRespondRequest request) {
+        RedriveResponse response = taskService.respondToTask(taskId, request.message());
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/{taskId}/events")
+    public ResponseEntity<TaskEventListResponse> getTaskEvents(
+            @PathVariable UUID taskId,
+            @RequestParam(defaultValue = "100") int limit) {
+        TaskEventListResponse events = taskEventService.listEvents(
+                taskId, ValidationConstants.DEFAULT_TENANT_ID, limit);
+        return ResponseEntity.ok(events);
     }
 }

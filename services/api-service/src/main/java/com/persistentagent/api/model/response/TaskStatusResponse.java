@@ -1,5 +1,6 @@
 package com.persistentagent.api.model.response;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.time.OffsetDateTime;
@@ -25,6 +26,9 @@ public record TaskStatusResponse(
         @JsonProperty("dead_lettered_at") OffsetDateTime deadLetteredAt,
         @JsonProperty("created_at") OffsetDateTime createdAt,
         @JsonProperty("updated_at") OffsetDateTime updatedAt,
-        @JsonProperty("langfuse_endpoint_id") UUID langfuseEndpointId
+        @JsonProperty("langfuse_endpoint_id") UUID langfuseEndpointId,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pending_input_prompt") String pendingInputPrompt,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pending_approval_action") Object pendingApprovalAction,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("human_input_timeout_at") OffsetDateTime humanInputTimeoutAt
 ) {
 }
