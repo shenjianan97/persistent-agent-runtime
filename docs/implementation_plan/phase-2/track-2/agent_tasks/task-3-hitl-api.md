@@ -99,7 +99,7 @@ SELECT
 
 The resume payload for approval should be a documented structured JSON value serialized into `human_response`, for example `{"kind":"approval","approved":true}`. Do not use an undocumented magic string sentinel.
 
-If `changed > 0`, emit `pg_notify('new_task', worker_pool_id)`. Return `MutationResult.UPDATED`, `WRONG_STATE`, or `NOT_FOUND` based on found/changed counts.
+The repository method should only perform the row mutation and return `MutationResult.UPDATED`, `WRONG_STATE`, or `NOT_FOUND` plus `worker_pool_id` for the service layer. The service method owns the single `pg_notify('new_task', worker_pool_id)` wake-up after a successful update.
 
 **`rejectTask(taskId, tenantId, reason)`:**
 ```sql
@@ -262,7 +262,7 @@ Ensure `listTasks()` handles the new statuses correctly in the status filter par
 
 ## Testing Requirements
 
-- **Unit tests:** Each repository method with test database — correct transitions, MutationResult handling, lease release, and `pg_notify('new_task', worker_pool_id)` emission.
+- **Unit tests:** Repository methods with test database — correct transitions, MutationResult handling, lease release, and `worker_pool_id` return value. Service-level tests should verify the single `pg_notify('new_task', worker_pool_id)` emission after a successful update.
 - **Integration tests:** End-to-end HTTP calls for approve, reject, respond with correct and wrong states.
 - **Failure scenarios:** approve on `running` → 409, approve on nonexistent → 404, reject with blank reason → 400, respond on `waiting_for_approval` → 409.
 
