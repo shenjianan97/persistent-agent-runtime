@@ -1,5 +1,5 @@
 import { Link } from 'react-router';
-import { AlertCircle, ArrowRight, Clock3, ListChecks, PlaySquare, ReceiptText, Zap } from 'lucide-react';
+import { AlertCircle, ArrowRight, Clock3, ListChecks, PlaySquare, ReceiptText, UserCheck, Zap } from 'lucide-react';
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -126,12 +126,18 @@ export function DashboardPage() {
                 </div>
             </div>
 
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
                 <SummaryCard
                     title="Queued + Running"
                     value={String(summary.inProgressCount)}
                     subtitle="Active tasks are shown as a quick signal, not as a separate empty panel."
                     icon={Clock3}
+                />
+                <SummaryCard
+                    title="Pending Actions"
+                    value={String(summary.pendingActionCount)}
+                    subtitle="Tasks awaiting human approval or input"
+                    icon={UserCheck}
                 />
                 <SummaryCard
                     title="Failed"

@@ -1,4 +1,27 @@
-export type TaskStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'dead_letter';
+export type TaskStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'dead_letter' | 'waiting_for_approval' | 'waiting_for_input' | 'paused';
+
+export type TaskEventType = 'task_submitted' | 'task_claimed' | 'task_retry_scheduled' |
+    'task_reclaimed_after_lease_expiry' | 'task_dead_lettered' | 'task_redriven' |
+    'task_completed' | 'task_paused' | 'task_resumed' | 'task_approval_requested' |
+    'task_approved' | 'task_rejected' | 'task_input_requested' | 'task_input_received' | 'task_cancelled';
+
+export interface TaskEventResponse {
+    event_id: string;
+    task_id: string;
+    agent_id: string;
+    event_type: TaskEventType;
+    status_before?: string;
+    status_after?: string;
+    worker_id?: string;
+    error_code?: string;
+    error_message?: string;
+    details?: Record<string, unknown>;
+    created_at: string;
+}
+
+export interface TaskEventListResponse {
+    events: TaskEventResponse[];
+}
 
 export interface TaskStatusResponse {
     task_id: string;
@@ -18,6 +41,9 @@ export interface TaskStatusResponse {
     dead_letter_reason?: string;
     dead_lettered_at?: string;
     langfuse_endpoint_id?: string;
+    pending_input_prompt?: string;
+    pending_approval_action?: Record<string, unknown>;
+    human_input_timeout_at?: string;
     created_at: string;
     updated_at: string;
 }
