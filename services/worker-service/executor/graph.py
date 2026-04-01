@@ -20,7 +20,8 @@ from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.errors import GraphRecursionError
+from langgraph.errors import GraphRecursionError, GraphInterrupt
+from langgraph.types import Command
 
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 from core.config import WorkerConfig
@@ -31,16 +32,42 @@ from tools.definitions import (
     READ_URL_TOOL,
     CALCULATOR_TOOL,
     DEV_SLEEP_TOOL,
+    REQUEST_HUMAN_INPUT_TOOL,
     WebSearchArguments,
     ReadUrlArguments,
     CalculatorArguments,
     DevSleepArguments,
+    RequestHumanInputArguments,
     dev_task_controls_enabled,
+    request_human_input,
 )
 from tools.calculator import evaluate_expression
 from tools.errors import ToolExecutionError, ToolTransportError
 
 logger = logging.getLogger(__name__)
+
+
+async def _insert_task_event(
+    conn,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    event_type: str,
+    status_before: str,
+    status_after: str,
+    worker_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    details: dict | None = None,
+):
+    """Insert a task_events row within an existing connection/transaction."""
+    await conn.execute('''
+        INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
+            status_before, status_after, worker_id, error_code, error_message, details)
+        VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+    ''', tenant_id, task_id, agent_id, event_type,
+        status_before, status_after, worker_id,
+        error_code, error_message, json.dumps(details or {}))
 
 
 class GraphExecutor:
@@ -120,6 +147,14 @@ class GraphExecutor:
                 name="calculator",
                 description=CALCULATOR_TOOL.description,
                 args_schema=CalculatorArguments
+            ))
+
+        if "request_human_input" in allowed_tools:
+            tools.append(StructuredTool.from_function(
+                func=request_human_input,
+                name="request_human_input",
+                description=REQUEST_HUMAN_INPUT_TOOL.description,
+                args_schema=RequestHumanInputArguments,
             ))
 
         if dev_task_controls_enabled() and "dev_sleep" in allowed_tools:
@@ -312,6 +347,22 @@ class GraphExecutor:
                 is_first_run = not checkpoint_tuple
                 initial_input = {"messages": [HumanMessage(content=task_input)]} if is_first_run else None
 
+                # Resume path: if this is a resumed task with a human response, use Command(resume=...)
+                if not is_first_run:
+                    human_response = await self.pool.fetchval(
+                        'SELECT human_response FROM tasks WHERE task_id = $1::uuid', task_id
+                    )
+                    if human_response:
+                        payload = json.loads(human_response)
+                        # Decode the documented HITL resume payload
+                        # {"kind":"input","message":"blue"} -> resume value is the message
+                        # {"kind":"approval","approved":true} -> resume value is the payload itself
+                        if payload.get("kind") == "input":
+                            resume_value = payload.get("message", "")
+                        else:
+                            resume_value = payload  # approval payload passed through
+                        initial_input = Command(resume=resume_value)
+
                 # Executing super-steps via astream
                 async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates"):
                     # Step 6: Cancellation Awareness
@@ -394,6 +445,11 @@ class GraphExecutor:
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
+                    # Clear human_response after successful completion (in case this was a resumed task)
+                    await self.pool.execute(
+                        'UPDATE tasks SET human_response = NULL WHERE task_id = $1::uuid AND human_response IS NOT NULL',
+                        task_id,
+                    )
                     logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, total_cost_microdollars, langfuse_status)
 
             # Step 2: Wrap execution in timeout
@@ -403,6 +459,8 @@ class GraphExecutor:
             await self._handle_dead_letter(task_id, "task_timeout", "Execution exceeded task logic timeout")
         except GraphRecursionError:
             await self._handle_dead_letter(task_id, "max_steps_exceeded", f"Execution exceeded max_steps ({max_steps})")
+        except GraphInterrupt as gi:
+            await self._handle_interrupt(task_data, gi, worker_id)
         except LeaseRevokedException:
             # Lease was explicitly stripped before a checkpoint write
             logger.warning("Task %s raised LeaseRevokedException, stopping gracefully.", task_id)
@@ -542,6 +600,62 @@ class GraphExecutor:
 
         # For Phase 1, default unknown exceptions to non-retryable
         return False
+
+    async def _handle_interrupt(self, task_data: dict, interrupt_exc: GraphInterrupt, worker_id: str):
+        """Handle a GraphInterrupt by transitioning the task to a waiting state."""
+        task_id = str(task_data["task_id"])
+        tenant_id = task_data["tenant_id"]
+        agent_id = task_data.get("agent_id") or "unknown"
+
+        # Parse interrupt values
+        interrupt_values = interrupt_exc.args[0] if interrupt_exc.args else [{}]
+        interrupt_data = interrupt_values[0] if isinstance(interrupt_values, list) and interrupt_values else {}
+        if isinstance(interrupt_data, dict):
+            interrupt_type = interrupt_data.get("type", "input")
+        else:
+            interrupt_type = "input"
+
+        if interrupt_type == "approval":
+            new_status = "waiting_for_approval"
+            event_type = "task_approval_requested"
+        else:
+            new_status = "waiting_for_input"
+            event_type = "task_input_requested"
+
+        # Calculate timeout (24 hours from now)
+        timeout_at = datetime.now(timezone.utc) + timedelta(hours=24)
+
+        # Atomically: update task to waiting state + release lease + insert event
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if interrupt_type == "approval":
+                    await conn.execute('''
+                        UPDATE tasks SET status = $1,
+                            pending_approval_action = $2::jsonb,
+                            human_input_timeout_at = $3,
+                            lease_owner = NULL, lease_expiry = NULL,
+                            version = version + 1, updated_at = NOW()
+                        WHERE task_id = $4::uuid AND lease_owner = $5
+                    ''', new_status, json.dumps(interrupt_data.get("action", {})),
+                        timeout_at, task_id, worker_id)
+                else:
+                    await conn.execute('''
+                        UPDATE tasks SET status = $1,
+                            pending_input_prompt = $2,
+                            human_input_timeout_at = $3,
+                            lease_owner = NULL, lease_expiry = NULL,
+                            version = version + 1, updated_at = NOW()
+                        WHERE task_id = $4::uuid AND lease_owner = $5
+                    ''', new_status, interrupt_data.get("prompt", "Agent is requesting input"),
+                        timeout_at, task_id, worker_id)
+
+                # Insert event in same transaction
+                await _insert_task_event(
+                    conn, task_id, tenant_id, agent_id, event_type,
+                    "running", new_status, worker_id=worker_id,
+                )
+
+        logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
 
     async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
         task_id = str(task_data["task_id"])

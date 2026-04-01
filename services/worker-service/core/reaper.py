@@ -95,6 +95,25 @@ WHERE status = 'queued';
 """
 
 # Mark workers as offline if no heartbeat for 90 seconds (3 missed heartbeats at 15s interval + buffer)
+# Reaper — human-input timeout scan
+REAPER_HUMAN_INPUT_TIMEOUT_QUERY = """
+UPDATE tasks
+SET status = 'dead_letter',
+    dead_letter_reason = 'human_input_timeout',
+    last_error_code = 'human_input_timeout',
+    last_error_message = 'No human response within timeout period',
+    dead_lettered_at = NOW(),
+    pending_input_prompt = NULL,
+    pending_approval_action = NULL,
+    human_input_timeout_at = NULL,
+    version = version + 1,
+    updated_at = NOW()
+WHERE status IN ('waiting_for_approval', 'waiting_for_input')
+  AND human_input_timeout_at IS NOT NULL
+  AND human_input_timeout_at < NOW()
+RETURNING task_id, tenant_id, agent_id;
+"""
+
 STALE_WORKER_QUERY = """
 UPDATE workers
 SET status = 'offline'
@@ -177,13 +196,14 @@ class ReaperTask:
         a reaper cycle without waiting for the jittered interval.
 
         Returns:
-            Dict with keys 'requeued', 'dead_lettered_expired', 'dead_lettered_timeout'
-            containing lists of task_ids.
+            Dict with keys 'requeued', 'dead_lettered_expired', 'dead_lettered_timeout',
+            'dead_lettered_human_timeout' containing lists of task_ids.
         """
         results: dict[str, list[str]] = {
             "requeued": [],
             "dead_lettered_expired": [],
             "dead_lettered_timeout": [],
+            "dead_lettered_human_timeout": [],
         }
 
         async with self._pool.acquire() as conn:
@@ -225,7 +245,19 @@ class ReaperTask:
                         reason="task_timeout",
                     )
 
-                # (c) Stale workers — mark offline if heartbeat expired
+                # (c) Human-input timeouts
+                human_timeout_rows = await conn.fetch(REAPER_HUMAN_INPUT_TIMEOUT_QUERY)
+                for row in human_timeout_rows:
+                    task_id = str(row["task_id"])
+                    results["dead_lettered_human_timeout"].append(task_id)
+                    self._metrics.increment("tasks.dead_letter")
+                    await self._log.ainfo(
+                        REAPER_DEAD_LETTERED,
+                        task_id=task_id,
+                        reason="human_input_timeout",
+                    )
+
+                # (d) Stale workers — mark offline if heartbeat expired
                 stale_rows = await conn.fetch(STALE_WORKER_QUERY)
                 for row in stale_rows:
                     worker_id = row["worker_id"]
