@@ -5,6 +5,7 @@ import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,6 +32,9 @@ class TaskControllerTest {
 
         @MockitoBean
         private TaskService taskService;
+
+        @MockitoBean
+        private TaskEventService taskEventService;
 
         // --- POST /v1/tasks ---
 
@@ -224,7 +228,8 @@ class TaskControllerTest {
                 TaskStatusResponse response = new TaskStatusResponse(
                                 taskId, "agent1", "Agent One", "running", "test input", null,
                                 0, List.of(), 5, 12500L, "worker-abc-123",
-                                null, null, null, null, null, now, now, null);
+                                null, null, null, null, null, now, now, null,
+                                null, null, null);
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId))

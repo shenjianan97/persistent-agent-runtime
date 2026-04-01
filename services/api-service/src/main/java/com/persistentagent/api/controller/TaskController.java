@@ -1,6 +1,8 @@
 package com.persistentagent.api.controller;
 
 import com.persistentagent.api.config.ValidationConstants;
+import com.persistentagent.api.model.request.TaskRejectRequest;
+import com.persistentagent.api.model.request.TaskRespondRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.service.TaskEventService;
@@ -75,6 +77,28 @@ public class TaskController {
     @PostMapping("/{taskId}/redrive")
     public ResponseEntity<RedriveResponse> redriveTask(@PathVariable UUID taskId) {
         RedriveResponse response = taskService.redriveTask(taskId);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/approve")
+    public ResponseEntity<RedriveResponse> approveTask(@PathVariable UUID taskId) {
+        RedriveResponse response = taskService.approveTask(taskId);
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/reject")
+    public ResponseEntity<RedriveResponse> rejectTask(
+            @PathVariable UUID taskId,
+            @Valid @RequestBody TaskRejectRequest request) {
+        RedriveResponse response = taskService.rejectTask(taskId, request.reason());
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/respond")
+    public ResponseEntity<RedriveResponse> respondToTask(
+            @PathVariable UUID taskId,
+            @Valid @RequestBody TaskRespondRequest request) {
+        RedriveResponse response = taskService.respondToTask(taskId, request.message());
         return ResponseEntity.ok(response);
     }
 

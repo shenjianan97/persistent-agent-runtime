@@ -31,6 +31,7 @@ public class TaskService {
     private final ModelRepository modelRepository;
     private final LangfuseEndpointRepository langfuseEndpointRepository;
     private final TaskObservabilityService taskObservabilityService;
+    private final TaskEventService taskEventService;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
     private final ConfigValidationHelper configValidationHelper;
@@ -42,6 +43,7 @@ public class TaskService {
             ModelRepository modelRepository,
             LangfuseEndpointRepository langfuseEndpointRepository,
             TaskObservabilityService taskObservabilityService,
+            TaskEventService taskEventService,
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
             ConfigValidationHelper configValidationHelper,
@@ -51,6 +53,7 @@ public class TaskService {
         this.modelRepository = modelRepository;
         this.langfuseEndpointRepository = langfuseEndpointRepository;
         this.taskObservabilityService = taskObservabilityService;
+        this.taskEventService = taskEventService;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
         this.configValidationHelper = configValidationHelper;
@@ -127,6 +130,9 @@ public class TaskService {
 
         String agentDisplayName = (String) task.get("agent_display_name_snapshot");
 
+        // Parse pending_approval_action from JSONB
+        Object pendingApprovalAction = parseJson(task.get("pending_approval_action"));
+
         return new TaskStatusResponse(
                 (UUID) task.get("task_id"),
                 (String) task.get("agent_id"),
@@ -146,7 +152,10 @@ public class TaskService {
                 DateTimeUtil.toOffsetDateTime(task.get("dead_lettered_at")),
                 DateTimeUtil.toOffsetDateTime(task.get("created_at")),
                 DateTimeUtil.toOffsetDateTime(task.get("updated_at")),
-                (UUID) task.get("langfuse_endpoint_id"));
+                (UUID) task.get("langfuse_endpoint_id"),
+                (String) task.get("pending_input_prompt"),
+                pendingApprovalAction,
+                DateTimeUtil.toOffsetDateTime(task.get("human_input_timeout_at")));
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {
@@ -224,7 +233,64 @@ public class TaskService {
             case UPDATED -> new TaskCancelResponse(taskId, "dead_letter", "cancelled_by_user");
             case NOT_FOUND -> throw new TaskNotFoundException(taskId);
             case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
-                    "Task " + taskId + " cannot be cancelled (must be in queued or running state)");
+                    "Task " + taskId + " cannot be cancelled (must be in queued, running, waiting_for_approval, waiting_for_input, or paused state)");
+        };
+    }
+
+    public RedriveResponse approveTask(UUID taskId) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        TaskRepository.HitlMutationResult hitlResult = taskRepository.approveTask(taskId, tenantId);
+        return switch (hitlResult.result()) {
+            case UPDATED -> {
+                taskRepository.notifyNewTask(hitlResult.workerPoolId());
+                taskEventService.recordEvent(tenantId, taskId, hitlResult.agentId(),
+                        "task_approved", "waiting_for_approval", "queued",
+                        null, null, null, "{}");
+                yield new RedriveResponse(taskId, "queued");
+            }
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
+                    "Task " + taskId + " cannot be approved (must be in waiting_for_approval state)");
+        };
+    }
+
+    public RedriveResponse rejectTask(UUID taskId, String reason) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        TaskRepository.HitlMutationResult hitlResult = taskRepository.rejectTask(taskId, tenantId, reason);
+        return switch (hitlResult.result()) {
+            case UPDATED -> {
+                taskRepository.notifyNewTask(hitlResult.workerPoolId());
+                String detailsJson = "{\"reason\":\"%s\"}"
+                        .formatted(reason.replace("\\", "\\\\").replace("\"", "\\\""));
+                taskEventService.recordEvent(tenantId, taskId, hitlResult.agentId(),
+                        "task_rejected", "waiting_for_approval", "queued",
+                        null, null, null, detailsJson);
+                yield new RedriveResponse(taskId, "queued");
+            }
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
+                    "Task " + taskId + " cannot be rejected (must be in waiting_for_approval state)");
+        };
+    }
+
+    public RedriveResponse respondToTask(UUID taskId, String message) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        TaskRepository.HitlMutationResult hitlResult = taskRepository.respondToTask(taskId, tenantId, message);
+        return switch (hitlResult.result()) {
+            case UPDATED -> {
+                taskRepository.notifyNewTask(hitlResult.workerPoolId());
+                String detailsJson = "{\"message_length\":%d}".formatted(message.length());
+                taskEventService.recordEvent(tenantId, taskId, hitlResult.agentId(),
+                        "task_input_received", "waiting_for_input", "queued",
+                        null, null, null, detailsJson);
+                yield new RedriveResponse(taskId, "queued");
+            }
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
+                    "Task " + taskId + " cannot receive input (must be in waiting_for_input state)");
         };
     }
 

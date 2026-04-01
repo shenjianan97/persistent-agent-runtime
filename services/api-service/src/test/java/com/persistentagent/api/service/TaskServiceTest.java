@@ -52,6 +52,9 @@ class TaskServiceTest {
     @Mock
     private ConfigValidationHelper configValidationHelper;
 
+    @Mock
+    private TaskEventService taskEventService;
+
     private TaskService taskService;
     private ObjectMapper objectMapper;
 
@@ -66,6 +69,7 @@ class TaskServiceTest {
                 modelRepository,
                 langfuseEndpointRepository,
                 taskObservabilityService,
+                taskEventService,
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
                 configValidationHelper,
@@ -243,6 +247,9 @@ class TaskServiceTest {
         taskRow.put("checkpoint_count", 3L);
         taskRow.put("total_cost_microdollars", 999L);
         taskRow.put("langfuse_endpoint_id", null);
+        taskRow.put("pending_input_prompt", null);
+        taskRow.put("pending_approval_action", null);
+        taskRow.put("human_input_timeout_at", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
@@ -256,6 +263,9 @@ class TaskServiceTest {
         assertEquals("queued", response.status());
         assertEquals(3, response.checkpointCount());
         assertEquals(5000L, response.totalCostMicrodollars());
+        assertNull(response.pendingInputPrompt());
+        assertNull(response.pendingApprovalAction());
+        assertNull(response.humanInputTimeoutAt());
     }
 
     @Test
