@@ -9,6 +9,8 @@ from typing import Annotated, Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from langgraph.types import interrupt
+
 from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
 from tools.providers.search import SearchProvider, SearchResult, TavilySearchProvider
 from tools.read_url import ReadUrlFetcher
@@ -105,6 +107,19 @@ class CalculatorResult(BaseModel):
     result: int | float
 
 
+class RequestHumanInputArguments(BaseModel):
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The question or request to present to the human operator.",
+    )
+
+
+class RequestHumanInputResult(BaseModel):
+    response: str
+
+
 class DevSleepArguments(BaseModel):
     seconds: DEV_SLEEP_SECONDS = 10
 
@@ -144,6 +159,12 @@ CALCULATOR_TOOL = ToolDefinition(
     description="Evaluate a bounded arithmetic expression without using an LLM.",
     input_model=CalculatorArguments,
     output_model=CalculatorResult,
+)
+REQUEST_HUMAN_INPUT_TOOL = ToolDefinition(
+    name="request_human_input",
+    description="Request input from a human operator. The task will pause and wait for a human to respond.",
+    input_model=RequestHumanInputArguments,
+    output_model=RequestHumanInputResult,
 )
 DEV_SLEEP_TOOL = ToolDefinition(
     name="dev_sleep",
@@ -289,6 +310,12 @@ def register_tools(server: FastMCP, dependencies: ToolDependencies) -> None:
             payload.result,
         )
         return payload
+
+
+def request_human_input(prompt: str) -> str:
+    """Request input from a human operator. The task will pause until a response is provided."""
+    response = interrupt({"type": "input", "prompt": prompt})
+    return response
 
 
 def normalize_search_results(results: list[SearchResult]) -> list[SearchResultModel]:
