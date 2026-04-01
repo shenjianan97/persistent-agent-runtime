@@ -288,11 +288,14 @@ event_type:           enum (
                          task_dead_lettered |
                          task_redriven |
                          task_completed |
+                         task_paused |
+                         task_resumed |
                          task_approval_requested |
                          task_approved |
                          task_rejected |
                          task_input_requested |
-                         task_input_received
+                         task_input_received |
+                         task_cancelled
                        )
 status_before:        enum (nullable)
 status_after:         enum (nullable)
@@ -310,6 +313,8 @@ created_at:           timestamp
 - `task_events` is the durable audit timeline for customers and operators
 - status/dead-letter list APIs can stay fast by reading `tasks`
 - detailed task history comes from `task_events`
+- `task_cancelled` records explicit user/operator cancellation transitions
+- `task_paused` / `task_resumed` are reserved canonical event types for generic non-HITL pause/resume flows (for example, future budget or operator-driven pauses)
 - for HITL flows, the audit trail should show both the pause request (`task_approval_requested` / `task_input_requested`) and the human response (`task_approved` / `task_rejected` / `task_input_received`)
 - because HITL resume is stateless, the subsequent `task_claimed` event after a human response is the observable resume point in the lifecycle timeline
 

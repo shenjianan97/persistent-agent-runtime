@@ -28,7 +28,7 @@ This task also adds the `request_human_input` built-in tool (the MVP HITL entry 
 - Pause states release the lease and do not require heartbeat while waiting.
 - Resume goes through the normal `queued` claim path; any worker can pick up the resumed task.
 - The `human_response` column stores a documented HITL resume payload for consumption on resume.
-- Worker clears `human_response` after reading it to avoid PII retention.
+- Worker must not clear `human_response` until the resume input has been durably consumed (for example, after a new checkpoint or terminal state has been persisted).
 - Default human-input-timeout is 24 hours (hardcoded for now, configurable per-agent in future tracks).
 - Worker-side event writes use direct asyncpg INSERT, but they must be part of the same transaction as the paired task-state mutation.
 
@@ -177,17 +177,16 @@ if not is_first_run:
         #   {"kind":"input","message":"blue"}
         #   {"kind":"approval","approved":true}
         #   {"kind":"approval","approved":false,"reason":"Not safe"}
-        # Clear human_response to avoid PII retention
-        await self.pool.execute(
-            '''UPDATE tasks SET human_response = NULL WHERE task_id = $1::uuid''',
-            task_id
-        )
+        # Do not clear human_response yet. Keep it until the resumed input has
+        # been durably consumed by a later checkpoint/terminal-state write.
         # Use Command(resume=...) to provide the interrupt response to LangGraph
         from langgraph.types import Command
         initial_input = Command(resume=decoded_payload)
 ```
 
 The `Command(resume=value)` tells LangGraph to resolve the pending `interrupt()` call with the given value. The graph then continues execution from the interrupt point after a normal `queued` → `running` claim.
+
+After the resumed execution has persisted a new checkpoint (or reached a terminal state such as `completed`, `queued` for retry, or `dead_letter`), clear `human_response` in the same transaction as that durable write. This preserves crash safety while still avoiding unnecessary long-term retention of human input.
 
 ### Step 6: Add reaper scan for human-input-timeout
 
@@ -227,7 +226,7 @@ Add a call to `_timeout_waiting_tasks()` in the reaper's `run_once()` method, al
 - [ ] `_handle_interrupt` records its task event in the same transaction as the waiting-state transition
 - [ ] On resume from checkpoint, worker reads `human_response` from task row
 - [ ] Worker decodes the documented HITL resume payload before calling `Command(resume=...)`
-- [ ] Worker clears `human_response` after reading (PII hygiene)
+- [ ] Worker clears `human_response` only after the resumed input has been durably consumed
 - [ ] Resume uses `Command(resume=decoded_payload)` to resolve the LangGraph interrupt
 - [ ] Resume happens after a second normal claim from the task poller
 - [ ] Reaper dead-letters tasks past `human_input_timeout_at` with reason `human_input_timeout`

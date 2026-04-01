@@ -113,7 +113,7 @@ Same pattern as Track 1: single coordinated deployment. Migration `0006` is pick
 | LangGraph `interrupt()` behavior may differ across versions | Verify with langgraph 1.0.5 (current). The `GraphInterrupt` exception is the stable API |
 | Resume after approval may re-execute the interrupted node | LangGraph checkpoint stores pre-interrupt state. `Command(resume=...)` provides the interrupt response. Test this explicitly in Task 7 |
 | Stateless resume across workers depends on correct LangGraph checkpoint semantics | Verify with integration tests that a different worker can claim a re-queued paused task and continue cleanly with `Command(resume=...)` |
-| `human_response` column could leak PII | Clear after consumption in the resumed worker. Document this in Task 4 |
+| `human_response` column could leak PII | Keep it only until the resumed input has been durably consumed, then clear it in the same transaction as the next checkpoint or terminal-state write. Document this in Task 4 |
 
 ---
 
@@ -142,7 +142,7 @@ Same pattern as Track 1: single coordinated deployment. Migration `0006` is pick
 
 4. **`paused` status added now but not implemented** — prepares for Track 3 budget enforcement without extra migration later.
 
-5. **`human_response` column on tasks** — stores the approval/rejection reason or freeform input so the resumed worker can read it. Cleared after consumption.
+5. **`human_response` column on tasks** — stores the approval/rejection reason or freeform input so the resumed worker can read it. It is cleared only after the resume payload has been durably consumed.
 
 6. **Event recording is durable, not best-effort** — `task_events` is the lifecycle audit trail, so paired task-state changes and event inserts must succeed or fail together.
 
