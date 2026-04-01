@@ -1,4 +1,5 @@
 import { useNavigate, useParams, Link } from 'react-router';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
 import { useTaskObservability } from './useTaskObservability';
 import { useCheckpoints } from './useCheckpoints';
@@ -7,10 +8,14 @@ import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { TaskStatusBadge } from './TaskStatusBadge';
 import { CostSummary } from './CostSummary';
 import { CheckpointTimeline } from './CheckpointTimeline';
+import { ApprovalPanel } from './ApprovalPanel';
+import { InputResponsePanel } from './InputResponsePanel';
+import { TaskEventsTimeline } from './TaskEventsTimeline';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { AlertCircle, Terminal, Ban, RotateCcw } from 'lucide-react';
 import { toast } from 'sonner';
+import { api } from '@/api/client';
 import { CheckpointResponse } from '@/types';
 
 export function TaskDetailPage() {
@@ -25,8 +30,24 @@ export function TaskDetailPage() {
         ? langfuseEndpoints.find(ep => ep.endpoint_id === task.langfuse_endpoint_id)
         : null;
 
+    const queryClient = useQueryClient();
     const cancelMutation = useCancelTask();
     const redriveMutation = useRedriveTask();
+
+    const isNonTerminal = task?.status === 'queued' || task?.status === 'running' ||
+        task?.status === 'waiting_for_approval' || task?.status === 'waiting_for_input' || task?.status === 'paused';
+
+    const { data: eventsData, isLoading: eventsLoading } = useQuery({
+        queryKey: ['task-events', taskId],
+        queryFn: () => api.getTaskEvents(taskId!),
+        refetchInterval: isNonTerminal ? 5000 : false,
+        enabled: !!taskId,
+    });
+
+    const handleActionComplete = () => {
+        queryClient.invalidateQueries({ queryKey: ['task', taskId] });
+        queryClient.invalidateQueries({ queryKey: ['task-events', taskId] });
+    };
 
     if (isLoading) {
         return (
@@ -46,6 +67,9 @@ export function TaskDetailPage() {
 
     const checkpoints: CheckpointResponse[] = checkpointsData?.checkpoints || [];
     const isRunning = task.status === 'running' || task.status === 'queued';
+    const isWaitingForApproval = task.status === 'waiting_for_approval';
+    const isWaitingForInput = task.status === 'waiting_for_input';
+    const isCancellable = isRunning || isWaitingForApproval || isWaitingForInput || task.status === 'paused';
     const isDeadLetter = task.status === 'dead_letter';
 
     const parsedOutput = (() => {
@@ -114,7 +138,7 @@ export function TaskDetailPage() {
                 </div>
 
                 <div className="flex gap-3">
-                    {isRunning && (
+                    {isCancellable && (
                         <Button
                             variant="outline"
                             className="uppercase tracking-[0.18em] font-bold text-xs h-9"
@@ -164,6 +188,14 @@ export function TaskDetailPage() {
                         </div>
                     )}
 
+                    {isWaitingForApproval && (
+                        <ApprovalPanel task={task} onActionComplete={handleActionComplete} />
+                    )}
+
+                    {isWaitingForInput && (
+                        <InputResponsePanel task={task} onActionComplete={handleActionComplete} />
+                    )}
+
                     <CheckpointTimeline
                         checkpoints={checkpoints}
                         isRunning={isRunning}
@@ -173,6 +205,11 @@ export function TaskDetailPage() {
                         lastErrorCode={task.last_error_code}
                         lastErrorMessage={task.last_error_message}
                         deadLetteredAt={task.dead_lettered_at}
+                    />
+
+                    <TaskEventsTimeline
+                        events={eventsData?.events ?? []}
+                        isLoading={eventsLoading}
                     />
 
                     {isDeadLetter && (

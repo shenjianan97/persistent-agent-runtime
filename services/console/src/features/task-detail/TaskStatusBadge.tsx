@@ -3,8 +3,15 @@ import { TaskStatus } from '@/types';
 import { cn } from '@/lib/utils';
 import { Loader2 } from 'lucide-react';
 
+const STATUS_LABELS: Record<string, string> = {
+    dead_letter: 'failed',
+    waiting_for_approval: 'Awaiting Approval',
+    waiting_for_input: 'Awaiting Input',
+    paused: 'Paused',
+};
+
 export function TaskStatusBadge({ status, className }: { status: TaskStatus, className?: string }) {
-    const label = status === 'dead_letter' ? 'failed' : status.replace('_', ' ');
+    const label = STATUS_LABELS[status] ?? status.replace('_', ' ');
 
     const getBadgeStyle = (status: TaskStatus) => {
         switch (status) {
@@ -18,6 +25,12 @@ export function TaskStatusBadge({ status, className }: { status: TaskStatus, cla
                 return 'bg-muted text-muted-foreground border-border';
             case 'dead_letter':
                 return 'bg-destructive/10 text-destructive border-destructive/40 shadow-[0_0_12px_var(--color-destructive)]';
+            case 'waiting_for_approval':
+                return 'bg-amber-500/10 text-amber-400 border-amber-500/40 shadow-[0_0_12px_rgba(245,158,11,0.3)]';
+            case 'waiting_for_input':
+                return 'bg-blue-500/10 text-blue-400 border-blue-500/40 shadow-[0_0_12px_rgba(59,130,246,0.3)]';
+            case 'paused':
+                return 'bg-gray-500/10 text-gray-400 border-gray-500/40';
             default:
                 return 'bg-muted text-foreground';
         }
