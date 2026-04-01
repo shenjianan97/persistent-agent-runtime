@@ -287,7 +287,15 @@ event_type:           enum (
                          task_reclaimed_after_lease_expiry |
                          task_dead_lettered |
                          task_redriven |
-                         task_completed
+                         task_completed |
+                         task_paused |
+                         task_resumed |
+                         task_approval_requested |
+                         task_approved |
+                         task_rejected |
+                         task_input_requested |
+                         task_input_received |
+                         task_cancelled
                        )
 status_before:        enum (nullable)
 status_after:         enum (nullable)
@@ -305,6 +313,10 @@ created_at:           timestamp
 - `task_events` is the durable audit timeline for customers and operators
 - status/dead-letter list APIs can stay fast by reading `tasks`
 - detailed task history comes from `task_events`
+- `task_cancelled` records explicit user/operator cancellation transitions
+- `task_paused` / `task_resumed` are reserved canonical event types for generic non-HITL pause/resume flows (for example, future budget or operator-driven pauses)
+- for HITL flows, the audit trail should show both the pause request (`task_approval_requested` / `task_input_requested`) and the human response (`task_approved` / `task_rejected` / `task_input_received`)
+- because HITL resume is stateless, the subsequent `task_claimed` event after a human response is the observable resume point in the lifecycle timeline
 
 ---
 
@@ -473,7 +485,15 @@ When the agent determines it needs clarification or additional information from 
 
 ### Shared semantics
 
-- Both `waiting_for_approval` and `waiting_for_input` are durable pause states — the task holds its lease, heartbeat continues, and the checkpoint is persisted before pausing
+- Both `waiting_for_approval` and `waiting_for_input` are durable pause states — the checkpoint is persisted before pausing and the task releases its lease while waiting for human action
+- Resuming a paused task is stateless: the API persists the human response, transitions the task back to `queued`, and any available worker can claim it and continue from the checkpoint with `Command(resume=...)`
+- entering a waiting state should clear `lease_owner` and `lease_expiry` so the original worker is free to shut down, deploy, or claim other tasks
+- approve/reject/respond should reuse the existing queue wake-up mechanism (`pg_notify('new_task', worker_pool_id)`) rather than introducing a worker-specific resume channel
+- the persisted human response should use a documented envelope so the resumed worker can decode the interrupt result deterministically; for example:
+  - approval accepted: `{ "kind": "approval", "approved": true }`
+  - approval rejected: `{ "kind": "approval", "approved": false, "reason": "..." }`
+  - input supplied: `{ "kind": "input", "message": "..." }`
+- resuming on a different worker than the one that originally paused the task is expected behavior, not an error case
 - Tasks in either state do not count against the agent's `max_concurrent_tasks` limit (they are not consuming compute)
 - A configurable timeout (default: 24 hours) auto-transitions unanswered tasks to `dead_letter` with reason `human_input_timeout`
 - The Console UI surfaces pending approval/input tasks in a dedicated queue with the agent's prompt and action context
