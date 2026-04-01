@@ -24,7 +24,7 @@ This is a breaking change to the public API contract.
 
 - The public task submission contract becomes agent-based only. Inline `agent_config` is removed.
 - The API must resolve the agent by `agent_id`, validate it is `active`, and snapshot the resolved config.
-- Agent config defaults (temperature, allowed_tools) should be applied during snapshotting, matching the existing Phase 1 default-application logic.
+- Agent config defaults (temperature, allowed_tools) are already canonicalized at agent creation/update time (Task 2). Submission snapshots the stored config as-is — no default re-application needed.
 - Re-validating that the model is still active at submission time is a safety check worth keeping.
 - `display_name` is snapshotted into `tasks.agent_display_name_snapshot` at submission time.
 
