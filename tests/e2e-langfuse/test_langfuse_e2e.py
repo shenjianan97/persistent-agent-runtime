@@ -113,8 +113,14 @@ async def test_traces_published_to_langfuse(e2e):
 
     await e2e.start_worker("e2e-trace-worker")
 
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": [],
+    })
     task_id = e2e.submit_task(
-        allowed_tools=[],
         input="Say hello for trace verification",
         langfuse_endpoint_id=endpoint_id,
     )
@@ -142,8 +148,14 @@ async def test_task_without_langfuse_completes_with_cost(e2e):
 
     await e2e.start_worker("e2e-no-langfuse-worker")
 
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": [],
+    })
     task_id = e2e.submit_task(
-        allowed_tools=[],
         input="Hello without observability",
         # No langfuse_endpoint_id
     )
@@ -183,8 +195,14 @@ async def test_bad_credentials_task_still_completes(e2e):
 
     await e2e.start_worker("e2e-bad-creds-worker")
 
+    e2e.ensure_agent(agent_config={
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": [],
+    })
     task_id = e2e.submit_task(
-        allowed_tools=[],
         input="Test graceful degradation",
         langfuse_endpoint_id=endpoint_id,
     )

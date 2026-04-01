@@ -39,11 +39,22 @@ class TaskControllerIntegrationTest {
         @Autowired
         private ObjectMapper objectMapper;
 
+        private static final String TEST_AGENT_ID = "integ-test-agent";
+
         @BeforeEach
         void cleanDb() {
                 jdbcTemplate.execute("DELETE FROM checkpoint_writes");
                 jdbcTemplate.execute("DELETE FROM checkpoints");
                 jdbcTemplate.execute("DELETE FROM tasks");
+                jdbcTemplate.execute("DELETE FROM agents");
+                // Create agent for task submission
+                jdbcTemplate.execute("""
+                        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+                        VALUES ('default', 'integ-test-agent', 'Integration Test Agent',
+                                '{"system_prompt":"You are a test assistant.","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":["web_search","calculator"]}'::jsonb,
+                                'active')
+                        ON CONFLICT (tenant_id, agent_id) DO NOTHING
+                        """);
         }
 
         @Test
@@ -51,14 +62,7 @@ class TaskControllerIntegrationTest {
                 // 1. Submit a task
                 String submitBody = """
                                 {
-                                  "agent_id": "test_agent",
-                                  "agent_config": {
-                                    "provider": "anthropic",
-                                    "system_prompt": "You are a test assistant",
-                                    "model": "claude-sonnet-4-6",
-                                    "temperature": 0.5,
-                                    "allowed_tools": ["web_search", "calculator"]
-                                  },
+                                  "agent_id": "integ-test-agent",
                                   "input": "What is 2+2?",
                                   "max_retries": 2,
                                   "max_steps": 10,
@@ -71,7 +75,7 @@ class TaskControllerIntegrationTest {
                                 .content(submitBody))
                                 .andExpect(status().isCreated())
                                 .andExpect(jsonPath("$.task_id").exists())
-                                .andExpect(jsonPath("$.agent_id").value("test_agent"))
+                                .andExpect(jsonPath("$.agent_id").value(TEST_AGENT_ID))
                                 .andExpect(jsonPath("$.status").value("queued"))
                                 .andReturn();
 
@@ -105,7 +109,7 @@ class TaskControllerIntegrationTest {
 
                 // 6. Verify in dead-letter list
                 mockMvc.perform(get("/v1/tasks/dead-letter")
-                                .param("agent_id", "test_agent"))
+                                .param("agent_id", TEST_AGENT_ID))
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.items[0].task_id").value(taskId));
 
@@ -121,16 +125,10 @@ class TaskControllerIntegrationTest {
         }
 
         @Test
-        void submitTask_invalidModel_returns400() throws Exception {
+        void submitTask_unknownAgent_returns404() throws Exception {
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "provider": "anthropic",
-                                    "system_prompt": "prompt",
-                                    "model": "invalid-model",
-                                    "temperature": 0.5
-                                  },
+                                  "agent_id": "nonexistent-agent",
                                   "input": "test"
                                 }
                                 """;
@@ -138,20 +136,22 @@ class TaskControllerIntegrationTest {
                 mockMvc.perform(post("/v1/tasks")
                                 .contentType(MediaType.APPLICATION_JSON_VALUE)
                                 .content(body))
-                                .andExpect(status().isBadRequest());
+                                .andExpect(status().isNotFound());
         }
 
         @Test
-        void submitTask_invalidTool_returns400() throws Exception {
+        void submitTask_disabledAgent_returns400() throws Exception {
+                jdbcTemplate.execute("""
+                        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+                        VALUES ('default', 'disabled-agent', 'Disabled Agent',
+                                '{"system_prompt":"prompt","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":[]}'::jsonb,
+                                'disabled')
+                        ON CONFLICT (tenant_id, agent_id) DO NOTHING
+                        """);
+
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "provider": "anthropic",
-                                    "system_prompt": "prompt",
-                                    "model": "claude-sonnet-4-6",
-                                    "allowed_tools": ["shell_exec"]
-                                  },
+                                  "agent_id": "disabled-agent",
                                   "input": "test"
                                 }
                                 """;
@@ -164,15 +164,9 @@ class TaskControllerIntegrationTest {
 
         @Test
         void cancelTask_alreadyCancelled_returns409() throws Exception {
-                // Submit and cancel
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "provider": "anthropic",
-                                    "system_prompt": "prompt",
-                                    "model": "claude-sonnet-4-6"
-                                  },
+                                  "agent_id": "integ-test-agent",
                                   "input": "test"
                                 }
                                 """;
@@ -199,12 +193,7 @@ class TaskControllerIntegrationTest {
         void redriveTask_notDeadLetter_returns409() throws Exception {
                 String body = """
                                 {
-                                  "agent_id": "agent1",
-                                  "agent_config": {
-                                    "provider": "anthropic",
-                                    "system_prompt": "prompt",
-                                    "model": "claude-sonnet-4-6"
-                                  },
+                                  "agent_id": "integ-test-agent",
                                   "input": "test"
                                 }
                                 """;
