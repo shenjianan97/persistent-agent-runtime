@@ -1,11 +1,9 @@
 package com.persistentagent.api.model.request;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
-import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Size;
 
 import java.util.UUID;
@@ -18,11 +16,6 @@ public record TaskSubmissionRequest(
         @Size(max = 64, message = "agent_id must not exceed 64 characters")
         @JsonProperty("agent_id")
         String agentId,
-
-        @NotNull(message = "agent_config is required")
-        @Valid
-        @JsonProperty("agent_config")
-        AgentConfigRequest agentConfig,
 
         @NotBlank(message = "input is required")
         @Size(max = 102400, message = "input must not exceed 100KB")

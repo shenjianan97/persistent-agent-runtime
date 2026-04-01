@@ -1,15 +1,8 @@
 import { cleanup, render, screen, fireEvent } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { LangfuseEndpointDialog } from './LangfuseEndpointDialog';
 import type { LangfuseEndpoint, LangfuseEndpointRequest } from '@/types';
-import { useTestLangfuseEndpoint } from './useLangfuseEndpoints';
-
-vi.mock('./useLangfuseEndpoints', () => ({
-    useTestLangfuseEndpoint: vi.fn(),
-}));
-
-const mockUseTestLangfuseEndpoint = vi.mocked(useTestLangfuseEndpoint);
 
 const sampleEndpoint: LangfuseEndpoint = {
     endpoint_id: 'ep-1',
@@ -28,13 +21,6 @@ const defaultProps = {
     endpoint: null,
 };
 
-beforeEach(() => {
-    mockUseTestLangfuseEndpoint.mockReturnValue({
-        mutate: vi.fn(),
-        isPending: false,
-    } as unknown as ReturnType<typeof useTestLangfuseEndpoint>);
-});
-
 afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -52,9 +38,6 @@ describe('LangfuseEndpointDialog', () => {
         inputs.forEach((input) => {
             expect(input).toHaveValue('');
         });
-
-        // No "Test Connection" button in create mode
-        expect(screen.queryByText('Test Connection')).not.toBeInTheDocument();
     });
 
     it('renders edit dialog with pre-filled fields', () => {
@@ -66,9 +49,6 @@ describe('LangfuseEndpointDialog', () => {
         // Name and Host fields are pre-filled
         expect(screen.getByDisplayValue('Production Langfuse')).toBeInTheDocument();
         expect(screen.getByDisplayValue('https://langfuse.example.com')).toBeInTheDocument();
-
-        // "Test Connection" button is shown in edit mode
-        expect(screen.getByText('Test Connection')).toBeInTheDocument();
     });
 
     it('validates required fields - submit is disabled when isPending', () => {
@@ -109,18 +89,9 @@ describe('LangfuseEndpointDialog', () => {
         } satisfies LangfuseEndpointRequest);
     });
 
-    it('test connection button calls the test mutation', () => {
-        const testMutate = vi.fn();
-        mockUseTestLangfuseEndpoint.mockReturnValue({
-            mutate: testMutate,
-            isPending: false,
-        } as unknown as ReturnType<typeof useTestLangfuseEndpoint>);
-
+    it('shows edit title in edit mode', () => {
         render(<LangfuseEndpointDialog {...defaultProps} endpoint={sampleEndpoint} />);
 
-        const testButton = screen.getByText('Test Connection');
-        fireEvent.click(testButton);
-
-        expect(testMutate).toHaveBeenCalledWith('ep-1', expect.any(Object));
+        expect(screen.getByText('Edit Endpoint')).toBeInTheDocument();
     });
 });

@@ -46,10 +46,10 @@ const noopMutation = {
 } as unknown as ReturnType<typeof useDeleteLangfuseEndpoint>;
 
 beforeEach(() => {
-    mockUseCreateLangfuseEndpoint.mockReturnValue(noopMutation as ReturnType<typeof useCreateLangfuseEndpoint>);
-    mockUseUpdateLangfuseEndpoint.mockReturnValue(noopMutation as ReturnType<typeof useUpdateLangfuseEndpoint>);
-    mockUseDeleteLangfuseEndpoint.mockReturnValue(noopMutation as ReturnType<typeof useDeleteLangfuseEndpoint>);
-    mockUseTestLangfuseEndpoint.mockReturnValue(noopMutation as ReturnType<typeof useTestLangfuseEndpoint>);
+    mockUseCreateLangfuseEndpoint.mockReturnValue(noopMutation as unknown as ReturnType<typeof useCreateLangfuseEndpoint>);
+    mockUseUpdateLangfuseEndpoint.mockReturnValue(noopMutation as unknown as ReturnType<typeof useUpdateLangfuseEndpoint>);
+    mockUseDeleteLangfuseEndpoint.mockReturnValue(noopMutation as unknown as ReturnType<typeof useDeleteLangfuseEndpoint>);
+    mockUseTestLangfuseEndpoint.mockReturnValue(noopMutation as unknown as ReturnType<typeof useTestLangfuseEndpoint>);
 });
 
 afterEach(() => {

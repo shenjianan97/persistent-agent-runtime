@@ -9,7 +9,8 @@ async def test_3_13_checkpoint_history_verification(e2e):
     e2e.use_llm(calculator_tool_call(expression="3*7", final_answer="21"))
     await e2e.start_worker("e2e-checkpoints")
 
-    task_id = e2e.submit_task(input="calc", allowed_tools=["calculator"])
+    e2e.ensure_agent()
+    task_id = e2e.submit_task(input="calc")
     task = await e2e.wait_for_status(task_id, "completed", timeout=20.0)
 
     checkpoints = e2e.get_checkpoints(task_id)

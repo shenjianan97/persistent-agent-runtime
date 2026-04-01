@@ -38,6 +38,7 @@ async def test_3_21_reaper_expired_lease_retries_exhausted_dead_letter(e2e):
 @pytest.mark.asyncio
 async def test_3_22_retry_backoff_invisibility_window(e2e):
     """3.22 retry_after should hide queued tasks from claimers until window expires."""
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="retry window")
     await e2e.db.set_retry_after_future(task_id, 30)
 

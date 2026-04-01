@@ -1,0 +1,158 @@
+package com.persistentagent.api.service;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.persistentagent.api.config.ValidationConstants;
+import com.persistentagent.api.exception.AgentNotFoundException;
+import com.persistentagent.api.exception.ValidationException;
+import com.persistentagent.api.model.request.AgentConfigRequest;
+import com.persistentagent.api.model.request.AgentCreateRequest;
+import com.persistentagent.api.model.request.AgentUpdateRequest;
+import com.persistentagent.api.model.response.AgentResponse;
+import com.persistentagent.api.model.response.AgentSummaryResponse;
+import com.persistentagent.api.repository.AgentRepository;
+import com.persistentagent.api.util.DateTimeUtil;
+import com.persistentagent.api.util.JsonParseUtil;
+import org.springframework.stereotype.Service;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+public class AgentService {
+
+    private final AgentRepository agentRepository;
+    private final ConfigValidationHelper configValidationHelper;
+    private final ObjectMapper objectMapper;
+
+    public AgentService(AgentRepository agentRepository,
+            ConfigValidationHelper configValidationHelper,
+            ObjectMapper objectMapper) {
+        this.agentRepository = agentRepository;
+        this.configValidationHelper = configValidationHelper;
+        this.objectMapper = objectMapper;
+    }
+
+    public AgentResponse createAgent(AgentCreateRequest request) {
+        configValidationHelper.validateAgentConfig(request.agentConfig());
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
+        String agentConfigJson = serializeConfig(canonicalized);
+
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+        String agentId = UUID.randomUUID().toString();
+
+        Map<String, Object> result = agentRepository.insert(
+                tenantId, agentId, request.displayName(), agentConfigJson);
+
+        OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(result.get("created_at"));
+        OffsetDateTime updatedAt = DateTimeUtil.toOffsetDateTime(result.get("updated_at"));
+
+        Object configObj = JsonParseUtil.parseJson(objectMapper, agentConfigJson, "agent_config", agentId);
+
+        return new AgentResponse(
+                agentId,
+                request.displayName(),
+                configObj,
+                ValidationConstants.AGENT_STATUS_ACTIVE,
+                createdAt,
+                updatedAt);
+    }
+
+    public AgentResponse getAgent(String agentId) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        Map<String, Object> row = agentRepository.findByIdAndTenant(tenantId, agentId)
+                .orElseThrow(() -> new AgentNotFoundException(agentId));
+
+        return toAgentResponse(row);
+    }
+
+    public List<AgentSummaryResponse> listAgents(String status, Integer limit) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        if (status != null && !status.isBlank()
+                && !ValidationConstants.VALID_AGENT_STATUSES.contains(status)) {
+            throw new ValidationException("Invalid status filter: " + status
+                    + ". Valid statuses: " + ValidationConstants.VALID_AGENT_STATUSES);
+        }
+
+        int effectiveLimit = limit != null
+                ? Math.min(Math.max(limit, 1), ValidationConstants.MAX_AGENT_LIST_LIMIT)
+                : ValidationConstants.DEFAULT_AGENT_LIST_LIMIT;
+
+        List<Map<String, Object>> rows = agentRepository.listByTenant(tenantId, status, effectiveLimit);
+
+        return rows.stream()
+                .map(row -> new AgentSummaryResponse(
+                        (String) row.get("agent_id"),
+                        (String) row.get("display_name"),
+                        (String) row.get("provider"),
+                        (String) row.get("model"),
+                        (String) row.get("status"),
+                        DateTimeUtil.toOffsetDateTime(row.get("created_at")),
+                        DateTimeUtil.toOffsetDateTime(row.get("updated_at"))))
+                .toList();
+    }
+
+    public AgentResponse updateAgent(String agentId, AgentUpdateRequest request) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // Validate status
+        if (!ValidationConstants.VALID_AGENT_STATUSES.contains(request.status())) {
+            throw new ValidationException("Invalid status: " + request.status()
+                    + ". Valid statuses: " + ValidationConstants.VALID_AGENT_STATUSES);
+        }
+
+        configValidationHelper.validateAgentConfig(request.agentConfig());
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
+        String agentConfigJson = serializeConfig(canonicalized);
+
+        Map<String, Object> row = agentRepository.update(
+                tenantId, agentId, request.displayName(), agentConfigJson, request.status())
+                .orElseThrow(() -> new AgentNotFoundException(agentId));
+
+        return toAgentResponse(row);
+    }
+
+    // --- Config canonicalization ---
+
+    private AgentConfigRequest canonicalizeConfig(AgentConfigRequest config) {
+        return new AgentConfigRequest(
+                config.systemPrompt(),
+                config.provider(),
+                config.model(),
+                config.temperature() != null
+                        ? config.temperature()
+                        : ValidationConstants.DEFAULT_TEMPERATURE,
+                config.allowedTools() != null
+                        ? config.allowedTools()
+                        : List.of());
+    }
+
+    private String serializeConfig(AgentConfigRequest config) {
+        try {
+            return objectMapper.writeValueAsString(config);
+        } catch (JsonProcessingException e) {
+            throw new ValidationException("Failed to serialize agent_config: " + e.getMessage());
+        }
+    }
+
+    // --- Conversion helpers ---
+
+    private AgentResponse toAgentResponse(Map<String, Object> row) {
+        Object agentConfig = JsonParseUtil.parseJson(objectMapper, row.get("agent_config"), "agent_config",
+                (String) row.get("agent_id"));
+        return new AgentResponse(
+                (String) row.get("agent_id"),
+                (String) row.get("display_name"),
+                agentConfig,
+                (String) row.get("status"),
+                DateTimeUtil.toOffsetDateTime(row.get("created_at")),
+                DateTimeUtil.toOffsetDateTime(row.get("updated_at")));
+    }
+
+}

@@ -44,11 +44,61 @@ public class TaskRepository {
     }
 
     /**
+     * Atomically resolves an agent, validates its model is active, and inserts a new task.
+     * Uses INSERT...SELECT with a models JOIN to enforce in a single SQL statement:
+     * 1. Agent exists and status = 'active'
+     * 2. Agent's model is still active in the models registry
+     *
+     * Returns Optional.empty() if any condition fails (caller differentiates the reason).
+     * Only fires pg_notify when a row is actually inserted.
+     */
+    public Optional<Map<String, Object>> insertTaskFromAgent(
+            String tenantId, String agentId, String workerPoolId,
+            String input, int maxRetries, int maxSteps, int taskTimeoutSeconds,
+            UUID langfuseEndpointId) {
+        String sql = """
+                WITH agent AS (
+                    SELECT a.agent_id, a.display_name, a.agent_config
+                    FROM agents a
+                    JOIN models m
+                      ON m.provider_id = a.agent_config->>'provider'
+                     AND m.model_id   = a.agent_config->>'model'
+                     AND m.is_active  = true
+                    WHERE a.tenant_id = ? AND a.agent_id = ? AND a.status = 'active'
+                ),
+                inserted AS (
+                    INSERT INTO tasks (tenant_id, agent_id, agent_config_snapshot, worker_pool_id,
+                                       input, max_retries, max_steps, task_timeout_seconds, status,
+                                       langfuse_endpoint_id, agent_display_name_snapshot)
+                    SELECT ?, a.agent_id, a.agent_config, ?,
+                           ?, ?, ?, ?, 'queued',
+                           ?, a.display_name
+                    FROM agent a
+                    RETURNING task_id, agent_display_name_snapshot, created_at
+                ),
+                notified AS (
+                    SELECT pg_notify('new_task', ?)
+                    FROM inserted
+                )
+                SELECT i.task_id, i.agent_display_name_snapshot, i.created_at
+                FROM inserted i
+                LEFT JOIN notified n ON true
+                """;
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(sql,
+                tenantId, agentId,
+                tenantId, workerPoolId,
+                input, maxRetries, maxSteps, taskTimeoutSeconds,
+                langfuseEndpointId,
+                workerPoolId);
+        return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
+    }
+
+    /**
      * Finds a task by ID scoped to tenant.
      */
     public Optional<Map<String, Object>> findByIdAndTenant(UUID taskId, String tenantId) {
         String sql = """
-                SELECT task_id, tenant_id, agent_id, status, input, output,
+                SELECT task_id, tenant_id, agent_id, agent_display_name_snapshot, status, input, output,
                        retry_count, retry_history, lease_owner,
                        last_error_code, last_error_message, last_worker_id,
                        dead_letter_reason, dead_lettered_at, created_at, updated_at,
@@ -67,7 +117,7 @@ public class TaskRepository {
      */
     public Optional<Map<String, Object>> findByIdWithAggregates(UUID taskId, String tenantId) {
         String sql = """
-                SELECT t.task_id, t.tenant_id, t.agent_id, t.status, t.input, t.output,
+                SELECT t.task_id, t.tenant_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.input, t.output,
                        t.retry_count, t.retry_history, t.lease_owner,
                        t.last_error_code, t.last_error_message, t.last_worker_id,
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
@@ -153,7 +203,7 @@ public class TaskRepository {
     @SuppressWarnings("null")
     public List<Map<String, Object>> listDeadLetterTasks(String tenantId, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
-                SELECT task_id, agent_id, dead_letter_reason, last_error_code,
+                SELECT task_id, agent_id, agent_display_name_snapshot, dead_letter_reason, last_error_code,
                        last_error_message, retry_count, last_worker_id, dead_lettered_at
                 FROM tasks
                 WHERE tenant_id = ? AND status = 'dead_letter'
@@ -278,7 +328,7 @@ public class TaskRepository {
     @SuppressWarnings("null")
     public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
         StringBuilder sql = new StringBuilder("""
-                SELECT t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at,
+                SELECT t.task_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.retry_count, t.created_at, t.updated_at,
                        t.langfuse_endpoint_id,
                        COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count,
                        COALESCE(SUM(c.cost_microdollars), 0) AS total_cost_microdollars
@@ -297,7 +347,7 @@ public class TaskRepository {
             sql.append(" AND t.agent_id = ?");
             params.add(agentId);
         }
-        sql.append(" GROUP BY t.task_id, t.agent_id, t.status, t.retry_count, t.created_at, t.updated_at, t.langfuse_endpoint_id");
+        sql.append(" GROUP BY t.task_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.retry_count, t.created_at, t.updated_at, t.langfuse_endpoint_id");
         sql.append(" ORDER BY t.created_at DESC LIMIT ?");
         params.add(limit);
 

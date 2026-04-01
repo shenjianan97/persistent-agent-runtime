@@ -4,6 +4,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_3_27_tenant_scoping(e2e):
     """3.27 API queries should remain scoped to tenant_id='default' in Phase 1."""
+    e2e.ensure_agent()
     assert e2e.submit_task(input="default tenant task")
 
     other_task = await e2e.db.insert_task(

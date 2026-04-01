@@ -116,7 +116,17 @@ export function TaskListPage() {
                                         {task.task_id.substring(0, 8)}...{task.task_id.substring(task.task_id.length - 4)}
                                     </Link>
                                 </TableCell>
-                                <TableCell>{task.agent_id}</TableCell>
+                                <TableCell>
+                                    <Link
+                                        to={`/agents/${encodeURIComponent(task.agent_id)}`}
+                                        className="hover:text-primary hover:underline underline-offset-4 decoration-primary/50 transition-colors"
+                                    >
+                                        {task.agent_display_name && (
+                                            <span className="block text-foreground">{task.agent_display_name}</span>
+                                        )}
+                                        <span className="block text-muted-foreground text-[10px]">{task.agent_id}</span>
+                                    </Link>
+                                </TableCell>
                                 <TableCell>
                                     <TaskStatusBadge status={task.status as TaskStatus} className="text-[10px] px-2 py-0.5" />
                                 </TableCell>

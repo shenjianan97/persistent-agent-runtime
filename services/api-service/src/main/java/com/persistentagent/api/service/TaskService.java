@@ -1,26 +1,25 @@
 package com.persistentagent.api.service;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
+import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
-import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
+import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
-import java.sql.Timestamp;
 import java.util.*;
 import java.util.stream.IntStream;
 
@@ -28,84 +27,87 @@ import java.util.stream.IntStream;
 public class TaskService {
 
     private final TaskRepository taskRepository;
+    private final AgentRepository agentRepository;
     private final ModelRepository modelRepository;
     private final LangfuseEndpointRepository langfuseEndpointRepository;
     private final TaskObservabilityService taskObservabilityService;
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
+    private final ConfigValidationHelper configValidationHelper;
     private final boolean devTaskControlsEnabled;
 
     public TaskService(
             TaskRepository taskRepository,
+            AgentRepository agentRepository,
             ModelRepository modelRepository,
             LangfuseEndpointRepository langfuseEndpointRepository,
             TaskObservabilityService taskObservabilityService,
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
+            ConfigValidationHelper configValidationHelper,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.taskRepository = taskRepository;
+        this.agentRepository = agentRepository;
         this.modelRepository = modelRepository;
         this.langfuseEndpointRepository = langfuseEndpointRepository;
         this.taskObservabilityService = taskObservabilityService;
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
+        this.configValidationHelper = configValidationHelper;
         this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
     public TaskSubmissionResponse submitTask(TaskSubmissionRequest request) {
-        // Additional validations beyond Bean Validation
-        validateModel(request.agentConfig().provider(), request.agentConfig().model());
-        validateAllowedTools(request.agentConfig().allowedTools());
-        validateTaskTimeoutSeconds(request.taskTimeoutSeconds());
-
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String workerPoolId = ValidationConstants.DEFAULT_WORKER_POOL_ID;
 
-        // Validate langfuse_endpoint_id if provided
+        // 1. Validate task-level fields first (cheap, no DB needed)
+        validateTaskTimeoutSeconds(request.taskTimeoutSeconds());
         if (request.langfuseEndpointId() != null) {
             langfuseEndpointRepository.findByIdAndTenant(request.langfuseEndpointId(), tenantId)
                     .orElseThrow(() -> new ValidationException(
                             "langfuse_endpoint_id not found: " + request.langfuseEndpointId()));
         }
 
-        // Build agent_config_snapshot
-        AgentConfigRequest agentConfigSnapshot = new AgentConfigRequest(
-                request.agentConfig().systemPrompt(),
-                request.agentConfig().provider(),
-                request.agentConfig().model(),
-                request.agentConfig().temperature() != null
-                        ? request.agentConfig().temperature()
-                        : ValidationConstants.DEFAULT_TEMPERATURE,
-                request.agentConfig().allowedTools() != null
-                        ? request.agentConfig().allowedTools()
-                        : List.of());
-
-        String agentConfigJson;
-        try {
-            agentConfigJson = objectMapper.writeValueAsString(agentConfigSnapshot);
-        } catch (JsonProcessingException e) {
-            throw new ValidationException("Failed to serialize agent_config: " + e.getMessage());
-        }
-
-        int maxRetries = request.maxRetries() != null
-                ? request.maxRetries()
-                : ValidationConstants.DEFAULT_MAX_RETRIES;
-        int maxSteps = request.maxSteps() != null
-                ? request.maxSteps()
-                : ValidationConstants.DEFAULT_MAX_STEPS;
+        // 2. Apply task-level defaults
+        int maxRetries = request.maxRetries() != null ? request.maxRetries() : ValidationConstants.DEFAULT_MAX_RETRIES;
+        int maxSteps = request.maxSteps() != null ? request.maxSteps() : ValidationConstants.DEFAULT_MAX_STEPS;
         int taskTimeoutSeconds = request.taskTimeoutSeconds() != null
-                ? request.taskTimeoutSeconds()
-                : ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS;
+                ? request.taskTimeoutSeconds() : ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS;
 
-        Map<String, Object> result = taskRepository.insertTask(
-                tenantId, request.agentId(), agentConfigJson, workerPoolId,
+        // 3. Atomic agent resolution + model validation + task insertion (single SQL statement)
+        //    The INSERT...SELECT joins agents with models to atomically enforce:
+        //    - Agent exists and status = 'active'
+        //    - Agent's model is active in the models registry
+        //    This prevents both TOCTOU races from concurrent agent updates and
+        //    enqueueing tasks against deactivated models.
+        Optional<Map<String, Object>> result = taskRepository.insertTaskFromAgent(
+                tenantId, request.agentId(), workerPoolId,
                 request.input(), maxRetries, maxSteps, taskTimeoutSeconds,
                 request.langfuseEndpointId());
 
-        UUID taskId = (UUID) result.get("task_id");
-        OffsetDateTime createdAt = toOffsetDateTime(result.get("created_at"));
+        if (result.isEmpty()) {
+            // Atomic INSERT returned empty — determine why for the error response.
+            Optional<Map<String, Object>> agent = agentRepository.findByIdAndTenant(tenantId, request.agentId());
+            if (agent.isEmpty()) {
+                throw new AgentNotFoundException(request.agentId());
+            }
+            String agentStatus = (String) agent.get().get("status");
+            if (!"active".equals(agentStatus)) {
+                throw new ValidationException(
+                        "Agent is disabled and cannot be used for task submission: " + request.agentId());
+            }
+            // Agent exists and is active, so the model must be deactivated
+            throw new ValidationException(
+                    "Agent's model is no longer active. Update the agent's model before submitting tasks: " + request.agentId());
+        }
 
-        return new TaskSubmissionResponse(taskId, request.agentId(), "queued", createdAt);
+        Map<String, Object> row = result.get();
+        UUID taskId = (UUID) row.get("task_id");
+        String displayName = (String) row.get("agent_display_name_snapshot");
+        OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(row.get("created_at"));
+
+        return new TaskSubmissionResponse(taskId, request.agentId(), displayName, "queued", createdAt);
     }
 
     public TaskStatusResponse getTaskStatus(UUID taskId) {
@@ -123,9 +125,12 @@ public class TaskService {
         // Parse output from JSONB
         Object output = parseJson(task.get("output"));
 
+        String agentDisplayName = (String) task.get("agent_display_name_snapshot");
+
         return new TaskStatusResponse(
                 (UUID) task.get("task_id"),
                 (String) task.get("agent_id"),
+                agentDisplayName,
                 (String) task.get("status"),
                 (String) task.get("input"),
                 output,
@@ -138,9 +143,9 @@ public class TaskService {
                 (String) task.get("last_error_message"),
                 (String) task.get("last_worker_id"),
                 (String) task.get("dead_letter_reason"),
-                toOffsetDateTime(task.get("dead_lettered_at")),
-                toOffsetDateTime(task.get("created_at")),
-                toOffsetDateTime(task.get("updated_at")),
+                DateTimeUtil.toOffsetDateTime(task.get("dead_lettered_at")),
+                DateTimeUtil.toOffsetDateTime(task.get("created_at")),
+                DateTimeUtil.toOffsetDateTime(task.get("updated_at")),
                 (UUID) task.get("langfuse_endpoint_id"));
     }
 
@@ -169,7 +174,7 @@ public class TaskService {
                             ((Number) row.get("cost_microdollars")).intValue(),
                             executionMetadata,
                             event,
-                            toOffsetDateTime(row.get("created_at")));
+                            DateTimeUtil.toOffsetDateTime(row.get("created_at")));
                 })
                 .toList();
 
@@ -182,6 +187,7 @@ public class TaskService {
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
         String agentId = (String) task.get("agent_id");
+        String agentDisplayName = (String) task.get("agent_display_name_snapshot");
         String status = (String) task.get("status");
 
         RuntimeItemsResult result = buildRuntimeItems(taskId, task);
@@ -199,6 +205,7 @@ public class TaskService {
                 true,
                 taskId,
                 agentId,
+                agentDisplayName,
                 status,
                 totals.totalCostMicrodollars(),
                 totals.inputTokens(),
@@ -234,12 +241,13 @@ public class TaskService {
                 .map(row -> new DeadLetterItemResponse(
                         (UUID) row.get("task_id"),
                         (String) row.get("agent_id"),
+                        (String) row.get("agent_display_name_snapshot"),
                         (String) row.get("dead_letter_reason"),
                         (String) row.get("last_error_code"),
                         (String) row.get("last_error_message"),
                         ((Number) row.get("retry_count")).intValue(),
                         (String) row.get("last_worker_id"),
-                        toOffsetDateTime(row.get("dead_lettered_at"))))
+                        DateTimeUtil.toOffsetDateTime(row.get("dead_lettered_at"))))
                 .toList();
 
         return new DeadLetterListResponse(items);
@@ -265,12 +273,13 @@ public class TaskService {
                     return new TaskSummaryResponse(
                             (UUID) row.get("task_id"),
                             (String) row.get("agent_id"),
+                            (String) row.get("agent_display_name_snapshot"),
                             (String) row.get("status"),
                             ((Number) row.get("retry_count")).intValue(),
                             ((Number) row.get("checkpoint_count")).intValue(),
                             asLong(row.get("total_cost_microdollars")),
-                            toOffsetDateTime(row.get("created_at")),
-                            toOffsetDateTime(row.get("updated_at")));
+                            DateTimeUtil.toOffsetDateTime(row.get("created_at")),
+                            DateTimeUtil.toOffsetDateTime(row.get("updated_at")));
                 })
                 .toList();
 
@@ -303,29 +312,6 @@ public class TaskService {
 
     // --- Validation helpers ---
 
-    private void validateModel(String provider, String model) {
-        if (!modelRepository.isModelActive(provider, model)) {
-            throw new ValidationException("Unsupported model or provider: " + provider + "/" + model
-                    + ". Check GET /v1/models for supported ones.");
-        }
-    }
-
-    private void validateAllowedTools(List<String> tools) {
-        if (tools == null || tools.isEmpty()) {
-            return; // no tools is valid
-        }
-        Set<String> allowedTools = new LinkedHashSet<>(ValidationConstants.ALLOWED_TOOLS);
-        if (devTaskControlsEnabled) {
-            allowedTools.addAll(ValidationConstants.DEV_TASK_CONTROL_TOOLS);
-        }
-        for (String tool : tools) {
-            if (!allowedTools.contains(tool)) {
-                throw new ValidationException("Unsupported tool: " + tool
-                        + ". Allowed tools: " + allowedTools);
-            }
-        }
-    }
-
     private void validateTaskTimeoutSeconds(Integer taskTimeoutSeconds) {
         if (taskTimeoutSeconds == null) {
             return;
@@ -342,18 +328,6 @@ public class TaskService {
     }
 
     // --- Conversion helpers ---
-
-    private OffsetDateTime toOffsetDateTime(Object value) {
-        if (value == null)
-            return null;
-        if (value instanceof OffsetDateTime odt)
-            return odt;
-        if (value instanceof Timestamp ts)
-            return ts.toInstant().atOffset(ZoneOffset.UTC);
-        if (value instanceof java.util.Date d)
-            return d.toInstant().atOffset(ZoneOffset.UTC);
-        return null;
-    }
 
     private long asLong(Object value) {
         if (value instanceof Number number) {
@@ -392,8 +366,8 @@ public class TaskService {
         int totalOutput = checkpointMarkers.stream().mapToInt(m -> m.item().outputTokens()).sum();
         Long durationMs = null;
         if (checkpointRows.size() >= 2) {
-            OffsetDateTime first = toOffsetDateTime(checkpointRows.get(0).get("created_at"));
-            OffsetDateTime last = toOffsetDateTime(checkpointRows.get(checkpointRows.size() - 1).get("created_at"));
+            OffsetDateTime first = DateTimeUtil.toOffsetDateTime(checkpointRows.get(0).get("created_at"));
+            OffsetDateTime last = DateTimeUtil.toOffsetDateTime(checkpointRows.get(checkpointRows.size() - 1).get("created_at"));
             if (first != null && last != null) {
                 durationMs = java.time.Duration.between(first, last).toMillis();
             }
@@ -435,8 +409,8 @@ public class TaskService {
                 ? null
                 : checkpointMarkers.get(checkpointMarkers.size() - 1).item().startedAt();
         OffsetDateTime terminalAt = switch (status) {
-            case "completed" -> toOffsetDateTime(task.get("updated_at"));
-            case "dead_letter" -> toOffsetDateTime(task.get("dead_lettered_at"));
+            case "completed" -> DateTimeUtil.toOffsetDateTime(task.get("updated_at"));
+            case "dead_letter" -> DateTimeUtil.toOffsetDateTime(task.get("dead_lettered_at"));
             default -> null;
         };
         if (terminalAt != null && lastCheckpointAt != null && terminalAt.isBefore(lastCheckpointAt)) {
@@ -478,7 +452,7 @@ public class TaskService {
     private CheckpointMarker checkpointMarker(UUID taskId, String agentId, int index, Map<String, Object> row) {
         String checkpointId = (String) row.get("checkpoint_id");
         String nodeName = checkpointEventParser.extractNodeName(row.get("metadata_payload"), checkpointId);
-        OffsetDateTime createdAt = toOffsetDateTime(row.get("created_at"));
+        OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(row.get("created_at"));
         int stepNumber = index + 1;
 
         // Extract cost and token data from checkpoint row

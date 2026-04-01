@@ -9,6 +9,7 @@ async def test_3_23_version_field_increments_on_transitions(e2e):
     e2e.use_llm(simple_response("done"))
     await e2e.start_worker("e2e-version")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="version path")
     created = await e2e.db.fetch_task_columns(task_id, "version")
     assert created is not None and created["version"] == 1
@@ -48,6 +49,7 @@ async def test_3_24_error_fields_cleared_on_completion(e2e):
     e2e.use_llm(retryable_then_success("503 Service Unavailable", "ok"))
     await e2e.start_worker("e2e-error-clear")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(max_retries=3, input="clear errors")
 
     async def _error_set() -> bool:
@@ -69,6 +71,7 @@ async def test_3_25_retry_history_append_only(e2e):
     e2e.use_llm(always_fails("503 Service Unavailable"))
     await e2e.start_worker("e2e-retry-history")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(max_retries=2, input="retry history")
     dead = await e2e.wait_for_status(task_id, "dead_letter", timeout=30.0)
     assert dead["dead_letter_reason"] == "retries_exhausted"

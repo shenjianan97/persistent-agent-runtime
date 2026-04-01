@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from helpers.api_client import ApiClient
+from helpers.api_client import ApiClient, ApiError
 from helpers.db import DbHelper
 from helpers.mock_llm import DynamicChatProvider
 from helpers.waiting import wait_for_async, wait_until_task_status_async, wait_until_task_statuses_async
@@ -23,6 +23,15 @@ class E2EContext:
     db: DbHelper
     llm: DynamicChatProvider
     workers: Any
+
+    _default_agent_id: str | None = None
+
+    def ensure_agent(self, **kwargs):
+        """Create an agent and cache its ID for subsequent submit_task calls."""
+        resp = self.api.create_agent(**kwargs)
+        agent_id = resp["body"]["agent_id"]
+        self._default_agent_id = agent_id
+        return resp
 
     def use_llm(self, llm_mock: Any) -> None:
         self.llm.set_llm(llm_mock)
@@ -40,6 +49,8 @@ class E2EContext:
         await self.workers.stop_all()
 
     def submit_task(self, **overrides: Any) -> str:
+        if "agent_id" not in overrides and self._default_agent_id:
+            overrides["agent_id"] = self._default_agent_id
         return self.api.submit_task(**overrides)["body"]["task_id"]
 
     def get_task(self, task_id: str) -> dict[str, Any]:

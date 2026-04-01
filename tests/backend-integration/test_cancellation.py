@@ -8,6 +8,7 @@ from helpers.mock_llm import slow_response
 @pytest.mark.asyncio
 async def test_3_3_cancel_while_queued(e2e):
     """3.3 Cancel a task before any worker claims it."""
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="Stay queued")
 
     cancel = e2e.api.cancel_task(task_id)["body"]
@@ -29,6 +30,7 @@ async def test_3_4_cancel_while_running(e2e):
     e2e.use_llm(slow_response(delay=30.0, content="slow"))
     await e2e.start_worker("e2e-cancel-running")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="Long task")
 
     async def _running() -> bool:

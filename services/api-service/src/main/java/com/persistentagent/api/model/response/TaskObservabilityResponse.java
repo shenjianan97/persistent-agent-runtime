@@ -9,6 +9,7 @@ public record TaskObservabilityResponse(
         boolean enabled,
         @JsonProperty("task_id") UUID taskId,
         @JsonProperty("agent_id") String agentId,
+        @JsonProperty("agent_display_name") String agentDisplayName,
         String status,
         @JsonProperty("total_cost_microdollars") long totalCostMicrodollars,
         @JsonProperty("input_tokens") int inputTokens,

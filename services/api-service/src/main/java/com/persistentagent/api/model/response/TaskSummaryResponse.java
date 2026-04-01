@@ -8,6 +8,7 @@ import java.util.UUID;
 public record TaskSummaryResponse(
         @JsonProperty("task_id") UUID taskId,
         @JsonProperty("agent_id") String agentId,
+        @JsonProperty("agent_display_name") String agentDisplayName,
         String status,
         @JsonProperty("retry_count") int retryCount,
         @JsonProperty("checkpoint_count") int checkpointCount,

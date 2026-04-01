@@ -1,7 +1,7 @@
 import { CheckpointEvent, CheckpointResponse } from '@/types';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertCircle, BrainCircuit, CheckCircle2, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
+import { AlertCircle, BrainCircuit, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { TaskStatus } from '@/types';

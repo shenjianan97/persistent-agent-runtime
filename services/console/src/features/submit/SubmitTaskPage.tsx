@@ -1,11 +1,13 @@
-import { useNavigate } from 'react-router';
+import { useNavigate, useSearchParams, Link } from 'react-router';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useSubmitTask } from './useSubmitTask';
-import { useModels } from './useModels';
+import { useAgents, useAgent } from '@/features/agents/useAgents';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
-import { submitTaskSchema, SubmitTaskFormValues, ALLOWED_TOOLS } from './schema';
+import { submitTaskSchema, SubmitTaskFormValues } from './schema';
 import { toast } from 'sonner';
+import { useState, useEffect } from 'react';
+
 
 import {
     Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage
@@ -13,62 +15,49 @@ import {
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { PlaySquare } from 'lucide-react';
-import type { ModelResponse } from '@/types';
-
-const PROVIDER_LABELS: Record<string, string> = {
-    anthropic: 'Anthropic',
-    openai: 'OpenAI',
-};
-
-function formatProviderLabel(provider: string) {
-    return PROVIDER_LABELS[provider] ?? (provider.charAt(0).toUpperCase() + provider.slice(1));
-}
-
-function groupModelsByProvider(models: ModelResponse[]) {
-    const groups = new Map<string, { provider: string; label: string; models: ModelResponse[] }>();
-
-    models.forEach((model) => {
-        const existingGroup = groups.get(model.provider);
-        if (existingGroup) {
-            existingGroup.models.push(model);
-            return;
-        }
-
-        groups.set(model.provider, {
-            provider: model.provider,
-            label: formatProviderLabel(model.provider),
-            models: [model],
-        });
-    });
-
-    return Array.from(groups.values());
-}
+import { PlaySquare, AlertCircle, Bot } from 'lucide-react';
 
 export function SubmitTaskPage() {
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const queryAgentId = searchParams.get('agent_id') || '';
+
     const mutation = useSubmitTask();
-    const { data: models = [], isLoading: isLoadingModels } = useModels();
+    const { data: agents = [], isLoading: isLoadingAgents } = useAgents('active');
     const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
-    const modelGroups = groupModelsByProvider(models);
+
+    const [queryParamError, setQueryParamError] = useState<string | null>(null);
 
     const form = useForm<SubmitTaskFormValues>({
         resolver: zodResolver(submitTaskSchema),
         defaultValues: {
-            agent_id: '',
+            agent_id: queryAgentId || '',
             input: '',
-            system_prompt: 'You are a helpful assistant. Provide concise and accurate answers.',
-            provider: 'anthropic',
-            model: 'claude-3-5-sonnet-latest',
-            temperature: 0.7,
-            allowed_tools: ['web_search', 'read_url', 'calculator'],
             max_steps: 100,
             max_retries: 3,
             task_timeout_seconds: import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? 60 : 3600,
         },
     });
+
+    const selectedAgentId = form.watch('agent_id');
+
+    const { data: selectedAgent, isLoading: isLoadingAgent } = useAgent(selectedAgentId);
+
+    // Validate query param agent_id against loaded agents
+    useEffect(() => {
+        if (!queryAgentId || isLoadingAgents) return;
+
+        const match = agents.find(a => a.agent_id === queryAgentId);
+        if (!match) {
+            setQueryParamError(
+                `Agent "${queryAgentId}" was not found or is not active. Please select another agent.`
+            );
+            form.setValue('agent_id', '');
+        } else {
+            setQueryParamError(null);
+        }
+    }, [queryAgentId, agents, isLoadingAgents, form]);
 
     function onSubmit(data: SubmitTaskFormValues) {
         mutation.mutate(data, {
@@ -86,294 +75,256 @@ export function SubmitTaskPage() {
         });
     }
 
+    const noAgentsExist = !isLoadingAgents && agents.length === 0;
+
     return (
         <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
             <div className="console-surface-strong rounded-[28px] p-6 md:p-7 mb-8">
-                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Create Execution</div>
-                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
-                        <PlaySquare className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
-                        Submit Task
-                    </h2>
+                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Create Execution</div>
+                <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
+                    <PlaySquare className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
+                    Submit Task
+                </h2>
                 <p className="text-muted-foreground w-full md:w-2/3">
-                    Initialize a new durable execution job. The task will be queued and picked up by an available worker.
+                    Select an agent and provide task-level inputs. The task will be queued and picked up by an available worker.
                 </p>
             </div>
 
-            <Form {...form}>
-                <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-                    <Card className="console-surface border-white/10">
-                        <CardHeader className="border-b border-white/8 pb-4">
-                            <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Identity & Prompt</CardTitle>
-                        </CardHeader>
-                        <CardContent className="pt-6 space-y-6">
-                            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {/* Query param error */}
+            {queryParamError && (
+                <div className="mb-6 flex items-start gap-3 p-4 rounded-lg border border-destructive/50 bg-destructive/10 text-destructive text-sm">
+                    <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />
+                    <span>{queryParamError}</span>
+                </div>
+            )}
+
+            {/* Empty state: no agents exist */}
+            {noAgentsExist && (
+                <Card className="console-surface border-white/10">
+                    <CardContent className="py-16 flex flex-col items-center justify-center gap-4 text-center">
+                        <Bot className="w-12 h-12 text-muted-foreground opacity-30" />
+                        <div>
+                            <p className="text-sm font-semibold text-muted-foreground uppercase tracking-widest mb-2">No agents exist yet</p>
+                            <p className="text-sm text-muted-foreground">Create an agent before submitting a task.</p>
+                        </div>
+                        <Link
+                            to="/agents"
+                            className="mt-2 inline-flex items-center gap-2 px-4 py-2 text-sm font-bold uppercase tracking-widest border border-primary text-primary hover:bg-primary hover:text-black transition-colors"
+                        >
+                            Go to Agents
+                        </Link>
+                    </CardContent>
+                </Card>
+            )}
+
+            {!noAgentsExist && (
+                <Form {...form}>
+                    <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
+                        {/* Agent Selection */}
+                        <Card className="console-surface border-white/10">
+                            <CardHeader className="border-b border-white/8 pb-3">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Agent Selection</CardTitle>
+                            </CardHeader>
+                            <CardContent className="pt-2 space-y-6">
                                 <FormField
                                     control={form.control}
                                     name="agent_id"
-                                    render={({ field }) => (
+                                    render={() => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Agent ID</FormLabel>
-                                            <FormControl>
-                                                <Input className="rounded-none border-border bg-black/50 focus-visible:ring-primary focus-visible:ring-1" placeholder="e.g., e2e-test" {...field} />
-                                            </FormControl>
-                                            <FormMessage className="text-destructive font-bold text-xs" />
-                                        </FormItem>
-                                    )}
-                                />
-                                <FormField
-                                    control={form.control}
-                                    name="model"
-                                    render={({ field }) => {
-                                        const currentValue = form.getValues('provider') && field.value
-                                            ? `${form.getValues('provider')}|${field.value}`
-                                            : "";
-                                        return (
-                                        <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Model</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Agent</FormLabel>
                                             <FormControl>
                                                 <select
-                                                    className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background file:border-0 file:bg-transparent file:text-sm file:font-medium placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
-                                                    value={currentValue}
+                                                    className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
+                                                    value={selectedAgentId}
                                                     onChange={(e) => {
-                                                        const val = e.target.value;
-                                                        if (val) {
-                                                            const [provider, modelId] = val.split('|');
-                                                            form.setValue('provider', provider);
-                                                            field.onChange(modelId);
-                                                        } else {
-                                                            form.setValue('provider', '');
-                                                            field.onChange('');
-                                                        }
+                                                        form.setValue('agent_id', e.target.value);
+                                                        setQueryParamError(null);
                                                     }}
                                                 >
-                                                    <option value="" disabled>{isLoadingModels ? "Loading models..." : "Select model"}</option>
-                                                    {modelGroups.map((group) => (
-                                                        <optgroup key={group.provider} label={group.label}>
-                                                            {group.models.map((model) => (
-                                                                <option key={`${model.provider}|${model.model_id}`} value={`${model.provider}|${model.model_id}`}>
-                                                                    {model.display_name}
-                                                                </option>
-                                                            ))}
-                                                        </optgroup>
+                                                    <option value="" disabled>
+                                                        {isLoadingAgents ? 'Loading agents...' : 'Select an agent'}
+                                                    </option>
+                                                    {agents.map((agent) => (
+                                                        <option key={agent.agent_id} value={agent.agent_id}>
+                                                            {agent.display_name} ({agent.agent_id})
+                                                        </option>
                                                     ))}
                                                 </select>
                                             </FormControl>
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
-                                    )}}
+                                    )}
                                 />
-                            </div>
 
-                            <FormField
-                                control={form.control}
-                                name="system_prompt"
-                                render={({ field }) => (
-                                    <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">System Prompt</FormLabel>
-                                        <FormControl>
-                                            <Textarea
-                                                className="min-h-[100px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary focus-visible:ring-1"
-                                                {...field}
-                                            />
-                                        </FormControl>
-                                        <FormMessage className="text-destructive font-bold text-xs" />
-                                    </FormItem>
+                                {/* Agent Config Preview */}
+                                {selectedAgentId && (
+                                    <div className="rounded-lg bg-muted/10 border border-white/5 p-4 space-y-3">
+                                        <div className="text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-3">Agent Configuration (read-only)</div>
+                                        {isLoadingAgent ? (
+                                            <div className="text-xs text-muted-foreground animate-pulse uppercase tracking-widest">Loading agent config...</div>
+                                        ) : selectedAgent ? (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Provider / Model</span>
+                                                    <span className="text-foreground">{selectedAgent.agent_config.provider} / {selectedAgent.agent_config.model}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Temperature</span>
+                                                    <span className="text-foreground">{selectedAgent.agent_config.temperature}</span>
+                                                </div>
+                                                <div className="md:col-span-2">
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">System Prompt</span>
+                                                    <span className="text-foreground/80 whitespace-pre-wrap line-clamp-3">{selectedAgent.agent_config.system_prompt}</span>
+                                                </div>
+                                                {selectedAgent.agent_config.allowed_tools && selectedAgent.agent_config.allowed_tools.length > 0 && (
+                                                    <div className="md:col-span-2">
+                                                        <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tools</span>
+                                                        <span className="text-foreground">{selectedAgent.agent_config.allowed_tools.join(', ')}</span>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <div className="text-xs text-destructive">Failed to load agent configuration.</div>
+                                        )}
+                                    </div>
                                 )}
-                            />
+                            </CardContent>
+                        </Card>
 
-                            <FormField
-                                control={form.control}
-                                name="input"
-                                render={({ field }) => (
-                                    <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Input Directive</FormLabel>
-                                        <FormControl>
-                                            <Textarea
-                                                className="min-h-[150px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary border-b-[3px] focus-visible:border-b-primary focus-visible:ring-0"
-                                                placeholder="What is 2+2?"
-                                                {...field}
-                                            />
-                                        </FormControl>
-                                        <FormDescription className="text-xs text-muted-foreground mt-2">The actual instruction or context for the agent.</FormDescription>
-                                        <FormMessage className="text-destructive font-bold text-xs" />
-                                    </FormItem>
-                                )}
-                            />
-                        </CardContent>
-                    </Card>
-
-                    <Card className="console-surface border-white/10">
-                        <CardHeader className="border-b border-white/8 pb-4">
-                            <CardTitle className="text-sm font-display uppercase tracking-widest">Execution Parameters</CardTitle>
-                        </CardHeader>
-                        <CardContent className="pt-6">
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                        {/* Task Inputs */}
+                        <Card className="console-surface border-white/10">
+                            <CardHeader className="border-b border-white/8 pb-3">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest">Task Input</CardTitle>
+                            </CardHeader>
+                            <CardContent className="pt-2 space-y-6">
                                 <FormField
                                     control={form.control}
-                                    name="temperature"
+                                    name="input"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Temperature</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Input Directive</FormLabel>
                                             <FormControl>
-                                                <Input type="number" step="0.1" min="0" max="2" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseFloat(e.target.value))} />
+                                                <Textarea
+                                                    className="min-h-[150px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary border-b-[3px] focus-visible:border-b-primary focus-visible:ring-0"
+                                                    placeholder="What is 2+2?"
+                                                    {...field}
+                                                />
                                             </FormControl>
+                                            <FormDescription className="text-xs text-muted-foreground mt-2">The actual instruction or context for the agent.</FormDescription>
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
                                     )}
                                 />
+                            </CardContent>
+                        </Card>
 
+                        {/* Execution Parameters */}
+                        <Card className="console-surface border-white/10">
+                            <CardHeader className="border-b border-white/8 pb-3">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest">Execution Parameters</CardTitle>
+                            </CardHeader>
+                            <CardContent className="pt-2">
+                                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                    <FormField
+                                        control={form.control}
+                                        name="max_steps"
+                                        render={({ field }) => (
+                                            <FormItem>
+                                                <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Steps</FormLabel>
+                                                <FormControl>
+                                                    <Input type="number" min="1" max="1000" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
+                                                </FormControl>
+                                                <FormMessage className="text-destructive font-bold text-xs" />
+                                            </FormItem>
+                                        )}
+                                    />
+
+                                    <FormField
+                                        control={form.control}
+                                        name="max_retries"
+                                        render={({ field }) => (
+                                            <FormItem>
+                                                <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Retries</FormLabel>
+                                                <FormControl>
+                                                    <Input type="number" min="0" max="10" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
+                                                </FormControl>
+                                                <FormMessage className="text-destructive font-bold text-xs" />
+                                            </FormItem>
+                                        )}
+                                    />
+
+                                    <FormField
+                                        control={form.control}
+                                        name="task_timeout_seconds"
+                                        render={({ field }) => (
+                                            <FormItem>
+                                                <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Timeout (s)</FormLabel>
+                                                <FormControl>
+                                                    <Input type="number" min={import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? "1" : "60"} max="86400" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
+                                                </FormControl>
+                                                <FormDescription className="text-xs text-muted-foreground">
+                                                    {import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true'
+                                                        ? 'Dev task controls enabled: short timeouts are allowed for local recovery testing.'
+                                                        : 'Minimum timeout is 60 seconds.'}
+                                                </FormDescription>
+                                                <FormMessage className="text-destructive font-bold text-xs" />
+                                            </FormItem>
+                                        )}
+                                    />
+                                </div>
+                            </CardContent>
+                        </Card>
+
+                        {/* Observability */}
+                        <Card className="console-surface border-white/10">
+                            <CardHeader className="border-b border-white/8 pb-3">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest">Observability</CardTitle>
+                            </CardHeader>
+                            <CardContent className="pt-2">
                                 <FormField
                                     control={form.control}
-                                    name="max_steps"
+                                    name="langfuse_endpoint_id"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Steps</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Langfuse Endpoint</FormLabel>
                                             <FormControl>
-                                                <Input type="number" min="1" max="1000" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
+                                                <select
+                                                    className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
+                                                    value={field.value ?? ''}
+                                                    onChange={(e) => field.onChange(e.target.value || undefined)}
+                                                >
+                                                    <option value="">None</option>
+                                                    {langfuseEndpoints.map((ep) => (
+                                                        <option key={ep.endpoint_id} value={ep.endpoint_id}>
+                                                            {ep.name} ({ep.host})
+                                                        </option>
+                                                    ))}
+                                                </select>
                                             </FormControl>
-                                            <FormMessage className="text-destructive font-bold text-xs" />
-                                        </FormItem>
-                                    )}
-                                />
-
-                                <FormField
-                                    control={form.control}
-                                    name="max_retries"
-                                    render={({ field }) => (
-                                        <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Retries</FormLabel>
-                                            <FormControl>
-                                                <Input type="number" min="0" max="10" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
-                                            </FormControl>
-                                            <FormMessage className="text-destructive font-bold text-xs" />
-                                        </FormItem>
-                                    )}
-                                />
-
-                                <FormField
-                                    control={form.control}
-                                    name="task_timeout_seconds"
-                                    render={({ field }) => (
-                                        <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Timeout (s)</FormLabel>
-                                            <FormControl>
-                                                <Input type="number" min={import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? "1" : "60"} max="86400" className="rounded-none border-border bg-black/50" {...field} onChange={e => field.onChange(parseInt(e.target.value, 10))} />
-                                            </FormControl>
-                                            <FormDescription className="text-xs text-muted-foreground">
-                                                {import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true'
-                                                    ? 'Dev task controls enabled: short timeouts are allowed for local recovery testing.'
-                                                    : 'Minimum timeout is 60 seconds.'}
+                                            <FormDescription className="text-xs text-muted-foreground mt-2">
+                                                {langfuseEndpoints.length === 0
+                                                    ? 'No endpoints configured \u2014 set up in Settings'
+                                                    : 'Optional: send execution traces to a Langfuse instance'}
                                             </FormDescription>
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
                                     )}
                                 />
-                            </div>
+                            </CardContent>
+                        </Card>
 
-                            <div className="mt-8 border-t border-border/40 pt-6">
-                                <FormField
-                                    control={form.control}
-                                    name="allowed_tools"
-                                    render={() => (
-                                        <FormItem>
-                                            <div className="mb-4">
-                                                <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Allowed Tools</FormLabel>
-                                                <FormDescription className="text-xs">
-                                                    Grant capabilities to this execution
-                                                </FormDescription>
-                                            </div>
-                                            <div className="flex flex-wrap gap-4">
-                                                {ALLOWED_TOOLS.map((item) => (
-                                                    <FormField
-                                                        key={item.id}
-                                                        control={form.control}
-                                                        name="allowed_tools"
-                                                        render={({ field }) => {
-                                                            return (
-                                                                <FormItem
-                                                                    key={item.id}
-                                                                    className="flex flex-row items-start space-x-3 space-y-0"
-                                                                >
-                                                                    <FormControl>
-                                                                        <Checkbox
-                                                                            className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
-                                                                            checked={field.value?.includes(item.id)}
-                                                                            onCheckedChange={(checked) => {
-                                                                                return checked
-                                                                                    ? field.onChange([...(field.value || []), item.id])
-                                                                                    : field.onChange(
-                                                                                        field.value?.filter(
-                                                                                            (value) => value !== item.id
-                                                                                        )
-                                                                                    )
-                                                                            }}
-                                                                        />
-                                                                    </FormControl>
-                                                                    <FormLabel className="font-normal font-mono cursor-pointer">
-                                                                        {item.label}
-                                                                    </FormLabel>
-                                                                </FormItem>
-                                                            )
-                                                        }}
-                                                    />
-                                                ))}
-                                            </div>
-                                            <FormMessage className="text-destructive font-bold text-xs" />
-                                        </FormItem>
-                                    )}
-                                />
-                            </div>
-                        </CardContent>
-                    </Card>
-
-                    <Card className="console-surface border-white/10">
-                        <CardHeader className="border-b border-white/8 pb-4">
-                            <CardTitle className="text-sm font-display uppercase tracking-widest">Observability</CardTitle>
-                        </CardHeader>
-                        <CardContent className="pt-6">
-                            <FormField
-                                control={form.control}
-                                name="langfuse_endpoint_id"
-                                render={({ field }) => (
-                                    <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Langfuse Endpoint</FormLabel>
-                                        <FormControl>
-                                            <select
-                                                className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-50 rounded-none appearance-none"
-                                                value={field.value ?? ''}
-                                                onChange={(e) => field.onChange(e.target.value || undefined)}
-                                            >
-                                                <option value="">None</option>
-                                                {langfuseEndpoints.map((ep) => (
-                                                    <option key={ep.endpoint_id} value={ep.endpoint_id}>
-                                                        {ep.name} ({ep.host})
-                                                    </option>
-                                                ))}
-                                            </select>
-                                        </FormControl>
-                                        <FormDescription className="text-xs text-muted-foreground mt-2">
-                                            {langfuseEndpoints.length === 0
-                                                ? 'No endpoints configured \u2014 set up in Settings'
-                                                : 'Optional: send execution traces to a Langfuse instance'}
-                                        </FormDescription>
-                                        <FormMessage className="text-destructive font-bold text-xs" />
-                                    </FormItem>
-                                )}
-                            />
-                        </CardContent>
-                    </Card>
-
-                    <div className="flex justify-end pt-4 pb-12">
-                        <Button
-                            type="submit"
-                            disabled={mutation.isPending}
-                            className="rounded-none font-bold uppercase tracking-widest px-8 hover:saturate-150 transition-all border border-primary text-black"
-                        >
-                            {mutation.isPending ? "INITIALIZING..." : "SUBMIT TASK"}
-                        </Button>
-                    </div>
-                </form>
-            </Form>
+                        <div className="flex justify-end pt-4 pb-12">
+                            <Button
+                                type="submit"
+                                disabled={mutation.isPending || !selectedAgentId}
+                                className="rounded-none font-bold uppercase tracking-widest px-8 hover:saturate-150 transition-all border border-primary text-black"
+                            >
+                                {mutation.isPending ? "INITIALIZING..." : "SUBMIT TASK"}
+                            </Button>
+                        </div>
+                    </form>
+                </Form>
+            )}
         </div>
     );
 }

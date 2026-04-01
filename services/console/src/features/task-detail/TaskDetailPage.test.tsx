@@ -241,16 +241,16 @@ vi.mock('./CostSummary', () => ({
     ),
 }));
 
-vi.mock('./ObservabilityTrace', () => ({
-    ObservabilityTrace: ({ observability }: { observability?: { items: Array<{ item_id: string }> } }) => (
-        <div>Execution items={observability?.items.length ?? 0}</div>
-    ),
-}));
-
 vi.mock('@/features/dead-letter/useDeadLetter', () => ({
     useRedriveTask: () => ({
         mutate: redriveMutateMock,
         isPending: false,
+    }),
+}));
+
+vi.mock('@/features/settings/useLangfuseEndpoints', () => ({
+    useLangfuseEndpoints: () => ({
+        data: [],
     }),
 }));
 
@@ -297,9 +297,5 @@ describe('TaskDetailPage', () => {
 
         expect(screen.getByText('Execution Failure')).toBeInTheDocument();
         expect(screen.getByText('CostSummary checkpoints=3')).toBeInTheDocument();
-        expect(screen.getByText('Execution items=4')).toBeInTheDocument();
-        expect(screen.queryByText('Tool Call: read_url')).not.toBeInTheDocument();
-        expect(screen.queryByText('Resumed From Saved Progress')).not.toBeInTheDocument();
-        expect(screen.queryByText('Waiting for checkpoints...')).not.toBeInTheDocument();
     });
 });

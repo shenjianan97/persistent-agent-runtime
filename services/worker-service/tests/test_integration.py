@@ -22,15 +22,36 @@ DB_DSN = os.getenv(
 )
 
 
+async def _ensure_agent(pool: asyncpg.Pool, *, tenant_id: str = "default", agent_id: str = "test_agent") -> None:
+    """Insert agent row if it doesn't exist (FK compliance)."""
+    agent_config = json.dumps({
+        "system_prompt": "You are a test assistant.",
+        "model": "claude-3-5-sonnet-latest",
+        "temperature": 0.5,
+        "allowed_tools": ["calculator"],
+    })
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+            VALUES ($1, $2, 'Test Agent', $3::jsonb, 'active')
+            ON CONFLICT (tenant_id, agent_id) DO NOTHING
+            """,
+            tenant_id, agent_id, agent_config,
+        )
+
+
 async def cleanup_test_db(pool: asyncpg.Pool) -> None:
     """Remove all test data to ensure isolation between integration tests."""
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")
+        await conn.execute("DELETE FROM agents")
 
 
 async def setup_test_task(pool: asyncpg.Pool) -> str:
+    await _ensure_agent(pool)
     task_id = str(uuid.uuid4())
     async with pool.acquire() as conn:
         agent_config = {
@@ -159,11 +180,12 @@ async def test_worker_core_primitives_integration():
         
         # Scenario 3: Reaper reclaims crashed task
         t3 = str(uuid.uuid4())
+        await _ensure_agent(pool)
         async with pool.acquire() as conn:
             agent_config = {"model": "test"}
             await conn.execute("""
                 INSERT INTO tasks (
-                    task_id, tenant_id, agent_id, agent_config_snapshot, 
+                    task_id, tenant_id, agent_id, agent_config_snapshot,
                     status, input, max_retries, max_steps, task_timeout_seconds,
                     lease_owner, lease_expiry, worker_pool_id
                 ) VALUES ($1, 'default', 'test_agent', $2, 'running', 'Test', 3, 5, 300, 'crashed-worker', NOW() - INTERVAL '10 seconds', 'test_pool')
@@ -179,6 +201,7 @@ async def test_worker_core_primitives_integration():
             
         # Scenario 4: Reaper dead-letters on task timeout
         t4 = str(uuid.uuid4())
+        await _ensure_agent(pool)
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO tasks (

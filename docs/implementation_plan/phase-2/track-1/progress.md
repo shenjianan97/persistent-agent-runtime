@@ -2,13 +2,13 @@
 
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
-| Task 1 | Database Schema | Not Started | Agents table, tasks.agent_display_name_snapshot, FK constraint, seed data |
-| Task 2 | Agent CRUD API | Not Started | AgentController/Service/Repository, POST/GET/GET/{id}/PUT at /v1/agents |
-| Task 3 | Task Submission Refactor | Not Started | Remove inline agent_config, resolve from agents table, snapshot config + display_name |
-| Task 4 | Task Response Enrichment | Not Started | Add agent_display_name to all task-facing responses |
-| Task 5 | Console: Agents Area | Not Started | /agents list + /agents/:agentId detail, sidebar nav, create dialog |
-| Task 6 | Console: Submit + Task Views | Not Started | Agent selector submit page, display_name in task list/detail/dead-letter |
-| Task 7 | Integration Tests + Worker | Not Started | Updated test contract, agent CRUD tests, worker FK compat |
+| Task 1 | Database Schema | Done | Agents table, tasks.agent_display_name_snapshot, FK constraint, seed data |
+| Task 2 | Agent CRUD API | Done | AgentController/Service/Repository, POST/GET/GET/{id}/PUT at /v1/agents |
+| Task 3 | Task Submission Refactor | Done | Remove inline agent_config, resolve from agents table, snapshot config + display_name |
+| Task 4 | Task Response Enrichment | Done | Add agent_display_name to all task-facing responses |
+| Task 5 | Console: Agents Area | Done | /agents list + /agents/:agentId detail, sidebar nav, create dialog |
+| Task 6 | Console: Submit + Task Views | Done | Agent selector submit page, display_name in task list/detail/dead-letter |
+| Task 7 | Integration Tests + Worker | Done | Updated test contract, agent CRUD tests, worker FK compat |
 
 ## Notes
 

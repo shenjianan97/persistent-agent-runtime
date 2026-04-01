@@ -66,9 +66,9 @@ describe('ObservabilityTrace', () => {
         render(<ObservabilityTrace observability={observability} />);
 
         expect(screen.getByText('Execution')).toBeInTheDocument();
-        expect(screen.getByText('Checkpoint saved')).toBeInTheDocument();
-        expect(screen.getByText('Checkpoint')).toBeInTheDocument();
-        expect(screen.getByText('1 checkpoint')).toBeInTheDocument();
+        // Component renders model_name or fallback 'LLM Call' for checkpoint items with tokens/cost
+        expect(screen.getByText('LLM Call')).toBeInTheDocument();
+        expect(screen.getByText('$0.0005')).toBeInTheDocument();
     });
 
     it('renders completed and retry items alongside checkpoints', () => {
@@ -92,7 +92,7 @@ describe('ObservabilityTrace', () => {
                     step_number: 1,
                     node_name: 'input',
                     tool_name: null,
-                    model_name: null,
+                    model_name: 'claude-sonnet-4-6',
                     cost_microdollars: 500,
                     input_tokens: 10,
                     output_tokens: 5,
@@ -128,8 +128,9 @@ describe('ObservabilityTrace', () => {
 
         render(<ObservabilityTrace observability={observability} />);
 
-        expect(screen.getByText('Checkpoint saved')).toBeInTheDocument();
-        expect(screen.getByText('Task completed')).toBeInTheDocument();
+        // Checkpoint with model_name renders model name as label
+        expect(screen.getByText('claude-sonnet-4-6')).toBeInTheDocument();
+        // Terminal completed item renders "Completed" label
         expect(screen.getByText('Completed')).toBeInTheDocument();
     });
 });

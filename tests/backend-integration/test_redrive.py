@@ -9,6 +9,7 @@ async def test_3_11_redrive_from_dead_letter(e2e):
     e2e.use_llm(always_fails("400 Bad Request: invalid prompt"))
     await e2e.start_worker("e2e-redrive")
 
+    e2e.ensure_agent()
     task_id = e2e.submit_task(input="first fail")
     dead = await e2e.wait_for_status(task_id, "dead_letter", timeout=20.0)
     assert dead["dead_letter_reason"] == "non_retryable_error"
