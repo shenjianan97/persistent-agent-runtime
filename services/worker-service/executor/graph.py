@@ -47,29 +47,6 @@ from tools.errors import ToolExecutionError, ToolTransportError
 logger = logging.getLogger(__name__)
 
 
-async def _insert_task_event(
-    conn,
-    task_id: str,
-    tenant_id: str,
-    agent_id: str,
-    event_type: str,
-    status_before: str,
-    status_after: str,
-    worker_id: str | None = None,
-    error_code: str | None = None,
-    error_message: str | None = None,
-    details: dict | None = None,
-):
-    """Insert a task_events row within an existing connection/transaction."""
-    await conn.execute('''
-        INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
-            status_before, status_after, worker_id, error_code, error_message, details)
-        VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
-    ''', tenant_id, task_id, agent_id, event_type,
-        status_before, status_after, worker_id,
-        error_code, error_message, json.dumps(details or {}))
-
-
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
@@ -425,23 +402,31 @@ class GraphExecutor:
                 output_data = {"result": output_content}
                 if langfuse_endpoint_id:
                     output_data["langfuse_status"] = langfuse_status
-                updated = await self.pool.fetchval(
-                    '''UPDATE tasks
-                       SET status='completed',
-                           output=$1,
-                           last_error_code=NULL,
-                           last_error_message=NULL,
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$2::uuid
-                         AND status='running'
-                         AND lease_owner=$3
-                       RETURNING task_id''',
-                    json.dumps(output_data),
-                    task_id,
-                    worker_id,
-                )
+                async with self.pool.acquire() as conn:
+                    async with conn.transaction():
+                        updated = await conn.fetchval(
+                            '''UPDATE tasks
+                               SET status='completed',
+                                   output=$1,
+                                   last_error_code=NULL,
+                                   last_error_message=NULL,
+                                   version=version+1,
+                                   lease_owner=NULL,
+                                   lease_expiry=NULL
+                               WHERE task_id=$2::uuid
+                                 AND status='running'
+                                 AND lease_owner=$3
+                               RETURNING task_id''',
+                            json.dumps(output_data),
+                            task_id,
+                            worker_id,
+                        )
+                        if updated is not None:
+                            await _insert_task_event(
+                                conn, task_id, tenant_id, agent_id,
+                                "task_completed", "running", "completed",
+                                worker_id,
+                            )
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
@@ -456,9 +441,9 @@ class GraphExecutor:
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
 
         except asyncio.TimeoutError:
-            await self._handle_dead_letter(task_id, "task_timeout", "Execution exceeded task logic timeout")
+            await self._handle_dead_letter(task_id, tenant_id, agent_id, "task_timeout", "Execution exceeded task logic timeout")
         except GraphRecursionError:
-            await self._handle_dead_letter(task_id, "max_steps_exceeded", f"Execution exceeded max_steps ({max_steps})")
+            await self._handle_dead_letter(task_id, tenant_id, agent_id, "max_steps_exceeded", f"Execution exceeded max_steps ({max_steps})")
         except GraphInterrupt as gi:
             await self._handle_interrupt(task_data, gi, worker_id)
         except LeaseRevokedException:
@@ -470,7 +455,7 @@ class GraphExecutor:
             if self._is_retryable_error(e):
                 await self._handle_retryable_error(task_data, e)
             else:
-                await self._handle_dead_letter(task_id, "non_retryable_error", str(e), error_code="fatal_error")
+                await self._handle_dead_letter(task_id, tenant_id, agent_id, "non_retryable_error", str(e), error_code="fatal_error")
         finally:
             if per_task_langfuse_client is not None:
                 try:
@@ -659,12 +644,14 @@ class GraphExecutor:
 
     async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
         task_id = str(task_data["task_id"])
+        tenant_id = task_data.get("tenant_id", "default")
+        agent_id = task_data.get("agent_id") or "unknown"
         retry_count = task_data.get("retry_count", 0)
         max_retries = task_data.get("max_retries", 3)
         worker_pool_id = self.config.worker_pool_id
 
         if retry_count >= max_retries:
-            await self._handle_dead_letter(task_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
+            await self._handle_dead_letter(task_id, tenant_id, agent_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
             return
 
         new_retry_count = retry_count + 1
@@ -674,64 +661,112 @@ class GraphExecutor:
         worker_id = self.config.worker_id
         error_msg = str(e)[:1024]
         async with self.pool.acquire() as conn:
-            updated = await conn.fetchval(
-                '''UPDATE tasks
-                   SET status='queued',
-                       retry_count=$1,
-                       retry_after=$2,
-                       retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
-                       last_error_code='retryable_error',
-                       last_error_message=$3,
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$4::uuid
-                     AND status='running'
-                     AND lease_owner=$5
-                   RETURNING task_id''',
-                new_retry_count,
-                retry_after,
-                error_msg,
-                task_id,
-                worker_id,
-            )
-            if updated is None:
-                logger.warning("Task %s retry-requeue skipped: lease no longer owned by this worker.", task_id)
-                return
-            # Re-queue notification
-            await conn.execute("SELECT pg_notify('new_task', $1)", worker_pool_id)
+            async with conn.transaction():
+                updated = await conn.fetchval(
+                    '''UPDATE tasks
+                       SET status='queued',
+                           retry_count=$1,
+                           retry_after=$2,
+                           retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
+                           last_error_code='retryable_error',
+                           last_error_message=$3,
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$4::uuid
+                         AND status='running'
+                         AND lease_owner=$5
+                       RETURNING task_id''',
+                    new_retry_count,
+                    retry_after,
+                    error_msg,
+                    task_id,
+                    worker_id,
+                )
+                if updated is None:
+                    logger.warning("Task %s retry-requeue skipped: lease no longer owned by this worker.", task_id)
+                    return
+                await _insert_task_event(
+                    conn, task_id, tenant_id, agent_id,
+                    "task_retry_scheduled", "running", "queued",
+                    worker_id, error_code="retryable_error",
+                    error_message=error_msg,
+                    details={"retry_count": new_retry_count, "retry_after": str(retry_after)},
+                )
+                # Re-queue notification
+                await conn.execute("SELECT pg_notify('new_task', $1)", worker_pool_id)
 
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
-    async def _handle_dead_letter(self, task_id: str, reason: str, error_msg: str, error_code: str | None = None):
+    async def _handle_dead_letter(self, task_id: str, tenant_id: str, agent_id: str,
+                                   reason: str, error_msg: str, error_code: str | None = None):
         worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
+        effective_error_code = error_code or reason
 
         async with self.pool.acquire() as conn:
-            updated = await conn.fetchval(
-                '''UPDATE tasks
-                   SET status='dead_letter',
-                       dead_letter_reason=$1,
-                       last_error_message=$2,
-                       last_error_code=$3,
-                       last_worker_id=$4,
-                       dead_lettered_at=NOW(),
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$5::uuid
-                     AND status='running'
-                     AND lease_owner=$6
-                   RETURNING task_id''',
-                reason,
-                error_msg,
-                error_code or reason,
-                worker_id,
-                task_id,
-                worker_id,
-            )
+            async with conn.transaction():
+                updated = await conn.fetchval(
+                    '''UPDATE tasks
+                       SET status='dead_letter',
+                           dead_letter_reason=$1,
+                           last_error_message=$2,
+                           last_error_code=$3,
+                           last_worker_id=$4,
+                           dead_lettered_at=NOW(),
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$5::uuid
+                         AND status='running'
+                         AND lease_owner=$6
+                       RETURNING task_id''',
+                    reason,
+                    error_msg,
+                    effective_error_code,
+                    worker_id,
+                    task_id,
+                    worker_id,
+                )
+                if updated is not None:
+                    await _insert_task_event(
+                        conn, task_id, tenant_id, agent_id,
+                        "task_dead_lettered", "running", "dead_letter",
+                        worker_id, error_code=effective_error_code,
+                        error_message=error_msg,
+                        details={"dead_letter_reason": reason},
+                    )
 
         if updated is None:
             logger.warning("Task %s dead-letter skipped: lease no longer owned by this worker.", task_id)
         else:
             logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+
+
+async def _insert_task_event(
+    conn,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    event_type: str,
+    status_before: str | None,
+    status_after: str | None,
+    worker_id: str | None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    details: dict | None = None,
+):
+    """Insert a task event on the current transaction-scoped connection.
+
+    Must be called inside an active transaction so the event INSERT commits
+    or rolls back atomically with the paired task-state mutation.
+    """
+    await conn.execute(
+        '''INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
+                                    status_before, status_after, worker_id,
+                                    error_code, error_message, details)
+           VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)''',
+        tenant_id, task_id, agent_id, event_type,
+        status_before, status_after, worker_id,
+        error_code, error_message, json.dumps(details or {}),
+    )

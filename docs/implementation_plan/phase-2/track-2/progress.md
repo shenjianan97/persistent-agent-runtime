@@ -6,7 +6,7 @@
 | Task 2 | Event Service | Done | TaskEventRepository/Service, GET /v1/tasks/{id}/events endpoint |
 | Task 3 | HITL API | Done | Approve/reject/respond endpoints, cancel expansion |
 | Task 4 | Worker Interrupt | Done | GraphInterrupt handling, request_human_input tool, reaper timeout |
-| Task 5 | Event Integration | Not Started | Emit events from all API, worker, and reaper state transitions |
+| Task 5 | Event Integration | Done | Emit events from all API, worker, and reaper state transitions |
 | Task 6 | Console Updates | Done | Status badges, approval/input panels, events timeline |
 | Task 7 | Integration Tests | Not Started | E2E tests for approval, input, timeout, event sequence flows |
 

@@ -8,6 +8,7 @@ Concurrency bounded by asyncio.Semaphore(MAX_CONCURRENT_TASKS).
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Callable, Awaitable
 
 import asyncpg
@@ -208,12 +209,26 @@ class TaskPoller:
         await self._semaphore.acquire()
         try:
             async with self._pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    build_claim_query(self._config.lease_duration_seconds),
-                    self._config.worker_pool_id,
-                    self._config.tenant_id,
-                    self._config.worker_id,
-                )
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        build_claim_query(self._config.lease_duration_seconds),
+                        self._config.worker_pool_id,
+                        self._config.tenant_id,
+                        self._config.worker_id,
+                    )
+                    if row is not None:
+                        task_id_str = str(row["task_id"])
+                        tenant_id = row["tenant_id"]
+                        agent_id = row.get("agent_id") or "unknown"
+                        await conn.execute(
+                            '''INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
+                                                        status_before, status_after, worker_id,
+                                                        error_code, error_message, details)
+                               VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)''',
+                            tenant_id, task_id_str, agent_id, "task_claimed",
+                            "queued", "running", self._config.worker_id,
+                            None, None, "{}",
+                        )
 
             if row is None:
                 self._semaphore.release()

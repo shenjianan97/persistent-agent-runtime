@@ -18,6 +18,7 @@ import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -60,6 +61,7 @@ public class TaskService {
         this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
+    @Transactional
     public TaskSubmissionResponse submitTask(TaskSubmissionRequest request) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String workerPoolId = ValidationConstants.DEFAULT_WORKER_POOL_ID;
@@ -109,6 +111,9 @@ public class TaskService {
         UUID taskId = (UUID) row.get("task_id");
         String displayName = (String) row.get("agent_display_name_snapshot");
         OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(row.get("created_at"));
+
+        taskEventService.recordEvent(tenantId, taskId, request.agentId(),
+                "task_submitted", null, "queued", null, null, null, "{}");
 
         return new TaskSubmissionResponse(taskId, request.agentId(), displayName, "queued", createdAt);
     }
@@ -225,12 +230,18 @@ public class TaskService {
         );
     }
 
+    @Transactional
     public TaskCancelResponse cancelTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        TaskRepository.MutationResult result = taskRepository.cancelTask(taskId, tenantId);
-        return switch (result) {
-            case UPDATED -> new TaskCancelResponse(taskId, "dead_letter", "cancelled_by_user");
+        TaskRepository.CancelResult cancelResult = taskRepository.cancelTask(taskId, tenantId);
+        return switch (cancelResult.outcome()) {
+            case UPDATED -> {
+                taskEventService.recordEvent(tenantId, taskId, cancelResult.agentId(),
+                        "task_cancelled", cancelResult.previousStatus(), "dead_letter",
+                        null, "cancelled_by_user", null, "{}");
+                yield new TaskCancelResponse(taskId, "dead_letter", "cancelled_by_user");
+            }
             case NOT_FOUND -> throw new TaskNotFoundException(taskId);
             case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
                     "Task " + taskId + " cannot be cancelled (must be in queued, running, waiting_for_approval, waiting_for_input, or paused state)");
@@ -352,12 +363,18 @@ public class TaskService {
         return new TaskListResponse(items);
     }
 
+    @Transactional
     public RedriveResponse redriveTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        TaskRepository.MutationResult result = taskRepository.redriveTask(taskId, tenantId);
-        return switch (result) {
-            case UPDATED -> new RedriveResponse(taskId, "queued");
+        TaskRepository.RedriveResult redriveResult = taskRepository.redriveTask(taskId, tenantId);
+        return switch (redriveResult.outcome()) {
+            case UPDATED -> {
+                taskEventService.recordEvent(tenantId, taskId, redriveResult.agentId(),
+                        "task_redriven", "dead_letter", "queued",
+                        null, null, null, "{}");
+                yield new RedriveResponse(taskId, "queued");
+            }
             case NOT_FOUND -> throw new TaskNotFoundException(taskId);
             case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
                     "Task " + taskId + " cannot be redriven (must be in dead_letter state)");
