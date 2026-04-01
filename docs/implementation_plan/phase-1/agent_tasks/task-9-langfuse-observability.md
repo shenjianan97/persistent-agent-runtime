@@ -8,7 +8,7 @@ Your scope covers the Worker Service, API Service, Console, and AWS infrastructu
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture, the observability proposal, and the current cost tracking implementation:
 1. `docs/PROJECT.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md` (Sections 5.5, 5.7, 6.4, and 10)
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` (Sections 5.5, 5.7, 6.4, and 10)
 3. `services/worker-service/executor/graph.py` (current manual cost tracking code to be removed)
 4. `services/console/src/features/task-detail/` (current cost visualization to be updated)
 5. `infrastructure/cdk/lib/compute-stack.ts` (ECS service definitions)

@@ -14,9 +14,9 @@ Validate the full request lifecycle across all three runtime components — **AP
 
 | Document | Path | What it covers |
 |----------|------|----------------|
-| **Phase 1 Design (PRIMARY)** | `docs/design/PHASE1_DURABLE_EXECUTION.md` | Canonical spec: entity model (§2), full API contract with request/response shapes (§3), state machine & transition table (§4), sequence diagrams for all 5 failure scenarios (§4), lease protocol & LISTEN/NOTIFY (§5.3), LangGraph execution & checkpointing (§5.4), error classification table (§5.5), all key SQL queries (§6.1), idempotency & crash recovery protocol (§6.2), security model (§6.3), observability (§6.4), demo scenario (§7) |
+| **Phase 1 Design (PRIMARY)** | `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` | Canonical spec: entity model (§2), full API contract with request/response shapes (§3), state machine & transition table (§4), sequence diagrams for all 5 failure scenarios (§4), lease protocol & LISTEN/NOTIFY (§5.3), LangGraph execution & checkpointing (§5.4), error classification table (§5.5), all key SQL queries (§6.1), idempotency & crash recovery protocol (§6.2), security model (§6.3), observability (§6.4), demo scenario (§7) |
 | Project Overview | `docs/PROJECT.md` | High-level vision, user stories, phases, tech stack |
-| Phase 2 Design | `docs/design/PHASE2_MULTI_AGENT.md` | Out of scope for E2E tests but useful for understanding forward-compatible fields (`tenant_id`, `worker_pool_id`) |
+| Phase 2 Design | `docs/design/phase-2/PHASE2_MULTI_AGENT.md` | Out of scope for E2E tests but useful for understanding forward-compatible fields (`tenant_id`, `worker_pool_id`) |
 | Implementation Plan | `docs/implementation_plan/phase-1/plan.md` | Orchestrator plan, dependency graph between tasks 1-7, handoff outputs |
 | CLAUDE.md | `CLAUDE.md` | Project-wide context: key architecture decisions, tech stack, project stages |
 

@@ -4,7 +4,7 @@
 
 **CRITICAL PRE-WORK:** Before delegating any tasks or making technical decisions, you MUST read the following context files to understand the project goals and system architecture:
 1. `docs/PROJECT.md`
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 Your responsibilities are to assign the individual tasks listed in Section B to specialized coding agents, track their progress in `progress.md`, and resolve any dependencies or blockers based on the architecture described in the design documents.
 
@@ -20,7 +20,7 @@ Phase 1 Durable Execution will be established through a Database-as-a-Queue mode
   Component: Database Schema
   Change type: new code
   Path: `infrastructure/database/`
-  Description: Implement the exact Phase 1 PostgreSQL schema and key query support described in `docs/design/PHASE1_DURABLE_EXECUTION.md`, including `tasks`, `checkpoints`, and `checkpoint_writes`, queue/reaper/dead-letter indexes, `updated_at` maintenance, and `LISTEN/NOTIFY` support for claimable task transitions.
+  Description: Implement the exact Phase 1 PostgreSQL schema and key query support described in `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`, including `tasks`, `checkpoints`, and `checkpoint_writes`, queue/reaper/dead-letter indexes, `updated_at` maintenance, and `LISTEN/NOTIFY` support for claimable task transitions.
 
   Component: API Service
   Change type: new code
@@ -178,7 +178,7 @@ Before implementation begins in earnest, the repo should pin or explicitly docum
 #### A9. Orchestrator Guidance
 When assigning tasks to implementation agents:
 
-  Use `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical architecture/behavior contract and `agent_tasks/*.md` as the task-local implementation contract.
+  Use `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical architecture/behavior contract and `agent_tasks/*.md` as the task-local implementation contract.
 
   Require each agent to state any dependency/version assumption explicitly before coding if that assumption is not already pinned in the repo.
 

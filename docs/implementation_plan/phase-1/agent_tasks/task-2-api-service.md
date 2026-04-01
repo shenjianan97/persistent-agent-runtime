@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 The API Service acts as the ingest and query interface between external clients and the underlying persistence data structure holding executable tasks. It is stateless and manages input creation and state overrides via PostgreSQL transactions without LangGraph logic.
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical API contract. Do not add endpoints, alternate state transitions, or response fields unless the design doc is updated.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical API contract. Do not add endpoints, alternate state transitions, or response fields unless the design doc is updated.
 - Phase 1 always resolves `tenant_id = "default"` internally, but SQL queries still remain tenant-scoped.
 - `agent_config.allowed_tools` must be validated against the co-located MCP server `listTools` response at submission time.
 - The API owns input validation only. It does not execute LangGraph logic, classify LLM failures, or enforce worker-side retry semantics.
@@ -43,7 +43,7 @@ The API Service acts as the ingest and query interface between external clients 
 - Prefer targeting this local PostgreSQL instance for API integration tests and manual endpoint validation.
 
 ## Implementation Specification
-Step 1: Implement `POST /v1/tasks` against the exact request/response contract in `docs/design/PHASE1_DURABLE_EXECUTION.md`, inserting a `queued` task row with `tenant_id` resolved internally to `"default"` and `agent_config` persisted as `agent_config_snapshot`. The INSERT transaction must also execute `SELECT pg_notify('new_task', :worker_pool_id)` before commit, as specified in Section 5.3 of the design doc — every transition to `status='queued'` must emit NOTIFY.
+Step 1: Implement `POST /v1/tasks` against the exact request/response contract in `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`, inserting a `queued` task row with `tenant_id` resolved internally to `"default"` and `agent_config` persisted as `agent_config_snapshot`. The INSERT transaction must also execute `SELECT pg_notify('new_task', :worker_pool_id)` before commit, as specified in Section 5.3 of the design doc — every transition to `status='queued'` must emit NOTIFY.
 Step 2: Enforce the documented API validation rules at submission time: payload size limits, supported model list, temperature range, retry/step/timeout bounds, and `allowed_tools` validation. Since the Phase 1 tool set is fixed, hardcode the allowed tool names (`web_search`, `read_url`, `calculator`) as a compile-time constant for validation — this avoids a runtime dependency on the MCP server at submission time while remaining consistent with the Task 5 `listTools` contract.
 Step 3: Implement `GET /v1/tasks/{task_id}` including checkpoint count and aggregate cost derived from `checkpoints`, scoped by the internal Phase 1 tenant.
 Step 4: Implement `GET /v1/tasks/{task_id}/checkpoints` returning root-namespace checkpoint history in the documented order and shape.

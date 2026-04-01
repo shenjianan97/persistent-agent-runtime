@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 Instead of native function calling, tool execution delegates across standardized Model Context Protocol (MCP) server structures abstracting interface implementations directly. Phase 1 targets deterministic read-only functions resolving safely natively mimicking external interface architectures properly.
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical Phase 1 tool contract. Phase 1 tools are strictly read-only and idempotent by design.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical Phase 1 tool contract. Phase 1 tools are strictly read-only and idempotent by design.
 - The MCP server must expose `web_search`, `read_url`, and `calculator` through `listTools` with stable argument schemas, because Task 2 validates `allowed_tools` against this interface and Task 6 dispatches through it.
 - Do not introduce mutable tools, customer-provided tools, or Phase 2 BYOT concepts into this task.
 - Tool outputs are untrusted data; keep tool implementations narrow and schema-validated.

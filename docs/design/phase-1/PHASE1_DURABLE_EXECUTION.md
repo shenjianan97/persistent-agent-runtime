@@ -6,7 +6,7 @@
 
 **Out of scope:** Agent as first-class entity (config is inline on Task), multi-agent scheduling, memory compaction, approval workflows, UI (except minimal demo dashboard), multi-tenancy, Custom Tool Runtime (BYOT — customer-provided MCP servers).
 
-For later-phase concepts beyond Phase 1, see [PHASE2_MULTI_AGENT.md](./PHASE2_MULTI_AGENT.md) for the consolidated Phase 2 design and [DESIGN_NOTES_PHASE3_PLUS.md](./DESIGN_NOTES_PHASE3_PLUS.md) for Phase 3+ reference material.
+For later-phase concepts beyond Phase 1, see [PHASE2_MULTI_AGENT.md](../phase-2/PHASE2_MULTI_AGENT.md) for the consolidated Phase 2 design and [DESIGN_NOTES_PHASE3_PLUS.md](../phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md) for Phase 3+ reference material.
 
 ---
 

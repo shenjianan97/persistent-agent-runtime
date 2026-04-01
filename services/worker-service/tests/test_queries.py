@@ -10,7 +10,7 @@ from core.reaper import (
 
 
 class TestClaimQueryContract:
-    """Verify the claim query matches docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1."""
+    """Verify the claim query matches docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1."""
 
     def test_uses_cte_pattern(self):
         assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)

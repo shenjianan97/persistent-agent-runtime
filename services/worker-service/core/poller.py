@@ -20,7 +20,7 @@ from core.logging import (
     get_logger,
 )
 
-# Exact claim query from docs/design/PHASE1_DURABLE_EXECUTION.md Section 6.1
+# Exact claim query from docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1
 def build_claim_query(lease_duration_seconds: int) -> str:
     return f"""
 WITH claimable AS (

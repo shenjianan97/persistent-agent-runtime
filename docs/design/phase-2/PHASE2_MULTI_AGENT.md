@@ -25,11 +25,95 @@
 
 ---
 
+## Planning Tracks
+
+Phase 2 spans several loosely coupled subsystems. To keep implementation planning manageable, treat the work as five planning tracks with clear dependencies.
+
+### Track 1 — Agent Control Plane
+
+Establish Agent as a first-class entity and make it the source of truth for runtime configuration.
+
+- Agent storage model and lifecycle
+- Agent CRUD and configuration management
+- Task submission refactor: submit by `agent_id`, resolve from the Agent table, then snapshot resolved config onto the task for execution stability and auditability
+- Console/API flows for selecting and managing agents
+
+Primary design coverage:
+- [Section 1. Agent Entity](#1-agent-entity)
+
+### Track 2 — Runtime State Model
+
+Extend the task lifecycle beyond Phase 1's queued/running/completed/dead-letter flow so Phase 2 features share one coherent state machine.
+
+- New durable pause states such as `waiting_for_approval` and `waiting_for_input`
+- Pause/resume/redrive/cancel semantics
+- Append-only task event history (`task_events`)
+- Status API and Console updates to expose richer runtime state
+
+Primary design coverage:
+- [Section 5. Execution Audit History](#5-execution-audit-history)
+- [Section 7. Human-in-the-Loop Input](#7-human-in-the-loop-input)
+- [Section 8. Reliability Additions](#8-reliability-additions)
+
+### Track 3 — Scheduler and Budgets
+
+Replace simple FIFO claiming with scheduling that accounts for agent-level concurrency and spend.
+
+- Per-agent concurrency limits
+- Fair scheduling across agents
+- Budget accounting and budget-based pause behavior
+- Console/API surfacing for paused and budget-constrained tasks
+
+Primary design coverage:
+- [Section 2. Cost-Aware Scheduling](#2-cost-aware-scheduling)
+
+### Track 4 — Secrets and Tool Runtime Foundation
+
+Harden credential handling and create the runtime abstraction needed before customer-provided tool pools can be added safely.
+
+- Secrets Manager-backed provider/tool credential registry
+- Shared secret resolver used by discovery, workers, built-in tools, and future BYOT runtimes
+- `worker_pool_id` as the routing seam for built-in versus custom tool runtimes
+- Isolation and credential-injection rules for future customer MCP runtimes
+
+Primary design coverage:
+- [Section 4. Custom Tool Runtime (BYOT — Bring Your Own Tools)](#4-custom-tool-runtime-byot--bring-your-own-tools)
+- [Section 6. LLM Credential Model and Secret Management](#6-llm-credential-model-and-secret-management)
+
+### Track 5 — Memory and Human Oversight Features
+
+Add the user-facing capabilities that build on the control-plane, scheduler, and runtime-state foundations.
+
+- Long-term memory extraction and append-only storage
+- Memory compaction flows
+- Human approval and freeform input workflows
+- Non-idempotent tool safeguards and mutable-tool execution policies
+
+Primary design coverage:
+- [Section 3. Agent Memory Model](#3-agent-memory-model)
+- [Section 4. Custom Tool Runtime (BYOT — Bring Your Own Tools)](#4-custom-tool-runtime-byot--bring-your-own-tools)
+- [Section 7. Human-in-the-Loop Input](#7-human-in-the-loop-input)
+
+### Recommended Planning Order
+
+For implementation planning, the safest order is:
+
+1. Track 1 — Agent Control Plane
+2. Track 2 — Runtime State Model
+3. Track 3 — Scheduler and Budgets
+4. Track 4 — Secrets and Tool Runtime Foundation
+5. Track 5 — Memory and Human Oversight Features
+
+This ordering reflects dependency flow rather than strict execution sequencing. Some lower-risk work can overlap later, but Track 1 is the clean starting point because the rest of Phase 2 assumes Agent already exists as a first-class control-plane entity.
+
+---
+
 ## 1. Agent Entity
 
 In Phase 1, agent config is snapshotted inline on the Task record. In Phase 2, Agent becomes a first-class entity with its own table, enabling per-agent concurrency limits, fair scheduling, and budget enforcement.
 
 ```
+tenant_id:            string (logical isolation key, used with agent_id as composite PK)
 agent_id:             string
 config:               JSON
   ├── system_prompt:  string ("you are a research assistant that...")
@@ -44,10 +128,12 @@ budget_max_per_hour:  int (microdollars, default 5000000 = $5.00)
 status:               enum (active | paused | disabled)
 ```
 
-An agent is a database record that defines identity. It stores what the agent is (persona, model, tools, budget, memory pointers) but not where it runs. Any worker can act as any agent by loading this config.
+An agent is a database record that defines identity. The true unique identity is `(tenant_id, agent_id)`. It stores what the agent is (persona, model, tools, budget, memory pointers) but not where it runs. Any worker can act as any agent by loading this config.
 
 ### Phase 1 to Phase 2 transition
 
+- **Task Status ENUM Expansion:** The Phase 1 `tasks.status` ENUM (`queued, running, completed, dead_letter`) must be altered or constraint-updated to include the new pause states (`waiting_for_approval`, `waiting_for_input`, and `paused`).
+- **Foreign Keys:** `tasks` and `task_events` should likely gain a composite foreign key referencing `agents(tenant_id, agent_id)`. To preserve task history when an agent is removed, soft deletes (`status = 'disabled'`) on the `agents` table should be used rather than destructive `DELETE`s to avoid cascaded execution history loss.
 - New task submissions reference `agent_id` and read config from the Agent table
 - The task still snapshots the resolved agent config at creation time for execution stability and auditability
 - Existing Phase 1 semantics remain: a Task belongs to exactly one Agent, fixed at creation time
@@ -75,7 +161,7 @@ Phase 2 adds scheduler behavior that reasons about agent fairness and budget, no
 ### Required scheduler behavior
 
 - Track cumulative task cost across checkpoints and completed tasks
-- Prefer claimable tasks from agents that are under concurrency and budget limits
+- Prefer claimable tasks from agents that are under concurrency and budget limits. **Note:** Enforcing `max_concurrent_tasks` dynamically within the worker's `FOR UPDATE SKIP LOCKED` claim query can create a severe database bottleneck under load. The design should evaluate maintaining a fast-path materialized counter of running tasks per agent, or enforcing this primarily at submission/requeue time.
 - Surface paused state clearly in status APIs and the customer-facing Console
 
 ---
@@ -230,7 +316,7 @@ The platform holds all LLM provider API keys centrally. Users never provide thei
 
 This decision aligns with the cost-aware scheduling design: the platform must control LLM spending to enforce `budget_max_per_task` and `budget_max_per_hour`. Platform-owned keys also enable centralized rate-limit management and negotiated enterprise pricing with providers.
 
-**BYOK (Bring Your Own Key) is explicitly deferred to Phase 3+.** See [DESIGN_NOTES_PHASE3_PLUS.md](./DESIGN_NOTES_PHASE3_PLUS.md).
+**BYOK (Bring Your Own Key) is explicitly deferred to Phase 3+.** See [DESIGN_NOTES_PHASE3_PLUS.md](../phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md).
 
 ### Centralized model and key registry
 
@@ -408,5 +494,5 @@ Phase 2 extends the Phase 1 recovery model with:
 ## References
 
 - [docs/PROJECT.md](../PROJECT.md) — phase definitions and scope
-- [PHASE1_DURABLE_EXECUTION.md](./PHASE1_DURABLE_EXECUTION.md) — foundation this phase builds on
-- [DESIGN_NOTES_PHASE3_PLUS.md](./DESIGN_NOTES_PHASE3_PLUS.md) — later-phase reference material
+- [PHASE1_DURABLE_EXECUTION.md](../phase-1/PHASE1_DURABLE_EXECUTION.md) — foundation this phase builds on
+- [DESIGN_NOTES_PHASE3_PLUS.md](../phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md) — later-phase reference material

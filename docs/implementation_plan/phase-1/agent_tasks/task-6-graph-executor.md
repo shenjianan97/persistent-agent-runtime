@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 The Graph Executor orchestrates the LangGraph instance mapping task API properties against active LLM components encapsulating failure parameters independently handling external tool integrations securely.
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical execution contract. Do not redefine retry policy, dead-letter reasons, or resume semantics here.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical execution contract. Do not redefine retry policy, dead-letter reasons, or resume semantics here.
 - This task consumes Task 3 worker-core primitives, Task 4 checkpointer behavior, and Task 5 MCP tool definitions. Reuse those interfaces instead of re-implementing them.
 - `thread_id = task_id` is the resume key. Execution must use the custom checkpointer and `recursion_limit = max_steps`.
 - Failure classification must follow the documented matrix:

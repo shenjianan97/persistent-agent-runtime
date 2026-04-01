@@ -9,7 +9,7 @@ the "Affected Component" listed below.
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
 1. `docs/PROJECT.md` 
-2. `docs/design/PHASE1_DURABLE_EXECUTION.md`
+2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
 
 **CRITICAL POST-WORK:** After completing this task, you MUST update the status of this task to "Done" in the `docs/implementation_plan/phase-1/progress.md` file.
 
@@ -17,7 +17,7 @@ the "Affected Component" listed below.
 Phase 1 of the Persistent Agent Runtime relies on a Database-as-a-Queue model to eliminate dual-write hazards. We use PostgreSQL to serialize durable graph engine state (via checkpoints) alongside a `tasks` queue architecture, managed comprehensively by lease-ownership paradigms and structured tables. Refer to PHASE1_DURABLE_EXECUTION.md under Database Schema & Key Queries (Section 6.1) for complete design constructs.
 
 ## Task-Specific Shared Contract
-- Treat `docs/design/PHASE1_DURABLE_EXECUTION.md` as the canonical schema contract. Do not invent additional statuses, dead-letter reasons, or retry semantics.
+- Treat `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md` as the canonical schema contract. Do not invent additional statuses, dead-letter reasons, or retry semantics.
 - `tasks.status` values are exactly: `queued`, `running`, `completed`, `dead_letter`.
 - `dead_letter_reason` values are exactly: `cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`.
 - Phase 1 API reads are tenant-scoped with `tenant_id = "default"`, so the schema must retain `tenant_id` even though Phase 1 is single-tenant in practice.
@@ -34,7 +34,7 @@ Phase 1 of the Persistent Agent Runtime relies on a Database-as-a-Queue model to
 - **Shared interfaces/contracts:** Standard PostgreSQL schema layout constraints.
 
 ## Implementation Specification
-Step 1: Implement the `tasks` table exactly as specified in `docs/design/PHASE1_DURABLE_EXECUTION.md`, including `tenant_id`, `agent_id`, `agent_config_snapshot`, `status`, `worker_pool_id`, `version`, `input`, `output`, `lease_owner`, `lease_expiry`, `retry_count`, `max_retries`, `retry_after`, `retry_history`, `task_timeout_seconds`, `max_steps`, `last_error_code`, `last_error_message`, `last_worker_id`, `dead_letter_reason`, `dead_lettered_at`, `created_at`, and `updated_at`. Note: `updated_at` uses `DEFAULT NOW()` for INSERT only. All application UPDATE queries must explicitly set `updated_at = NOW()` — the design doc's key queries all follow this pattern. Do not rely on the DEFAULT for updates.
+Step 1: Implement the `tasks` table exactly as specified in `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`, including `tenant_id`, `agent_id`, `agent_config_snapshot`, `status`, `worker_pool_id`, `version`, `input`, `output`, `lease_owner`, `lease_expiry`, `retry_count`, `max_retries`, `retry_after`, `retry_history`, `task_timeout_seconds`, `max_steps`, `last_error_code`, `last_error_message`, `last_worker_id`, `dead_letter_reason`, `dead_lettered_at`, `created_at`, and `updated_at`. Note: `updated_at` uses `DEFAULT NOW()` for INSERT only. All application UPDATE queries must explicitly set `updated_at = NOW()` — the design doc's key queries all follow this pattern. Do not rely on the DEFAULT for updates.
 Step 2: Create the required Phase 1 indexes supporting claim, reaper, timeout, tenant/agent lookup, and dead-letter listing: `idx_tasks_claim`, `idx_tasks_lease_expiry`, `idx_tasks_timeout`, `idx_tasks_tenant_agent`, and `idx_tasks_dead_letter`.
 Step 3: Define the `checkpoints` table with the exact composite primary key and columns from the design doc, including `worker_id`, `parent_checkpoint_id`, `thread_ts`, `parent_ts`, `checkpoint_payload`, `metadata_payload`, `cost_microdollars`, `execution_metadata`, and `created_at`, plus the required checkpoint lookup indexes: `idx_checkpoints_task_ts` and `idx_checkpoints_task_created`.
 Step 4: Define the `checkpoint_writes` table exactly to support `BaseCheckpointSaver.put_writes()`, including the composite primary key. No FK to `checkpoints` — LangGraph calls `aput_writes()` before `aput()`, so the checkpoint row does not exist yet when writes are inserted.
