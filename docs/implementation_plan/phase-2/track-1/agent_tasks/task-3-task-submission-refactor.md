@@ -122,9 +122,11 @@ public Optional<Map<String, Object>> insertTaskFromAgent(
         ),
         notified AS (
             SELECT pg_notify('new_task', ?)
+            FROM inserted
         )
         SELECT i.task_id, i.agent_display_name_snapshot, i.created_at
-        FROM inserted i, notified n
+        FROM inserted i
+        LEFT JOIN notified n ON true
         """;
     List<Map<String, Object>> results = jdbcTemplate.queryForList(sql,
         tenantId, agentId,

@@ -65,16 +65,18 @@ In `services/console/src/types/index.ts`:
 In `services/console/src/api/client.ts`, update `submitTask()`:
 
 ```typescript
-async submitTask(request: TaskSubmissionRequest): Promise<TaskSubmissionResponse> {
-    return this._request('POST', '/v1/tasks', {
-        agent_id: request.agent_id,
-        input: request.input,
-        max_steps: request.max_steps,
-        max_retries: request.max_retries,
-        task_timeout_seconds: request.task_timeout_seconds,
-        langfuse_endpoint_id: request.langfuse_endpoint_id,
-    });
-}
+submitTask: (request: TaskSubmissionRequest) =>
+    fetchApi<TaskSubmissionResponse>('/v1/tasks', {
+        method: 'POST',
+        body: JSON.stringify({
+            agent_id: request.agent_id,
+            input: request.input,
+            max_steps: request.max_steps,
+            max_retries: request.max_retries,
+            task_timeout_seconds: request.task_timeout_seconds,
+            langfuse_endpoint_id: request.langfuse_endpoint_id,
+        }),
+    }),
 ```
 
 Remove any `agent_config` nesting from the payload construction.
