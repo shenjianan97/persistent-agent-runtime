@@ -2,7 +2,7 @@
 
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
-| Task 1 | Database Schema | Not Started | New statuses, task_events table, new task columns, indexes |
+| Task 1 | Database Schema | Done | New statuses, task_events table, new task columns, indexes |
 | Task 2 | Event Service | Not Started | TaskEventRepository/Service, GET /v1/tasks/{id}/events endpoint |
 | Task 3 | HITL API | Not Started | Approve/reject/respond endpoints, cancel expansion |
 | Task 4 | Worker Interrupt | Not Started | GraphInterrupt handling, request_human_input tool, reaper timeout |
