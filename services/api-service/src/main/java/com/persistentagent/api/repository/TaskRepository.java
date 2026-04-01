@@ -161,13 +161,19 @@ public class TaskRepository {
     public enum MutationResult { UPDATED, WRONG_STATE, NOT_FOUND }
 
     /**
-     * Cancels a task (queued or running -> dead_letter) in a single query.
-     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
+     * Result of a cancel operation that includes the previous status and agent_id
+     * for event recording.
      */
-    public MutationResult cancelTask(UUID taskId, String tenantId) {
+    public record CancelResult(MutationResult outcome, String previousStatus, String agentId) {}
+
+    /**
+     * Cancels a task (queued or running -> dead_letter) in a single query.
+     * Returns CancelResult with outcome and previous status for audit trail.
+     */
+    public CancelResult cancelTask(UUID taskId, String tenantId) {
         String sql = """
                 WITH target AS (
-                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                    SELECT task_id, status, agent_id FROM tasks WHERE task_id = ? AND tenant_id = ?
                 )
                 , updated AS (
                     UPDATE tasks
@@ -187,14 +193,19 @@ public class TaskRepository {
                 )
                 SELECT
                     (SELECT COUNT(*) FROM target) AS found,
-                    (SELECT COUNT(*) FROM updated) AS updated
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT status FROM target LIMIT 1) AS previous_status,
+                    (SELECT agent_id FROM target LIMIT 1) AS agent_id
                 """;
 
         Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
         long updated = ((Number) result.get("updated")).longValue();
-        if (updated > 0) return MutationResult.UPDATED;
+        String previousStatus = (String) result.get("previous_status");
+        String agentId = (String) result.get("agent_id");
+        if (updated > 0) return new CancelResult(MutationResult.UPDATED, previousStatus, agentId);
         long found = ((Number) result.get("found")).longValue();
-        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        MutationResult outcome = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new CancelResult(outcome, previousStatus, agentId);
     }
 
     /**
@@ -222,13 +233,18 @@ public class TaskRepository {
     }
 
     /**
-     * Redrives a dead-lettered task back to queued with pg_notify.
-     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
+     * Result of a redrive operation that includes agent_id for event recording.
      */
-    public MutationResult redriveTask(UUID taskId, String tenantId) {
+    public record RedriveResult(MutationResult outcome, String agentId) {}
+
+    /**
+     * Redrives a dead-lettered task back to queued with pg_notify.
+     * Returns RedriveResult with outcome and agent_id for audit trail.
+     */
+    public RedriveResult redriveTask(UUID taskId, String tenantId) {
         String sql = """
                 WITH target AS (
-                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                    SELECT task_id, agent_id FROM tasks WHERE task_id = ? AND tenant_id = ?
                 )
                 , redriven AS (
                     UPDATE tasks
@@ -256,6 +272,7 @@ public class TaskRepository {
                 SELECT
                     (SELECT COUNT(*) FROM target) AS found,
                     (SELECT COUNT(*) FROM redriven) AS updated,
+                    (SELECT agent_id FROM target LIMIT 1) AS agent_id,
                     n.*
                 FROM notified n
                 RIGHT JOIN (SELECT 1) AS dummy ON true
@@ -263,9 +280,11 @@ public class TaskRepository {
 
         Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
         long updated = ((Number) result.get("updated")).longValue();
-        if (updated > 0) return MutationResult.UPDATED;
+        String agentId = (String) result.get("agent_id");
+        if (updated > 0) return new RedriveResult(MutationResult.UPDATED, agentId);
         long found = ((Number) result.get("found")).longValue();
-        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        MutationResult outcome = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new RedriveResult(outcome, agentId);
     }
 
     public boolean expireLease(UUID taskId, String tenantId, String leaseOwnerOverride) {
