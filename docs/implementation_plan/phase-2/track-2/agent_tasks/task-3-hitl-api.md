@@ -271,7 +271,7 @@ Ensure `listTasks()` handles the new statuses correctly in the status filter par
 - Do not implement worker-side resume logic — Task 4 handles that.
 - Do not emit events from existing flows (submit, cancel, redrive) — Task 5 handles that.
 - Follow the existing error response format (error message string in response body).
-- The `human_response` column stores raw text. Do not attempt to structure or validate its format.
+- The `human_response` column stores a documented JSON resume payload serialized as text. Do not use ad hoc magic strings or raw free-form payloads that the worker cannot decode reliably.
 
 ## Assumptions
 

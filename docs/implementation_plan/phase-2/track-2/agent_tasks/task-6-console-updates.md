@@ -107,30 +107,29 @@ In `api/client.ts`, add:
 
 ```typescript
 export const approveTask = async (taskId: string): Promise<void> => {
-    await fetch(`${API_BASE}/v1/tasks/${taskId}/approve`, { method: 'POST' });
+    await fetchApi<void>(`/v1/tasks/${taskId}/approve`, { method: 'POST' });
 };
 
 export const rejectTask = async (taskId: string, reason: string): Promise<void> => {
-    await fetch(`${API_BASE}/v1/tasks/${taskId}/reject`, {
+    await fetchApi<void>(`/v1/tasks/${taskId}/reject`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason }),
     });
 };
 
 export const respondToTask = async (taskId: string, message: string): Promise<void> => {
-    await fetch(`${API_BASE}/v1/tasks/${taskId}/respond`, {
+    await fetchApi<void>(`/v1/tasks/${taskId}/respond`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message }),
     });
 };
 
 export const getTaskEvents = async (taskId: string, limit = 100): Promise<TaskEventListResponse> => {
-    const res = await fetch(`${API_BASE}/v1/tasks/${taskId}/events?limit=${limit}`);
-    return res.json();
+    return fetchApi<TaskEventListResponse>(`/v1/tasks/${taskId}/events?limit=${limit}`);
 };
 ```
+
+Use the existing shared `fetchApi()` helper (or add these methods onto the existing exported `api` object) rather than bare `fetch(...)` so HTTP errors surface consistently through the Console's existing `ApiError` handling and toast flows.
 
 ### Step 3: Update status badges
 

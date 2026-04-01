@@ -95,15 +95,19 @@ taskEventService.recordEvent(
 
 Using the transaction-scoped event insert helper from Task 4, add event recording to:
 
-**Task claim (in poller or at start of execution):**
+**Task claim (in the poller claim transaction):**
 
-In the `execute_task()` method, right after the task starts executing (before the LangGraph graph runs):
+Record `task_claimed` in the same database transaction and on the same connection that performs the `queued -> running` claim update in `core/poller.py`. Do not defer this event until `execute_task()` starts, because that would break the requirement that the claim state change and event INSERT commit or roll back together.
+
+Right after the claim UPDATE succeeds and before that transaction commits:
 ```python
 await self._record_task_event(
     task_id, tenant_id, agent_id,
     "task_claimed", "queued", "running", worker_id
 )
 ```
+
+If the current poller callback boundary makes this awkward, extend the poller claim path so it can emit the event before handing the claimed task to `execute_task()`.
 
 **Successful completion (after the completion UPDATE):**
 ```python
@@ -193,7 +197,7 @@ Note: The reaper's existing UPDATE...RETURNING queries may need to include `tena
 - [ ] `task_submitted` event recorded on every successful task submission
 - [ ] `task_cancelled` event recorded on every successful cancellation
 - [ ] `task_redriven` event recorded on every successful redrive
-- [ ] `task_claimed` event recorded when worker claims a task
+- [ ] `task_claimed` event recorded in the same transaction as the `queued` → `running` claim update
 - [ ] `task_completed` event recorded on successful completion
 - [ ] `task_retry_scheduled` event recorded on retryable error
 - [ ] `task_dead_lettered` event recorded on dead-letter (all paths: retries exhausted, timeout, non-retryable, human input timeout)

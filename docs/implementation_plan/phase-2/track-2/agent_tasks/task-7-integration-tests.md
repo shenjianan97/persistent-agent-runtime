@@ -148,7 +148,7 @@ Since approval gates for non-idempotent tools are not implemented until Track 5,
 2. Call `approve_task_raw(task_id)` → assert 409
 
 **Test: Approve on nonexistent → 404**
-1. Call `approve_task_raw("nonexistent-uuid")` → assert 404
+1. Call `approve_task_raw("00000000-0000-0000-0000-000000000000")` → assert 404
 
 ### Step 4: Create test_task_events.py
 
