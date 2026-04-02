@@ -107,7 +107,7 @@ class TestReaperRunOnce:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return [{"task_id": task_id}]
+                return [{"task_id": task_id, "tenant_id": "default", "agent_id": "test-agent"}]
             return []
 
         conn.fetch = mock_fetch
@@ -134,7 +134,7 @@ class TestReaperRunOnce:
             nonlocal call_count
             call_count += 1
             if call_count == 2:  # Second query is dead-letter
-                return [{"task_id": task_id}]
+                return [{"task_id": task_id, "tenant_id": "default", "agent_id": "test-agent"}]
             return []
 
         conn.fetch = mock_fetch
@@ -160,7 +160,7 @@ class TestReaperRunOnce:
             nonlocal call_count
             call_count += 1
             if call_count == 3:  # Third query is timeout
-                return [{"task_id": task_id}]
+                return [{"task_id": task_id, "tenant_id": "default", "agent_id": "test-agent"}]
             return []
 
         conn.fetch = mock_fetch

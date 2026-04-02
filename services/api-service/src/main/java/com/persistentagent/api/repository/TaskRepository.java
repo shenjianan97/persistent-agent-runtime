@@ -102,7 +102,8 @@ public class TaskRepository {
                        retry_count, retry_history, lease_owner,
                        last_error_code, last_error_message, last_worker_id,
                        dead_letter_reason, dead_lettered_at, created_at, updated_at,
-                       langfuse_endpoint_id
+                       langfuse_endpoint_id,
+                       pending_input_prompt, pending_approval_action, human_input_timeout_at
                 FROM tasks
                 WHERE task_id = ? AND tenant_id = ?
                 """;
@@ -122,6 +123,7 @@ public class TaskRepository {
                        t.last_error_code, t.last_error_message, t.last_worker_id,
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
                        t.langfuse_endpoint_id,
+                       t.pending_input_prompt, t.pending_approval_action, t.human_input_timeout_at,
                        (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
                        (SELECT COALESCE(SUM(c.cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
                 FROM tasks t
@@ -161,13 +163,19 @@ public class TaskRepository {
     public enum MutationResult { UPDATED, WRONG_STATE, NOT_FOUND }
 
     /**
-     * Cancels a task (queued or running -> dead_letter) in a single query.
-     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
+     * Result of a cancel operation that includes the previous status and agent_id
+     * for event recording.
      */
-    public MutationResult cancelTask(UUID taskId, String tenantId) {
+    public record CancelResult(MutationResult outcome, String previousStatus, String agentId) {}
+
+    /**
+     * Cancels a task (queued or running -> dead_letter) in a single query.
+     * Returns CancelResult with outcome and previous status for audit trail.
+     */
+    public CancelResult cancelTask(UUID taskId, String tenantId) {
         String sql = """
                 WITH target AS (
-                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                    SELECT task_id, status, agent_id FROM tasks WHERE task_id = ? AND tenant_id = ?
                 )
                 , updated AS (
                     UPDATE tasks
@@ -179,22 +187,164 @@ public class TaskRepository {
                         last_error_message = 'task cancelled by user request',
                         dead_letter_reason = 'cancelled_by_user',
                         dead_lettered_at = NOW(),
+                        pending_input_prompt = NULL,
+                        pending_approval_action = NULL,
+                        human_input_timeout_at = NULL,
+                        human_response = NULL,
                         version = version + 1,
                         updated_at = NOW()
                     WHERE task_id = ? AND tenant_id = ?
-                      AND status IN ('queued', 'running')
+                      AND status IN ('queued', 'running', 'waiting_for_approval', 'waiting_for_input', 'paused')
                     RETURNING task_id
                 )
                 SELECT
                     (SELECT COUNT(*) FROM target) AS found,
-                    (SELECT COUNT(*) FROM updated) AS updated
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT status FROM target LIMIT 1) AS previous_status,
+                    (SELECT agent_id FROM target LIMIT 1) AS agent_id
                 """;
 
         Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
         long updated = ((Number) result.get("updated")).longValue();
-        if (updated > 0) return MutationResult.UPDATED;
+        String previousStatus = (String) result.get("previous_status");
+        String agentId = (String) result.get("agent_id");
+        if (updated > 0) return new CancelResult(MutationResult.UPDATED, previousStatus, agentId);
         long found = ((Number) result.get("found")).longValue();
-        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        MutationResult outcome = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new CancelResult(outcome, previousStatus, agentId);
+    }
+
+    /**
+     * Approves a task waiting for approval. Sets human_response with approval JSON,
+     * transitions to queued, and returns worker_pool_id + agent_id for notification/event recording.
+     */
+    public HitlMutationResult approveTask(UUID taskId, String tenantId) {
+        String sql = """
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                )
+                , updated AS (
+                    UPDATE tasks
+                    SET status = 'queued',
+                        human_response = '{"kind":"approval","approved":true}',
+                        pending_approval_action = NULL,
+                        human_input_timeout_at = NULL,
+                        timeout_reference_at = NOW(),
+                        lease_owner = NULL,
+                        lease_expiry = NULL,
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE task_id = ? AND tenant_id = ?
+                      AND status = 'waiting_for_approval'
+                    RETURNING task_id, worker_pool_id, agent_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT worker_pool_id FROM updated) AS worker_pool_id,
+                    (SELECT agent_id FROM updated) AS agent_id
+                """;
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
+        long updatedCount = ((Number) result.get("updated")).longValue();
+        if (updatedCount > 0) {
+            return new HitlMutationResult(MutationResult.UPDATED,
+                    (String) result.get("worker_pool_id"), (String) result.get("agent_id"));
+        }
+        long found = ((Number) result.get("found")).longValue();
+        MutationResult mr = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new HitlMutationResult(mr, null, null);
+    }
+
+    /**
+     * Rejects a task waiting for approval. Sets human_response with rejection JSON including reason,
+     * transitions to queued, and returns worker_pool_id + agent_id.
+     */
+    public HitlMutationResult rejectTask(UUID taskId, String tenantId, String humanResponse) {
+        String sql = """
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                )
+                , updated AS (
+                    UPDATE tasks
+                    SET status = 'queued',
+                        human_response = ?,
+                        pending_approval_action = NULL,
+                        human_input_timeout_at = NULL,
+                        timeout_reference_at = NOW(),
+                        lease_owner = NULL,
+                        lease_expiry = NULL,
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE task_id = ? AND tenant_id = ?
+                      AND status = 'waiting_for_approval'
+                    RETURNING task_id, worker_pool_id, agent_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT worker_pool_id FROM updated) AS worker_pool_id,
+                    (SELECT agent_id FROM updated) AS agent_id
+                """;
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, humanResponse, taskId, tenantId);
+        long updatedCount = ((Number) result.get("updated")).longValue();
+        if (updatedCount > 0) {
+            return new HitlMutationResult(MutationResult.UPDATED,
+                    (String) result.get("worker_pool_id"), (String) result.get("agent_id"));
+        }
+        long found = ((Number) result.get("found")).longValue();
+        MutationResult mr = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new HitlMutationResult(mr, null, null);
+    }
+
+    /**
+     * Responds to a task waiting for human input. Sets human_response with input JSON,
+     * transitions to queued, and returns worker_pool_id + agent_id.
+     */
+    public HitlMutationResult respondToTask(UUID taskId, String tenantId, String humanResponse) {
+        String sql = """
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                )
+                , updated AS (
+                    UPDATE tasks
+                    SET status = 'queued',
+                        human_response = ?,
+                        pending_input_prompt = NULL,
+                        human_input_timeout_at = NULL,
+                        timeout_reference_at = NOW(),
+                        lease_owner = NULL,
+                        lease_expiry = NULL,
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE task_id = ? AND tenant_id = ?
+                      AND status = 'waiting_for_input'
+                    RETURNING task_id, worker_pool_id, agent_id
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT worker_pool_id FROM updated) AS worker_pool_id,
+                    (SELECT agent_id FROM updated) AS agent_id
+                """;
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, humanResponse, taskId, tenantId);
+        long updatedCount = ((Number) result.get("updated")).longValue();
+        if (updatedCount > 0) {
+            return new HitlMutationResult(MutationResult.UPDATED,
+                    (String) result.get("worker_pool_id"), (String) result.get("agent_id"));
+        }
+        long found = ((Number) result.get("found")).longValue();
+        MutationResult mr = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new HitlMutationResult(mr, null, null);
+    }
+
+    /**
+     * Result of a HITL mutation that also carries the worker_pool_id and agent_id
+     * needed for pg_notify and event recording.
+     */
+    public record HitlMutationResult(MutationResult result, String workerPoolId, String agentId) {
     }
 
     /**
@@ -222,13 +372,18 @@ public class TaskRepository {
     }
 
     /**
-     * Redrives a dead-lettered task back to queued with pg_notify.
-     * Returns UPDATED, WRONG_STATE, or NOT_FOUND.
+     * Result of a redrive operation that includes agent_id for event recording.
      */
-    public MutationResult redriveTask(UUID taskId, String tenantId) {
+    public record RedriveResult(MutationResult outcome, String agentId) {}
+
+    /**
+     * Redrives a dead-lettered task back to queued with pg_notify.
+     * Returns RedriveResult with outcome and agent_id for audit trail.
+     */
+    public RedriveResult redriveTask(UUID taskId, String tenantId) {
         String sql = """
                 WITH target AS (
-                    SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
+                    SELECT task_id, agent_id FROM tasks WHERE task_id = ? AND tenant_id = ?
                 )
                 , redriven AS (
                     UPDATE tasks
@@ -256,6 +411,7 @@ public class TaskRepository {
                 SELECT
                     (SELECT COUNT(*) FROM target) AS found,
                     (SELECT COUNT(*) FROM redriven) AS updated,
+                    (SELECT agent_id FROM target LIMIT 1) AS agent_id,
                     n.*
                 FROM notified n
                 RIGHT JOIN (SELECT 1) AS dummy ON true
@@ -263,9 +419,11 @@ public class TaskRepository {
 
         Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId, taskId, tenantId);
         long updated = ((Number) result.get("updated")).longValue();
-        if (updated > 0) return MutationResult.UPDATED;
+        String agentId = (String) result.get("agent_id");
+        if (updated > 0) return new RedriveResult(MutationResult.UPDATED, agentId);
         long found = ((Number) result.get("found")).longValue();
-        return found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        MutationResult outcome = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new RedriveResult(outcome, agentId);
     }
 
     public boolean expireLease(UUID taskId, String tenantId, String leaseOwnerOverride) {
@@ -352,6 +510,13 @@ public class TaskRepository {
         params.add(limit);
 
         return jdbcTemplate.queryForList(sql.toString(), params.toArray());
+    }
+
+    /**
+     * Sends a pg_notify on the 'new_task' channel to wake up polling workers.
+     */
+    public void notifyNewTask(String workerPoolId) {
+        jdbcTemplate.queryForList("SELECT pg_notify('new_task', ?)", workerPoolId);
     }
 
     /**

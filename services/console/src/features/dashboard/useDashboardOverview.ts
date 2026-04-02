@@ -24,6 +24,9 @@ export function useDashboardOverview() {
         const inProgressTasks = tasks
             .filter((task) => task.status === 'queued' || task.status === 'running')
             .sort(byNewest);
+        const pendingActionTasks = tasks
+            .filter((task) => task.status === 'waiting_for_approval' || task.status === 'waiting_for_input')
+            .sort(byNewest);
         const completedTasks = tasks
             .filter((task) => task.status === 'completed')
             .sort(byNewest);
@@ -34,6 +37,7 @@ export function useDashboardOverview() {
             inProgress,
             recentCompleted,
             inProgressCount: inProgressTasks.length,
+            pendingActionCount: pendingActionTasks.length,
             deadLetterCount: deadLetters.length,
             completedCount: completedTasks.length,
         };
@@ -75,6 +79,7 @@ export function useDashboardOverview() {
         deadLetters,
         summary: {
             inProgressCount: derived.inProgressCount,
+            pendingActionCount: derived.pendingActionCount,
             deadLetterCount: derived.deadLetterCount,
             completedCount: derived.completedCount,
             recentCostMicrodollars,

@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import socket
 import subprocess
@@ -247,22 +249,123 @@ def asyncio_run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
+def _emit_cleanup_log(event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    print(json.dumps(payload, default=str), file=sys.stderr, flush=True)
+
+
+async def _snapshot_db_activity(reason: str, attempt: int) -> None:
+    try:
+        conn = await asyncpg.connect(DB_DSN, timeout=2.0, command_timeout=2.0)
+    except Exception as exc:
+        _emit_cleanup_log(
+            "e2e_cleanup_snapshot_failed",
+            reason=reason,
+            attempt=attempt,
+            error=str(exc),
+        )
+        return
+
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT pid,
+                   state,
+                   wait_event_type,
+                   wait_event,
+                   left(query, 200) AS query,
+                   pg_blocking_pids(pid) AS blocking_pids
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+            ORDER BY xact_start NULLS LAST, query_start NULLS LAST
+            """
+        )
+        _emit_cleanup_log(
+            "e2e_cleanup_snapshot",
+            reason=reason,
+            attempt=attempt,
+            sessions=[dict(row) for row in rows],
+        )
+    except Exception as exc:
+        _emit_cleanup_log(
+            "e2e_cleanup_snapshot_failed",
+            reason=reason,
+            attempt=attempt,
+            error=str(exc),
+        )
+    finally:
+        await conn.close()
+
+
+async def _force_clean() -> None:
+    """Terminate all other connections, wait for locks to release, then clean tables.
+
+    Retries the cleanup with escalating waits to handle slow CI runners where
+    PostgreSQL backends take time to release row locks after termination.
+    """
+    for attempt in range(3):
+        try:
+            _emit_cleanup_log("e2e_force_clean_attempt_started", attempt=attempt + 1)
+            # Step 1: Kill all other connections to release row locks
+            conn = await asyncpg.connect(DB_DSN)
+            try:
+                await conn.execute("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                """)
+            finally:
+                await conn.close()
+
+            # Step 2: Wait for backends to finish cleanup (longer on CI)
+            await asyncio.sleep(0.5 + attempt * 1.0)
+
+            # Step 3: Clean tables via a fresh connection
+            conn = await asyncpg.connect(DB_DSN)
+            try:
+                await asyncio.wait_for(
+                    _do_clean(conn), timeout=5.0,
+                )
+            finally:
+                await conn.close()
+            _emit_cleanup_log("e2e_force_clean_attempt_succeeded", attempt=attempt + 1)
+            return  # success
+        except (asyncio.TimeoutError, Exception) as exc:
+            _emit_cleanup_log(
+                "e2e_force_clean_attempt_failed",
+                attempt=attempt + 1,
+                error=repr(exc),
+            )
+            await _snapshot_db_activity(reason=type(exc).__name__, attempt=attempt + 1)
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1.0)
+
+
+async def _do_clean(conn: asyncpg.Connection) -> None:
+    await conn.execute("DELETE FROM task_events")
+    await conn.execute("DELETE FROM checkpoint_writes")
+    await conn.execute("DELETE FROM checkpoints")
+    await conn.execute("DELETE FROM tasks")
+    await conn.execute("DELETE FROM agents")
+
+
 @pytest_asyncio.fixture
 async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
     del runtime_environment
+    # Cancel orphaned asyncio tasks from previous tests (e.g. mock LLMs
+    # with asyncio.sleep still running after worker stop).
+    current = asyncio.current_task()
+    for t in asyncio.all_tasks():
+        if t is not current and not t.done() and "pytest" not in (t.get_name() or ""):
+            t.cancel()
+    await asyncio.sleep(0.2)
+    await _force_clean()
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM checkpoint_writes")
-        await conn.execute("DELETE FROM checkpoints")
-        await conn.execute("DELETE FROM tasks")
-        await conn.execute("DELETE FROM agents")
     yield pool
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM checkpoint_writes")
-        await conn.execute("DELETE FROM checkpoints")
-        await conn.execute("DELETE FROM tasks")
-        await conn.execute("DELETE FROM agents")
-    await pool.close()
+    pool.terminate()
 
 
 @pytest.fixture

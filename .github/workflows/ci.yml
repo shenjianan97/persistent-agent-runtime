@@ -119,6 +119,8 @@ jobs:
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0005_agents_table.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0006_runtime_state_model.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run API integration tests
@@ -173,6 +175,8 @@ jobs:
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0005_agents_table.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0006_runtime_state_model.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run worker integration tests
@@ -190,6 +194,7 @@ jobs:
   e2e-tests:
     name: E2E Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
@@ -240,7 +245,13 @@ jobs:
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0005_agents_table.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0006_runtime_state_model.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
+
+      - name: Pre-build API service
+        working-directory: services/api-service
+        run: ./gradlew classes testClasses
 
       - name: Run E2E tests
         env:
@@ -255,9 +266,17 @@ jobs:
           # conftest will auto-start the API via ./gradlew bootRun
         run: |
           set -o pipefail
-          python -m pytest tests/backend-integration \
-            -ra -q | tee /tmp/e2e.log
+          python -u -m pytest tests/backend-integration \
+            -ra -s -vv --tb=short 2>&1 | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
+
+      - name: Upload E2E log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: /tmp/e2e.log
+          if-no-files-found: ignore
 
   observability-smoke-tests:
     name: Observability Smoke Tests
@@ -311,6 +330,8 @@ jobs:
             -f infrastructure/database/migrations/0004_timeout_reference.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0005_agents_table.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0006_runtime_state_model.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 

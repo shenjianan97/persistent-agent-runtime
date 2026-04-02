@@ -38,9 +38,8 @@ export function DeadLetterPage() {
         <div className="space-y-6 animate-in fade-in duration-500">
             <div className="console-surface-strong rounded-[28px] p-6 md:p-7 flex flex-col md:flex-row md:items-end justify-between gap-4">
                 <div>
-                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-destructive">Task Recovery</div>
-                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2 text-destructive">
-                        <AlertCircle className="w-6 h-6 drop-shadow-[0_0_12px_var(--color-destructive)]" />
+                    <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
+                        <AlertCircle className="w-6 h-6 text-destructive drop-shadow-[0_0_12px_var(--color-destructive)]" />
                         Failed
                     </h2>
                     <p className="text-muted-foreground">
