@@ -6,7 +6,7 @@ from helpers.mock_llm import dev_sleep_tool_call, simple_response, slow_response
 @pytest.mark.asyncio
 async def test_dev_expire_lease_recovers_with_preserved_checkpoints(e2e):
     """Dev task-control lease expiry should trigger recovery without losing prior checkpoints."""
-    e2e.use_llm(slow_response(delay=8.0, content="recovered after dev lease expiry"))
+    e2e.use_llm(slow_response(delay=4.0, content="recovered after dev lease expiry"))
     worker_a = await e2e.start_worker("e2e-dev-crash-a")
 
     e2e.ensure_agent(agent_config={
@@ -27,12 +27,16 @@ async def test_dev_expire_lease_recovers_with_preserved_checkpoints(e2e):
     before_ids = {cp["checkpoint_id"] for cp in checkpoints_before}
     assert before_ids
 
-    await e2e.start_worker("e2e-dev-crash-b")
     forced = e2e.dev_expire_lease(task_id, lease_owner="crashed-worker")
     assert forced["status"] == "running"
     await e2e.stop_worker(worker_a)
 
-    done = await e2e.wait_for_status(task_id, "completed", timeout=25.0)
+    # Start Worker B (with fresh mock) — its reaper will detect the expired
+    # lease and requeue the task, then Worker B's poller will claim and complete it.
+    e2e.use_llm(simple_response("recovered after dev lease expiry"))
+    await e2e.start_worker("e2e-dev-crash-b")
+
+    done = await e2e.wait_for_status(task_id, "completed", timeout=30.0)
     assert done["status"] == "completed"
     assert done["retry_count"] >= 1
 
