@@ -18,12 +18,14 @@ DEFAULT_TEST_CONFIG = {
     "shutdown_drain_seconds": 3,
 }
 
+_DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
+
 
 async def create_worker(
     pool: asyncpg.Pool,
     *,
     worker_id: str | None = None,
-    db_dsn: str = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime",
+    db_dsn: str = _DB_DSN,
     config_overrides: dict[str, Any] | None = None,
 ) -> WorkerService:
     cfg = dict(DEFAULT_TEST_CONFIG)
@@ -49,3 +51,22 @@ async def stop_worker(worker: WorkerService) -> None:
         t.cancel()
     if orphans:
         await asyncio.gather(*orphans, return_exceptions=True)
+    # Terminate any DB connections stuck in "idle in transaction" state.
+    # These hold row locks from cancelled coroutines and block test cleanup.
+    # Use a fresh direct connection to avoid deadlocking on the shared pool.
+    try:
+        conn = await asyncpg.connect(worker._config.db_dsn)  # noqa: SLF001
+        try:
+            await conn.execute("""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND state = 'idle in transaction'
+                  AND pid <> pg_backend_pid()
+            """)
+        finally:
+            await conn.close()
+    except Exception:
+        pass
+    # Give terminated connections a moment to release locks
+    await asyncio.sleep(0.2)

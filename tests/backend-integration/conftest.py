@@ -1,3 +1,4 @@
+import asyncio
 import os
 import socket
 import subprocess
@@ -247,24 +248,56 @@ def asyncio_run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
+async def _terminate_stuck_connections() -> None:
+    """Kill any connections stuck in 'idle in transaction' from cancelled coroutines."""
+    try:
+        conn = await asyncpg.connect(DB_DSN)
+        try:
+            await conn.execute("""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND state = 'idle in transaction'
+                  AND pid <> pg_backend_pid()
+            """)
+        finally:
+            await conn.close()
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+
+
+async def _clean_tables() -> None:
+    """Delete all test data using a direct connection (avoids pool issues)."""
+    conn = await asyncpg.connect(DB_DSN)
+    try:
+        await conn.execute("DELETE FROM task_events")
+        await conn.execute("DELETE FROM checkpoint_writes")
+        await conn.execute("DELETE FROM checkpoints")
+        await conn.execute("DELETE FROM tasks")
+        await conn.execute("DELETE FROM agents")
+    finally:
+        await conn.close()
+
+
 @pytest_asyncio.fixture
 async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
     del runtime_environment
+    # Cancel any orphaned asyncio tasks from previous tests (e.g. mock LLMs
+    # with asyncio.sleep still running after worker stop).  These can acquire
+    # new pool connections and hold row locks indefinitely.
+    current = asyncio.current_task()
+    for t in asyncio.all_tasks():
+        if t is not current and not t.done() and "pytest" not in (t.get_name() or ""):
+            t.cancel()
+    await asyncio.sleep(0.1)  # let cancellations propagate
+    await _terminate_stuck_connections()
+    await _clean_tables()
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM task_events")
-        await conn.execute("DELETE FROM checkpoint_writes")
-        await conn.execute("DELETE FROM checkpoints")
-        await conn.execute("DELETE FROM tasks")
-        await conn.execute("DELETE FROM agents")
     yield pool
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM task_events")
-        await conn.execute("DELETE FROM checkpoint_writes")
-        await conn.execute("DELETE FROM checkpoints")
-        await conn.execute("DELETE FROM tasks")
-        await conn.execute("DELETE FROM agents")
-    await pool.close()
+    pool.terminate()
+    await _terminate_stuck_connections()
+    await _clean_tables()
 
 
 @pytest.fixture
