@@ -267,8 +267,16 @@ jobs:
         run: |
           set -o pipefail
           python -u -m pytest tests/backend-integration \
-            -ra -v --tb=short 2>&1 | tee /tmp/e2e.log
+            -ra -s -vv --tb=short 2>&1 | tee /tmp/e2e.log
           ! grep -Eq '(^|[^0-9])[1-9][0-9]* skipped' /tmp/e2e.log
+
+      - name: Upload E2E log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: /tmp/e2e.log
+          if-no-files-found: ignore
 
   observability-smoke-tests:
     name: Observability Smoke Tests

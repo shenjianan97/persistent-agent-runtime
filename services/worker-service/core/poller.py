@@ -79,6 +79,7 @@ class TaskPoller:
         self._poll_task: asyncio.Task | None = None
         self._listen_task: asyncio.Task | None = None
         self._active_tasks_count = 0
+        self._execution_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -88,6 +89,14 @@ class TaskPoller:
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def active_execution_tasks_count(self) -> int:
+        return len(self._execution_tasks)
+
+    @property
+    def active_tasks_count(self) -> int:
+        return self._active_tasks_count
 
     async def start(self) -> None:
         """Start the poller and LISTEN listener."""
@@ -129,6 +138,26 @@ class TaskPoller:
         if self._listen_conn and not self._listen_conn.is_closed():
             await self._listen_conn.close()
         await self._log.ainfo("poller_stopped")
+
+    async def cancel_active_tasks(self) -> None:
+        """Cancel in-flight execution tasks and wait for their cleanup to finish."""
+        if not self._execution_tasks:
+            return
+
+        tasks = list(self._execution_tasks)
+        await self._log.ainfo(
+            "poller_cancel_active_tasks_started",
+            active_execution_tasks_count=len(tasks),
+        )
+        for task in tasks:
+            task.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._execution_tasks.difference_update(tasks)
+        await self._log.ainfo(
+            "poller_cancel_active_tasks_completed",
+            active_execution_tasks_count=self.active_execution_tasks_count,
+        )
 
     async def _listen_loop(self) -> None:
         """Maintain a LISTEN connection and signal the poller on notifications."""
@@ -254,9 +283,9 @@ class TaskPoller:
             if self._router:
                 # Launch task execution without blocking the poller.
                 # The semaphore is released by the executor when the task finishes.
-                asyncio.create_task(
-                    self._execute_and_release(task_data)
-                )
+                execution_task = asyncio.create_task(self._execute_and_release(task_data))
+                self._execution_tasks.add(execution_task)
+                execution_task.add_done_callback(self._execution_tasks.discard)
             else:
                 # No executor callback — release immediately (useful in tests)
                 self._semaphore.release()

@@ -279,3 +279,68 @@ class TestPollerDrain:
         release_try_claim.set()
         await quiesce_task
         assert poller._poll_task.done()
+
+    @pytest.mark.asyncio
+    async def test_cancel_active_tasks_cancels_running_execution_tasks(self):
+        config = WorkerConfig(worker_id="test-poller")
+        task_id = uuid.uuid4()
+        row = {
+            "task_id": task_id,
+            "tenant_id": "default",
+            "agent_id": "test-agent",
+            "status": "running",
+            "retry_count": 0,
+        }
+
+        conn = TestPollerTryClaim._make_poller_conn(fetchrow_return=row)
+        pool = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        pool.acquire = MagicMock(return_value=ctx)
+        metrics = MetricsCollector()
+
+        started = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        class MockExecutor:
+            async def execute_task(self, td: dict, cancel_event):
+                del td, cancel_event
+                started.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    cleaned_up.set()
+
+        class MockRouter:
+            def get_executor(self, task_data: dict):
+                del task_data
+                return MockExecutor()
+
+        heartbeat = MagicMock()
+        handle = MagicMock()
+        handle.cancel_event = asyncio.Event()
+        heartbeat.start_heartbeat.return_value = handle
+        heartbeat.stop_heartbeat = AsyncMock()
+
+        poller = TaskPoller(config, pool, metrics, heartbeat, MockRouter())
+        poller._log = MagicMock()
+        poller._log.ainfo = AsyncMock()
+
+        result = await poller._try_claim()
+        assert result is True
+        await started.wait()
+
+        await poller.cancel_active_tasks()
+
+        await asyncio.wait_for(cleaned_up.wait(), timeout=1.0)
+        heartbeat.stop_heartbeat.assert_awaited_once_with(str(task_id))
+        assert poller._active_tasks_count == 0
+        poller._log.ainfo.assert_any_await(
+            "poller_cancel_active_tasks_started",
+            active_execution_tasks_count=1,
+        )
+        poller._log.ainfo.assert_any_await(
+            "poller_cancel_active_tasks_completed",
+            active_execution_tasks_count=0,
+        )
