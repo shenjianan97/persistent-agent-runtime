@@ -78,9 +78,8 @@ export function SubmitTaskPage() {
     const noAgentsExist = !isLoadingAgents && agents.length === 0;
 
     return (
-        <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
+        <div className="space-y-6 animate-in fade-in duration-500">
             <div className="console-surface-strong rounded-[28px] p-6 md:p-7 mb-8">
-                <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Create Execution</div>
                 <h2 className="text-3xl font-display font-semibold tracking-tight mb-2 flex items-center gap-2">
                     <PlaySquare className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
                     Submit Task
@@ -176,10 +175,16 @@ export function SubmitTaskPage() {
                                                     <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">System Prompt</span>
                                                     <span className="text-foreground/80 whitespace-pre-wrap line-clamp-3">{selectedAgent.agent_config.system_prompt}</span>
                                                 </div>
-                                                {selectedAgent.agent_config.allowed_tools && selectedAgent.agent_config.allowed_tools.length > 0 && (
+                                                {selectedAgent.agent_config.allowed_tools && selectedAgent.agent_config.allowed_tools.filter(t => t !== 'request_human_input').length > 0 && (
                                                     <div className="md:col-span-2">
                                                         <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tools</span>
-                                                        <span className="text-foreground">{selectedAgent.agent_config.allowed_tools.join(', ')}</span>
+                                                        <span className="text-foreground">{selectedAgent.agent_config.allowed_tools.filter(t => t !== 'request_human_input').join(', ')}</span>
+                                                    </div>
+                                                )}
+                                                {selectedAgent.agent_config.allowed_tools?.includes('request_human_input') && (
+                                                    <div>
+                                                        <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Human-in-the-Loop</span>
+                                                        <span className="text-foreground">Enabled</span>
                                                     </div>
                                                 )}
                                             </div>

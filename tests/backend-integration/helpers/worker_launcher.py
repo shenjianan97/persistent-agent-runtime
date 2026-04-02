@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import asyncpg
@@ -14,14 +15,17 @@ DEFAULT_TEST_CONFIG = {
     "max_concurrent_tasks": 10,
     "poll_backoff_initial_ms": 50,
     "poll_backoff_max_ms": 500,
+    "shutdown_drain_seconds": 3,
 }
+
+_DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
 
 
 async def create_worker(
     pool: asyncpg.Pool,
     *,
     worker_id: str | None = None,
-    db_dsn: str = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime",
+    db_dsn: str = _DB_DSN,
     config_overrides: dict[str, Any] | None = None,
 ) -> WorkerService:
     cfg = dict(DEFAULT_TEST_CONFIG)

@@ -181,6 +181,67 @@ class ApiClient:
     def health(self, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
         return self._request("GET", "/health", expected_status=expected_status, raise_for_status=raise_for_status)
 
+    # --- HITL endpoints ---
+
+    def approve_task(
+        self,
+        task_id: str,
+        *,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/approve"""
+        return self._request("POST", f"/tasks/{task_id}/approve", expected_status=expected_status, raise_for_status=raise_for_status)
+
+    def reject_task(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/reject"""
+        return self._request("POST", f"/tasks/{task_id}/reject", {"reason": reason}, expected_status=expected_status, raise_for_status=raise_for_status)
+
+    def respond_to_task(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/respond"""
+        return self._request("POST", f"/tasks/{task_id}/respond", {"message": message}, expected_status=expected_status, raise_for_status=raise_for_status)
+
+    # --- Raw (non-raising) variants for status-code assertion tests ---
+
+    def approve_task_raw(self, task_id: str) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/approve — returns status/body without raising."""
+        return self._request("POST", f"/tasks/{task_id}/approve", raise_for_status=False)
+
+    def reject_task_raw(self, task_id: str, reason: str) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/reject — returns status/body without raising."""
+        return self._request("POST", f"/tasks/{task_id}/reject", {"reason": reason}, raise_for_status=False)
+
+    def respond_to_task_raw(self, task_id: str, message: str) -> dict[str, Any]:
+        """POST /v1/tasks/{task_id}/respond — returns status/body without raising."""
+        return self._request("POST", f"/tasks/{task_id}/respond", {"message": message}, raise_for_status=False)
+
+    # --- Task events ---
+
+    def get_task_events(
+        self,
+        task_id: str,
+        *,
+        limit: int = 100,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        """GET /v1/tasks/{task_id}/events"""
+        return self._request("GET", f"/tasks/{task_id}/events?limit={limit}", expected_status=expected_status, raise_for_status=raise_for_status)
+
     def poll_until(
         self,
         task_id: str,

@@ -10,6 +10,7 @@ Both requeue paths emit pg_notify('new_task', worker_pool_id) in the same txn.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 
 import asyncpg
@@ -40,13 +41,13 @@ WITH requeued AS (
     WHERE status = 'running'
       AND lease_expiry < NOW()
       AND retry_count < max_retries
-    RETURNING task_id, worker_pool_id
+    RETURNING task_id, tenant_id, agent_id, worker_pool_id
 )
 , notified AS (
     SELECT pg_notify('new_task', worker_pool_id)
     FROM requeued
 )
-SELECT task_id
+SELECT task_id, tenant_id, agent_id
 FROM requeued;
 """
 
@@ -66,7 +67,7 @@ SET status = 'dead_letter',
 WHERE status = 'running'
   AND lease_expiry < NOW()
   AND retry_count >= max_retries
-RETURNING task_id;
+RETURNING task_id, tenant_id, agent_id;
 """
 
 # Reaper — task timeout scan
@@ -84,7 +85,7 @@ SET status = 'dead_letter',
     updated_at = NOW()
 WHERE status IN ('running', 'queued')
   AND timeout_reference_at + (task_timeout_seconds * INTERVAL '1 second') < NOW()
-RETURNING task_id;
+RETURNING task_id, tenant_id, agent_id;
 """
 
 # Queue depth query for metrics
@@ -95,6 +96,25 @@ WHERE status = 'queued';
 """
 
 # Mark workers as offline if no heartbeat for 90 seconds (3 missed heartbeats at 15s interval + buffer)
+# Reaper — human-input timeout scan
+REAPER_HUMAN_INPUT_TIMEOUT_QUERY = """
+UPDATE tasks
+SET status = 'dead_letter',
+    dead_letter_reason = 'human_input_timeout',
+    last_error_code = 'human_input_timeout',
+    last_error_message = 'No human response within timeout period',
+    dead_lettered_at = NOW(),
+    pending_input_prompt = NULL,
+    pending_approval_action = NULL,
+    human_input_timeout_at = NULL,
+    version = version + 1,
+    updated_at = NOW()
+WHERE status IN ('waiting_for_approval', 'waiting_for_input')
+  AND human_input_timeout_at IS NOT NULL
+  AND human_input_timeout_at < NOW()
+RETURNING task_id, tenant_id, agent_id;
+"""
+
 STALE_WORKER_QUERY = """
 UPDATE workers
 SET status = 'offline'
@@ -177,13 +197,14 @@ class ReaperTask:
         a reaper cycle without waiting for the jittered interval.
 
         Returns:
-            Dict with keys 'requeued', 'dead_lettered_expired', 'dead_lettered_timeout'
-            containing lists of task_ids.
+            Dict with keys 'requeued', 'dead_lettered_expired', 'dead_lettered_timeout',
+            'dead_lettered_human_timeout' containing lists of task_ids.
         """
         results: dict[str, list[str]] = {
             "requeued": [],
             "dead_lettered_expired": [],
             "dead_lettered_timeout": [],
+            "dead_lettered_human_timeout": [],
         }
 
         async with self._pool.acquire() as conn:
@@ -194,6 +215,10 @@ class ReaperTask:
                     task_id = str(row["task_id"])
                     results["requeued"].append(task_id)
                     self._metrics.increment("leases.expired")
+                    await _insert_task_event(
+                        conn, task_id, row["tenant_id"], row["agent_id"],
+                        "task_reclaimed_after_lease_expiry", "running", "queued",
+                    )
                     await self._log.ainfo(
                         REAPER_LEASE_EXPIRED,
                         task_id=task_id,
@@ -207,6 +232,11 @@ class ReaperTask:
                     results["dead_lettered_expired"].append(task_id)
                     self._metrics.increment("leases.expired")
                     self._metrics.increment("tasks.dead_letter")
+                    await _insert_task_event(
+                        conn, task_id, row["tenant_id"], row["agent_id"],
+                        "task_dead_lettered", "running", "dead_letter",
+                        error_code="retries_exhausted",
+                    )
                     await self._log.ainfo(
                         REAPER_DEAD_LETTERED,
                         task_id=task_id,
@@ -219,13 +249,35 @@ class ReaperTask:
                     task_id = str(row["task_id"])
                     results["dead_lettered_timeout"].append(task_id)
                     self._metrics.increment("tasks.dead_letter")
+                    await _insert_task_event(
+                        conn, task_id, row["tenant_id"], row["agent_id"],
+                        "task_dead_lettered", None, "dead_letter",
+                        error_code="task_timeout",
+                    )
                     await self._log.ainfo(
                         REAPER_TASK_TIMEOUT,
                         task_id=task_id,
                         reason="task_timeout",
                     )
 
-                # (c) Stale workers — mark offline if heartbeat expired
+                # (c) Human-input timeouts
+                human_timeout_rows = await conn.fetch(REAPER_HUMAN_INPUT_TIMEOUT_QUERY)
+                for row in human_timeout_rows:
+                    task_id = str(row["task_id"])
+                    results["dead_lettered_human_timeout"].append(task_id)
+                    self._metrics.increment("tasks.dead_letter")
+                    await _insert_task_event(
+                        conn, task_id, row["tenant_id"], row["agent_id"],
+                        "task_dead_lettered", None, "dead_letter",
+                        error_code="human_input_timeout",
+                    )
+                    await self._log.ainfo(
+                        REAPER_DEAD_LETTERED,
+                        task_id=task_id,
+                        reason="human_input_timeout",
+                    )
+
+                # (d) Stale workers — mark offline if heartbeat expired
                 stale_rows = await conn.fetch(STALE_WORKER_QUERY)
                 for row in stale_rows:
                     worker_id = row["worker_id"]
@@ -242,3 +294,32 @@ class ReaperTask:
                     self._metrics.set_gauge("queue.depth", float(depth_row["depth"]))
 
         return results
+
+
+async def _insert_task_event(
+    conn,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    event_type: str,
+    status_before: str | None,
+    status_after: str | None,
+    worker_id: str | None = None,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    details: dict | None = None,
+):
+    """Insert a task event on the current transaction-scoped connection.
+
+    Must be called inside an active transaction so the event INSERT commits
+    or rolls back atomically with the paired task-state mutation.
+    """
+    await conn.execute(
+        '''INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
+                                    status_before, status_after, worker_id,
+                                    error_code, error_message, details)
+           VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)''',
+        tenant_id, task_id, agent_id, event_type,
+        status_before, status_after, worker_id,
+        error_code, error_message, json.dumps(details or {}),
+    )

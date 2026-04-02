@@ -14,6 +14,8 @@ import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
+import com.persistentagent.api.repository.TaskRepository.CancelResult;
+import com.persistentagent.api.repository.TaskRepository.RedriveResult;
 import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
 import org.junit.jupiter.api.BeforeEach;
@@ -50,6 +52,9 @@ class TaskServiceTest {
     private TaskObservabilityService taskObservabilityService;
 
     @Mock
+    private TaskEventService taskEventService;
+
+    @Mock
     private ConfigValidationHelper configValidationHelper;
 
     private TaskService taskService;
@@ -66,6 +71,7 @@ class TaskServiceTest {
                 modelRepository,
                 langfuseEndpointRepository,
                 taskObservabilityService,
+                taskEventService,
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
                 configValidationHelper,
@@ -243,6 +249,9 @@ class TaskServiceTest {
         taskRow.put("checkpoint_count", 3L);
         taskRow.put("total_cost_microdollars", 999L);
         taskRow.put("langfuse_endpoint_id", null);
+        taskRow.put("pending_input_prompt", null);
+        taskRow.put("pending_approval_action", null);
+        taskRow.put("human_input_timeout_at", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
@@ -256,6 +265,9 @@ class TaskServiceTest {
         assertEquals("queued", response.status());
         assertEquals(3, response.checkpointCount());
         assertEquals(5000L, response.totalCostMicrodollars());
+        assertNull(response.pendingInputPrompt());
+        assertNull(response.pendingApprovalAction());
+        assertNull(response.humanInputTimeoutAt());
     }
 
     @Test
@@ -334,19 +346,24 @@ class TaskServiceTest {
     @Test
     void cancelTask_queuedTask_succeeds() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.UPDATED);
+        when(taskRepository.cancelTask(taskId, "default"))
+                .thenReturn(new CancelResult(MutationResult.UPDATED, "queued", "agent1"));
 
         TaskCancelResponse response = taskService.cancelTask(taskId);
 
         assertEquals(taskId, response.taskId());
         assertEquals("dead_letter", response.status());
         assertEquals("cancelled_by_user", response.deadLetterReason());
+        verify(taskEventService).recordEvent(eq("default"), eq(taskId), eq("agent1"),
+                eq("task_cancelled"), eq("queued"), eq("dead_letter"),
+                isNull(), eq("cancelled_by_user"), isNull(), eq("{}"));
     }
 
     @Test
     void cancelTask_completedTask_throwsConflict() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.WRONG_STATE);
+        when(taskRepository.cancelTask(taskId, "default"))
+                .thenReturn(new CancelResult(MutationResult.WRONG_STATE, "completed", "agent1"));
 
         assertThrows(InvalidStateTransitionException.class, () -> taskService.cancelTask(taskId));
     }
@@ -354,7 +371,8 @@ class TaskServiceTest {
     @Test
     void cancelTask_notFound_throwsNotFound() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.cancelTask(taskId, "default")).thenReturn(MutationResult.NOT_FOUND);
+        when(taskRepository.cancelTask(taskId, "default"))
+                .thenReturn(new CancelResult(MutationResult.NOT_FOUND, null, null));
 
         assertThrows(TaskNotFoundException.class, () -> taskService.cancelTask(taskId));
     }
@@ -364,18 +382,23 @@ class TaskServiceTest {
     @Test
     void redriveTask_deadLetteredTask_succeeds() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.UPDATED);
+        when(taskRepository.redriveTask(taskId, "default"))
+                .thenReturn(new RedriveResult(MutationResult.UPDATED, "agent1"));
 
         RedriveResponse response = taskService.redriveTask(taskId);
 
         assertEquals(taskId, response.taskId());
         assertEquals("queued", response.status());
+        verify(taskEventService).recordEvent(eq("default"), eq(taskId), eq("agent1"),
+                eq("task_redriven"), eq("dead_letter"), eq("queued"),
+                isNull(), isNull(), isNull(), eq("{}"));
     }
 
     @Test
     void redriveTask_queuedTask_throwsConflict() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.WRONG_STATE);
+        when(taskRepository.redriveTask(taskId, "default"))
+                .thenReturn(new RedriveResult(MutationResult.WRONG_STATE, null));
 
         assertThrows(InvalidStateTransitionException.class, () -> taskService.redriveTask(taskId));
     }
@@ -383,7 +406,8 @@ class TaskServiceTest {
     @Test
     void redriveTask_notFound_throwsNotFound() {
         UUID taskId = UUID.randomUUID();
-        when(taskRepository.redriveTask(taskId, "default")).thenReturn(MutationResult.NOT_FOUND);
+        when(taskRepository.redriveTask(taskId, "default"))
+                .thenReturn(new RedriveResult(MutationResult.NOT_FOUND, null));
 
         assertThrows(TaskNotFoundException.class, () -> taskService.redriveTask(taskId));
     }

@@ -43,6 +43,7 @@ class TaskControllerIntegrationTest {
 
         @BeforeEach
         void cleanDb() {
+                jdbcTemplate.execute("DELETE FROM task_events");
                 jdbcTemplate.execute("DELETE FROM checkpoint_writes");
                 jdbcTemplate.execute("DELETE FROM checkpoints");
                 jdbcTemplate.execute("DELETE FROM tasks");

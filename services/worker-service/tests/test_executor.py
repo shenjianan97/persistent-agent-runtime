@@ -11,24 +11,48 @@ from checkpointer.postgres import LeaseRevokedException
 from tools.errors import ToolExecutionError, ToolTransportError
 
 
+def _make_mock_conn():
+    """Create a mock connection that supports transaction() as an async context manager."""
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.fetchrow = AsyncMock(return_value=None)
+    mock_conn.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000000")
+
+    # transaction() must return a sync object with __aenter__/__aexit__
+    mock_tx = AsyncMock()
+    mock_tx.__aenter__ = AsyncMock(return_value=None)
+    mock_tx.__aexit__ = AsyncMock(return_value=False)
+    mock_conn.transaction = MagicMock(return_value=mock_tx)
+    return mock_conn
+
+
+def _make_mock_pool(mock_conn=None):
+    """Create a mock pool where acquire() is an async context manager yielding mock_conn."""
+    if mock_conn is None:
+        mock_conn = _make_mock_conn()
+    pool = MagicMock()
+    mock_acquire_ctx = AsyncMock()
+    mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+    pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+    # Direct pool methods (for code that uses pool.execute/fetch/etc. directly)
+    pool.execute = AsyncMock()
+    pool.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000000")
+    pool.fetchrow = AsyncMock(return_value=None)
+    pool.fetch = AsyncMock(return_value=[])
+    return pool, mock_conn
+
+
 @pytest.fixture
 def mock_worker():
     config = WorkerConfig(worker_id="test-worker", worker_pool_id="shared")
     worker = MagicMock(spec=WorkerService)
     worker.config = config
-    
-    # Setup pool acquire async context manager
-    mock_conn = AsyncMock()
-    mock_conn.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000000")
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__.return_value = mock_conn
-    worker.pool = MagicMock()
-    worker.pool.acquire.return_value = mock_ctx
-    worker.pool.execute = AsyncMock()
-    worker.pool.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000000")
-    worker.pool.fetchrow = AsyncMock(return_value=None)
-    worker.pool.fetch = AsyncMock(return_value=[])
-    
+
+    pool, mock_conn = _make_mock_pool()
+    worker.pool = pool
+
     worker.heartbeat = MagicMock()
     worker.heartbeat.stop_heartbeat = AsyncMock()
     # Heartbeat handle
@@ -86,20 +110,22 @@ async def test_completion_path(mock_worker, task_data):
             
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
-            # Verify completed path — completion now uses pool.fetchval with lease guard
-            mock_worker.pool.fetchval.assert_called_once_with(
+            # Verify completed path — completion now uses conn.fetchval via pool.acquire()
+            mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+            mock_conn.fetchval.assert_called_with(
                 '''UPDATE tasks
-                       SET status='completed',
-                           output=$1,
-                           last_error_code=NULL,
-                           last_error_message=NULL,
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$2::uuid
-                         AND status='running'
-                         AND lease_owner=$3
-                       RETURNING task_id''',
+                               SET status='completed',
+                                   output=$1,
+                                   last_error_code=NULL,
+                                   last_error_message=NULL,
+                                   human_response=NULL,
+                                   version=version+1,
+                                   lease_owner=NULL,
+                                   lease_expiry=NULL
+                               WHERE task_id=$2::uuid
+                                 AND status='running'
+                                 AND lease_owner=$3
+                               RETURNING task_id''',
                 json.dumps({"result": "Final Answer: 4"}),
                 task_data["task_id"],
                 "test-worker",
@@ -189,7 +215,9 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
             execute_calls = mock_worker.pool.execute.call_args_list
             cost_update_calls = [c for c in execute_calls if "UPDATE checkpoints" in str(c) and "cost_microdollars" in str(c)]
             assert len(cost_update_calls) > 0, "Expected checkpoint cost update via pool.execute"
-            completion_args, _ = mock_worker.pool.fetchval.call_args
+            # Completion now uses conn.fetchval via pool.acquire()
+            mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+            completion_args, _ = mock_conn.fetchval.call_args
             assert "UPDATE tasks" in completion_args[0]
             assert "status='completed'" in completion_args[0]
 
@@ -219,19 +247,19 @@ async def test_timeout_dead_letter(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                   SET status='dead_letter',
-                       dead_letter_reason=$1,
-                       last_error_message=$2,
-                       last_error_code=$3,
-                       last_worker_id=$4,
-                       dead_lettered_at=NOW(),
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$5::uuid
-                     AND status='running'
-                     AND lease_owner=$6
-                   RETURNING task_id''',
+                       SET status='dead_letter',
+                           dead_letter_reason=$1,
+                           last_error_message=$2,
+                           last_error_code=$3,
+                           last_worker_id=$4,
+                           dead_lettered_at=NOW(),
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$5::uuid
+                         AND status='running'
+                         AND lease_owner=$6
+                       RETURNING task_id''',
                 "task_timeout",
                 "Execution exceeded task logic timeout",
                 "task_timeout",
@@ -293,19 +321,19 @@ async def test_non_retryable_error(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                   SET status='dead_letter',
-                       dead_letter_reason=$1,
-                       last_error_message=$2,
-                       last_error_code=$3,
-                       last_worker_id=$4,
-                       dead_lettered_at=NOW(),
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$5::uuid
-                     AND status='running'
-                     AND lease_owner=$6
-                   RETURNING task_id''',
+                       SET status='dead_letter',
+                           dead_letter_reason=$1,
+                           last_error_message=$2,
+                           last_error_code=$3,
+                           last_worker_id=$4,
+                           dead_lettered_at=NOW(),
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$5::uuid
+                         AND status='running'
+                         AND lease_owner=$6
+                       RETURNING task_id''',
                 "non_retryable_error",
                 "pydantic validation error: invalid property",
                 "fatal_error",
@@ -339,19 +367,19 @@ async def test_graph_recursion_error(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                   SET status='dead_letter',
-                       dead_letter_reason=$1,
-                       last_error_message=$2,
-                       last_error_code=$3,
-                       last_worker_id=$4,
-                       dead_lettered_at=NOW(),
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$5::uuid
-                     AND status='running'
-                     AND lease_owner=$6
-                   RETURNING task_id''',
+                       SET status='dead_letter',
+                           dead_letter_reason=$1,
+                           last_error_message=$2,
+                           last_error_code=$3,
+                           last_worker_id=$4,
+                           dead_lettered_at=NOW(),
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$5::uuid
+                         AND status='running'
+                         AND lease_owner=$6
+                       RETURNING task_id''',
                 "max_steps_exceeded",
                 "Execution exceeded max_steps (5)",
                 "max_steps_exceeded",
@@ -387,19 +415,19 @@ async def test_retries_exhausted(mock_worker, task_data):
             # Verify dead letter logic with retries_exhausted — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                   SET status='dead_letter',
-                       dead_letter_reason=$1,
-                       last_error_message=$2,
-                       last_error_code=$3,
-                       last_worker_id=$4,
-                       dead_lettered_at=NOW(),
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$5::uuid
-                     AND status='running'
-                     AND lease_owner=$6
-                   RETURNING task_id''',
+                       SET status='dead_letter',
+                           dead_letter_reason=$1,
+                           last_error_message=$2,
+                           last_error_code=$3,
+                           last_worker_id=$4,
+                           dead_lettered_at=NOW(),
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$5::uuid
+                         AND status='running'
+                         AND lease_owner=$6
+                       RETURNING task_id''',
                 "retries_exhausted",
                 "Max retries reached. Last error: 503 Service Unavailable",
                 "retries_exhausted",
@@ -468,19 +496,19 @@ async def test_read_url_failure_preserves_failing_url_on_retryable_requeue(mock_
     # Retry requeue now uses conn.fetchval with lease guard
     mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_any_call(
         '''UPDATE tasks
-                   SET status='queued',
-                       retry_count=$1,
-                       retry_after=$2,
-                       retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
-                       last_error_code='retryable_error',
-                       last_error_message=$3,
-                       version=version+1,
-                       lease_owner=NULL,
-                       lease_expiry=NULL
-                   WHERE task_id=$4::uuid
-                     AND status='running'
-                     AND lease_owner=$5
-                   RETURNING task_id''',
+                       SET status='queued',
+                           retry_count=$1,
+                           retry_after=$2,
+                           retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
+                           last_error_code='retryable_error',
+                           last_error_message=$3,
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$4::uuid
+                         AND status='running'
+                         AND lease_owner=$5
+                       RETURNING task_id''',
         1,
         ANY,
         "URL fetch request failed for https://bad.example/fail: network down",
@@ -521,8 +549,9 @@ async def test_completion_stolen_lease_does_not_crash(mock_worker, task_data):
     """Issue #12: if the lease was stolen before completion, fetchval returns None.
     The executor must log a warning and return cleanly instead of crashing."""
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-    # Simulate lease stolen: fetchval returns None (0 rows updated)
-    mock_worker.pool.fetchval = AsyncMock(return_value=None)
+    # Simulate lease stolen: conn.fetchval returns None (0 rows updated)
+    mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+    mock_conn.fetchval = AsyncMock(return_value=None)
 
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()
@@ -546,8 +575,8 @@ async def test_completion_stolen_lease_does_not_crash(mock_worker, task_data):
             # Should not raise
             await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
-        # fetchval was called (attempted the update) but returned None — no exception
-        mock_worker.pool.fetchval.assert_called_once()
+        # conn.fetchval was called (attempted the update) but returned None — no exception
+        mock_conn.fetchval.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -587,12 +616,13 @@ async def test_retry_requeue_stolen_lease_skips_notify(mock_worker, task_data):
     task_data["max_retries"] = 3
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     # Simulate lease stolen on the retry-requeue UPDATE
-    mock_conn = AsyncMock()
+    mock_conn = _make_mock_conn()
     mock_conn.fetchval = AsyncMock(return_value=None)
     mock_conn.execute = AsyncMock()
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__.return_value = mock_conn
-    mock_worker.pool.acquire.return_value = mock_ctx
+    mock_acquire_ctx = AsyncMock()
+    mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+    mock_worker.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
 
     with patch.object(executor, "_build_graph") as mock_build:
         mock_graph = MagicMock()

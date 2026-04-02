@@ -13,10 +13,13 @@ export const submitTaskSchema = z.object({
 
 export type SubmitTaskFormValues = z.infer<typeof submitTaskSchema>;
 
-// Tools from ValidationConstants.java — used by agent create/edit forms
+// Capability tools — do external work and return results
 export const ALLOWED_TOOLS = [
     { id: "web_search", label: "Web Search" },
     { id: "read_url", label: "Read URL" },
     { id: "calculator", label: "Calculator" },
     ...(devTaskControlsEnabled ? [{ id: "dev_sleep", label: "Dev Sleep" }] : [])
 ];
+
+// Runtime tool ID for human-in-the-loop — presented as a separate toggle
+export const HUMAN_INPUT_TOOL_ID = "request_human_input";

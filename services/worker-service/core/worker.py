@@ -120,7 +120,7 @@ class WorkerService:
         await self._log.ainfo("worker_started")
 
     async def stop(self) -> None:
-        """Gracefully shut down all subsystems."""
+        """Fully stop the worker, forcing leftover execution cleanup after drain timeout."""
         await self._log.ainfo("worker_stopping")
 
         if self._registry_task:
@@ -137,12 +137,37 @@ class WorkerService:
         # Drain in-flight tasks before revoking heartbeats so workers don't burn
         # retry attempts on every ECS deployment.
         if self.poller:
+            active_tasks_count = getattr(self.poller, "active_tasks_count", getattr(self.poller, "_active_tasks_count", 0))
+            active_execution_tasks_count = getattr(
+                self.poller,
+                "active_execution_tasks_count",
+                len(getattr(self.poller, "_execution_tasks", ())),
+            )
+            await self._log.ainfo(
+                "worker_drain_started",
+                shutdown_drain_seconds=self._config.shutdown_drain_seconds,
+                active_tasks_count=active_tasks_count,
+                active_execution_tasks_count=active_execution_tasks_count,
+            )
             drained = await self.poller.drain(self._config.shutdown_drain_seconds)
             if not drained:
                 await self._log.awarn(
                     "drain_timeout",
                     shutdown_drain_seconds=self._config.shutdown_drain_seconds,
+                    active_tasks_count=active_tasks_count,
+                    active_execution_tasks_count=active_execution_tasks_count,
                 )
+                await self.poller.cancel_active_tasks()
+            await self._log.ainfo(
+                "worker_drain_completed",
+                drained=drained,
+                active_tasks_count=getattr(self.poller, "active_tasks_count", getattr(self.poller, "_active_tasks_count", 0)),
+                active_execution_tasks_count=getattr(
+                    self.poller,
+                    "active_execution_tasks_count",
+                    len(getattr(self.poller, "_execution_tasks", ())),
+                ),
+            )
 
         if self.poller:
             await self.poller.stop()

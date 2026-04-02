@@ -17,7 +17,7 @@ public final class ValidationConstants {
     public static final String DEFAULT_WORKER_POOL_ID = "shared";
 
     /** Stable public tools available in all environments. */
-    public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator");
+    public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator", "request_human_input");
 
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
@@ -28,7 +28,9 @@ public final class ValidationConstants {
             "retries_exhausted",
             "task_timeout",
             "non_retryable_error",
-            "max_steps_exceeded"
+            "max_steps_exceeded",
+            "human_input_timeout",
+            "rejected_by_user"
     );
 
     public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";
@@ -51,7 +53,8 @@ public final class ValidationConstants {
 
     /** Valid task statuses matching the database CHECK constraint. */
     public static final Set<String> VALID_TASK_STATUSES = Set.of(
-            "queued", "running", "completed", "dead_letter"
+            "queued", "running", "completed", "dead_letter",
+            "waiting_for_approval", "waiting_for_input", "paused"
     );
 
     // Agent listing defaults

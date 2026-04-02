@@ -72,3 +72,54 @@ async def test_worker_stop_quiesces_and_drains_before_stopping_poller():
 
     assert events[:3] == ["poller_quiesce", "poller_drain:7", "poller_stop"]
     assert events[3:] == ["heartbeat_stop", "reaper_stop", "deregister"]
+
+
+async def test_worker_stop_cancels_inflight_tasks_when_drain_times_out():
+    pool = MagicMock()
+    config = WorkerConfig(worker_id="test-worker-stop-timeout", shutdown_drain_seconds=7)
+    service = WorkerService(config, pool, router=MagicMock())
+
+    events: list[str] = []
+
+    class MockPoller:
+        _active_tasks_count = 1
+        _execution_tasks = {object()}
+
+        async def quiesce(self) -> None:
+            events.append("poller_quiesce")
+
+        async def drain(self, timeout: float) -> bool:
+            events.append(f"poller_drain:{int(timeout)}")
+            return False
+
+        async def cancel_active_tasks(self) -> None:
+            events.append("poller_cancel_active_tasks")
+
+        async def stop(self) -> None:
+            events.append("poller_stop")
+
+    service.poller = MockPoller()
+    service.heartbeat = MagicMock()
+    service.heartbeat.stop_all = AsyncMock(side_effect=lambda: events.append("heartbeat_stop"))
+    service.reaper = MagicMock()
+    service.reaper.stop = AsyncMock(side_effect=lambda: events.append("reaper_stop"))
+    service._deregister_worker = AsyncMock(side_effect=lambda: events.append("deregister"))
+    service._log = MagicMock()
+    service._log.ainfo = AsyncMock()
+    service._log.awarn = AsyncMock()
+
+    await service.stop()
+
+    assert events[:4] == [
+        "poller_quiesce",
+        "poller_drain:7",
+        "poller_cancel_active_tasks",
+        "poller_stop",
+    ]
+    assert events[4:] == ["heartbeat_stop", "reaper_stop", "deregister"]
+    service._log.awarn.assert_awaited_once_with(
+        "drain_timeout",
+        shutdown_drain_seconds=7,
+        active_tasks_count=1,
+        active_execution_tasks_count=1,
+    )

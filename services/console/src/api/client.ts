@@ -16,6 +16,7 @@ import {
     AgentResponse,
     AgentCreateRequest,
     AgentUpdateRequest,
+    TaskEventListResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -165,4 +166,26 @@ export const api = {
             method: 'PUT',
             body: JSON.stringify(request),
         }),
+
+    // HITL Actions
+    approveTask: (taskId: string) =>
+        fetchApi<TaskStatusResponse>(`/v1/tasks/${taskId}/approve`, {
+            method: 'POST',
+        }),
+
+    rejectTask: (taskId: string, reason: string) =>
+        fetchApi<TaskStatusResponse>(`/v1/tasks/${taskId}/reject`, {
+            method: 'POST',
+            body: JSON.stringify({ reason }),
+        }),
+
+    respondToTask: (taskId: string, message: string) =>
+        fetchApi<TaskStatusResponse>(`/v1/tasks/${taskId}/respond`, {
+            method: 'POST',
+            body: JSON.stringify({ message }),
+        }),
+
+    // Task Events
+    getTaskEvents: (taskId: string, limit = 100) =>
+        fetchApi<TaskEventListResponse>(`/v1/tasks/${taskId}/events?limit=${limit}`),
 };
