@@ -249,6 +249,10 @@ jobs:
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
+      - name: Pre-build API service
+        working-directory: services/api-service
+        run: ./gradlew classes testClasses
+
       - name: Run E2E tests
         env:
           # Point conftest at the GH Actions PostgreSQL service (skips Docker management)
