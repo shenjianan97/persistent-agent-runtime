@@ -252,12 +252,14 @@ async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
     del runtime_environment
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
     async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM task_events")
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")
         await conn.execute("DELETE FROM agents")
     yield pool
     async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM task_events")
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")

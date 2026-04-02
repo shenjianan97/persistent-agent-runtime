@@ -18,20 +18,11 @@ from helpers.mock_llm import simple_response
 @pytest.mark.asyncio
 async def test_approve_transitions_to_queued(e2e):
     """Approve a task in waiting_for_approval -> transitions back to queued."""
-    e2e.use_llm(simple_response("ok"))
-    await e2e.start_worker("e2e-approval-approve")
-
     e2e.ensure_agent()
     task_id = e2e.submit_task(input="Approval test")
 
-    # Wait for task to be claimed (running)
-    running = await e2e.wait_for_status(task_id, "running", timeout=15.0)
-    assert running["status"] == "running"
-
-    # Stop the worker so it doesn't interfere with our DB manipulation
-    await e2e.stop_workers()
-
     # Directly set the task to waiting_for_approval with a mock pending action
+    # (no worker needed — we skip the execution step entirely)
     mock_action = json.dumps({
         "tool_name": "dangerous_tool",
         "tool_args": {"target": "production"},
@@ -74,20 +65,10 @@ async def test_approve_transitions_to_queued(e2e):
 @pytest.mark.asyncio
 async def test_reject_transitions_to_queued(e2e):
     """Reject a task in waiting_for_approval -> transitions back to queued."""
-    e2e.use_llm(simple_response("ok"))
-    await e2e.start_worker("e2e-approval-reject")
-
     e2e.ensure_agent()
     task_id = e2e.submit_task(input="Rejection test")
 
-    # Wait for task to be claimed
-    running = await e2e.wait_for_status(task_id, "running", timeout=15.0)
-    assert running["status"] == "running"
-
-    # Stop worker
-    await e2e.stop_workers()
-
-    # Set to waiting_for_approval
+    # Set to waiting_for_approval directly (no worker needed)
     mock_action = json.dumps({
         "tool_name": "dangerous_tool",
         "tool_args": {"target": "production"},

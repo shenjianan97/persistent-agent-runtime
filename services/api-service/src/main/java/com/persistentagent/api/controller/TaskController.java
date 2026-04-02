@@ -106,6 +106,8 @@ public class TaskController {
     public ResponseEntity<TaskEventListResponse> getTaskEvents(
             @PathVariable UUID taskId,
             @RequestParam(defaultValue = "100") int limit) {
+        // Verify the task exists (throws TaskNotFoundException → 404)
+        taskService.getTaskStatus(taskId);
         TaskEventListResponse events = taskEventService.listEvents(
                 taskId, ValidationConstants.DEFAULT_TENANT_ID, limit);
         return ResponseEntity.ok(events);
