@@ -11,7 +11,7 @@ async def test_3_26_zombie_checkpointer_protection(e2e):
 
     async def _slow_final(*args, **kwargs):
         del args, kwargs
-        await asyncio.sleep(20)
+        await asyncio.sleep(5)
         return AIMessage(content="final")
 
     first_turn = AIMessage(

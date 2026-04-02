@@ -40,33 +40,4 @@ async def create_worker(
 
 
 async def stop_worker(worker: WorkerService) -> None:
-    # Snapshot tasks before stop so we can cancel orphaned coroutines after.
-    tasks_before = {t for t in asyncio.all_tasks() if not t.done()}
     await worker.stop()
-    # Cancel any tasks that were spawned during the worker's lifetime and
-    # survived the graceful drain (e.g. asyncio.sleep in mock LLMs).
-    tasks_after = asyncio.all_tasks()
-    orphans = {t for t in tasks_after if not t.done()} - tasks_before
-    for t in orphans:
-        t.cancel()
-    if orphans:
-        await asyncio.gather(*orphans, return_exceptions=True)
-    # Terminate any DB connections stuck in "idle in transaction" state.
-    # These hold row locks from cancelled coroutines and block test cleanup.
-    # Use a fresh direct connection to avoid deadlocking on the shared pool.
-    try:
-        conn = await asyncpg.connect(worker._config.db_dsn)  # noqa: SLF001
-        try:
-            await conn.execute("""
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE datname = current_database()
-                  AND state = 'idle in transaction'
-                  AND pid <> pg_backend_pid()
-            """)
-        finally:
-            await conn.close()
-    except Exception:
-        pass
-    # Give terminated connections a moment to release locks
-    await asyncio.sleep(0.2)

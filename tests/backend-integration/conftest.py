@@ -248,8 +248,14 @@ def asyncio_run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-async def _terminate_stuck_connections() -> None:
-    """Kill any connections stuck in 'idle in transaction' from cancelled coroutines."""
+async def _terminate_other_connections() -> None:
+    """Kill ALL other connections to release any row locks from orphaned coroutines.
+
+    This is aggressive but necessary: cancelled asyncio tasks can leave
+    connections in 'idle in transaction' or even 'active' state, holding
+    row locks that block test cleanup indefinitely.  The API (Java/JDBC)
+    and any new pool will reconnect automatically.
+    """
     try:
         conn = await asyncpg.connect(DB_DSN)
         try:
@@ -257,12 +263,11 @@ async def _terminate_stuck_connections() -> None:
                 SELECT pg_terminate_backend(pid)
                 FROM pg_stat_activity
                 WHERE datname = current_database()
-                  AND state = 'idle in transaction'
                   AND pid <> pg_backend_pid()
             """)
         finally:
             await conn.close()
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.5)
     except Exception:
         pass
 
@@ -291,12 +296,12 @@ async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
         if t is not current and not t.done() and "pytest" not in (t.get_name() or ""):
             t.cancel()
     await asyncio.sleep(0.1)  # let cancellations propagate
-    await _terminate_stuck_connections()
+    await _terminate_other_connections()
     await _clean_tables()
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
     yield pool
     pool.terminate()
-    await _terminate_stuck_connections()
+    await _terminate_other_connections()
     await _clean_tables()
 
 
