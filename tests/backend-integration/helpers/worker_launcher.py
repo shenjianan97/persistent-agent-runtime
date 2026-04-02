@@ -14,6 +14,7 @@ DEFAULT_TEST_CONFIG = {
     "max_concurrent_tasks": 10,
     "poll_backoff_initial_ms": 50,
     "poll_backoff_max_ms": 500,
+    "shutdown_drain_seconds": 3,
 }
 
 
