@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import asyncpg
@@ -37,4 +38,14 @@ async def create_worker(
 
 
 async def stop_worker(worker: WorkerService) -> None:
+    # Snapshot tasks before stop so we can cancel orphaned coroutines after.
+    tasks_before = {t for t in asyncio.all_tasks() if not t.done()}
     await worker.stop()
+    # Cancel any tasks that were spawned during the worker's lifetime and
+    # survived the graceful drain (e.g. asyncio.sleep in mock LLMs).
+    tasks_after = asyncio.all_tasks()
+    orphans = {t for t in tasks_after if not t.done()} - tasks_before
+    for t in orphans:
+        t.cancel()
+    if orphans:
+        await asyncio.gather(*orphans, return_exceptions=True)
