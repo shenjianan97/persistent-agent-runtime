@@ -57,9 +57,6 @@ class TaskServiceTest {
     @Mock
     private ConfigValidationHelper configValidationHelper;
 
-    @Mock
-    private TaskEventService taskEventService;
-
     private TaskService taskService;
     private ObjectMapper objectMapper;
 

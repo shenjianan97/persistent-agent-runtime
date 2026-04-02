@@ -117,11 +117,25 @@ class TestPollerSemaphore:
 class TestPollerTryClaim:
     """Test the _try_claim method with mocked database."""
 
+    @staticmethod
+    def _make_poller_conn(fetchrow_return=None):
+        """Create a mock conn with transaction() support for poller tests."""
+        conn = AsyncMock()
+        conn.fetchrow = AsyncMock(return_value=fetchrow_return)
+        conn.execute = AsyncMock()
+        conn.fetch = AsyncMock(return_value=[])
+        conn.fetchval = AsyncMock(return_value=None)
+        # transaction() returns a sync object usable as async context manager
+        tx = AsyncMock()
+        tx.__aenter__ = AsyncMock(return_value=None)
+        tx.__aexit__ = AsyncMock(return_value=False)
+        conn.transaction = MagicMock(return_value=tx)
+        return conn
+
     async def test_try_claim_returns_false_when_no_task(self):
         config = WorkerConfig(worker_id="test-poller")
+        conn = self._make_poller_conn(fetchrow_return=None)
         pool = MagicMock()
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value=None)
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -143,9 +157,8 @@ class TestPollerTryClaim:
             "retry_count": 0,
         }
 
+        conn = self._make_poller_conn(fetchrow_return=row)
         pool = MagicMock()
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value=row)
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)
@@ -170,9 +183,8 @@ class TestPollerTryClaim:
             "retry_count": 0,
         }
 
+        conn = self._make_poller_conn(fetchrow_return=row)
         pool = MagicMock()
-        conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value=row)
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
         ctx.__aexit__ = AsyncMock(return_value=False)

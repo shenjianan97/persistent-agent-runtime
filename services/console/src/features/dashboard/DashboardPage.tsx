@@ -1,5 +1,5 @@
 import { Link } from 'react-router';
-import { AlertCircle, ArrowRight, Clock3, ListChecks, PlaySquare, ReceiptText, UserCheck, Zap } from 'lucide-react';
+import { AlertCircle, ArrowRight, Clock3, LayoutDashboard, ListChecks, PlaySquare, ReceiptText, UserCheck, Zap } from 'lucide-react';
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -96,10 +96,12 @@ export function DashboardPage() {
 
     return (
         <div className="space-y-8 animate-in fade-in duration-500">
-            <div className="console-surface-strong flex flex-col gap-4 rounded-[28px] p-6 md:flex-row md:items-end md:justify-between md:p-8">
+            <div className="console-surface-strong flex flex-col gap-4 rounded-[28px] p-6 md:p-7 md:flex-row md:items-end md:justify-between">
                 <div className="space-y-2">
-                    <div className="text-[11px] font-semibold uppercase tracking-[0.26em] text-primary">Customer Home</div>
-                    <h2 className="text-3xl font-semibold tracking-tight text-foreground">Home</h2>
+                    <h2 className="text-3xl font-display font-semibold tracking-tight flex items-center gap-2">
+                        <LayoutDashboard className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
+                        Home
+                    </h2>
                     <p className="max-w-2xl text-sm text-muted-foreground md:text-base">
                         Track what needs attention first, then review recent agent activity and completed work.
                     </p>

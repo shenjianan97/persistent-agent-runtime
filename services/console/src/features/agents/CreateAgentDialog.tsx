@@ -3,7 +3,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useCreateAgent } from './useAgents';
 import { useModels } from '@/features/submit/useModels';
-import { ALLOWED_TOOLS } from '@/features/submit/schema';
+import { ALLOWED_TOOLS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 
@@ -47,7 +47,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
             provider: 'anthropic',
             model: 'claude-3-5-sonnet-latest',
             temperature: 0.7,
-            allowed_tools: ['web_search', 'read_url', 'calculator'],
+            allowed_tools: ['web_search', 'read_url', 'calculator', 'request_human_input'],
         },
     });
 
@@ -193,7 +193,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             name="allowed_tools"
                             render={() => (
                                 <FormItem>
-                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Allowed Tools</FormLabel>
+                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Tools</FormLabel>
                                     <div className="flex flex-wrap gap-4 mt-2">
                                         {ALLOWED_TOOLS.map((item) => (
                                             <FormField
@@ -222,6 +222,37 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                         ))}
                                     </div>
                                     <FormMessage className="text-destructive font-bold text-xs" />
+                                </FormItem>
+                            )}
+                        />
+
+                        <FormField
+                            control={form.control}
+                            name="allowed_tools"
+                            render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Human-in-the-Loop</FormLabel>
+                                    <div className="flex items-center gap-3 mt-2 p-3 border border-border rounded-none bg-black/30">
+                                        <FormControl>
+                                            <Checkbox
+                                                className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
+                                                checked={field.value?.includes(HUMAN_INPUT_TOOL_ID)}
+                                                onCheckedChange={(checked) =>
+                                                    checked
+                                                        ? field.onChange([...(field.value || []), HUMAN_INPUT_TOOL_ID])
+                                                        : field.onChange(field.value?.filter((v) => v !== HUMAN_INPUT_TOOL_ID))
+                                                }
+                                            />
+                                        </FormControl>
+                                        <div>
+                                            <FormLabel className="font-normal font-mono cursor-pointer text-sm">
+                                                Enable Human Input
+                                            </FormLabel>
+                                            <p className="text-xs text-muted-foreground mt-0.5">
+                                                Allow this agent to pause and request input from a human operator
+                                            </p>
+                                        </div>
+                                    </div>
                                 </FormItem>
                             )}
                         />

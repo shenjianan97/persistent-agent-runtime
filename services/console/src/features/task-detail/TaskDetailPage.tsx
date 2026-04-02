@@ -10,7 +10,6 @@ import { CostSummary } from './CostSummary';
 import { CheckpointTimeline } from './CheckpointTimeline';
 import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
-import { TaskEventsTimeline } from './TaskEventsTimeline';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { AlertCircle, Terminal, Ban, RotateCcw } from 'lucide-react';
@@ -37,7 +36,7 @@ export function TaskDetailPage() {
     const isNonTerminal = task?.status === 'queued' || task?.status === 'running' ||
         task?.status === 'waiting_for_approval' || task?.status === 'waiting_for_input' || task?.status === 'paused';
 
-    const { data: eventsData, isLoading: eventsLoading } = useQuery({
+    const { data: eventsData } = useQuery({
         queryKey: ['task-events', taskId],
         queryFn: () => api.getTaskEvents(taskId!),
         refetchInterval: isNonTerminal ? 5000 : false,
@@ -122,7 +121,7 @@ export function TaskDetailPage() {
     return (
         <div className="space-y-6 animate-in fade-in duration-500 pb-20">
             {/* Header Panel */}
-            <div className="console-surface-strong rounded-[28px] p-6 flex flex-col md:flex-row md:items-start justify-between gap-4">
+            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 flex flex-col md:flex-row md:items-start justify-between gap-4">
                 <div className="space-y-2">
                     <div className="flex items-center gap-3">
                         <h2 className="text-2xl font-display font-semibold tracking-tight">
@@ -198,6 +197,7 @@ export function TaskDetailPage() {
 
                     <CheckpointTimeline
                         checkpoints={checkpoints}
+                        hitlEvents={eventsData?.events ?? []}
                         isRunning={isRunning}
                         retryHistory={task.retry_history}
                         status={task.status}
@@ -205,11 +205,6 @@ export function TaskDetailPage() {
                         lastErrorCode={task.last_error_code}
                         lastErrorMessage={task.last_error_message}
                         deadLetteredAt={task.dead_lettered_at}
-                    />
-
-                    <TaskEventsTimeline
-                        events={eventsData?.events ?? []}
-                        isLoading={eventsLoading}
                     />
 
                     {isDeadLetter && (

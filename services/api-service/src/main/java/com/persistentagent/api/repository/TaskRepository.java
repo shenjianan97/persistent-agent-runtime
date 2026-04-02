@@ -259,9 +259,7 @@ public class TaskRepository {
      * Rejects a task waiting for approval. Sets human_response with rejection JSON including reason,
      * transitions to queued, and returns worker_pool_id + agent_id.
      */
-    public HitlMutationResult rejectTask(UUID taskId, String tenantId, String reason) {
-        String humanResponse = "{\"kind\":\"approval\",\"approved\":false,\"reason\":\"%s\"}"
-                .formatted(reason.replace("\\", "\\\\").replace("\"", "\\\""));
+    public HitlMutationResult rejectTask(UUID taskId, String tenantId, String humanResponse) {
         String sql = """
                 WITH target AS (
                     SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?
@@ -302,9 +300,7 @@ public class TaskRepository {
      * Responds to a task waiting for human input. Sets human_response with input JSON,
      * transitions to queued, and returns worker_pool_id + agent_id.
      */
-    public HitlMutationResult respondToTask(UUID taskId, String tenantId, String message) {
-        String humanResponse = "{\"kind\":\"input\",\"message\":\"%s\"}"
-                .formatted(message.replace("\\", "\\\\").replace("\"", "\\\""));
+    public HitlMutationResult respondToTask(UUID taskId, String tenantId, String humanResponse) {
         String sql = """
                 WITH target AS (
                     SELECT task_id FROM tasks WHERE task_id = ? AND tenant_id = ?

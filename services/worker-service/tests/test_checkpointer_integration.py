@@ -25,6 +25,7 @@ async def integration_pool():
         pytest.skip(f"PostgreSQL test database is not available: {exc}")
 
     async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM task_events")
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")

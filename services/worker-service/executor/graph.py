@@ -350,8 +350,33 @@ class GraphExecutor:
                 if cancel_event.is_set():
                     return
 
-                # Execution Finished successfully. Compute final output.
+                # Check for pending interrupts (e.g., request_human_input called interrupt())
                 final_state = await compiled_graph.aget_state(config)
+                if final_state.tasks:
+                    for task_obj in final_state.tasks:
+                        if hasattr(task_obj, 'interrupts') and task_obj.interrupts:
+                            # Graph paused due to interrupt() — handle as HITL pause
+                            interrupt_data = task_obj.interrupts[0].value if task_obj.interrupts else {}
+                            # Extract the last AI message text as context for the prompt
+                            messages = final_state.values.get("messages", [])
+                            ai_context = ""
+                            for msg in reversed(messages):
+                                if getattr(msg, "type", None) == "ai" and msg.content:
+                                    # AI content can be a string or a list of content blocks
+                                    if isinstance(msg.content, str):
+                                        ai_context = msg.content
+                                    elif isinstance(msg.content, list):
+                                        text_parts = [b["text"] for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
+                                        ai_context = "\n".join(text_parts)
+                                    break
+                            if ai_context and isinstance(interrupt_data, dict):
+                                # Prepend the AI's text content to the prompt for full context
+                                tool_prompt = interrupt_data.get("prompt", "")
+                                interrupt_data["prompt"] = f"{ai_context}\n\n{tool_prompt}" if tool_prompt else ai_context
+                            await self._handle_interrupt_from_state(task_data, interrupt_data, worker_id)
+                            return
+
+                # Execution Finished successfully. Compute final output.
                 messages = final_state.values.get("messages", [])
                 output_content = messages[-1].content if messages else ""
 
@@ -410,6 +435,7 @@ class GraphExecutor:
                                    output=$1,
                                    last_error_code=NULL,
                                    last_error_message=NULL,
+                                   human_response=NULL,
                                    version=version+1,
                                    lease_owner=NULL,
                                    lease_expiry=NULL
@@ -430,11 +456,6 @@ class GraphExecutor:
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
-                    # Clear human_response after successful completion (in case this was a resumed task)
-                    await self.pool.execute(
-                        'UPDATE tasks SET human_response = NULL WHERE task_id = $1::uuid AND human_response IS NOT NULL',
-                        task_id,
-                    )
                     logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, total_cost_microdollars, langfuse_status)
 
             # Step 2: Wrap execution in timeout
@@ -586,19 +607,29 @@ class GraphExecutor:
         # For Phase 1, default unknown exceptions to non-retryable
         return False
 
+    async def _handle_interrupt_from_state(self, task_data: dict, interrupt_data: dict, worker_id: str):
+        """Handle an interrupt detected via graph state inspection."""
+        if not isinstance(interrupt_data, dict):
+            interrupt_data = {"type": "input", "prompt": str(interrupt_data)}
+        # Preserve original tool prompt before AI context is prepended
+        original_tool_prompt = interrupt_data.get("prompt", "")
+        await self._handle_interrupt_internal(task_data, interrupt_data, worker_id, original_tool_prompt=original_tool_prompt)
+
     async def _handle_interrupt(self, task_data: dict, interrupt_exc: GraphInterrupt, worker_id: str):
-        """Handle a GraphInterrupt by transitioning the task to a waiting state."""
+        """Handle a GraphInterrupt exception by transitioning the task to a waiting state."""
+        interrupt_values = interrupt_exc.args[0] if interrupt_exc.args else [{}]
+        interrupt_data = interrupt_values[0] if isinstance(interrupt_values, list) and interrupt_values else {}
+        if not isinstance(interrupt_data, dict):
+            interrupt_data = {"type": "input", "prompt": str(interrupt_data)}
+        await self._handle_interrupt_internal(task_data, interrupt_data, worker_id)
+
+    async def _handle_interrupt_internal(self, task_data: dict, interrupt_data: dict, worker_id: str, *, original_tool_prompt: str | None = None):
+        """Core interrupt handling: transition task to waiting state, release lease, record event."""
         task_id = str(task_data["task_id"])
         tenant_id = task_data["tenant_id"]
         agent_id = task_data.get("agent_id") or "unknown"
 
-        # Parse interrupt values
-        interrupt_values = interrupt_exc.args[0] if interrupt_exc.args else [{}]
-        interrupt_data = interrupt_values[0] if isinstance(interrupt_values, list) and interrupt_values else {}
-        if isinstance(interrupt_data, dict):
-            interrupt_type = interrupt_data.get("type", "input")
-        else:
-            interrupt_type = "input"
+        interrupt_type = interrupt_data.get("type", "input")
 
         if interrupt_type == "approval":
             new_status = "waiting_for_approval"
@@ -614,33 +645,46 @@ class GraphExecutor:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 if interrupt_type == "approval":
-                    await conn.execute('''
+                    updated = await conn.fetchval('''
                         UPDATE tasks SET status = $1,
                             pending_approval_action = $2::jsonb,
                             human_input_timeout_at = $3,
                             lease_owner = NULL, lease_expiry = NULL,
                             version = version + 1, updated_at = NOW()
                         WHERE task_id = $4::uuid AND lease_owner = $5
+                        RETURNING task_id
                     ''', new_status, json.dumps(interrupt_data.get("action", {})),
                         timeout_at, task_id, worker_id)
                 else:
-                    await conn.execute('''
+                    updated = await conn.fetchval('''
                         UPDATE tasks SET status = $1,
                             pending_input_prompt = $2,
                             human_input_timeout_at = $3,
                             lease_owner = NULL, lease_expiry = NULL,
                             version = version + 1, updated_at = NOW()
                         WHERE task_id = $4::uuid AND lease_owner = $5
+                        RETURNING task_id
                     ''', new_status, interrupt_data.get("prompt", "Agent is requesting input"),
                         timeout_at, task_id, worker_id)
 
-                # Insert event in same transaction
-                await _insert_task_event(
-                    conn, task_id, tenant_id, agent_id, event_type,
-                    "running", new_status, worker_id=worker_id,
-                )
+                if updated is not None:
+                    # Insert event in same transaction only if the UPDATE affected a row
+                    event_details = None
+                    if interrupt_type == "input":
+                        # Use original tool argument, not the AI-context-enriched prompt
+                        event_details = {"prompt": original_tool_prompt if original_tool_prompt is not None else interrupt_data.get("prompt", "")}
+                    elif interrupt_type == "approval":
+                        event_details = {"action": interrupt_data.get("action", {})}
+                    await _insert_task_event(
+                        conn, task_id, tenant_id, agent_id, event_type,
+                        "running", new_status, worker_id=worker_id,
+                        details=event_details,
+                    )
 
-        logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
+        if updated is None:
+            logger.warning("Task %s interrupt handling skipped: lease no longer owned by this worker.", task_id)
+        else:
+            logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
 
     async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
         task_id = str(task_data["task_id"])

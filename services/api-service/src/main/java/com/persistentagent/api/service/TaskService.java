@@ -248,6 +248,7 @@ public class TaskService {
         };
     }
 
+    @Transactional
     public RedriveResponse approveTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
@@ -266,15 +267,23 @@ public class TaskService {
         };
     }
 
+    @Transactional
     public RedriveResponse rejectTask(UUID taskId, String reason) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        TaskRepository.HitlMutationResult hitlResult = taskRepository.rejectTask(taskId, tenantId, reason);
+        String humanResponse;
+        String detailsJson;
+        try {
+            humanResponse = objectMapper.writeValueAsString(Map.of("kind", "approval", "approved", false, "reason", reason));
+            detailsJson = objectMapper.writeValueAsString(Map.of("reason", reason));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize rejection payload", e);
+        }
+
+        TaskRepository.HitlMutationResult hitlResult = taskRepository.rejectTask(taskId, tenantId, humanResponse);
         return switch (hitlResult.result()) {
             case UPDATED -> {
                 taskRepository.notifyNewTask(hitlResult.workerPoolId());
-                String detailsJson = "{\"reason\":\"%s\"}"
-                        .formatted(reason.replace("\\", "\\\\").replace("\"", "\\\""));
                 taskEventService.recordEvent(tenantId, taskId, hitlResult.agentId(),
                         "task_rejected", "waiting_for_approval", "queued",
                         null, null, null, detailsJson);
@@ -286,14 +295,23 @@ public class TaskService {
         };
     }
 
+    @Transactional
     public RedriveResponse respondToTask(UUID taskId, String message) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
-        TaskRepository.HitlMutationResult hitlResult = taskRepository.respondToTask(taskId, tenantId, message);
+        String humanResponse;
+        String detailsJson;
+        try {
+            humanResponse = objectMapper.writeValueAsString(Map.of("kind", "input", "message", message));
+            detailsJson = objectMapper.writeValueAsString(Map.of("message", message));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize response payload", e);
+        }
+
+        TaskRepository.HitlMutationResult hitlResult = taskRepository.respondToTask(taskId, tenantId, humanResponse);
         return switch (hitlResult.result()) {
             case UPDATED -> {
                 taskRepository.notifyNewTask(hitlResult.workerPoolId());
-                String detailsJson = "{\"message_length\":%d}".formatted(message.length());
                 taskEventService.recordEvent(tenantId, taskId, hitlResult.agentId(),
                         "task_input_received", "waiting_for_input", "queued",
                         null, null, null, detailsJson);

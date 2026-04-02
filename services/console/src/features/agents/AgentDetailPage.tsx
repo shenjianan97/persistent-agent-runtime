@@ -4,7 +4,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAgent, useUpdateAgent } from './useAgents';
 import { useModels } from '@/features/submit/useModels';
-import { ALLOWED_TOOLS } from '@/features/submit/schema';
+import { ALLOWED_TOOLS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 import { useEffect } from 'react';
@@ -101,7 +101,7 @@ export function AgentDetailPage() {
 
     if (isLoading) {
         return (
-            <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
+            <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="console-surface-strong rounded-[28px] p-6 md:p-7">
                     <span className="uppercase tracking-widest text-xs font-bold text-muted-foreground animate-pulse">Loading agent...</span>
                 </div>
@@ -111,7 +111,7 @@ export function AgentDetailPage() {
 
     if (error || !agent) {
         return (
-            <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
+            <div className="space-y-6 animate-in fade-in duration-500">
                 <div className="console-surface-strong rounded-[28px] p-6 md:p-7">
                     <h2 className="text-xl font-display font-semibold text-destructive mb-2">Agent Not Found</h2>
                     <p className="text-muted-foreground text-sm">
@@ -125,10 +125,9 @@ export function AgentDetailPage() {
     const isDisabled = form.watch('status') === 'disabled';
 
     return (
-        <div className="max-w-4xl mx-auto animate-in fade-in duration-500">
+        <div className="space-y-6 animate-in fade-in duration-500">
             <div className="console-surface-strong rounded-[28px] p-6 md:p-7 mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4">
                 <div>
-                    <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.24em] text-primary">Agent Detail</div>
                     <h2 className="text-3xl font-display font-semibold tracking-tight mb-1 flex items-center gap-2">
                         <Bot className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
                         {agent.display_name}
@@ -267,7 +266,7 @@ export function AgentDetailPage() {
                                 name="allowed_tools"
                                 render={() => (
                                     <FormItem>
-                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Allowed Tools</FormLabel>
+                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Tools</FormLabel>
                                         <div className="flex flex-wrap gap-4 mt-2">
                                             {ALLOWED_TOOLS.map((item) => (
                                                 <FormField
@@ -296,6 +295,37 @@ export function AgentDetailPage() {
                                             ))}
                                         </div>
                                         <FormMessage className="text-destructive font-bold text-xs" />
+                                    </FormItem>
+                                )}
+                            />
+
+                            <FormField
+                                control={form.control}
+                                name="allowed_tools"
+                                render={({ field }) => (
+                                    <FormItem>
+                                        <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Human-in-the-Loop</FormLabel>
+                                        <div className="flex items-center gap-3 mt-2 p-3 border border-border rounded-none bg-black/30">
+                                            <FormControl>
+                                                <Checkbox
+                                                    className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
+                                                    checked={field.value?.includes(HUMAN_INPUT_TOOL_ID)}
+                                                    onCheckedChange={(checked) =>
+                                                        checked
+                                                            ? field.onChange([...(field.value || []), HUMAN_INPUT_TOOL_ID])
+                                                            : field.onChange(field.value?.filter((v) => v !== HUMAN_INPUT_TOOL_ID))
+                                                    }
+                                                />
+                                            </FormControl>
+                                            <div>
+                                                <FormLabel className="font-normal font-mono cursor-pointer text-sm">
+                                                    Enable Human Input
+                                                </FormLabel>
+                                                <p className="text-xs text-muted-foreground mt-0.5">
+                                                    Allow this agent to pause and request input from a human operator
+                                                </p>
+                                            </div>
+                                        </div>
                                     </FormItem>
                                 )}
                             />

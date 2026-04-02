@@ -1,13 +1,78 @@
-import { CheckpointEvent, CheckpointResponse } from '@/types';
+import { CheckpointEvent, CheckpointResponse, TaskEventResponse, TaskEventType } from '@/types';
 import { Card, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { AlertCircle, BrainCircuit, MoveRight, RotateCcw, User, Wrench, Zap } from 'lucide-react';
+import {
+    AlertCircle, BrainCircuit, MoveRight, RotateCcw, User, Wrench, Zap,
+    Pause, PlayCircle, ShieldCheck, ShieldX,
+    MessageSquare, MessageCircle, Ban, RefreshCw,
+} from 'lucide-react';
 import { useEffect, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { TaskStatus } from '@/types';
 
+// ─── HITL event types to show as inline markers ────────────────────
+
+const HITL_EVENT_TYPES = new Set<TaskEventType>([
+    'task_approval_requested',
+    'task_approved',
+    'task_rejected',
+    'task_input_requested',
+    'task_input_received',
+    'task_paused',
+    'task_resumed',
+    'task_cancelled',
+    'task_redriven',
+]);
+
+interface HitlMarkerStyle {
+    label: string;
+    colorClass: string;
+    bgClass: string;
+    icon: typeof Pause;
+}
+
+const HITL_STYLES: Partial<Record<TaskEventType, HitlMarkerStyle>> = {
+    task_approval_requested: { label: 'Approval Requested',  colorClass: 'text-amber-400',  bgClass: 'bg-amber-500',  icon: ShieldCheck },
+    task_approved:           { label: 'Approved',            colorClass: 'text-green-400',  bgClass: 'bg-green-500',  icon: ShieldCheck },
+    task_rejected:           { label: 'Rejected',            colorClass: 'text-red-400',    bgClass: 'bg-red-500',    icon: ShieldX },
+    task_input_requested:    { label: 'Input Requested',     colorClass: 'text-amber-400',  bgClass: 'bg-amber-500',  icon: MessageSquare },
+    task_input_received:     { label: 'Input Received',      colorClass: 'text-amber-400',  bgClass: 'bg-amber-500',  icon: MessageCircle },
+    task_paused:             { label: 'Task Paused',         colorClass: 'text-amber-400',  bgClass: 'bg-amber-500',  icon: Pause },
+    task_resumed:            { label: 'Task Resumed',        colorClass: 'text-green-400',  bgClass: 'bg-green-500',  icon: PlayCircle },
+    task_cancelled:          { label: 'Task Cancelled',      colorClass: 'text-red-400',    bgClass: 'bg-red-500',    icon: Ban },
+    task_redriven:           { label: 'Task Redriven',       colorClass: 'text-blue-400',   bgClass: 'bg-blue-500',   icon: RefreshCw },
+};
+
+// ─── Unified timeline entry ────────────────────────────────────────
+
+type TimelineEntry =
+    | { kind: 'checkpoint'; data: CheckpointResponse; ts: number }
+    | { kind: 'hitl'; data: TaskEventResponse; ts: number };
+
+function buildTimeline(
+    checkpoints: CheckpointResponse[],
+    hitlEvents: TaskEventResponse[],
+): TimelineEntry[] {
+    const entries: TimelineEntry[] = [];
+
+    for (const cp of checkpoints) {
+        entries.push({ kind: 'checkpoint', data: cp, ts: new Date(cp.created_at).getTime() });
+    }
+    for (const ev of hitlEvents) {
+        if (HITL_EVENT_TYPES.has(ev.event_type)) {
+            entries.push({ kind: 'hitl', data: ev, ts: new Date(ev.created_at).getTime() });
+        }
+    }
+
+    entries.sort((a, b) => a.ts - b.ts);
+    return entries;
+}
+
+// ─── Props ─────────────────────────────────────────────────────────
+
 interface CheckpointTimelineProps {
     checkpoints: CheckpointResponse[];
+    hitlEvents?: TaskEventResponse[];
     isRunning: boolean;
     retryHistory?: string[];
     status?: TaskStatus;
@@ -16,6 +81,8 @@ interface CheckpointTimelineProps {
     lastErrorMessage?: string;
     deadLetteredAt?: string;
 }
+
+// ─── Resume / failure markers (unchanged logic) ────────────────────
 
 interface ResumeMarker {
     resumedAfterStep: number | null;
@@ -103,6 +170,8 @@ export function getTerminalFailureMarker(
     } satisfies TerminalFailureMarker;
 }
 
+// ─── Checkpoint event styling ──────────────────────────────────────
+
 const EVENT_STYLES: Record<CheckpointEvent['type'], { label: string; chipClassName: string }> = {
     system: {
         label: 'System',
@@ -178,8 +247,11 @@ function getContentLabel(event?: CheckpointEvent) {
     }
 }
 
+// ─── Main component ────────────────────────────────────────────────
+
 export function CheckpointTimeline({
     checkpoints,
+    hitlEvents = [],
     isRunning,
     retryHistory = [],
     status,
@@ -200,6 +272,11 @@ export function CheckpointTimeline({
         deadLetteredAt,
     );
 
+    const timeline = buildTimeline(checkpoints, hitlEvents);
+
+    // Track previous checkpoint worker for handoff detection
+    let lastCheckpointWorkerId: string | null = null;
+
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -208,7 +285,9 @@ export function CheckpointTimeline({
                 viewport.scrollTop = viewport.scrollHeight;
             }
         }
-    }, [checkpoints.length]);
+    }, [timeline.length]);
+
+    const isWaiting = status === 'waiting_for_approval' || status === 'waiting_for_input';
 
     return (
         <Card className="console-surface border-white/10 flex flex-col h-[480px]">
@@ -220,7 +299,7 @@ export function CheckpointTimeline({
 
             <ScrollArea className="flex-1" ref={scrollRef}>
                 <div className="p-6">
-                    {checkpoints.length === 0 ? (
+                    {timeline.length === 0 ? (
                         <div className="h-full flex items-center justify-center pt-20">
                             <span className="text-muted-foreground text-sm tracking-widest uppercase animate-pulse">
                                 Waiting for checkpoints...
@@ -228,8 +307,51 @@ export function CheckpointTimeline({
                         </div>
                     ) : (
                         <div className="relative border-l border-border/40 ml-10 space-y-8 pl-8 pb-8">
-                            {checkpoints.map((cp, idx) => {
-                                const prevWorker = idx > 0 ? checkpoints[idx - 1].worker_id : null;
+                            {timeline.map((entry) => {
+                                // ── HITL marker row ──
+                                if (entry.kind === 'hitl') {
+                                    const ev = entry.data;
+                                    const hitlStyle = HITL_STYLES[ev.event_type];
+                                    if (!hitlStyle) return null;
+                                    const HitlIcon = hitlStyle.icon;
+
+                                    // Extract displayable detail from event
+                                    const detail = ev.details as Record<string, unknown> | undefined;
+                                    const detailText =
+                                        (detail?.message as string) ||   // input received
+                                        (detail?.prompt as string) ||    // input requested
+                                        (detail?.reason as string) ||    // rejected
+                                        null;
+
+                                    return (
+                                        <div key={`hitl-${ev.event_id}`} className="relative animate-in slide-in-from-left-4 fade-in duration-300">
+                                            <div className={`absolute -left-[45px] top-0.5 h-6 w-6 rounded-full border-2 border-background ${hitlStyle.bgClass} shadow-[0_0_8px_rgba(0,0,0,0.3)] flex items-center justify-center`}>
+                                                <HitlIcon className="w-3 h-3 text-black" />
+                                            </div>
+
+                                            <div className="border border-border/30 bg-black/35 px-4 py-3 space-y-2">
+                                                <div className="flex items-center justify-between gap-3">
+                                                    <span className={`text-xs font-bold tracking-wider uppercase ${hitlStyle.colorClass}`}>
+                                                        {hitlStyle.label}
+                                                    </span>
+                                                    <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                                                        {new Date(ev.created_at).toLocaleTimeString()}
+                                                    </span>
+                                                </div>
+                                                {detailText && (
+                                                    <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap break-all leading-5">
+                                                        {detailText}
+                                                    </pre>
+                                                )}
+                                            </div>
+                                        </div>
+                                    );
+                                }
+
+                                // ── Checkpoint row ──
+                                const cp = entry.data;
+                                const prevWorker = lastCheckpointWorkerId;
+                                lastCheckpointWorkerId = cp.worker_id;
                                 const isHandoff = prevWorker && prevWorker !== cp.worker_id;
                                 const resumeMarker = resumeMarkers.get(cp.checkpoint_id);
                                 const event = cp.event;
@@ -421,6 +543,18 @@ export function CheckpointTimeline({
                                     <div className="pl-2">
                                         <span className="text-xs tracking-widest font-bold uppercase text-primary animate-pulse">
                                             Running Compute...
+                                        </span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {isWaiting && (
+                                <div className="relative pt-4">
+                                    <div className="absolute -left-[41px] top-6 h-4 w-4 rounded-full border border-amber-500 bg-amber-500/20 animate-ping" />
+                                    <div className="absolute -left-[39px] top-[26px] h-3 w-3 rounded-full bg-amber-500" />
+                                    <div className="pl-2">
+                                        <span className="text-xs tracking-widest font-bold uppercase text-amber-400 animate-pulse">
+                                            {status === 'waiting_for_approval' ? 'Awaiting Approval...' : 'Awaiting Human Input...'}
                                         </span>
                                     </div>
                                 </div>

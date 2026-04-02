@@ -266,6 +266,11 @@ class ReaperTask:
                     task_id = str(row["task_id"])
                     results["dead_lettered_human_timeout"].append(task_id)
                     self._metrics.increment("tasks.dead_letter")
+                    await _insert_task_event(
+                        conn, task_id, row["tenant_id"], row["agent_id"],
+                        "task_dead_lettered", None, "dead_letter",
+                        error_code="human_input_timeout",
+                    )
                     await self._log.ainfo(
                         REAPER_DEAD_LETTERED,
                         task_id=task_id,

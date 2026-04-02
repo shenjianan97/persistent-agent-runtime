@@ -44,6 +44,7 @@ async def _ensure_agent(pool: asyncpg.Pool, *, tenant_id: str = "default", agent
 async def cleanup_test_db(pool: asyncpg.Pool) -> None:
     """Remove all test data to ensure isolation between integration tests."""
     async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM task_events")
         await conn.execute("DELETE FROM checkpoint_writes")
         await conn.execute("DELETE FROM checkpoints")
         await conn.execute("DELETE FROM tasks")
