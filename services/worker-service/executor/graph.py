@@ -369,11 +369,13 @@ class GraphExecutor:
                                         text_parts = [b["text"] for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
                                         ai_context = "\n".join(text_parts)
                                     break
+                            # Capture the original tool prompt before enrichment
+                            original_tool_prompt = interrupt_data.get("prompt", "") if isinstance(interrupt_data, dict) else str(interrupt_data)
                             if ai_context and isinstance(interrupt_data, dict):
                                 # Prepend the AI's text content to the prompt for full context
                                 tool_prompt = interrupt_data.get("prompt", "")
                                 interrupt_data["prompt"] = f"{ai_context}\n\n{tool_prompt}" if tool_prompt else ai_context
-                            await self._handle_interrupt_from_state(task_data, interrupt_data, worker_id)
+                            await self._handle_interrupt_from_state(task_data, interrupt_data, worker_id, original_tool_prompt=original_tool_prompt)
                             return
 
                 # Execution Finished successfully. Compute final output.
@@ -607,12 +609,12 @@ class GraphExecutor:
         # For Phase 1, default unknown exceptions to non-retryable
         return False
 
-    async def _handle_interrupt_from_state(self, task_data: dict, interrupt_data: dict, worker_id: str):
+    async def _handle_interrupt_from_state(self, task_data: dict, interrupt_data: dict, worker_id: str, *, original_tool_prompt: str | None = None):
         """Handle an interrupt detected via graph state inspection."""
         if not isinstance(interrupt_data, dict):
             interrupt_data = {"type": "input", "prompt": str(interrupt_data)}
-        # Preserve original tool prompt before AI context is prepended
-        original_tool_prompt = interrupt_data.get("prompt", "")
+        if original_tool_prompt is None:
+            original_tool_prompt = interrupt_data.get("prompt", "")
         await self._handle_interrupt_internal(task_data, interrupt_data, worker_id, original_tool_prompt=original_tool_prompt)
 
     async def _handle_interrupt(self, task_data: dict, interrupt_exc: GraphInterrupt, worker_id: str):
