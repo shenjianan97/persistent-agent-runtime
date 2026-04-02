@@ -248,61 +248,66 @@ def asyncio_run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-async def _terminate_other_connections() -> None:
-    """Kill ALL other connections to release any row locks from orphaned coroutines.
+async def _force_clean() -> None:
+    """Terminate all other connections, wait for locks to release, then clean tables.
 
-    This is aggressive but necessary: cancelled asyncio tasks can leave
-    connections in 'idle in transaction' or even 'active' state, holding
-    row locks that block test cleanup indefinitely.  The API (Java/JDBC)
-    and any new pool will reconnect automatically.
+    Retries the cleanup with escalating waits to handle slow CI runners where
+    PostgreSQL backends take time to release row locks after termination.
     """
-    try:
-        conn = await asyncpg.connect(DB_DSN)
+    for attempt in range(3):
         try:
-            await conn.execute("""
-                SELECT pg_terminate_backend(pid)
-                FROM pg_stat_activity
-                WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
-            """)
-        finally:
-            await conn.close()
-        await asyncio.sleep(0.5)
-    except Exception:
-        pass
+            # Step 1: Kill all other connections to release row locks
+            conn = await asyncpg.connect(DB_DSN)
+            try:
+                await conn.execute("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                """)
+            finally:
+                await conn.close()
+
+            # Step 2: Wait for backends to finish cleanup (longer on CI)
+            await asyncio.sleep(0.5 + attempt * 1.0)
+
+            # Step 3: Clean tables via a fresh connection
+            conn = await asyncpg.connect(DB_DSN)
+            try:
+                await asyncio.wait_for(
+                    _do_clean(conn), timeout=5.0,
+                )
+            finally:
+                await conn.close()
+            return  # success
+        except (asyncio.TimeoutError, Exception):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(1.0)
 
 
-async def _clean_tables() -> None:
-    """Delete all test data using a direct connection (avoids pool issues)."""
-    conn = await asyncpg.connect(DB_DSN)
-    try:
-        await conn.execute("DELETE FROM task_events")
-        await conn.execute("DELETE FROM checkpoint_writes")
-        await conn.execute("DELETE FROM checkpoints")
-        await conn.execute("DELETE FROM tasks")
-        await conn.execute("DELETE FROM agents")
-    finally:
-        await conn.close()
+async def _do_clean(conn: asyncpg.Connection) -> None:
+    await conn.execute("DELETE FROM task_events")
+    await conn.execute("DELETE FROM checkpoint_writes")
+    await conn.execute("DELETE FROM checkpoints")
+    await conn.execute("DELETE FROM tasks")
+    await conn.execute("DELETE FROM agents")
 
 
 @pytest_asyncio.fixture
 async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
     del runtime_environment
-    # Cancel any orphaned asyncio tasks from previous tests (e.g. mock LLMs
-    # with asyncio.sleep still running after worker stop).  These can acquire
-    # new pool connections and hold row locks indefinitely.
+    # Cancel orphaned asyncio tasks from previous tests (e.g. mock LLMs
+    # with asyncio.sleep still running after worker stop).
     current = asyncio.current_task()
     for t in asyncio.all_tasks():
         if t is not current and not t.done() and "pytest" not in (t.get_name() or ""):
             t.cancel()
-    await asyncio.sleep(0.1)  # let cancellations propagate
-    await _terminate_other_connections()
-    await _clean_tables()
+    await asyncio.sleep(0.2)
+    await _force_clean()
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
     yield pool
     pool.terminate()
-    await _terminate_other_connections()
-    await _clean_tables()
 
 
 @pytest.fixture
