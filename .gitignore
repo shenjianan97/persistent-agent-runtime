@@ -107,6 +107,7 @@ infrastructure/cdk/lib/*.js.map
 infrastructure/cdk/lib/schema-bootstrap/*.js
 infrastructure/cdk/lib/schema-bootstrap/*.js.map
 infrastructure/cdk/lib/compute/
+services/api-service/bin/
 
 .superpowers
 .playwright-mcp/
