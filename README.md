@@ -27,9 +27,9 @@ Phase 1 uses a database-as-queue model:
 
 ## Repository Layout
 
-- [`docs/PROJECT.md`](./docs/PROJECT.md): project overview, phases, tradeoffs, and roadmap
-- [`docs/design/`](./docs/design/): architecture and design documents
-- [`docs/implementation_plan/`](./docs/implementation_plan/): implementation planning and progress
+- [`docs/product-specs/`](./docs/product-specs/): vision, user stories, core concepts
+- [`docs/design-docs/`](./docs/design-docs/): architecture and design documents
+- [`docs/exec-plans/`](./docs/exec-plans/): implementation plans (active and completed)
 - [`services/api-service/`](./services/api-service/): Spring Boot API service
 - [`services/console/`](./services/console/): React SPA for monitoring and controlling the runtime
 - [`services/worker-service/`](./services/worker-service/): Python worker, checkpointer, executor, and tools
@@ -134,14 +134,14 @@ Still evolving:
 
 Start here if you want the actual system contract rather than the repo overview:
 
-- [`docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`](./docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md)
-- [`docs/design/phase-2/PHASE2_MULTI_AGENT.md`](./docs/design/phase-2/PHASE2_MULTI_AGENT.md)
-- [`docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md`](./docs/design/phase-3-plus/DESIGN_NOTES_PHASE3_PLUS.md)
+- [`docs/design-docs/phase-1/design.md`](./docs/design-docs/phase-1/design.md)
+- [`docs/design-docs/phase-2/design.md`](./docs/design-docs/phase-2/design.md)
+- [`docs/design-docs/phase-3-plus/design-notes.md`](./docs/design-docs/phase-3-plus/design-notes.md)
 
 For implementation planning:
 
-- [`docs/implementation_plan/phase-1/plan.md`](./docs/implementation_plan/phase-1/plan.md)
-- [`docs/implementation_plan/phase-1/progress.md`](./docs/implementation_plan/phase-1/progress.md)
+- [`docs/exec-plans/completed/phase-1/plan.md`](./docs/exec-plans/completed/phase-1/plan.md)
+- [`docs/exec-plans/completed/phase-1/progress.md`](./docs/exec-plans/completed/phase-1/progress.md)
 
 ## Testing
 
@@ -186,6 +186,6 @@ When validating background service management, prefer running `make start`, `mak
 
 ## Notes
 
-- `CLAUDE.md` remains at the repo root for tool-facing project context.
+- `AGENTS.md` is the primary agent-facing navigation file. `CLAUDE.md` redirects to it.
 - Local `.venv`, build output, caches, and logs are intentionally not part of the committed project structure.
 - `.tmp/` is used for transient local runtime output such as E2E service logs.

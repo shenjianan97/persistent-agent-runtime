@@ -7,8 +7,8 @@ You are a software engineer building a Proof of Concept (POC) to validate core a
 Your scope is strictly limited to this task. 
 
 **CRITICAL PRE-WORK:** Before beginning implementation, you MUST read the following context files to understand the system architecture and constraints:
-1. `docs/PROJECT.md` 
-2. `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`
+1. `docs/product-specs/core-concepts.md` 
+2. `docs/design-docs/phase-1/design.md`
 3. `experiments/langgraph/plan.md`
 
 ## Context
