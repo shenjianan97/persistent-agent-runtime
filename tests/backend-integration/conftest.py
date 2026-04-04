@@ -307,22 +307,7 @@ async def _force_clean() -> None:
     for attempt in range(3):
         try:
             _emit_cleanup_log("e2e_force_clean_attempt_started", attempt=attempt + 1)
-            # Step 1: Kill all other connections to release row locks
-            conn = await asyncpg.connect(DB_DSN)
-            try:
-                await conn.execute("""
-                    SELECT pg_terminate_backend(pid)
-                    FROM pg_stat_activity
-                    WHERE datname = current_database()
-                      AND pid <> pg_backend_pid()
-                """)
-            finally:
-                await conn.close()
-
-            # Step 2: Wait for backends to finish cleanup (longer on CI)
-            await asyncio.sleep(0.5 + attempt * 1.0)
-
-            # Step 3: Clean tables via a fresh connection
+            # Try a direct cleanup first so healthy runs do not disrupt the shared API pool.
             conn = await asyncpg.connect(DB_DSN)
             try:
                 await asyncio.wait_for(
@@ -330,6 +315,7 @@ async def _force_clean() -> None:
                 )
             finally:
                 await conn.close()
+
             _emit_cleanup_log("e2e_force_clean_attempt_succeeded", attempt=attempt + 1)
             return  # success
         except (asyncio.TimeoutError, Exception) as exc:
@@ -341,6 +327,18 @@ async def _force_clean() -> None:
             await _snapshot_db_activity(reason=type(exc).__name__, attempt=attempt + 1)
             if attempt == 2:
                 raise
+            # Escalate only after a failed direct cleanup by terminating the
+            # remaining sessions that may still be holding locks.
+            conn = await asyncpg.connect(DB_DSN)
+            try:
+                await conn.execute("""
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                """)
+            finally:
+                await conn.close()
             await asyncio.sleep(1.0)
 
 
@@ -363,6 +361,7 @@ async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
             t.cancel()
     await asyncio.sleep(0.2)
     await _force_clean()
+    _wait_for_api(API_BASE, timeout_sec=30.0)
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=8)
     yield pool
     pool.terminate()

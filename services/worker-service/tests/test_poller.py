@@ -214,6 +214,64 @@ class TestPollerTryClaim:
         assert len(callback_received) == 1
         assert callback_received[0]["task_id"] == task_id
 
+    async def test_try_claim_materializes_row_before_connection_release(self):
+        config = WorkerConfig(worker_id="test-poller")
+        task_id = uuid.uuid4()
+
+        class ConnectionBoundRow:
+            def __init__(self, data):
+                self._data = data
+                self._closed = False
+
+            def mark_closed(self):
+                self._closed = True
+
+            def _ensure_open(self):
+                if self._closed:
+                    raise RuntimeError("row accessed after connection released")
+
+            def __getitem__(self, key):
+                self._ensure_open()
+                return self._data[key]
+
+            def get(self, key, default=None):
+                self._ensure_open()
+                return self._data.get(key, default)
+
+            def keys(self):
+                self._ensure_open()
+                return self._data.keys()
+
+        row = ConnectionBoundRow(
+            {
+                "task_id": task_id,
+                "tenant_id": "default",
+                "agent_id": "test-agent",
+                "status": "running",
+                "retry_count": 0,
+            }
+        )
+
+        conn = self._make_poller_conn(fetchrow_return=row)
+        pool = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+
+        async def _close_connection(exc_type=None, exc=None, tb=None):
+            del exc_type, exc, tb
+            row.mark_closed()
+            return False
+
+        ctx.__aexit__ = AsyncMock(side_effect=_close_connection)
+        pool.acquire = MagicMock(return_value=ctx)
+        metrics = MetricsCollector()
+
+        poller = TaskPoller(config, pool, metrics, MagicMock(), None)
+
+        result = await poller._try_claim()
+
+        assert result is True
+
 
 class TestPollerDrain:
     """Issue #15: drain() should wait for in-flight tasks before returning."""

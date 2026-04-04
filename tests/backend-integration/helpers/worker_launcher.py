@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Any
 
 import asyncpg
@@ -18,14 +19,14 @@ DEFAULT_TEST_CONFIG = {
     "shutdown_drain_seconds": 3,
 }
 
-_DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
+_DEFAULT_DB_DSN = "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
 
 
 async def create_worker(
     pool: asyncpg.Pool,
     *,
     worker_id: str | None = None,
-    db_dsn: str = _DB_DSN,
+    db_dsn: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> WorkerService:
     cfg = dict(DEFAULT_TEST_CONFIG)
@@ -34,7 +35,8 @@ async def create_worker(
     if worker_id:
         cfg["worker_id"] = worker_id
 
-    config = WorkerConfig(db_dsn=db_dsn, **cfg)
+    resolved_db_dsn = db_dsn or os.getenv("E2E_DB_DSN", _DEFAULT_DB_DSN)
+    config = WorkerConfig(db_dsn=resolved_db_dsn, **cfg)
     router = DefaultTaskRouter(config, pool)
     return WorkerService(config, pool, router)
 
