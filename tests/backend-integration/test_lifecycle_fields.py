@@ -25,6 +25,8 @@ async def test_3_23_version_field_increments_on_transitions(e2e):
     after = await e2e.db.fetch_task_columns(task_id, "version")
     assert after is not None and after["version"] >= 3
 
+    await e2e.stop_workers()
+
     second_task = e2e.submit_task(input="cancel redrive")
     before_cancel = await e2e.db.fetch_task_columns(second_task, "version")
 

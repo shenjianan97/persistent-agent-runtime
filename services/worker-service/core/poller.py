@@ -237,6 +237,7 @@ class TaskPoller:
 
         await self._semaphore.acquire()
         try:
+            task_data: dict[str, Any] | None = None
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
                     row = await conn.fetchrow(
@@ -258,12 +259,12 @@ class TaskPoller:
                             "queued", "running", self._config.worker_id,
                             None, None, "{}",
                         )
+                        task_data = dict(row)
 
-            if row is None:
+            if task_data is None:
                 self._semaphore.release()
                 return False
 
-            task_data = dict(row)
             task_id = str(task_data["task_id"])
 
             self._active_tasks_count += 1

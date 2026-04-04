@@ -18,6 +18,7 @@ dependencies = [
     "langchain-aws>=0.2.0",
     "langfuse==4.0.1",
     "langgraph==1.0.5",
+    "langgraph-prebuilt==1.0.8",
     "langgraph-checkpoint==3.0.1",
     "langgraph-checkpoint-postgres==3.0.4",
     "mcp==1.26.0",

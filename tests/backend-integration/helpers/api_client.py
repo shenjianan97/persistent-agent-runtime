@@ -1,4 +1,6 @@
 import json
+import os
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -16,6 +18,7 @@ class ApiError(RuntimeError):
 class ApiClient:
     def __init__(self, base_url: str):
         self.base = base_url.rstrip("/")
+        self.request_timeout = float(os.getenv("E2E_API_REQUEST_TIMEOUT_SECONDS", "10.0"))
 
     def create_agent(self, display_name="E2E Test Agent",
                      agent_config=None, expected_status=201, raise_for_status=True,
@@ -73,7 +76,7 @@ class ApiClient:
         expected = (expected_status,) if isinstance(expected_status, int) else expected_status
 
         try:
-            with urllib.request.urlopen(req) as resp:
+            with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
                 raw = resp.read().decode("utf-8")
                 body = json.loads(raw) if raw else None
                 result = {"status_code": resp.status, "body": body}
@@ -84,6 +87,10 @@ class ApiClient:
             except json.JSONDecodeError:
                 body = {"message": raw}
             result = {"status_code": exc.code, "body": body}
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(
+                f"API request to {url} timed out after {self.request_timeout}s: {exc}"
+            ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Unable to reach API at {url}: {exc}") from exc
 
