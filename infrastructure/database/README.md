@@ -12,7 +12,7 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 
 ## Contract Boundaries
 
-- The schema contract is defined by `docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md`, Section 6.1.
+- The schema contract is defined by `docs/design-docs/phase-1/design.md`, Section 6.1.
 - `tasks.status` values are exactly `queued`, `running`, `completed`, `dead_letter`.
 - `dead_letter_reason` values are exactly `cancelled_by_user`, `retries_exhausted`, `task_timeout`, `non_retryable_error`, `max_steps_exceeded`.
 - `updated_at` uses `DEFAULT NOW()` for inserts only. Application update queries must set `updated_at = NOW()` explicitly. There are no triggers or database functions that maintain `updated_at`.
