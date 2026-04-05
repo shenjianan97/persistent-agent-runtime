@@ -20,12 +20,30 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
     { value: 'dead_letter', label: 'Failed' },
 ];
 
+const PAUSE_REASON_OPTIONS: { value: string; label: string }[] = [
+    { value: '', label: 'All' },
+    { value: 'budget_per_task', label: 'Budget (Task)' },
+    { value: 'budget_per_hour', label: 'Budget (Hourly)' },
+];
+
+function formatRelativeTime(dateString: string): string {
+    const now = new Date();
+    const target = new Date(dateString);
+    const diffMs = target.getTime() - now.getTime();
+    if (diffMs <= 0) return 'now';
+    const diffMin = Math.ceil(diffMs / 60000);
+    if (diffMin < 60) return `in ${diffMin} min`;
+    const diffHours = Math.ceil(diffMin / 60);
+    return `in ${diffHours}h`;
+}
+
 export function TaskListPage() {
     const [status, setStatus] = useState('');
     const [agentId, setAgentId] = useState('');
+    const [pauseReason, setPauseReason] = useState('');
     const [debouncedAgentId, setDebouncedAgentId] = useState('');
     const debounceTimer = useRef<ReturnType<typeof setTimeout>>(null);
-    const { data, isLoading } = useTaskList(status || undefined, debouncedAgentId || undefined);
+    const { data, isLoading } = useTaskList(status || undefined, debouncedAgentId || undefined, pauseReason || undefined);
 
     const handleSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
         const value = e.target.value;
@@ -72,6 +90,20 @@ export function TaskListPage() {
                             value={agentId}
                             onChange={handleSearchChange}
                         />
+                    </div>
+                    <div>
+                        <label className="text-xs uppercase tracking-widest text-muted-foreground mb-2 block">
+                            Pause Reason
+                        </label>
+                        <select
+                            className="flex h-10 w-40 rounded-xl border border-white/10 bg-white/5 px-3 py-1 text-sm font-mono backdrop-blur-xl appearance-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                            value={pauseReason}
+                            onChange={(e) => setPauseReason(e.target.value)}
+                        >
+                            {PAUSE_REASON_OPTIONS.map((opt) => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                        </select>
                     </div>
                 </div>
             </div>
@@ -130,7 +162,12 @@ export function TaskListPage() {
                                     </Link>
                                 </TableCell>
                                 <TableCell>
-                                    <TaskStatusBadge status={task.status as TaskStatus} className="text-[10px] px-2 py-0.5" />
+                                    <TaskStatusBadge status={task.status as TaskStatus} pauseReason={task.pause_reason} className="text-[10px] px-2 py-0.5" />
+                                    {task.status === 'paused' && task.pause_reason === 'budget_per_hour' && task.resume_eligible_at && (
+                                        <span className="block text-[10px] text-muted-foreground mt-1">
+                                            Recovers {formatRelativeTime(task.resume_eligible_at)}
+                                        </span>
+                                    )}
                                 </TableCell>
                                 <TableCell className="text-right tabular-nums">{task.checkpoint_count}</TableCell>
                                 <TableCell className="text-right tabular-nums text-success">${formatUsd(task.total_cost_microdollars)}</TableCell>

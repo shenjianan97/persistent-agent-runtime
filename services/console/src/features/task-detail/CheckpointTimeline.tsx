@@ -317,11 +317,24 @@ export function CheckpointTimeline({
 
                                     // Extract displayable detail from event
                                     const detail = ev.details as Record<string, unknown> | undefined;
-                                    const detailText =
+                                    let detailText: string | null =
                                         (detail?.message as string) ||   // input received
                                         (detail?.prompt as string) ||    // input requested
                                         (detail?.reason as string) ||    // rejected
                                         null;
+
+                                    // Budget pause/resume events
+                                    if (detail?.pause_reason) {
+                                        const limit = (detail.budget_max_per_task as number) || (detail.budget_max_per_hour as number);
+                                        const observed = (detail.observed_task_cost_microdollars as number) || (detail.observed_hour_cost_microdollars as number);
+                                        if (limit && observed) {
+                                            detailText = `$${formatUsd(observed)} / $${formatUsd(limit)} limit`;
+                                        }
+                                    } else if (detail?.resume_trigger) {
+                                        detailText = (detail.resume_trigger as string) === 'automatic_hourly_recovery'
+                                            ? 'Hourly budget cleared'
+                                            : 'Operator action';
+                                    }
 
                                     return (
                                         <div key={`hitl-${ev.event_id}`} className="relative animate-in slide-in-from-left-4 fade-in duration-300">

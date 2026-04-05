@@ -75,11 +75,12 @@ export const api = {
             }),
         }),
 
-    listTasks: (status?: string, agentId?: string, limit?: number) => {
+    listTasks: (status?: string, agentId?: string, limit?: number, pauseReason?: string) => {
         const params = new URLSearchParams();
         if (status) params.append('status', status);
         if (agentId) params.append('agent_id', agentId);
         if (limit) params.append('limit', limit.toString());
+        if (pauseReason) params.append('pause_reason', pauseReason);
         const query = params.toString();
         return fetchApi<TaskListResponse>(`/v1/tasks${query ? `?${query}` : ''}`);
     },
@@ -108,6 +109,11 @@ export const api = {
 
     redriveTask: (taskId: string) =>
         fetchApi<RedriveResponse>(`/v1/tasks/${taskId}/redrive`, {
+            method: 'POST',
+        }),
+
+    resumeTask: (taskId: string) =>
+        fetchApi<RedriveResponse>(`/v1/tasks/${taskId}/resume`, {
             method: 'POST',
         }),
 

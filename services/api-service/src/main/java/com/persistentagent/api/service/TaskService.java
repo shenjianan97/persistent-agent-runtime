@@ -27,6 +27,8 @@ import java.util.stream.IntStream;
 @Service
 public class TaskService {
 
+    private static final Set<String> VALID_PAUSE_REASONS = Set.of("budget_per_task", "budget_per_hour");
+
     private final TaskRepository taskRepository;
     private final AgentRepository agentRepository;
     private final ModelRepository modelRepository;
@@ -138,6 +140,10 @@ public class TaskService {
         // Parse pending_approval_action from JSONB
         Object pendingApprovalAction = parseJson(task.get("pending_approval_action"));
 
+        // Parse pause_details from JSONB
+        Object pauseDetails = JsonParseUtil.parseJson(objectMapper, task.get("pause_details"), "pause_details",
+                taskId.toString());
+
         return new TaskStatusResponse(
                 (UUID) task.get("task_id"),
                 (String) task.get("agent_id"),
@@ -160,7 +166,10 @@ public class TaskService {
                 (UUID) task.get("langfuse_endpoint_id"),
                 (String) task.get("pending_input_prompt"),
                 pendingApprovalAction,
-                DateTimeUtil.toOffsetDateTime(task.get("human_input_timeout_at")));
+                DateTimeUtil.toOffsetDateTime(task.get("human_input_timeout_at")),
+                (String) task.get("pause_reason"),
+                pauseDetails,
+                DateTimeUtil.toOffsetDateTime(task.get("resume_eligible_at")));
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {
@@ -323,6 +332,53 @@ public class TaskService {
         };
     }
 
+    @Transactional
+    public RedriveResponse resumeTask(UUID taskId) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        TaskRepository.ResumeMutationResult resumeResult = taskRepository.resumeTask(taskId, tenantId);
+        return switch (resumeResult.outcome()) {
+            case UPDATED -> {
+                taskRepository.notifyNewTask(resumeResult.workerPoolId());
+                String detailsJson;
+                try {
+                    detailsJson = objectMapper.writeValueAsString(Map.of(
+                            "resume_trigger", "manual_operator_resume",
+                            "budget_max_per_task_at_resume", resumeResult.budgetMax(),
+                            "task_cost_microdollars", resumeResult.taskCost()));
+                } catch (Exception e) {
+                    detailsJson = "{}";
+                }
+                taskEventService.recordEvent(tenantId, taskId, resumeResult.agentId(),
+                        "task_resumed", "paused", "queued",
+                        null, null, null, detailsJson);
+                yield new RedriveResponse(taskId, "queued");
+            }
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> {
+                // Differentiated 409 messages based on diagnostic fields
+                if (!"paused".equals(resumeResult.currentStatus())) {
+                    throw new InvalidStateTransitionException(taskId,
+                            "Task " + taskId + " is not paused (current status: " + resumeResult.currentStatus() + ")");
+                }
+                if (!"active".equals(resumeResult.agentStatus())) {
+                    throw new InvalidStateTransitionException(taskId,
+                            "Task " + taskId + " cannot be resumed because the agent is disabled");
+                }
+                if (resumeResult.taskCost() != null && resumeResult.budgetMax() != null
+                        && resumeResult.taskCost() > resumeResult.budgetMax()) {
+                    throw new InvalidStateTransitionException(taskId,
+                            "Task " + taskId + " cost (" + resumeResult.taskCost()
+                                    + ") still exceeds budget (" + resumeResult.budgetMax()
+                                    + "). Increase budget_max_per_task first.");
+                }
+                // Generic fallback
+                throw new InvalidStateTransitionException(taskId,
+                        "Task " + taskId + " cannot be resumed");
+            }
+        };
+    }
+
     public DeadLetterListResponse listDeadLetterTasks(String agentId, Integer limit) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
@@ -348,7 +404,7 @@ public class TaskService {
         return new DeadLetterListResponse(items);
     }
 
-    public TaskListResponse listTasks(String status, String agentId, Integer limit) {
+    public TaskListResponse listTasks(String status, String agentId, String pauseReason, Integer limit) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 
         if (status != null && !status.isBlank()
@@ -357,11 +413,17 @@ public class TaskService {
                     + ". Valid statuses: " + ValidationConstants.VALID_TASK_STATUSES);
         }
 
+        if (pauseReason != null && !pauseReason.isBlank()
+                && !VALID_PAUSE_REASONS.contains(pauseReason)) {
+            throw new ValidationException("Invalid pause_reason filter: " + pauseReason
+                    + ". Valid pause reasons: " + VALID_PAUSE_REASONS);
+        }
+
         int effectiveLimit = limit != null
                 ? Math.min(Math.max(limit, 1), ValidationConstants.MAX_TASK_LIST_LIMIT)
                 : ValidationConstants.DEFAULT_TASK_LIST_LIMIT;
 
-        List<Map<String, Object>> rows = taskRepository.listTasks(tenantId, status, agentId, effectiveLimit);
+        List<Map<String, Object>> rows = taskRepository.listTasks(tenantId, status, agentId, pauseReason, effectiveLimit);
 
         List<TaskSummaryResponse> items = rows.stream()
                 .map(row -> {
@@ -374,7 +436,9 @@ public class TaskService {
                             ((Number) row.get("checkpoint_count")).intValue(),
                             asLong(row.get("total_cost_microdollars")),
                             DateTimeUtil.toOffsetDateTime(row.get("created_at")),
-                            DateTimeUtil.toOffsetDateTime(row.get("updated_at")));
+                            DateTimeUtil.toOffsetDateTime(row.get("updated_at")),
+                            (String) row.get("pause_reason"),
+                            DateTimeUtil.toOffsetDateTime(row.get("resume_eligible_at")));
                 })
                 .toList();
 

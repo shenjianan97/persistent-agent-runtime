@@ -229,6 +229,7 @@ class TaskControllerTest {
                                 taskId, "agent1", "Agent One", "running", "test input", null,
                                 0, List.of(), 5, 12500L, "worker-abc-123",
                                 null, null, null, null, null, now, now, null,
+                                null, null, null,
                                 null, null, null);
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 

@@ -88,9 +88,7 @@ describe('AgentDetailPage', () => {
 
         expect(screen.getByText('research-agent')).toBeInTheDocument();
         expect(screen.getByText('active')).toBeInTheDocument();
-        expect(screen.getByText('Agent Detail')).toBeInTheDocument();
         expect(screen.getByText('Configuration')).toBeInTheDocument();
-        expect(screen.getByText('Lifecycle')).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /save changes/i })).toBeInTheDocument();
     });
 

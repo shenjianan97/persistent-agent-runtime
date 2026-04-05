@@ -51,13 +51,30 @@ class ApiClient:
         path = f"/agents{'?' + query if query else ''}"
         return self._request("GET", path)
 
-    def update_agent(self, agent_id, display_name, agent_config, status):
-        """Update agent. Returns response dict."""
+    def update_agent(self, agent_id, display_name=None, agent_config=None, status=None, **kwargs):
+        """Update agent with partial update support.
+
+        Fetches current agent state, merges provided fields, then PUTs the full payload.
+        Positional args are kept for backward compatibility; kwargs override everything.
+        """
+        current = self.get_agent(agent_id)["body"]
         payload = {
-            "display_name": display_name,
-            "agent_config": agent_config,
-            "status": status
+            "display_name": current["display_name"],
+            "agent_config": current["agent_config"],
+            "status": current["status"],
+            "max_concurrent_tasks": current.get("max_concurrent_tasks", 5),
+            "budget_max_per_task": current.get("budget_max_per_task", 500000),
+            "budget_max_per_hour": current.get("budget_max_per_hour", 5000000),
         }
+        # Apply explicit positional args if provided
+        if display_name is not None:
+            payload["display_name"] = display_name
+        if agent_config is not None:
+            payload["agent_config"] = agent_config
+        if status is not None:
+            payload["status"] = status
+        # Apply any additional kwargs (budget fields, etc.)
+        payload.update(kwargs)
         return self._request("PUT", f"/agents/{agent_id}", payload)
 
     def _request(
@@ -187,6 +204,24 @@ class ApiClient:
 
     def health(self, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
         return self._request("GET", "/health", expected_status=expected_status, raise_for_status=raise_for_status)
+
+    # --- Resume endpoint ---
+
+    def resume_task(self, task_id: str) -> dict:
+        """POST /tasks/{task_id}/resume"""
+        return self._request("POST", f"/tasks/{task_id}/resume")
+
+    def resume_task_raw(self, task_id: str) -> dict:
+        """POST /tasks/{task_id}/resume — returns status/body without raising."""
+        return self._request("POST", f"/tasks/{task_id}/resume", raise_for_status=False)
+
+    # --- Task list ---
+
+    def list_tasks(self, **params) -> dict:
+        """GET /tasks with optional filters (status, agent_id, pause_reason, limit)."""
+        query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None)
+        path = f"/tasks?{query}" if query else "/tasks"
+        return self._request("GET", path)
 
     # --- HITL endpoints ---
 

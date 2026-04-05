@@ -8,6 +8,7 @@ import { ALLOWED_TOOLS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 import { useEffect } from 'react';
+import { formatUsd } from '@/lib/utils';
 
 import {
     Form, FormControl, FormField, FormItem, FormLabel, FormMessage,
@@ -28,6 +29,9 @@ const agentDetailSchema = z.object({
     temperature: z.number().min(0).max(2).default(0.7),
     allowed_tools: z.array(z.string()).default([]),
     status: z.enum(['active', 'disabled']),
+    max_concurrent_tasks: z.number().int().min(1).default(5),
+    budget_max_per_task: z.number().int().min(1).default(500000),
+    budget_max_per_hour: z.number().int().min(1).default(5000000),
 });
 
 type AgentDetailFormValues = z.infer<typeof agentDetailSchema>;
@@ -50,6 +54,9 @@ export function AgentDetailPage() {
             temperature: 0.7,
             allowed_tools: [],
             status: 'active',
+            max_concurrent_tasks: 5,
+            budget_max_per_task: 500000,
+            budget_max_per_hour: 5000000,
         },
     });
 
@@ -63,6 +70,9 @@ export function AgentDetailPage() {
                 temperature: agent.agent_config.temperature,
                 allowed_tools: agent.agent_config.allowed_tools ?? [],
                 status: agent.status,
+                max_concurrent_tasks: agent.max_concurrent_tasks ?? 5,
+                budget_max_per_task: agent.budget_max_per_task ?? 500000,
+                budget_max_per_hour: agent.budget_max_per_hour ?? 5000000,
             });
         }
     }, [agent, form]);
@@ -82,6 +92,9 @@ export function AgentDetailPage() {
                         allowed_tools: data.allowed_tools,
                     },
                     status: data.status,
+                    max_concurrent_tasks: data.max_concurrent_tasks,
+                    budget_max_per_task: data.budget_max_per_task,
+                    budget_max_per_hour: data.budget_max_per_hour,
                 },
             },
             {
@@ -329,6 +342,78 @@ export function AgentDetailPage() {
                                     </FormItem>
                                 )}
                             />
+                        </CardContent>
+                    </Card>
+
+                    <Card className="console-surface border-white/10">
+                        <CardHeader className="border-b border-white/8 pb-4">
+                            <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">Scheduling & Budget</CardTitle>
+                        </CardHeader>
+                        <CardContent className="pt-6 space-y-6">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                <FormField
+                                    control={form.control}
+                                    name="max_concurrent_tasks"
+                                    render={({ field }) => (
+                                        <FormItem>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Concurrent Tasks</FormLabel>
+                                            <FormControl>
+                                                <Input
+                                                    type="number"
+                                                    min="1"
+                                                    step="1"
+                                                    className="rounded-none border-border bg-black/50 w-32"
+                                                    {...field}
+                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 1)}
+                                                />
+                                            </FormControl>
+                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                        </FormItem>
+                                    )}
+                                />
+                                <FormField
+                                    control={form.control}
+                                    name="budget_max_per_task"
+                                    render={({ field }) => (
+                                        <FormItem>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Budget per Task (microdollars)</FormLabel>
+                                            <FormControl>
+                                                <Input
+                                                    type="number"
+                                                    min="1"
+                                                    step="1"
+                                                    className="rounded-none border-border bg-black/50 w-48"
+                                                    {...field}
+                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 1)}
+                                                />
+                                            </FormControl>
+                                            <p className="text-xs text-muted-foreground mt-1">${formatUsd(field.value)}</p>
+                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                        </FormItem>
+                                    )}
+                                />
+                                <FormField
+                                    control={form.control}
+                                    name="budget_max_per_hour"
+                                    render={({ field }) => (
+                                        <FormItem>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Budget per Hour (microdollars)</FormLabel>
+                                            <FormControl>
+                                                <Input
+                                                    type="number"
+                                                    min="1"
+                                                    step="1"
+                                                    className="rounded-none border-border bg-black/50 w-48"
+                                                    {...field}
+                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 1)}
+                                                />
+                                            </FormControl>
+                                            <p className="text-xs text-muted-foreground mt-1">${formatUsd(field.value)}</p>
+                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                        </FormItem>
+                                    )}
+                                />
+                            </div>
                         </CardContent>
                     </Card>
 

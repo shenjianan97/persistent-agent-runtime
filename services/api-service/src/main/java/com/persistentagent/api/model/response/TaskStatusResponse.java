@@ -29,6 +29,9 @@ public record TaskStatusResponse(
         @JsonProperty("langfuse_endpoint_id") UUID langfuseEndpointId,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pending_input_prompt") String pendingInputPrompt,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pending_approval_action") Object pendingApprovalAction,
-        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("human_input_timeout_at") OffsetDateTime humanInputTimeoutAt
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("human_input_timeout_at") OffsetDateTime humanInputTimeoutAt,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_reason") String pauseReason,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_details") Object pauseDetails,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("resume_eligible_at") OffsetDateTime resumeEligibleAt
 ) {
 }

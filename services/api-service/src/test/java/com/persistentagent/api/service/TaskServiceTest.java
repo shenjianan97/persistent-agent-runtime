@@ -252,6 +252,9 @@ class TaskServiceTest {
         taskRow.put("pending_input_prompt", null);
         taskRow.put("pending_approval_action", null);
         taskRow.put("human_input_timeout_at", null);
+        taskRow.put("pause_reason", null);
+        taskRow.put("pause_details", null);
+        taskRow.put("resume_eligible_at", null);
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
@@ -268,6 +271,9 @@ class TaskServiceTest {
         assertNull(response.pendingInputPrompt());
         assertNull(response.pendingApprovalAction());
         assertNull(response.humanInputTimeoutAt());
+        assertNull(response.pauseReason());
+        assertNull(response.pauseDetails());
+        assertNull(response.resumeEligibleAt());
     }
 
     @Test
@@ -624,7 +630,7 @@ class TaskServiceTest {
 
     @Test
     void listTasks_invalidStatus_throwsValidation() {
-        assertThrows(ValidationException.class, () -> taskService.listTasks("garbage", null, null));
+        assertThrows(ValidationException.class, () -> taskService.listTasks("garbage", null, null, null));
     }
 
     @Test
@@ -641,10 +647,12 @@ class TaskServiceTest {
         row.put("total_cost_microdollars", 0L);
         row.put("created_at", now);
         row.put("updated_at", now);
+        row.put("pause_reason", null);
+        row.put("resume_eligible_at", null);
 
-        when(taskRepository.listTasks("default", null, null, 50)).thenReturn(List.of(row));
+        when(taskRepository.listTasks("default", null, null, null, 50)).thenReturn(List.of(row));
 
-        TaskListResponse response = taskService.listTasks(null, null, null);
+        TaskListResponse response = taskService.listTasks(null, null, null, null);
 
         assertEquals(1, response.items().size());
         assertEquals(0L, response.items().get(0).totalCostMicrodollars());

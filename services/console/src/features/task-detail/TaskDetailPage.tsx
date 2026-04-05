@@ -1,5 +1,5 @@
 import { useNavigate, useParams, Link } from 'react-router';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
 import { useTaskObservability } from './useTaskObservability';
 import { useCheckpoints } from './useCheckpoints';
@@ -12,10 +12,11 @@ import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { AlertCircle, Terminal, Ban, RotateCcw } from 'lucide-react';
+import { AlertCircle, Terminal, Ban, RotateCcw, PlayCircle } from 'lucide-react';
 import { toast } from 'sonner';
-import { api } from '@/api/client';
+import { api, ApiError } from '@/api/client';
 import { CheckpointResponse } from '@/types';
+import { formatUsd } from '@/lib/utils';
 
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
@@ -32,6 +33,18 @@ export function TaskDetailPage() {
     const queryClient = useQueryClient();
     const cancelMutation = useCancelTask();
     const redriveMutation = useRedriveTask();
+
+    const resumeMutation = useMutation({
+        mutationFn: (id: string) => api.resumeTask(id),
+        onSuccess: (_, id) => {
+            queryClient.invalidateQueries({ queryKey: ['task', id] });
+            queryClient.invalidateQueries({ queryKey: ['task-events', id] });
+            toast.success('Task resumed');
+        },
+        onError: (error: ApiError) => {
+            toast.error(error.message || 'Resume failed');
+        },
+    });
 
     const isNonTerminal = task?.status === 'queued' || task?.status === 'running' ||
         task?.status === 'waiting_for_approval' || task?.status === 'waiting_for_input' || task?.status === 'paused';
@@ -127,7 +140,7 @@ export function TaskDetailPage() {
                         <h2 className="text-2xl font-display font-semibold tracking-tight">
                             {task.task_id}
                         </h2>
-                        <TaskStatusBadge status={task.status} />
+                        <TaskStatusBadge status={task.status} pauseReason={task.pause_reason} />
                     </div>
                     <div className="flex flex-wrap gap-4 text-xs font-mono text-muted-foreground uppercase tracking-[0.18em]">
                         <span>Agent: <Link to={`/agents/${encodeURIComponent(task.agent_id)}`} className="text-foreground hover:text-primary hover:underline underline-offset-4 decoration-primary/50 transition-colors">{task.agent_display_name ? `${task.agent_display_name} (${task.agent_id})` : task.agent_id}</Link></span>
@@ -193,6 +206,59 @@ export function TaskDetailPage() {
 
                     {isWaitingForInput && (
                         <InputResponsePanel task={task} onActionComplete={handleActionComplete} />
+                    )}
+
+                    {task.status === 'paused' && task.pause_reason && (
+                        <div className="console-surface rounded-[24px] p-6 space-y-4 relative overflow-hidden border border-amber-500/30 bg-amber-500/5">
+                            <div className="absolute top-0 left-0 w-1 h-full bg-amber-500" />
+                            <h3 className="text-amber-400 font-bold uppercase tracking-widest flex items-center gap-2 text-sm">
+                                <AlertCircle className="w-4 h-4" /> Budget Pause
+                            </h3>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm font-mono">
+                                <div>
+                                    <span className="text-muted-foreground block text-xs uppercase mb-1">Pause Reason</span>
+                                    <span className="text-amber-400 font-bold">
+                                        {task.pause_reason === 'budget_per_task' ? 'Per-Task Budget Exceeded' : 'Hourly Budget Exceeded'}
+                                    </span>
+                                </div>
+                                {task.pause_details && (
+                                    <>
+                                        <div>
+                                            <span className="text-muted-foreground block text-xs uppercase mb-1">Budget Limit</span>
+                                            <span className="text-foreground">
+                                                ${formatUsd(task.pause_details.budget_max_per_task ?? task.pause_details.budget_max_per_hour ?? 0)}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="text-muted-foreground block text-xs uppercase mb-1">Observed Cost</span>
+                                            <span className="text-foreground">
+                                                ${formatUsd(task.pause_details.observed_task_cost_microdollars ?? task.pause_details.observed_hour_cost_microdollars ?? 0)}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="text-muted-foreground block text-xs uppercase mb-1">Recovery</span>
+                                            <span className="text-foreground">
+                                                {task.pause_details.recovery_mode === 'automatic_after_window_clears'
+                                                    ? `Auto-recovers${task.resume_eligible_at ? ` at ${new Date(task.resume_eligible_at).toLocaleString()}` : ''}`
+                                                    : 'Requires budget increase + manual resume'}
+                                            </span>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                            {task.pause_reason === 'budget_per_task' && (
+                                <div className="pt-2">
+                                    <Button
+                                        onClick={() => resumeMutation.mutate(task.task_id)}
+                                        disabled={resumeMutation.isPending}
+                                        className="font-bold uppercase tracking-widest px-6 hover:saturate-150 transition-all"
+                                    >
+                                        <PlayCircle className="w-4 h-4 mr-2" />
+                                        {resumeMutation.isPending ? 'Resuming...' : 'Resume Task'}
+                                    </Button>
+                                </div>
+                            )}
+                        </div>
                     )}
 
                     <CheckpointTimeline

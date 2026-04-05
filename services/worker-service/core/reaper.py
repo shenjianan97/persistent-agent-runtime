@@ -1,9 +1,11 @@
 """Distributed Reaper — reclaims expired leases and timed-out tasks.
 
 Runs on every worker instance at a jittered interval (30s +/- 10s).
-Handles two conditions:
+Handles multiple conditions:
   (a) Expired leases: requeue with retry_count++ or dead-letter if exhausted.
   (b) Task timeouts: dead-letter with reason 'task_timeout'.
+  (c) Human-input timeouts: dead-letter with reason 'human_input_timeout'.
+  (d) Track 3: Hourly budget auto-recovery, running-count reconciliation, cost ledger pruning.
 Both requeue paths emit pg_notify('new_task', worker_pool_id) in the same txn.
 """
 
@@ -123,6 +125,15 @@ WHERE status = 'online'
 RETURNING worker_id;
 """
 
+# Track 3: Running-count decrement SQL (used after each reaper terminal transition)
+DECREMENT_RUNNING_COUNT_SQL = """
+INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+ON CONFLICT (tenant_id, agent_id) DO UPDATE
+SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+    updated_at = NOW()
+"""
+
 
 class ReaperTask:
     """Distributed reaper that scans for expired leases and timed-out tasks.
@@ -215,6 +226,11 @@ class ReaperTask:
                     task_id = str(row["task_id"])
                     results["requeued"].append(task_id)
                     self._metrics.increment("leases.expired")
+                    # Track 3: Decrement running_task_count on requeue
+                    await conn.execute(
+                        DECREMENT_RUNNING_COUNT_SQL,
+                        row["tenant_id"], row["agent_id"]
+                    )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
                         "task_reclaimed_after_lease_expiry", "running", "queued",
@@ -232,6 +248,11 @@ class ReaperTask:
                     results["dead_lettered_expired"].append(task_id)
                     self._metrics.increment("leases.expired")
                     self._metrics.increment("tasks.dead_letter")
+                    # Track 3: Decrement running_task_count on dead-letter
+                    await conn.execute(
+                        DECREMENT_RUNNING_COUNT_SQL,
+                        row["tenant_id"], row["agent_id"]
+                    )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
                         "task_dead_lettered", "running", "dead_letter",
@@ -249,6 +270,11 @@ class ReaperTask:
                     task_id = str(row["task_id"])
                     results["dead_lettered_timeout"].append(task_id)
                     self._metrics.increment("tasks.dead_letter")
+                    # Track 3: Decrement running_task_count on timeout
+                    await conn.execute(
+                        DECREMENT_RUNNING_COUNT_SQL,
+                        row["tenant_id"], row["agent_id"]
+                    )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
                         "task_dead_lettered", None, "dead_letter",
@@ -293,7 +319,209 @@ class ReaperTask:
                 if depth_row:
                     self._metrics.set_gauge("queue.depth", float(depth_row["depth"]))
 
+        # Track 3: Scheduler and Budget scans (independent — failure in one doesn't prevent others)
+        try:
+            recovered = await self._recover_hourly_budget_pauses()
+            if recovered:
+                results['budget_recovered'] = recovered
+                await self._log.ainfo("reaper_budget_recovery", count=len(recovered))
+        except Exception as exc:
+            await self._log.aerror("reaper_budget_recovery_error", error=str(exc), exc_info=True)
+
+        try:
+            corrections = await self._reconcile_runtime_state()
+            if corrections:
+                await self._log.ainfo("reaper_reconciliation", corrections=corrections)
+        except Exception as exc:
+            await self._log.aerror("reaper_reconciliation_error", error=str(exc), exc_info=True)
+
+        try:
+            pruned = await self._prune_cost_ledger()
+            if pruned > 0:
+                await self._log.ainfo("reaper_ledger_pruned", count=pruned)
+        except Exception as exc:
+            await self._log.aerror("reaper_ledger_prune_error", error=str(exc), exc_info=True)
+
         return results
+
+    async def _recover_hourly_budget_pauses(self) -> list[str]:
+        """Resume tasks paused for hourly budget once the rolling window clears."""
+        recovered_task_ids: list[str] = []
+
+        # Find agents with hourly-budget-paused tasks whose resume_eligible_at has passed
+        paused_agents = await self._pool.fetch(
+            '''SELECT DISTINCT t.tenant_id, t.agent_id
+               FROM tasks t
+               WHERE t.status = 'paused'
+                 AND t.pause_reason = 'budget_per_hour'
+                 AND t.resume_eligible_at IS NOT NULL
+                 AND t.resume_eligible_at <= NOW()'''
+        )
+
+        for agent_row in paused_agents:
+            tenant_id = agent_row['tenant_id']
+            agent_id = agent_row['agent_id']
+
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    # Verify agent is active
+                    agent = await conn.fetchrow(
+                        '''SELECT budget_max_per_hour, max_concurrent_tasks, status
+                           FROM agents WHERE tenant_id = $1 AND agent_id = $2''',
+                        tenant_id, agent_id
+                    )
+                    if not agent or agent['status'] != 'active':
+                        continue
+
+                    # Recompute rolling hourly spend from canonical ledger
+                    hour_cost = await conn.fetchval(
+                        '''SELECT COALESCE(SUM(cost_microdollars), 0)
+                           FROM agent_cost_ledger
+                           WHERE tenant_id = $1 AND agent_id = $2
+                             AND created_at > NOW() - INTERVAL '60 minutes' ''',
+                        tenant_id, agent_id
+                    )
+
+                    if hour_cost >= agent['budget_max_per_hour']:
+                        continue  # Still over budget
+
+                    # Get current running count
+                    runtime = await conn.fetchrow(
+                        '''SELECT running_task_count FROM agent_runtime_state
+                           WHERE tenant_id = $1 AND agent_id = $2
+                           FOR UPDATE''',
+                        tenant_id, agent_id
+                    )
+                    current_running = runtime['running_task_count'] if runtime else 0
+                    available_slots = agent['max_concurrent_tasks'] - current_running
+
+                    if available_slots <= 0:
+                        continue  # No concurrency slots
+
+                    # Resume up to available_slots tasks
+                    resumed_rows = await conn.fetch(
+                        '''UPDATE tasks
+                           SET status = 'queued',
+                               pause_reason = NULL,
+                               pause_details = NULL,
+                               resume_eligible_at = NULL,
+                               version = version + 1,
+                               updated_at = NOW()
+                           WHERE task_id IN (
+                               SELECT task_id FROM tasks
+                               WHERE tenant_id = $1 AND agent_id = $2
+                                 AND status = 'paused'
+                                 AND pause_reason = 'budget_per_hour'
+                               ORDER BY created_at ASC
+                               LIMIT $3
+                               FOR UPDATE SKIP LOCKED
+                           )
+                           RETURNING task_id, worker_pool_id''',
+                        tenant_id, agent_id, available_slots
+                    )
+
+                    # Record events and notify for each resumed task
+                    notified_pools: set[str] = set()
+                    for row in resumed_rows:
+                        await _insert_task_event(
+                            conn, str(row['task_id']), tenant_id, agent_id,
+                            event_type='task_resumed',
+                            status_before='paused',
+                            status_after='queued',
+                            worker_id=None,
+                            details={
+                                'resume_trigger': 'automatic_hourly_recovery',
+                                'agent_hour_cost_at_resume': int(hour_cost),
+                                'budget_max_per_hour': int(agent['budget_max_per_hour'])
+                            }
+                        )
+                        notified_pools.add(row['worker_pool_id'])
+                        recovered_task_ids.append(str(row['task_id']))
+
+                    # Notify all affected worker pools
+                    for pool_id in notified_pools:
+                        await conn.execute(
+                            "SELECT pg_notify('new_task', $1)", pool_id
+                        )
+
+                    # Update hourly cost cache while we have the accurate value
+                    await conn.execute(
+                        '''UPDATE agent_runtime_state
+                           SET hour_window_cost_microdollars = $1, updated_at = NOW()
+                           WHERE tenant_id = $2 AND agent_id = $3''',
+                        hour_cost, tenant_id, agent_id
+                    )
+
+        return recovered_task_ids
+
+    async def _reconcile_runtime_state(self) -> str:
+        """Reconcile agent_runtime_state with actual task counts and ledger spend."""
+        # Reconcile running_task_count from actual running tasks
+        count_corrections = await self._pool.execute(
+            '''UPDATE agent_runtime_state ars
+               SET running_task_count = sub.actual_count, updated_at = NOW()
+               FROM (
+                   SELECT tenant_id, agent_id, COUNT(*) AS actual_count
+                   FROM tasks WHERE status = 'running'
+                   GROUP BY tenant_id, agent_id
+               ) sub
+               WHERE ars.tenant_id = sub.tenant_id AND ars.agent_id = sub.agent_id
+                 AND ars.running_task_count != sub.actual_count'''
+        )
+
+        # Zero out counts for agents with no running tasks but non-zero count
+        await self._pool.execute(
+            '''UPDATE agent_runtime_state ars
+               SET running_task_count = 0, updated_at = NOW()
+               WHERE ars.running_task_count > 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM tasks t
+                     WHERE t.tenant_id = ars.tenant_id
+                       AND t.agent_id = ars.agent_id
+                       AND t.status = 'running'
+                 )'''
+        )
+
+        # Reconcile hour_window_cost_microdollars from canonical ledger
+        await self._pool.execute(
+            '''UPDATE agent_runtime_state ars
+               SET hour_window_cost_microdollars = COALESCE(sub.actual_cost, 0), updated_at = NOW()
+               FROM (
+                   SELECT tenant_id, agent_id, SUM(cost_microdollars) AS actual_cost
+                   FROM agent_cost_ledger
+                   WHERE created_at > NOW() - INTERVAL '60 minutes'
+                   GROUP BY tenant_id, agent_id
+               ) sub
+               WHERE ars.tenant_id = sub.tenant_id AND ars.agent_id = sub.agent_id
+                 AND ars.hour_window_cost_microdollars != COALESCE(sub.actual_cost, 0)'''
+        )
+
+        # Zero out hourly cost for agents with no recent ledger entries
+        await self._pool.execute(
+            '''UPDATE agent_runtime_state ars
+               SET hour_window_cost_microdollars = 0, updated_at = NOW()
+               WHERE ars.hour_window_cost_microdollars > 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM agent_cost_ledger acl
+                     WHERE acl.tenant_id = ars.tenant_id
+                       AND acl.agent_id = ars.agent_id
+                       AND acl.created_at > NOW() - INTERVAL '60 minutes'
+                 )'''
+        )
+
+        return count_corrections
+
+    async def _prune_cost_ledger(self) -> int:
+        """Delete agent_cost_ledger entries older than 2 hours."""
+        result = await self._pool.execute(
+            '''DELETE FROM agent_cost_ledger
+               WHERE created_at < NOW() - INTERVAL '2 hours' '''
+        )
+        # asyncpg execute returns a string like 'DELETE 5'
+        try:
+            return int(result.split()[-1]) if result else 0
+        except (ValueError, IndexError):
+            return 0
 
 
 async def _insert_task_event(

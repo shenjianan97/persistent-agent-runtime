@@ -38,12 +38,11 @@ make start
 
 ## Local Langfuse Observability
 
-Langfuse is part of the default local development stack.
+Langfuse is configured per-agent via the Console Settings page. A local Langfuse instance is available for testing but is **not** started automatically by `make start`.
 
-- `make start` always runs `make langfuse-up`.
-- `make check` and local startup fail fast if `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, or `LANGFUSE_SECRET_KEY` are missing.
-- Use `make langfuse-status` to inspect the local Langfuse containers and `make langfuse-down` to stop them.
-- Direct `bootRun` / `python main.py` startup paths do not force local Langfuse defaults; the supported default-on path is `make start`.
+- `make test-langfuse-up` — start a local Langfuse Docker stack
+- `make test-langfuse-status` — inspect Langfuse container status
+- `make test-langfuse-down` — stop the local Langfuse stack
 
 The checked-in local stack initializes a local Langfuse organization, project, and API keys automatically with the credentials from `.env.localdev.example`:
 
@@ -126,6 +125,10 @@ If you already have your own PostgreSQL instance, skip the script and apply the 
 infrastructure/database/migrations/0001_phase1_durable_execution.sql
 infrastructure/database/migrations/0002_worker_registry.sql
 infrastructure/database/migrations/0003_dynamic_models.sql
+infrastructure/database/migrations/0004_timeout_reference.sql
+infrastructure/database/migrations/0005_agents_table.sql
+infrastructure/database/migrations/0006_runtime_state_model.sql
+infrastructure/database/migrations/0007_scheduler_and_budgets.sql
 ```
 
 To reset and re-verify the schema (destructive — drops all data):
@@ -133,3 +136,108 @@ To reset and re-verify the schema (destructive — drops all data):
 ```bash
 make db-reset-verify
 ```
+
+## E2E Tests (Isolated Infrastructure)
+
+E2E tests run against **fully isolated infrastructure** that does not interfere with local development:
+
+| Resource   | Local Dev          | E2E Tests                    |
+|------------|--------------------|------------------------------|
+| Postgres   | `:55432`           | `:55433`                     |
+| API        | `:8080`            | `:8081`                      |
+| DB name    | `persistent_agent_runtime` | `persistent_agent_runtime_e2e` |
+| Container  | `persistent-agent-runtime-postgres` | `par-e2e-postgres` |
+
+### Running E2E tests
+
+```bash
+# Run E2E tests (auto-starts isolated Postgres + API if needed)
+make e2e-test
+
+# Or manage E2E infra manually
+make e2e-up        # start isolated DB + API
+make e2e-status    # check what's running
+make e2e-down      # stop E2E stack
+
+# If something failed mid-run, force-clean leftovers
+make e2e-clean
+```
+
+`make e2e-test` uses `-v --tb=short -ra` for verbose progress and failure details. Logs are written to `.tmp/e2e-test.log` and `.tmp/e2e-api-service.log`.
+
+### Test targets
+
+- `make test` — unit tests only (API, Worker, Console). Fast, no infrastructure needed.
+- `make test-all` — unit tests + E2E. Full validation.
+- `make e2e-test` — E2E only. Auto-manages its own infrastructure.
+
+## Testing Rules
+
+### Every code change requires tests
+
+If you change code, you must add or update tests that cover the change — unless the change is purely cosmetic (e.g., comments, formatting) or the existing test suite already covers the new behavior. Test all use cases and failure scenarios, not just the happy path.
+
+### Where to put tests
+
+| Service | Test directory | Framework | Example |
+|---------|---------------|-----------|---------|
+| API (Spring Boot) | `services/api-service/src/test/java/...` | JUnit 5 | `AgentControllerTest.java` |
+| Worker (Python) | `services/worker-service/tests/` | pytest | `test_poller.py`, `test_executor.py` |
+| Console (React) | Co-located `*.test.tsx` / `*.test.ts` | Vitest | `src/features/agents/AgentDetailPage.test.tsx` |
+| E2E (integration) | `tests/backend-integration/` | pytest (async) | `test_budget_enforcement.py` |
+
+Follow existing conventions in each directory. Place unit tests next to the code they test (console) or in the flat `tests/` directory (worker).
+
+### Running a single test
+
+Use these commands to run individual tests when debugging failures. Always use the project venv for Python.
+
+**Worker (Python):**
+```bash
+# Single file
+services/worker-service/.venv/bin/python -m pytest services/worker-service/tests/test_poller.py -v
+
+# Single test function
+services/worker-service/.venv/bin/python -m pytest services/worker-service/tests/test_poller.py::test_function_name -v
+
+# Single test class method
+services/worker-service/.venv/bin/python -m pytest services/worker-service/tests/test_poller.py::TestClassName::test_method -v
+
+# With print output visible
+services/worker-service/.venv/bin/python -m pytest services/worker-service/tests/test_poller.py -v -s
+```
+
+**E2E (Python):**
+```bash
+# Single file
+services/worker-service/.venv/bin/python -m pytest tests/backend-integration/test_budget_enforcement.py -v -s
+
+# Single test
+services/worker-service/.venv/bin/python -m pytest tests/backend-integration/test_budget_enforcement.py::TestBudgetEnforcement::test_per_task_budget_pause -v -s
+```
+
+**API (Gradle/JUnit):**
+```bash
+cd services/api-service
+
+# Single test class
+./gradlew test --tests "com.persistentagent.api.controller.AgentControllerTest"
+
+# Single test method
+./gradlew test --tests "com.persistentagent.api.controller.AgentControllerTest.methodName"
+```
+
+**Console (Vitest):**
+```bash
+cd services/console
+
+# Single file
+npx vitest run src/features/agents/AgentDetailPage.test.tsx
+
+# Filter by test name
+npx vitest run --reporter=verbose -t "renders budget fields"
+```
+
+### Pre-existing test failures
+
+If tests fail that are unrelated to your change, you must still fix them. Use `git stash` or a separate branch to verify the failure exists on `main` before your changes. If it does, fix it as part of your work — do not leave broken tests behind.

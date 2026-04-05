@@ -3,6 +3,8 @@
 # Automates local development, service management, and testing
 # ============================================================
 
+SHELL := /bin/bash
+
 # --- Configuration & Environment ---
 
 # Load local environment variables if present
@@ -50,6 +52,19 @@ LANGFUSE_PUBLIC_KEY ?= pk-lf-local
 LANGFUSE_SECRET_KEY ?= sk-lf-local
 LANGFUSE_WEB_PORT ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 80)' "$(LANGFUSE_HOST)"),3300)
 
+# E2E Test Infrastructure (fully isolated from local dev)
+E2E_DB_PORT ?= 55433
+E2E_DB_NAME ?= persistent_agent_runtime_e2e
+E2E_DB_USER ?= postgres
+E2E_DB_PASSWORD ?= postgres
+E2E_DB_HOST ?= localhost
+E2E_DB_DSN ?= postgresql://$(E2E_DB_USER):$(E2E_DB_PASSWORD)@$(E2E_DB_HOST):$(E2E_DB_PORT)/$(E2E_DB_NAME)
+E2E_PG_CONTAINER ?= par-e2e-postgres
+E2E_PG_IMAGE ?= postgres:16
+E2E_API_PORT ?= 8081
+E2E_API_BASE ?= http://localhost:$(E2E_API_PORT)/v1
+E2E_API_LOG ?= $(TMP_DIR)/e2e-api-service.log
+
 # Color Output
 GREEN := \033[0;32m
 YELLOW := \033[0;33m
@@ -62,7 +77,8 @@ NC := \033[0m
         scale-worker \
         status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
         test-langfuse-up test-langfuse-down test-langfuse-status \
-        test api-test worker-test console-test e2e-test test-e2e-langfuse local-ci clean logs
+        test test-all api-test worker-test console-test e2e-test e2e-up e2e-down e2e-clean e2e-status \
+        test-e2e-langfuse local-ci clean logs
 
 
 # ============================================================
@@ -98,13 +114,20 @@ help:
 	@echo "  $(YELLOW)make test-langfuse-status$(NC) - 📊 Show local Langfuse container status"
 	@echo ""
 	@echo "$(CYAN)[Testing]$(NC)"
-	@echo "  $(YELLOW)make test$(NC)           - 🧪 Run all tests (API, Worker, Console, E2E)"
+	@echo "  $(YELLOW)make test$(NC)           - 🧪 Run unit tests only (API, Worker, Console)"
+	@echo "  $(YELLOW)make test-all$(NC)       - 🧪 Run all tests including E2E"
 	@echo "  $(YELLOW)make api-test$(NC)       -    Run API tests (Gradle)"
 	@echo "  $(YELLOW)make worker-test$(NC)    -    Run Worker unit tests (Pytest)"
 	@echo "  $(YELLOW)make console-test$(NC)   -    Run Console tests (Vitest)"
-	@echo "  $(YELLOW)make e2e-test$(NC)       -    Run Backend E2E tests"
+	@echo "  $(YELLOW)make e2e-test$(NC)       -    Run Backend E2E tests (auto-starts isolated infra)"
 	@echo "  $(YELLOW)make test-e2e-langfuse$(NC) - Run Langfuse E2E tests (requires Langfuse + full stack)"
 	@echo "  $(YELLOW)make local-ci$(NC)       - ✅ Run local CI script"
+	@echo ""
+	@echo "$(CYAN)[E2E Infrastructure]$(NC)"
+	@echo "  $(YELLOW)make e2e-up$(NC)         - 🧪 Start isolated E2E stack (DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))"
+	@echo "  $(YELLOW)make e2e-down$(NC)       - 🛑 Stop E2E stack"
+	@echo "  $(YELLOW)make e2e-clean$(NC)      - 🧹 Force-remove E2E containers and leftover processes"
+	@echo "  $(YELLOW)make e2e-status$(NC)     - 📊 Show E2E infrastructure status"
 	@echo ""
 	@echo "$(CYAN)[Dependency Management]$(NC)"
 	@echo "  $(YELLOW)make install$(NC)        - 📦 Install all dependencies (API, Console, Worker)"
@@ -713,8 +736,11 @@ db-reset-verify: db-up
 # Testing
 # ============================================================
 
-test: api-test worker-test console-test e2e-test
-	@echo "$(GREEN)✅ All tests passed!$(NC)"
+test: api-test worker-test console-test
+	@echo "$(GREEN)✅ All unit tests passed!$(NC)"
+
+test-all: api-test worker-test console-test e2e-test
+	@echo "$(GREEN)✅ All tests passed (unit + E2E)!$(NC)"
 
 api-test:
 	@echo "$(CYAN)🧪 Running API tests...$(NC)"
@@ -728,13 +754,155 @@ console-test:
 	@echo "$(CYAN)🧪 Running Console tests...$(NC)"
 	@cd $(CONSOLE_DIR) && npm test
 
-e2e-test:
-	@echo "$(CYAN)🧪 Running E2E tests...$(NC)"
-	@$(WORKER_VENV_PYTHON) -m pytest tests/backend-integration -q
+e2e-test: e2e-up
+	@echo "$(CYAN)🧪 Running E2E tests (isolated infra: DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))...$(NC)"
+	@mkdir -p $(TMP_DIR)
+	@E2E_DB_HOST=$(E2E_DB_HOST) \
+	 E2E_DB_PORT=$(E2E_DB_PORT) \
+	 E2E_DB_NAME=$(E2E_DB_NAME) \
+	 E2E_DB_USER=$(E2E_DB_USER) \
+	 E2E_DB_PASSWORD=$(E2E_DB_PASSWORD) \
+	 E2E_DB_DSN=$(E2E_DB_DSN) \
+	 E2E_PG_CONTAINER=$(E2E_PG_CONTAINER) \
+	 E2E_PG_IMAGE=$(E2E_PG_IMAGE) \
+	 E2E_API_PORT=$(E2E_API_PORT) \
+	 E2E_API_BASE=$(E2E_API_BASE) \
+	 APP_DEV_TASK_CONTROLS_ENABLED=true \
+	 $(WORKER_VENV_PYTHON) -m pytest tests/backend-integration -v --tb=short -ra 2>&1 | tee $(TMP_DIR)/e2e-test.log; \
+	 e2e_exit=$${PIPESTATUS[0]}; \
+	 $(MAKE) e2e-down; \
+	 if [ $$e2e_exit -ne 0 ]; then \
+	   echo "$(RED)❌ E2E tests failed. Full log: $(TMP_DIR)/e2e-test.log$(NC)"; \
+	   echo "$(YELLOW)   API log: $(E2E_API_LOG)$(NC)"; \
+	   exit $$e2e_exit; \
+	 fi
 
 test-e2e-langfuse: ## Run Langfuse E2E tests (requires: make test-langfuse-up && make start)
 	@echo "$(CYAN)🧪 Running Langfuse E2E tests...$(NC)"
 	@$(WORKER_VENV_PYTHON) -m pytest tests/e2e-langfuse -ra -q
+
+
+# ============================================================
+# E2E Infrastructure (isolated from local dev)
+# ============================================================
+
+e2e-up:
+	@command -v docker >/dev/null 2>&1 || { echo "$(RED)❌ Docker is required for E2E tests$(NC)"; exit 1; }
+	@mkdir -p $(TMP_DIR)
+	@echo "$(YELLOW)🧪 Starting E2E infrastructure (DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))...$(NC)"
+	@# --- Postgres ---
+	@if docker ps --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
+		echo "  $(GREEN)✓ E2E Postgres already running$(NC)"; \
+	elif docker ps -a --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
+		echo "  $(YELLOW)▶ Starting existing E2E Postgres container...$(NC)"; \
+		docker start $(E2E_PG_CONTAINER); \
+	else \
+		echo "  $(YELLOW)▶ Creating E2E Postgres container...$(NC)"; \
+		docker run -d --name $(E2E_PG_CONTAINER) \
+			-e POSTGRES_USER=$(E2E_DB_USER) \
+			-e POSTGRES_PASSWORD=$(E2E_DB_PASSWORD) \
+			-e POSTGRES_DB=$(E2E_DB_NAME) \
+			-p $(E2E_DB_PORT):5432 \
+			$(E2E_PG_IMAGE); \
+	fi
+	@echo "  $(YELLOW)⏳ Waiting for E2E Postgres...$(NC)"
+	@for i in $$(seq 1 60); do \
+		docker exec $(E2E_PG_CONTAINER) pg_isready -U $(E2E_DB_USER) >/dev/null 2>&1 && break; \
+		sleep 0.5; \
+	done
+	@docker exec $(E2E_PG_CONTAINER) pg_isready -U $(E2E_DB_USER) >/dev/null 2>&1 || \
+		(echo "$(RED)❌ E2E Postgres did not become ready$(NC)" && exit 1)
+	@echo "  $(GREEN)✓ E2E Postgres ready$(NC)"
+	@# --- Migrations ---
+	@echo "  $(YELLOW)▶ Applying migrations to E2E database...$(NC)"
+	@for f in $(MIGRATION_FILES); do \
+		PGPASSWORD=$(E2E_DB_PASSWORD) psql -h $(E2E_DB_HOST) -p $(E2E_DB_PORT) -U $(E2E_DB_USER) -d $(E2E_DB_NAME) -f "$$f" -q 2>/dev/null || true; \
+	done
+	@echo "  $(GREEN)✓ E2E migrations applied$(NC)"
+	@# --- Seed test models (no API keys needed) ---
+	@echo "  $(YELLOW)▶ Seeding test models...$(NC)"
+	@PGPASSWORD=$(E2E_DB_PASSWORD) psql -h $(E2E_DB_HOST) -p $(E2E_DB_PORT) -U $(E2E_DB_USER) -d $(E2E_DB_NAME) -q \
+		-c "INSERT INTO provider_keys (provider_id, api_key) VALUES ('anthropic', 'e2e-placeholder') ON CONFLICT (provider_id) DO NOTHING;" \
+		-c "INSERT INTO models (model_id, provider_id, display_name, is_active, input_microdollars_per_million, output_microdollars_per_million) VALUES ('claude-sonnet-4-6', 'anthropic', 'Claude Sonnet 4.6', true, 3000000, 15000000) ON CONFLICT (provider_id, model_id) DO NOTHING;"
+	@echo "  $(GREEN)✓ E2E test models seeded$(NC)"
+	@# --- API ---
+	@if curl -sf http://localhost:$(E2E_API_PORT)/v1/health >/dev/null 2>&1; then \
+		echo "  $(GREEN)✓ E2E API already running$(NC)"; \
+	else \
+		echo "  $(YELLOW)▶ Starting E2E API on port $(E2E_API_PORT)...$(NC)"; \
+		DB_HOST=$(E2E_DB_HOST) DB_PORT=$(E2E_DB_PORT) DB_NAME=$(E2E_DB_NAME) \
+		DB_USER=$(E2E_DB_USER) DB_PASSWORD=$(E2E_DB_PASSWORD) \
+		SERVER_PORT=$(E2E_API_PORT) APP_DEV_TASK_CONTROLS_ENABLED=true \
+		nohup $(API_DIR)/gradlew bootRun -p $(API_DIR) > $(E2E_API_LOG) 2>&1 & \
+		echo $$! > $(TMP_DIR)/e2e-api.pid; \
+		echo "  $(YELLOW)⏳ Waiting for E2E API health...$(NC)"; \
+		for i in $$(seq 1 120); do \
+			curl -sf http://localhost:$(E2E_API_PORT)/v1/health >/dev/null 2>&1 && break; \
+			sleep 1; \
+		done; \
+		if curl -sf http://localhost:$(E2E_API_PORT)/v1/health >/dev/null 2>&1; then \
+			echo "  $(GREEN)✓ E2E API ready$(NC)"; \
+		else \
+			echo "$(RED)❌ E2E API failed to start. Check $(E2E_API_LOG)$(NC)"; \
+			exit 1; \
+		fi; \
+	fi
+	@echo "$(GREEN)✅ E2E infrastructure ready$(NC)"
+
+e2e-down:
+	@echo "$(YELLOW)🛑 Stopping E2E infrastructure...$(NC)"
+	@# --- API ---
+	@if [ -f $(TMP_DIR)/e2e-api.pid ]; then \
+		pid=$$(cat $(TMP_DIR)/e2e-api.pid); \
+		if kill -0 $$pid 2>/dev/null; then \
+			echo "  $(YELLOW)▶ Stopping E2E API (PID $$pid)...$(NC)"; \
+			kill $$pid 2>/dev/null || true; \
+			for i in $$(seq 1 20); do kill -0 $$pid 2>/dev/null || break; sleep 1; done; \
+			kill -9 $$pid 2>/dev/null || true; \
+		fi; \
+		rm -f $(TMP_DIR)/e2e-api.pid; \
+	fi
+	@# Also kill any bootRun on the E2E port
+	@lsof -ti :$(E2E_API_PORT) | xargs kill 2>/dev/null || true
+	@echo "  $(GREEN)✓ E2E API stopped$(NC)"
+	@# --- Postgres ---
+	@if docker ps --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
+		echo "  $(YELLOW)▶ Stopping E2E Postgres...$(NC)"; \
+		docker stop $(E2E_PG_CONTAINER); \
+	fi
+	@echo "  $(GREEN)✓ E2E Postgres stopped$(NC)"
+	@echo "$(GREEN)✅ E2E infrastructure stopped$(NC)"
+
+e2e-clean:
+	@echo "$(YELLOW)🧹 Force-cleaning E2E leftovers...$(NC)"
+	@# Kill any process on E2E API port
+	@lsof -ti :$(E2E_API_PORT) | xargs kill -9 2>/dev/null || true
+	@rm -f $(TMP_DIR)/e2e-api.pid $(TMP_DIR)/e2e-api-service.log $(TMP_DIR)/e2e-test.log
+	@# Remove E2E Postgres container entirely
+	@docker rm -f $(E2E_PG_CONTAINER) 2>/dev/null || true
+	@echo "$(GREEN)✅ E2E leftovers cleaned$(NC)"
+
+e2e-status:
+	@echo "$(CYAN)📊 E2E Infrastructure Status$(NC)"
+	@echo "   DB Port:  $(E2E_DB_PORT)  (local dev: $(DB_PORT))"
+	@echo "   API Port: $(E2E_API_PORT)  (local dev: $(SERVER_PORT))"
+	@echo "   DB Name:  $(E2E_DB_NAME)"
+	@printf "   Postgres: "; \
+	if docker ps --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
+		echo "$(GREEN)running$(NC)"; \
+	elif docker ps -a --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
+		echo "$(YELLOW)stopped$(NC)"; \
+	else \
+		echo "$(RED)not created$(NC)"; \
+	fi
+	@printf "   API:      "; \
+	if curl -sf http://localhost:$(E2E_API_PORT)/v1/health >/dev/null 2>&1; then \
+		echo "$(GREEN)healthy$(NC)"; \
+	elif [ -f $(TMP_DIR)/e2e-api.pid ] && kill -0 $$(cat $(TMP_DIR)/e2e-api.pid 2>/dev/null) 2>/dev/null; then \
+		echo "$(YELLOW)starting$(NC)"; \
+	else \
+		echo "$(RED)not running$(NC)"; \
+	fi
 
 local-ci:
 	@echo "$(CYAN)🚀 Running Local CI checks...$(NC)"

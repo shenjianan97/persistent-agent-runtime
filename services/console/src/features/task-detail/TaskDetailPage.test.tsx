@@ -1,8 +1,18 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { TaskDetailPage } from './TaskDetailPage';
+
+function createTestQueryClient() {
+    return new QueryClient({
+        defaultOptions: {
+            queries: { retry: false },
+            mutations: { retry: false },
+        },
+    });
+}
 
 const navigateMock = vi.fn();
 const redriveMutateMock = vi.fn();
@@ -273,12 +283,15 @@ describe('TaskDetailPage', () => {
             options?.onSuccess?.({ task_id: 'task-2', status: 'queued' });
         });
 
+        const queryClient = createTestQueryClient();
         render(
-            <MemoryRouter initialEntries={['/tasks/task-1']}>
-                <Routes>
-                    <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
-                </Routes>
-            </MemoryRouter>,
+            <QueryClientProvider client={queryClient}>
+                <MemoryRouter initialEntries={['/tasks/task-1']}>
+                    <Routes>
+                        <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+                    </Routes>
+                </MemoryRouter>
+            </QueryClientProvider>,
         );
 
         fireEvent.click(screen.getByRole('button', { name: 'Redrive Task' }));
@@ -287,12 +300,15 @@ describe('TaskDetailPage', () => {
     });
 
     it('renders persisted checkpoints for dead-lettered tasks', () => {
+        const queryClient = createTestQueryClient();
         render(
-            <MemoryRouter initialEntries={['/tasks/task-1']}>
-                <Routes>
-                    <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
-                </Routes>
-            </MemoryRouter>,
+            <QueryClientProvider client={queryClient}>
+                <MemoryRouter initialEntries={['/tasks/task-1']}>
+                    <Routes>
+                        <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+                    </Routes>
+                </MemoryRouter>
+            </QueryClientProvider>,
         );
 
         expect(screen.getByText('Execution Failure')).toBeInTheDocument();

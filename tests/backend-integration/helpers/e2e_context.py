@@ -27,7 +27,15 @@ class E2EContext:
     _default_agent_id: str | None = None
 
     def ensure_agent(self, **kwargs):
-        """Create an agent and cache its ID for subsequent submit_task calls."""
+        """Create an agent and cache its ID for subsequent submit_task calls.
+
+        Accepts an optional `agent_id` kwarg for test readability — it is
+        stripped from the API payload (agent_id is server-generated) and used
+        as display_name if none is provided.
+        """
+        friendly_id = kwargs.pop("agent_id", None)
+        if friendly_id and "display_name" not in kwargs:
+            kwargs["display_name"] = friendly_id
         resp = self.api.create_agent(**kwargs)
         agent_id = resp["body"]["agent_id"]
         self._default_agent_id = agent_id
@@ -55,6 +63,13 @@ class E2EContext:
 
     def get_task(self, task_id: str) -> dict[str, Any]:
         return self.api.get_task(task_id)["body"]
+
+    def resume_task(self, task_id: str) -> dict:
+        return self.api.resume_task(task_id)["body"]
+
+    def get_events(self, task_id: str) -> list:
+        resp = self.api.get_task_events(task_id)
+        return resp["body"]["events"]
 
     def get_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
         return self.api.get_checkpoints(task_id)["body"]["checkpoints"]

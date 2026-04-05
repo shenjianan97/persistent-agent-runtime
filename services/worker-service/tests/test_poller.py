@@ -1,4 +1,4 @@
-"""Tests for TaskPoller — claim query, LISTEN/NOTIFY, backoff behavior."""
+"""Tests for TaskPoller — agent-aware round-robin claim, LISTEN/NOTIFY, backoff behavior."""
 
 import asyncio
 import uuid
@@ -8,39 +8,98 @@ import pytest
 
 from core.config import WorkerConfig
 from core.logging import MetricsCollector
-from core.poller import build_claim_query, TaskPoller
+from core.poller import (
+    _PRECLAIM_UPSERT_SQL,
+    _FIND_ELIGIBLE_AGENT_SQL,
+    _FIND_AGENT_TASK_SQL,
+    _CLAIM_TASK_SQL,
+    _UPDATE_RUNTIME_STATE_SQL,
+    _INSERT_TASK_EVENT_SQL,
+    TaskPoller,
+)
 
 
-class TestClaimQuery:
-    """Verify the claim query matches the design doc."""
+class TestSchedulerClaimSQL:
+    """Verify the round-robin claim SQL fragments match the design doc contract."""
 
-    def test_claim_query_has_for_update_skip_locked(self):
-        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
+    def test_preclaim_upsert_targets_agent_runtime_state(self):
+        assert "agent_runtime_state" in _PRECLAIM_UPSERT_SQL
 
-    def test_claim_query_checks_retry_after(self):
-        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
+    def test_preclaim_upsert_filters_queued_tasks(self):
+        assert "status = 'queued'" in _PRECLAIM_UPSERT_SQL
 
-    def test_claim_query_uses_cte(self):
-        assert "WITH claimable AS" in build_claim_query(60)
+    def test_preclaim_upsert_uses_on_conflict(self):
+        assert "ON CONFLICT DO NOTHING" in _PRECLAIM_UPSERT_SQL
 
-    def test_claim_query_sets_running(self):
-        assert "status = 'running'" in build_claim_query(60)
+    def test_preclaim_upsert_filters_by_pool_and_tenant(self):
+        assert "worker_pool_id = $1" in _PRECLAIM_UPSERT_SQL
+        assert "tenant_id = $2" in _PRECLAIM_UPSERT_SQL
 
-    def test_claim_query_sets_lease_expiry(self):
-        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in build_claim_query(60)
+    def test_eligible_agent_joins_agents_table(self):
+        assert "JOIN agents a" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_claim_query_returns_full_row(self):
-        assert "RETURNING t.*" in build_claim_query(60)
+    def test_eligible_agent_checks_active_status(self):
+        assert "a.status = 'active'" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_claim_query_orders_by_created_at(self):
-        assert "ORDER BY created_at" in build_claim_query(60)
+    def test_eligible_agent_checks_concurrency_limit(self):
+        assert "running_task_count < a.max_concurrent_tasks" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_claim_query_filters_by_pool_and_tenant(self):
-        assert "worker_pool_id = $1" in build_claim_query(60)
-        assert "tenant_id = $2" in build_claim_query(60)
+    def test_eligible_agent_checks_hourly_budget(self):
+        assert "hour_window_cost_microdollars < a.budget_max_per_hour" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_claim_query_increments_version(self):
-        assert "version = t.version + 1" in build_claim_query(60)
+    def test_eligible_agent_checks_queued_tasks_exist(self):
+        assert "EXISTS" in _FIND_ELIGIBLE_AGENT_SQL
+        assert "status = 'queued'" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_checks_retry_after(self):
+        assert "t.retry_after IS NULL OR t.retry_after < NOW()" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_orders_by_scheduler_cursor(self):
+        assert "ORDER BY ars.scheduler_cursor ASC" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_uses_for_update_of_ars(self):
+        assert "FOR UPDATE OF ars" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_filters_by_pool_and_tenant(self):
+        assert "worker_pool_id = $1" in _FIND_ELIGIBLE_AGENT_SQL
+        assert "ars.tenant_id = $2" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_find_task_has_for_update_skip_locked(self):
+        assert "FOR UPDATE SKIP LOCKED" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_checks_retry_after(self):
+        assert "retry_after IS NULL OR retry_after < NOW()" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_orders_by_created_at(self):
+        assert "ORDER BY created_at ASC" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_filters_by_pool_and_agent(self):
+        assert "tenant_id = $1" in _FIND_AGENT_TASK_SQL
+        assert "agent_id = $2" in _FIND_AGENT_TASK_SQL
+        assert "worker_pool_id = $3" in _FIND_AGENT_TASK_SQL
+
+    def test_claim_task_sets_running(self):
+        assert "status = 'running'" in _CLAIM_TASK_SQL
+
+    def test_claim_task_sets_lease(self):
+        assert "lease_owner = $1" in _CLAIM_TASK_SQL
+        assert "lease_expiry" in _CLAIM_TASK_SQL
+
+    def test_claim_task_increments_version(self):
+        assert "version = version + 1" in _CLAIM_TASK_SQL
+
+    def test_claim_task_returns_full_row(self):
+        assert "RETURNING *" in _CLAIM_TASK_SQL
+
+    def test_update_runtime_state_increments_running_count(self):
+        assert "running_task_count = running_task_count + 1" in _UPDATE_RUNTIME_STATE_SQL
+
+    def test_update_runtime_state_advances_cursor(self):
+        assert "scheduler_cursor = NOW()" in _UPDATE_RUNTIME_STATE_SQL
+
+    def test_insert_task_event_matches_pattern(self):
+        assert "task_events" in _INSERT_TASK_EVENT_SQL
+        assert "event_type" in _INSERT_TASK_EVENT_SQL
 
 
 class TestPollerBackoff:
@@ -115,13 +174,29 @@ class TestPollerSemaphore:
 
 
 class TestPollerTryClaim:
-    """Test the _try_claim method with mocked database."""
+    """Test the _try_claim method with mocked database.
+
+    The new claim path makes multiple sequential fetchrow calls within a single
+    transaction.  The mock conn's fetchrow is configured via side_effect to
+    return different values for the agent-eligibility step, the task-find step,
+    and the claim-update step.
+    """
 
     @staticmethod
-    def _make_poller_conn(fetchrow_return=None):
-        """Create a mock conn with transaction() support for poller tests."""
+    def _make_poller_conn(fetchrow_side_effect=None, fetchrow_return=None):
+        """Create a mock conn with transaction() support for poller tests.
+
+        For the new round-robin claim, fetchrow is called 3 times in succession
+        (find agent, find task, claim task).  Use ``fetchrow_side_effect`` to
+        provide a list of return values for each call.  If only
+        ``fetchrow_return`` is given, all calls return the same value (backward
+        compat for simple cases).
+        """
         conn = AsyncMock()
-        conn.fetchrow = AsyncMock(return_value=fetchrow_return)
+        if fetchrow_side_effect is not None:
+            conn.fetchrow = AsyncMock(side_effect=fetchrow_side_effect)
+        else:
+            conn.fetchrow = AsyncMock(return_value=fetchrow_return)
         conn.execute = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
         conn.fetchval = AsyncMock(return_value=None)
@@ -132,9 +207,28 @@ class TestPollerTryClaim:
         conn.transaction = MagicMock(return_value=tx)
         return conn
 
-    async def test_try_claim_returns_false_when_no_task(self):
+    async def test_try_claim_returns_false_when_no_eligible_agent(self):
+        """When step 1 (find eligible agent) returns None, claim should fail."""
         config = WorkerConfig(worker_id="test-poller")
-        conn = self._make_poller_conn(fetchrow_return=None)
+        # Step 1 returns None → no eligible agent
+        conn = self._make_poller_conn(fetchrow_side_effect=[None])
+        pool = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        pool.acquire = MagicMock(return_value=ctx)
+        metrics = MetricsCollector()
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
+
+        result = await poller._try_claim()
+        assert result is False
+
+    async def test_try_claim_returns_false_when_no_task_found(self):
+        """When step 2 (find task) returns None, claim should fail."""
+        config = WorkerConfig(worker_id="test-poller")
+        agent_row = {"tenant_id": "default", "agent_id": "agent-1"}
+        # Step 1 returns agent, Step 2 returns None (no task)
+        conn = self._make_poller_conn(fetchrow_side_effect=[agent_row, None])
         pool = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -149,7 +243,9 @@ class TestPollerTryClaim:
     async def test_try_claim_returns_true_when_task_claimed(self):
         config = WorkerConfig(worker_id="test-poller")
         task_id = uuid.uuid4()
-        row = {
+        agent_row = {"tenant_id": "default", "agent_id": "test-agent"}
+        task_row = {"task_id": task_id}
+        claimed_row = {
             "task_id": task_id,
             "tenant_id": "default",
             "agent_id": "test-agent",
@@ -157,7 +253,10 @@ class TestPollerTryClaim:
             "retry_count": 0,
         }
 
-        conn = self._make_poller_conn(fetchrow_return=row)
+        # Step 1: agent, Step 2: task, Step 3: claimed row
+        conn = self._make_poller_conn(
+            fetchrow_side_effect=[agent_row, task_row, claimed_row]
+        )
         pool = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -172,10 +271,34 @@ class TestPollerTryClaim:
         assert result is True
         assert metrics.get_counter("tasks.active", worker_id="test-poller") >= 1
 
-    async def test_try_claim_invokes_callback(self):
+    async def test_try_claim_executes_preclaim_upsert(self):
+        """Verify the pre-claim upsert (step 0) is called before finding agents."""
+        config = WorkerConfig(worker_id="test-poller", worker_pool_id="pool-1", tenant_id="t1")
+        # No eligible agent
+        conn = self._make_poller_conn(fetchrow_side_effect=[None])
+        pool = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        pool.acquire = MagicMock(return_value=ctx)
+        metrics = MetricsCollector()
+        poller = TaskPoller(config, pool, metrics, MagicMock(), MagicMock())
+
+        await poller._try_claim()
+
+        # The first conn.execute call should be the pre-claim upsert
+        first_execute_call = conn.execute.call_args_list[0]
+        assert "agent_runtime_state" in first_execute_call[0][0]
+        assert first_execute_call[0][1] == "pool-1"
+        assert first_execute_call[0][2] == "t1"
+
+    async def test_try_claim_updates_runtime_state_and_inserts_event(self):
+        """Verify step 4 (runtime state update) and step 5 (event insert) are called."""
         config = WorkerConfig(worker_id="test-poller")
         task_id = uuid.uuid4()
-        row = {
+        agent_row = {"tenant_id": "default", "agent_id": "test-agent"}
+        task_row = {"task_id": task_id}
+        claimed_row = {
             "task_id": task_id,
             "tenant_id": "default",
             "agent_id": "test-agent",
@@ -183,7 +306,49 @@ class TestPollerTryClaim:
             "retry_count": 0,
         }
 
-        conn = self._make_poller_conn(fetchrow_return=row)
+        conn = self._make_poller_conn(
+            fetchrow_side_effect=[agent_row, task_row, claimed_row]
+        )
+        pool = MagicMock()
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=conn)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        pool.acquire = MagicMock(return_value=ctx)
+        metrics = MetricsCollector()
+        poller = TaskPoller(config, pool, metrics, MagicMock(), None)
+
+        await poller._try_claim()
+
+        # conn.execute is called 3 times: pre-claim upsert, runtime state update, event insert
+        assert conn.execute.call_count == 3
+
+        # Step 4: runtime state update
+        runtime_call = conn.execute.call_args_list[1]
+        assert "running_task_count = running_task_count + 1" in runtime_call[0][0]
+        assert runtime_call[0][1] == "default"
+        assert runtime_call[0][2] == "test-agent"
+
+        # Step 5: event insert
+        event_call = conn.execute.call_args_list[2]
+        assert "task_events" in event_call[0][0]
+        assert event_call[0][4] == "task_claimed"
+
+    async def test_try_claim_invokes_callback(self):
+        config = WorkerConfig(worker_id="test-poller")
+        task_id = uuid.uuid4()
+        agent_row = {"tenant_id": "default", "agent_id": "test-agent"}
+        task_row = {"task_id": task_id}
+        claimed_row = {
+            "task_id": task_id,
+            "tenant_id": "default",
+            "agent_id": "test-agent",
+            "status": "running",
+            "retry_count": 0,
+        }
+
+        conn = self._make_poller_conn(
+            fetchrow_side_effect=[agent_row, task_row, claimed_row]
+        )
         pool = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
@@ -242,7 +407,9 @@ class TestPollerTryClaim:
                 self._ensure_open()
                 return self._data.keys()
 
-        row = ConnectionBoundRow(
+        agent_row = {"tenant_id": "default", "agent_id": "test-agent"}
+        task_row = {"task_id": task_id}
+        claimed_row = ConnectionBoundRow(
             {
                 "task_id": task_id,
                 "tenant_id": "default",
@@ -252,14 +419,16 @@ class TestPollerTryClaim:
             }
         )
 
-        conn = self._make_poller_conn(fetchrow_return=row)
+        conn = self._make_poller_conn(
+            fetchrow_side_effect=[agent_row, task_row, claimed_row]
+        )
         pool = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)
 
         async def _close_connection(exc_type=None, exc=None, tb=None):
             del exc_type, exc, tb
-            row.mark_closed()
+            claimed_row.mark_closed()
             return False
 
         ctx.__aexit__ = AsyncMock(side_effect=_close_connection)
@@ -342,7 +511,9 @@ class TestPollerDrain:
     async def test_cancel_active_tasks_cancels_running_execution_tasks(self):
         config = WorkerConfig(worker_id="test-poller")
         task_id = uuid.uuid4()
-        row = {
+        agent_row = {"tenant_id": "default", "agent_id": "test-agent"}
+        task_row_data = {"task_id": task_id}
+        claimed_row = {
             "task_id": task_id,
             "tenant_id": "default",
             "agent_id": "test-agent",
@@ -350,7 +521,9 @@ class TestPollerDrain:
             "retry_count": 0,
         }
 
-        conn = TestPollerTryClaim._make_poller_conn(fetchrow_return=row)
+        conn = TestPollerTryClaim._make_poller_conn(
+            fetchrow_side_effect=[agent_row, task_row_data, claimed_row]
+        )
         pool = MagicMock()
         ctx = AsyncMock()
         ctx.__aenter__ = AsyncMock(return_value=conn)

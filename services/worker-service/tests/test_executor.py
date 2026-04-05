@@ -196,30 +196,45 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
             mock_ckpt.aget_tuple.return_value = None
             MockCheckpointer.return_value = mock_ckpt
 
-            async def mock_astream(*args, **kwargs):
-                yield {"mock": "event"}
-            mock_compiled.astream = mock_astream
-
+            # Build an AI message with response_metadata for per-step cost tracking
             mock_msg = MagicMock()
             mock_msg.type = "ai"
             mock_msg.content = "Final Answer: 4"
             mock_msg.response_metadata = {
                 "usage": {"input_tokens": 100, "output_tokens": 50},
             }
+
+            async def mock_astream(*args, **kwargs):
+                # Yield an agent event so per-step cost tracking fires
+                yield {"agent": {"messages": [mock_msg]}}
+            mock_compiled.astream = mock_astream
+
             mock_state = MagicMock()
             mock_state.values = {"messages": [mock_msg]}
             mock_compiled.aget_state.return_value = mock_state
-            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
 
-            # The worker now writes cost to checkpoints via pool.execute
-            execute_calls = mock_worker.pool.execute.call_args_list
-            cost_update_calls = [c for c in execute_calls if "UPDATE checkpoints" in str(c) and "cost_microdollars" in str(c)]
-            assert len(cost_update_calls) > 0, "Expected checkpoint cost update via pool.execute"
-            # Completion now uses conn.fetchval via pool.acquire()
+            # Mock _calculate_step_cost to return a non-zero cost and
+            # _record_step_cost to verify it is called
+            with patch.object(executor, "_calculate_step_cost", new_callable=AsyncMock, return_value=(150, {"input_tokens": 100, "output_tokens": 50, "model": "claude-3-5-sonnet-latest"})):
+                with patch.object(executor, "_record_step_cost", new_callable=AsyncMock, return_value=(150, 150)) as mock_record:
+                    await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+                    # Per-step cost recording should have been called via pool.acquire()
+                    mock_record.assert_called_once()
+                    call_args = mock_record.call_args
+                    # Verify task_id, tenant_id, agent_id were passed
+                    assert call_args[0][1] == task_data["task_id"]
+                    assert call_args[0][2] == task_data["tenant_id"]
+                    assert call_args[0][3] == task_data["agent_id"]
+                    # Verify cost_microdollars was passed
+                    assert call_args[0][5] == 150
+
+            # Completion should still work via conn.fetchval
             mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
-            completion_args, _ = mock_conn.fetchval.call_args
-            assert "UPDATE tasks" in completion_args[0]
-            assert "status='completed'" in completion_args[0]
+            # Find the completion call among all fetchval calls
+            fetchval_calls = mock_conn.fetchval.call_args_list
+            completion_calls = [c for c in fetchval_calls if "UPDATE tasks" in str(c) and "status='completed'" in str(c)]
+            assert len(completion_calls) > 0, "Expected task completion UPDATE"
 
 
 @pytest.mark.asyncio

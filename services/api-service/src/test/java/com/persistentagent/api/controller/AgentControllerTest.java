@@ -67,7 +67,7 @@ class AgentControllerTest {
                 "provider", "openai", "model", "gpt-4o",
                 "temperature", 0.7, "allowed_tools", List.of("web_search"));
         AgentResponse response = new AgentResponse(
-                "generated-uuid", "Test Agent", configObj, "active", now, now);
+                "generated-uuid", "Test Agent", configObj, "active", 5, 500000L, 5000000L, now, now);
         when(agentService.createAgent(any())).thenReturn(response);
 
         mockMvc.perform(post("/v1/agents")
@@ -117,7 +117,7 @@ class AgentControllerTest {
     void listAgents_returns200() throws Exception {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         AgentSummaryResponse item = new AgentSummaryResponse(
-                "test-agent", "Test Agent", "openai", "gpt-4o", "active", now, now);
+                "test-agent", "Test Agent", "openai", "gpt-4o", "active", 5, 500000L, 5000000L, now, now);
         when(agentService.listAgents(isNull(), isNull())).thenReturn(List.of(item));
 
         mockMvc.perform(get("/v1/agents"))
@@ -133,7 +133,7 @@ class AgentControllerTest {
     void listAgents_withStatusFilter_returns200() throws Exception {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         AgentSummaryResponse item = new AgentSummaryResponse(
-                "test-agent", "Test Agent", "openai", "gpt-4o", "disabled", now, now);
+                "test-agent", "Test Agent", "openai", "gpt-4o", "disabled", 5, 500000L, 5000000L, now, now);
         when(agentService.listAgents(eq("disabled"), isNull())).thenReturn(List.of(item));
 
         mockMvc.perform(get("/v1/agents").param("status", "disabled"))
@@ -158,7 +158,7 @@ class AgentControllerTest {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         Object configObj = Map.of("system_prompt", "prompt", "provider", "openai", "model", "gpt-4o");
         AgentResponse response = new AgentResponse(
-                "test-agent", "Test Agent", configObj, "active", now, now);
+                "test-agent", "Test Agent", configObj, "active", 5, 500000L, 5000000L, now, now);
         when(agentService.getAgent("test-agent")).thenReturn(response);
 
         mockMvc.perform(get("/v1/agents/test-agent"))
@@ -186,7 +186,7 @@ class AgentControllerTest {
         Object configObj = Map.of("system_prompt", "You are an updated assistant.",
                 "provider", "openai", "model", "gpt-4o");
         AgentResponse response = new AgentResponse(
-                "test-agent", "Updated Agent", configObj, "active", now, now);
+                "test-agent", "Updated Agent", configObj, "active", 5, 500000L, 5000000L, now, now);
         when(agentService.updateAgent(eq("test-agent"), any())).thenReturn(response);
 
         mockMvc.perform(put("/v1/agents/test-agent")

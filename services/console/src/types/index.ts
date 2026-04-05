@@ -44,6 +44,15 @@ export interface TaskStatusResponse {
     pending_input_prompt?: string;
     pending_approval_action?: Record<string, unknown>;
     human_input_timeout_at?: string;
+    pause_reason?: 'budget_per_task' | 'budget_per_hour' | null;
+    pause_details?: {
+        budget_max_per_task?: number;
+        budget_max_per_hour?: number;
+        observed_task_cost_microdollars?: number;
+        observed_hour_cost_microdollars?: number;
+        recovery_mode?: 'manual_resume_after_budget_increase' | 'automatic_after_window_clears';
+    } | null;
+    resume_eligible_at?: string | null;
     created_at: string;
     updated_at: string;
 }
@@ -155,6 +164,8 @@ export interface TaskSummaryResponse {
     retry_count: number;
     checkpoint_count: number;
     total_cost_microdollars: number;
+    pause_reason?: 'budget_per_task' | 'budget_per_hour' | null;
+    resume_eligible_at?: string | null;
     created_at: string;
     updated_at: string;
 }
@@ -209,6 +220,9 @@ export interface AgentSummaryResponse {
     provider: string;
     model: string;
     status: 'active' | 'disabled';
+    max_concurrent_tasks: number;
+    budget_max_per_task: number;
+    budget_max_per_hour: number;
     created_at: string;
     updated_at: string;
 }
@@ -226,6 +240,9 @@ export interface AgentResponse {
     display_name: string;
     agent_config: AgentConfig;
     status: 'active' | 'disabled';
+    max_concurrent_tasks: number;
+    budget_max_per_task: number;
+    budget_max_per_hour: number;
     created_at: string;
     updated_at: string;
 }
@@ -236,6 +253,9 @@ export interface AgentCreateRequest {
         temperature?: number;
         allowed_tools?: string[];
     };
+    max_concurrent_tasks?: number;
+    budget_max_per_task?: number;
+    budget_max_per_hour?: number;
 }
 
 export interface AgentUpdateRequest {
@@ -245,4 +265,7 @@ export interface AgentUpdateRequest {
         allowed_tools?: string[];
     };
     status: 'active' | 'disabled';
+    max_concurrent_tasks?: number;
+    budget_max_per_task?: number;
+    budget_max_per_hour?: number;
 }

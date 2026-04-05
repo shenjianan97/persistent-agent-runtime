@@ -54,9 +54,26 @@ See [STATUS.md](./STATUS.md) for phase-level tracking and links to each track's 
 
 ## Agent Skills (Superpowers)
 
-If superpowers skills are installed, agents MUST use them. Before starting any task, check if a relevant skill applies and invoke it via the `Skill` tool. Skills provide specialized workflows (debugging, TDD, brainstorming, code review, etc.) that override default behavior. User instructions always take precedence over skills.
+**Non-negotiable:** If superpowers skills are installed, agents MUST use them.
+
+1. **At conversation start**, invoke the `using-superpowers` skill via the `Skill` tool. This is mandatory before any other action — including reading files, exploring the codebase, or asking clarifying questions.
+2. **Before every task**, check if a relevant skill applies (debugging, TDD, brainstorming, code review, etc.) and invoke it via the `Skill` tool. If there is even a 1% chance a skill is relevant, invoke it.
+3. **Priority order**: User instructions > Superpowers skills > Default system behavior.
+4. **Do not rationalize skipping skills.** "This is just a simple question" or "Let me explore first" are not valid reasons. The skill tells you *how* to explore or answer.
 
 ## Local Validation Notes
 
 - For local testing, follow `README.md` and `docs/LOCAL_DEVELOPMENT.md`.
+- The `Makefile` has wrapper targets for setup and testing (`make init`, `make install`, `make test`, `make start`, `make stop`, `make status`). Use these as the primary entry point.
 - When validating background `Makefile` targets (`make start`, `make status`, `make stop`), prefer an interactive shell / PTY.
+- **Python:** Always use the worker virtualenv at `services/worker-service/.venv/`. Run Python commands via `services/worker-service/.venv/bin/python` or activate with `source services/worker-service/.venv/bin/activate`. Do NOT use bare `python3` or `uv run` — the venv has all dependencies pinned.
+
+## Testing (Mandatory)
+
+**Every code change must be tested before it is considered done.** No exceptions. See [LOCAL_DEVELOPMENT.md](./docs/LOCAL_DEVELOPMENT.md) for full details on test locations, single-test commands, and conventions.
+
+- **Write tests** for every code change. Cover all use cases and failure scenarios.
+- `make test` — unit tests (fast, no infra). **Required after every change.**
+- `make e2e-test` — E2E on isolated infra. **Required after DB/schema or cross-service changes.**
+- `make test-all` — both combined.
+- Run the **narrowest scope** that covers your change. If tests fail — including pre-existing failures — fix them before moving on.
