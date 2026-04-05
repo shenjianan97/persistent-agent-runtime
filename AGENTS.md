@@ -53,6 +53,10 @@ Example (Phase 2 had 2 tracks, ~14 tasks total):
 - Stage 5 (Validation): In progress — remaining: crash-recovery demo, perf testing, demo video
 - Stage 6 (Launch): Not started
 
+## Agent Skills (Superpowers)
+
+If superpowers skills are installed, agents MUST use them. Before starting any task, check if a relevant skill applies and invoke it via the `Skill` tool. Skills provide specialized workflows (debugging, TDD, brainstorming, code review, etc.) that override default behavior. User instructions always take precedence over skills.
+
 ## Local Validation Notes
 
 - For local testing, follow `README.md` and `docs/LOCAL_DEVELOPMENT.md`.
