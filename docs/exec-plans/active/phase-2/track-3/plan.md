@@ -48,8 +48,9 @@ Track 3 extends the Phase 1/2 runtime with:
 Task 1 (Schema) ─┬──→ Task 2 (Incremental Cost) ──→ Task 4 (Budget Enforcement) ──┐
                   │                                                                  │
                   ├──→ Task 3 (Scheduler Claim) ────────────────────────────────────→├──→ Task 8 (Integration Tests)
-                  │                                                                  │
-                  ├──→ Task 5 (Reaper: Auto-Recovery + Reconciliation) ─────────────→│
+                  │                                    │                             │
+                  │    Task 2 ──→ Task 5 (Reaper) ─────┤────────────────────────────→│
+                  │    Task 3 ──↗                       │                             │
                   │                                                                  │
                   ├──→ Task 6 (Agent + Task API) ──→ Task 7 (Console) ──────────────→│
                   │                                                                  │
@@ -57,8 +58,9 @@ Task 1 (Schema) ─┬──→ Task 2 (Incremental Cost) ──→ Task 4 (Budg
 ```
 
 **Parallelization opportunities:**
-- After Task 1: Tasks 2, 3, 5, 6 can all start in parallel
-- Task 4 depends on Task 2 (incremental cost must exist before budget enforcement)
+- After Task 1: Tasks 2, 3, 6 can all start in parallel
+- Task 4 depends on Tasks 1, 2 (incremental cost must exist before budget enforcement)
+- Task 5 depends on Tasks 1, 2, 3 (needs cost ledger + running count increments from claim)
 - Task 7 depends on Task 6 (API must expose fields before console can consume them)
 - Task 8 depends on all backend tasks (1-6)
 
