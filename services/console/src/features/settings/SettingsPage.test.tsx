@@ -16,7 +16,7 @@ describe('SettingsPage', () => {
         render(<SettingsPage />);
 
         expect(screen.getByText('Settings')).toBeInTheDocument();
-        expect(screen.getByText('Configuration')).toBeInTheDocument();
+        expect(screen.getByText(/manage integrations and platform configuration/i)).toBeInTheDocument();
     });
 
     it('renders endpoint list component', () => {

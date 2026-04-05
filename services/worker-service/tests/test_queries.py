@@ -1,7 +1,14 @@
 """Tests verifying SQL queries match the design document exactly."""
 
 from core.heartbeat import build_heartbeat_query
-from core.poller import build_claim_query
+from core.poller import (
+    _PRECLAIM_UPSERT_SQL,
+    _FIND_ELIGIBLE_AGENT_SQL,
+    _FIND_AGENT_TASK_SQL,
+    _CLAIM_TASK_SQL,
+    _UPDATE_RUNTIME_STATE_SQL,
+    _INSERT_TASK_EVENT_SQL,
+)
 from core.reaper import (
     REAPER_DEAD_LETTER_QUERY,
     REAPER_REQUEUE_QUERY,
@@ -10,69 +17,120 @@ from core.reaper import (
 
 
 class TestClaimQueryContract:
-    """Verify the claim query matches docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1."""
+    """Verify the agent-aware round-robin claim SQL matches the Track 3 design contract.
 
-    def test_uses_cte_pattern(self):
-        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
+    The claim path uses sequential queries within a single transaction instead
+    of a single CTE-based query.  Each SQL fragment is tested individually.
+    """
 
-    def test_claim_query_checks_retry_after(self):
-        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
+    # --- Pre-claim upsert (Step 0) ---
 
-    def test_claim_query_uses_cte(self):
-        assert "WITH claimable AS" in build_claim_query(60)
+    def test_preclaim_upsert_targets_agent_runtime_state(self):
+        assert "agent_runtime_state" in _PRECLAIM_UPSERT_SQL
 
-    def test_selects_queued_tasks(self):
-        assert "status = 'queued'" in build_claim_query(60)
+    def test_preclaim_upsert_selects_queued_tasks(self):
+        assert "status = 'queued'" in _PRECLAIM_UPSERT_SQL
 
-    def test_filters_by_pool(self):
-        assert "worker_pool_id = $1" in build_claim_query(60)
+    def test_preclaim_upsert_filters_by_pool(self):
+        assert "worker_pool_id = $1" in _PRECLAIM_UPSERT_SQL
 
-    def test_filters_by_tenant(self):
-        assert "tenant_id = $2" in build_claim_query(60)
+    def test_preclaim_upsert_filters_by_tenant(self):
+        assert "tenant_id = $2" in _PRECLAIM_UPSERT_SQL
 
-    def test_respects_retry_after(self):
-        assert "retry_after IS NULL OR retry_after < NOW()" in build_claim_query(60)
+    def test_preclaim_upsert_uses_on_conflict_do_nothing(self):
+        assert "ON CONFLICT DO NOTHING" in _PRECLAIM_UPSERT_SQL
 
-    def test_orders_by_created_at(self):
-        assert "ORDER BY created_at" in build_claim_query(60)
+    # --- Eligible agent selection (Step 1) ---
 
-    def test_limits_to_one(self):
-        assert "LIMIT 1" in build_claim_query(60)
+    def test_eligible_agent_joins_agents_table(self):
+        assert "JOIN agents a" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_for_update_skip_locked(self):
-        assert "FOR UPDATE SKIP LOCKED" in build_claim_query(60)
+    def test_eligible_agent_checks_active_status(self):
+        assert "a.status = 'active'" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_updates_to_running(self):
-        assert "SET status = 'running'" in build_claim_query(60)
+    def test_eligible_agent_checks_concurrency(self):
+        assert "running_task_count < a.max_concurrent_tasks" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_sets_lease_owner(self):
-        assert "lease_owner = $3" in build_claim_query(60)
+    def test_eligible_agent_checks_hourly_budget(self):
+        assert "hour_window_cost_microdollars < a.budget_max_per_hour" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_sets_lease_expiry_60s(self):
-        assert "lease_expiry = NOW() + INTERVAL '60 seconds'" in build_claim_query(60)
+    def test_eligible_agent_has_queued_tasks(self):
+        assert "EXISTS" in _FIND_ELIGIBLE_AGENT_SQL
+        assert "status = 'queued'" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_claim_query_respects_configured_lease_duration(self):
-        assert "lease_expiry = NOW() + INTERVAL '7 seconds'" in build_claim_query(7)
+    def test_eligible_agent_respects_retry_after(self):
+        assert "t.retry_after IS NULL OR t.retry_after < NOW()" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_increments_version(self):
-        assert "version = t.version + 1" in build_claim_query(60)
+    def test_eligible_agent_orders_by_scheduler_cursor(self):
+        assert "ORDER BY ars.scheduler_cursor ASC" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_returns_full_row(self):
-        assert "RETURNING t.*" in build_claim_query(60)
+    def test_eligible_agent_limits_to_one(self):
+        assert "LIMIT 1" in _FIND_ELIGIBLE_AGENT_SQL
 
-    def test_no_version_in_where(self):
-        """Version check is intentionally omitted from WHERE clause per design doc."""
-        # Ensure version is not in the WHERE of the CTE or UPDATE
-        where_sections = build_claim_query(60).split("WHERE")
-        for section in where_sections[1:]:
-            # Only check until SET or RETURNING
-            end = section.find("SET")
-            if end == -1:
-                end = section.find("RETURNING")
-            if end == -1:
-                end = len(section)
-            where_clause = section[:end]
-            assert "version" not in where_clause.lower() or "t.version + 1" in section
+    def test_eligible_agent_locks_runtime_state(self):
+        assert "FOR UPDATE OF ars" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_filters_by_pool(self):
+        assert "worker_pool_id = $1" in _FIND_ELIGIBLE_AGENT_SQL
+
+    def test_eligible_agent_filters_by_tenant(self):
+        assert "ars.tenant_id = $2" in _FIND_ELIGIBLE_AGENT_SQL
+
+    # --- Task selection (Step 2) ---
+
+    def test_find_task_selects_queued(self):
+        assert "status = 'queued'" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_filters_by_agent(self):
+        assert "agent_id = $2" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_filters_by_pool(self):
+        assert "worker_pool_id = $3" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_respects_retry_after(self):
+        assert "retry_after IS NULL OR retry_after < NOW()" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_orders_by_created_at(self):
+        assert "ORDER BY created_at ASC" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_limits_to_one(self):
+        assert "LIMIT 1" in _FIND_AGENT_TASK_SQL
+
+    def test_find_task_for_update_skip_locked(self):
+        assert "FOR UPDATE SKIP LOCKED" in _FIND_AGENT_TASK_SQL
+
+    # --- Claim update (Step 3) ---
+
+    def test_claim_updates_to_running(self):
+        assert "status = 'running'" in _CLAIM_TASK_SQL
+
+    def test_claim_sets_lease_owner(self):
+        assert "lease_owner = $1" in _CLAIM_TASK_SQL
+
+    def test_claim_sets_lease_expiry(self):
+        assert "lease_expiry" in _CLAIM_TASK_SQL
+
+    def test_claim_increments_version(self):
+        assert "version = version + 1" in _CLAIM_TASK_SQL
+
+    def test_claim_returns_full_row(self):
+        assert "RETURNING *" in _CLAIM_TASK_SQL
+
+    # --- Runtime state update (Step 4) ---
+
+    def test_runtime_state_increments_running_count(self):
+        assert "running_task_count = running_task_count + 1" in _UPDATE_RUNTIME_STATE_SQL
+
+    def test_runtime_state_advances_scheduler_cursor(self):
+        assert "scheduler_cursor = NOW()" in _UPDATE_RUNTIME_STATE_SQL
+
+    # --- Task event insert (Step 5) ---
+
+    def test_event_insert_targets_task_events(self):
+        assert "task_events" in _INSERT_TASK_EVENT_SQL
+
+    def test_event_insert_includes_event_type(self):
+        assert "event_type" in _INSERT_TASK_EVENT_SQL
 
 
 class TestHeartbeatQueryContract:

@@ -1,8 +1,12 @@
-"""Task Poller — claims queued tasks using FOR UPDATE SKIP LOCKED.
+"""Task Poller — claims queued tasks using agent-aware round-robin scheduling.
 
 Primary wake mechanism: LISTEN new_task (PostgreSQL LISTEN/NOTIFY).
 Fallback: periodic polling with exponential backoff on empty polls.
 Concurrency bounded by asyncio.Semaphore(MAX_CONCURRENT_TASKS).
+
+Scheduling model: round-robin across eligible agents within each worker_pool_id.
+Agent eligibility requires: active status, running_task_count < max_concurrent_tasks,
+hour_window_cost_microdollars < budget_max_per_hour, and queued tasks in the pool.
 """
 
 from __future__ import annotations
@@ -21,30 +25,82 @@ from core.logging import (
     get_logger,
 )
 
-# Exact claim query from docs/design/phase-1/PHASE1_DURABLE_EXECUTION.md Section 6.1
-def build_claim_query(lease_duration_seconds: int) -> str:
-    return f"""
-WITH claimable AS (
-    SELECT task_id
-    FROM tasks
-    WHERE status = 'queued'
-      AND worker_pool_id = $1
-      AND tenant_id = $2
-      AND (retry_after IS NULL OR retry_after < NOW())
-    ORDER BY created_at
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED
-)
-UPDATE tasks t
+
+# SQL fragments for the agent-aware round-robin claim path.
+# These are sequential queries executed within a single transaction.
+
+# Step 0: Ensure all agents with queued tasks have runtime state rows.
+_PRECLAIM_UPSERT_SQL = '''
+INSERT INTO agent_runtime_state
+    (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+SELECT DISTINCT t.tenant_id, t.agent_id, 0, 0, '1970-01-01T00:00:00Z'::timestamptz, NOW()
+FROM tasks t
+WHERE t.worker_pool_id = $1 AND t.tenant_id = $2 AND t.status = 'queued'
+ON CONFLICT DO NOTHING
+'''
+
+# Step 1: Find and lock the next eligible agent (oldest scheduler_cursor).
+_FIND_ELIGIBLE_AGENT_SQL = '''
+SELECT ars.tenant_id, ars.agent_id
+FROM agent_runtime_state ars
+JOIN agents a ON a.tenant_id = ars.tenant_id AND a.agent_id = ars.agent_id
+WHERE a.status = 'active'
+  AND ars.tenant_id = $2
+  AND ars.running_task_count < a.max_concurrent_tasks
+  AND ars.hour_window_cost_microdollars < a.budget_max_per_hour
+  AND EXISTS (
+      SELECT 1 FROM tasks t
+      WHERE t.tenant_id = ars.tenant_id
+        AND t.agent_id = ars.agent_id
+        AND t.worker_pool_id = $1
+        AND t.status = 'queued'
+        AND (t.retry_after IS NULL OR t.retry_after < NOW())
+  )
+ORDER BY ars.scheduler_cursor ASC
+LIMIT 1
+FOR UPDATE OF ars
+'''
+
+# Step 2: Find and lock the chosen agent's oldest eligible queued task.
+_FIND_AGENT_TASK_SQL = '''
+SELECT task_id FROM tasks
+WHERE tenant_id = $1 AND agent_id = $2
+  AND worker_pool_id = $3
+  AND status = 'queued'
+  AND (retry_after IS NULL OR retry_after < NOW())
+ORDER BY created_at ASC
+LIMIT 1
+FOR UPDATE SKIP LOCKED
+'''
+
+# Step 3: Claim the task (queued -> running).
+_CLAIM_TASK_SQL = '''
+UPDATE tasks
 SET status = 'running',
-    lease_owner = $3,
-    lease_expiry = NOW() + INTERVAL '{lease_duration_seconds} seconds',
-    version = t.version + 1,
+    lease_owner = $1,
+    lease_expiry = NOW() + $2 * INTERVAL '1 second',
+    version = version + 1,
     updated_at = NOW()
-FROM claimable c
-WHERE t.task_id = c.task_id
-RETURNING t.*;
-"""
+WHERE task_id = $3
+RETURNING *
+'''
+
+# Step 4: Increment running_task_count and advance scheduler_cursor.
+_UPDATE_RUNTIME_STATE_SQL = '''
+UPDATE agent_runtime_state
+SET running_task_count = running_task_count + 1,
+    scheduler_cursor = NOW(),
+    updated_at = NOW()
+WHERE tenant_id = $1 AND agent_id = $2
+'''
+
+# Step 5: Record task_claimed event.
+_INSERT_TASK_EVENT_SQL = '''
+INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
+                         status_before, status_after, worker_id,
+                         error_code, error_message, details)
+VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+'''
 
 
 class TaskPoller:
@@ -230,7 +286,15 @@ class TaskPoller:
                 await asyncio.sleep(1.0)
 
     async def _try_claim(self) -> bool:
-        """Attempt to claim a single task. Returns True if a task was claimed."""
+        """Attempt to claim a single task using agent-aware round-robin.
+
+        The claim selects the next eligible agent (oldest scheduler_cursor) and
+        claims that agent's oldest queued task.  All state mutations — task status
+        change, running_task_count increment, scheduler_cursor advance, and
+        task_claimed event — happen in a single transaction.
+
+        Returns True if a task was claimed.
+        """
         # Check semaphore availability without blocking
         if self._active_tasks_count >= self._config.max_concurrent_tasks:
             return False
@@ -240,30 +304,69 @@ class TaskPoller:
             task_data: dict[str, Any] | None = None
             async with self._pool.acquire() as conn:
                 async with conn.transaction():
-                    row = await conn.fetchrow(
-                        build_claim_query(self._config.lease_duration_seconds),
+                    # Step 0: Pre-claim upsert — ensure agents with queued
+                    # tasks have runtime state rows so newly created agents
+                    # are visible to the scheduler.
+                    await conn.execute(
+                        _PRECLAIM_UPSERT_SQL,
                         self._config.worker_pool_id,
                         self._config.tenant_id,
-                        self._config.worker_id,
                     )
-                    if row is not None:
-                        task_id_str = str(row["task_id"])
-                        tenant_id = row["tenant_id"]
-                        agent_id = row.get("agent_id") or "unknown"
-                        await conn.execute(
-                            '''INSERT INTO task_events (tenant_id, task_id, agent_id, event_type,
-                                                        status_before, status_after, worker_id,
-                                                        error_code, error_message, details)
-                               VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)''',
-                            tenant_id, task_id_str, agent_id, "task_claimed",
-                            "queued", "running", self._config.worker_id,
-                            None, None, "{}",
-                        )
-                        task_data = dict(row)
 
-            if task_data is None:
-                self._semaphore.release()
-                return False
+                    # Step 1: Find and lock the next eligible agent
+                    agent_row = await conn.fetchrow(
+                        _FIND_ELIGIBLE_AGENT_SQL,
+                        self._config.worker_pool_id,
+                        self._config.tenant_id,
+                    )
+                    if agent_row is None:
+                        # No eligible agents — release semaphore and back off
+                        self._semaphore.release()
+                        return False
+
+                    # Step 2: Find and lock that agent's oldest queued task
+                    task_row = await conn.fetchrow(
+                        _FIND_AGENT_TASK_SQL,
+                        agent_row['tenant_id'],
+                        agent_row['agent_id'],
+                        self._config.worker_pool_id,
+                    )
+                    if task_row is None:
+                        # Task was claimed by another worker between steps
+                        self._semaphore.release()
+                        return False
+
+                    # Step 3: Claim the task (queued -> running)
+                    claimed = await conn.fetchrow(
+                        _CLAIM_TASK_SQL,
+                        self._config.worker_id,
+                        self._config.lease_duration_seconds,
+                        task_row['task_id'],
+                    )
+
+                    # Step 4: Increment running_task_count and advance cursor
+                    await conn.execute(
+                        _UPDATE_RUNTIME_STATE_SQL,
+                        agent_row['tenant_id'],
+                        agent_row['agent_id'],
+                    )
+
+                    # Step 5: Record task_claimed event
+                    await conn.execute(
+                        _INSERT_TASK_EVENT_SQL,
+                        claimed['tenant_id'],
+                        str(claimed['task_id']),
+                        claimed['agent_id'],
+                        "task_claimed",
+                        "queued",
+                        "running",
+                        self._config.worker_id,
+                        None,
+                        None,
+                        "{}",
+                    )
+
+                    task_data = dict(claimed)
 
             task_id = str(task_data["task_id"])
 

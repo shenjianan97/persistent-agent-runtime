@@ -103,7 +103,8 @@ public class TaskRepository {
                        last_error_code, last_error_message, last_worker_id,
                        dead_letter_reason, dead_lettered_at, created_at, updated_at,
                        langfuse_endpoint_id,
-                       pending_input_prompt, pending_approval_action, human_input_timeout_at
+                       pending_input_prompt, pending_approval_action, human_input_timeout_at,
+                       pause_reason, pause_details, resume_eligible_at
                 FROM tasks
                 WHERE task_id = ? AND tenant_id = ?
                 """;
@@ -124,6 +125,7 @@ public class TaskRepository {
                        t.dead_letter_reason, t.dead_lettered_at, t.created_at, t.updated_at,
                        t.langfuse_endpoint_id,
                        t.pending_input_prompt, t.pending_approval_action, t.human_input_timeout_at,
+                       t.pause_reason, t.pause_details, t.resume_eligible_at,
                        (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
                        (SELECT COALESCE(SUM(c.cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
                 FROM tasks t
@@ -348,6 +350,76 @@ public class TaskRepository {
     }
 
     /**
+     * Result of a resume mutation that carries diagnostic fields for differentiated 409 messages.
+     */
+    public record ResumeMutationResult(
+            MutationResult outcome,
+            String workerPoolId,
+            String agentId,
+            String currentStatus,
+            Long taskCost,
+            Long budgetMax,
+            String agentStatus
+    ) {}
+
+    /**
+     * Resumes a paused task back to queued, validating budget and agent status atomically.
+     * Returns ResumeMutationResult with diagnostic fields for differentiated error messages.
+     */
+    public ResumeMutationResult resumeTask(UUID taskId, String tenantId) {
+        String sql = """
+                WITH target AS (
+                    SELECT t.task_id, t.status, t.worker_pool_id, t.tenant_id, t.agent_id,
+                           COALESCE((SELECT SUM(cost_microdollars) FROM agent_cost_ledger WHERE task_id = t.task_id), 0) AS task_cost,
+                           a.budget_max_per_task, a.status AS agent_status
+                    FROM tasks t
+                    JOIN agents a ON t.tenant_id = a.tenant_id AND t.agent_id = a.agent_id
+                    WHERE t.task_id = ? AND t.tenant_id = ?
+                ),
+                updated AS (
+                    UPDATE tasks t
+                    SET status = 'queued', pause_reason = NULL, pause_details = NULL,
+                        resume_eligible_at = NULL, version = version + 1, updated_at = NOW()
+                    FROM target tgt
+                    WHERE t.task_id = tgt.task_id AND t.status = 'paused'
+                      AND tgt.task_cost <= tgt.budget_max_per_task AND tgt.agent_status = 'active'
+                    RETURNING t.task_id, tgt.worker_pool_id, tgt.agent_id
+                )
+                SELECT (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS changed,
+                    (SELECT status FROM target LIMIT 1) AS current_status,
+                    (SELECT task_cost FROM target LIMIT 1) AS task_cost,
+                    (SELECT budget_max_per_task FROM target LIMIT 1) AS budget_max,
+                    (SELECT agent_status FROM target LIMIT 1) AS agent_status,
+                    (SELECT worker_pool_id FROM updated LIMIT 1) AS worker_pool_id,
+                    (SELECT agent_id FROM updated LIMIT 1) AS agent_id
+                """;
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql, taskId, tenantId);
+        long found = ((Number) result.get("found")).longValue();
+        long changed = ((Number) result.get("changed")).longValue();
+
+        if (found == 0) {
+            return new ResumeMutationResult(MutationResult.NOT_FOUND, null, null, null, null, null, null);
+        }
+
+        String currentStatus = (String) result.get("current_status");
+        Long taskCost = result.get("task_cost") != null ? ((Number) result.get("task_cost")).longValue() : null;
+        Long budgetMax = result.get("budget_max") != null ? ((Number) result.get("budget_max")).longValue() : null;
+        String agentStatus = (String) result.get("agent_status");
+
+        if (changed > 0) {
+            return new ResumeMutationResult(MutationResult.UPDATED,
+                    (String) result.get("worker_pool_id"),
+                    (String) result.get("agent_id"),
+                    currentStatus, taskCost, budgetMax, agentStatus);
+        }
+
+        return new ResumeMutationResult(MutationResult.WRONG_STATE,
+                null, null, currentStatus, taskCost, budgetMax, agentStatus);
+    }
+
+    /**
      * Lists dead-lettered tasks with optional agent_id filter.
      */
     @SuppressWarnings("null")
@@ -481,13 +553,14 @@ public class TaskRepository {
     }
 
     /**
-     * Lists tasks with optional status and agent_id filters, ordered by most recent first.
+     * Lists tasks with optional status, agent_id, and pause_reason filters, ordered by most recent first.
      */
     @SuppressWarnings("null")
-    public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId, int limit) {
+    public List<Map<String, Object>> listTasks(String tenantId, String status, String agentId,
+            String pauseReason, int limit) {
         StringBuilder sql = new StringBuilder("""
                 SELECT t.task_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.retry_count, t.created_at, t.updated_at,
-                       t.langfuse_endpoint_id,
+                       t.langfuse_endpoint_id, t.pause_reason, t.resume_eligible_at,
                        COALESCE(COUNT(c.checkpoint_id), 0) AS checkpoint_count,
                        COALESCE(SUM(c.cost_microdollars), 0) AS total_cost_microdollars
                 FROM tasks t
@@ -505,7 +578,11 @@ public class TaskRepository {
             sql.append(" AND t.agent_id = ?");
             params.add(agentId);
         }
-        sql.append(" GROUP BY t.task_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.retry_count, t.created_at, t.updated_at, t.langfuse_endpoint_id");
+        if (pauseReason != null && !pauseReason.isBlank()) {
+            sql.append(" AND t.pause_reason = ?");
+            params.add(pauseReason);
+        }
+        sql.append(" GROUP BY t.task_id, t.agent_id, t.agent_display_name_snapshot, t.status, t.retry_count, t.created_at, t.updated_at, t.langfuse_endpoint_id, t.pause_reason, t.resume_eligible_at");
         sql.append(" ORDER BY t.created_at DESC LIMIT ?");
         params.add(limit);
 

@@ -10,10 +10,27 @@ const STATUS_LABELS: Record<string, string> = {
     paused: 'Paused',
 };
 
-export function TaskStatusBadge({ status, className }: { status: TaskStatus, className?: string }) {
-    const label = STATUS_LABELS[status] ?? status.replace('_', ' ');
+export function TaskStatusBadge({ status, pauseReason, className }: { status: TaskStatus, pauseReason?: string | null, className?: string }) {
+    const getBudgetPauseLabel = (reason: string) => {
+        switch (reason) {
+            case 'budget_per_task':
+                return 'Budget (Task)';
+            case 'budget_per_hour':
+                return 'Budget (Hourly)';
+            default:
+                return 'Paused';
+        }
+    };
+
+    const isBudgetPause = status === 'paused' && pauseReason;
+    const label = isBudgetPause
+        ? getBudgetPauseLabel(pauseReason)
+        : (STATUS_LABELS[status] ?? status.replace('_', ' '));
 
     const getBadgeStyle = (status: TaskStatus) => {
+        if (isBudgetPause) {
+            return 'bg-amber-500/10 text-amber-400 border-amber-500/40 shadow-[0_0_12px_rgba(245,158,11,0.3)]';
+        }
         switch (status) {
             case 'queued':
                 return 'bg-warning/10 text-warning border-warning/40 shadow-[0_0_12px_var(--color-warning)]';

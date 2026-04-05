@@ -31,8 +31,8 @@ from helpers.worker_launcher import create_worker, stop_worker
 MIGRATIONS_DIR = REPO_ROOT / "infrastructure" / "database" / "migrations"
 
 DB_HOST = os.getenv("E2E_DB_HOST", "localhost")
-DB_PORT = int(os.getenv("E2E_DB_PORT", "55432"))
-DB_NAME = os.getenv("E2E_DB_NAME", "persistent_agent_runtime")
+DB_PORT = int(os.getenv("E2E_DB_PORT", "55433"))
+DB_NAME = os.getenv("E2E_DB_NAME", "persistent_agent_runtime_e2e")
 DB_USER = os.getenv("E2E_DB_USER", "postgres")
 DB_PASSWORD = os.getenv("E2E_DB_PASSWORD", "postgres")
 DB_DSN = os.getenv(
@@ -40,7 +40,7 @@ DB_DSN = os.getenv(
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
 )
 
-API_PORT = int(os.getenv("E2E_API_PORT", "8080"))
+API_PORT = int(os.getenv("E2E_API_PORT", "8081"))
 API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
 
 os.environ.setdefault("APP_DEV_TASK_CONTROLS_ENABLED", "true")
@@ -343,10 +343,12 @@ async def _force_clean() -> None:
 
 
 async def _do_clean(conn: asyncpg.Connection) -> None:
+    await conn.execute("DELETE FROM agent_cost_ledger")
     await conn.execute("DELETE FROM task_events")
     await conn.execute("DELETE FROM checkpoint_writes")
     await conn.execute("DELETE FROM checkpoints")
     await conn.execute("DELETE FROM tasks")
+    await conn.execute("DELETE FROM agent_runtime_state")
     await conn.execute("DELETE FROM agents")
 
 

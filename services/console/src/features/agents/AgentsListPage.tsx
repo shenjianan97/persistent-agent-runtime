@@ -6,6 +6,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Bot, Ghost, Plus } from 'lucide-react';
+import { formatUsd } from '@/lib/utils';
 
 const STATUS_OPTIONS = [
     { value: '', label: 'All' },
@@ -65,13 +66,16 @@ export function AgentsListPage() {
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Provider</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Model</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10">Status</TableHead>
+                            <TableHead className="font-display uppercase tracking-widest text-xs h-10 text-right">Max Tasks</TableHead>
+                            <TableHead className="font-display uppercase tracking-widest text-xs h-10 text-right">Budget/Task</TableHead>
+                            <TableHead className="font-display uppercase tracking-widest text-xs h-10 text-right">Budget/Hour</TableHead>
                             <TableHead className="font-display uppercase tracking-widest text-xs h-10 text-right">Created</TableHead>
                         </TableRow>
                     </TableHeader>
                     <TableBody>
                         {isLoading && (
                             <TableRow>
-                                <TableCell colSpan={6} className="h-24 text-center">
+                                <TableCell colSpan={9} className="h-24 text-center">
                                     <span className="uppercase tracking-widest text-xs font-bold text-muted-foreground animate-pulse">Loading agents...</span>
                                 </TableCell>
                             </TableRow>
@@ -79,7 +83,7 @@ export function AgentsListPage() {
 
                         {!isLoading && agents.length === 0 && (
                             <TableRow>
-                                <TableCell colSpan={6} className="h-48 text-center text-muted-foreground hover:bg-transparent">
+                                <TableCell colSpan={9} className="h-48 text-center text-muted-foreground hover:bg-transparent">
                                     <div className="flex flex-col items-center justify-center gap-2">
                                         <Ghost className="w-8 h-8 opacity-20 mb-2" />
                                         <span className="uppercase tracking-widest text-xs">No agents found</span>
@@ -114,6 +118,9 @@ export function AgentsListPage() {
                                         {agent.status}
                                     </Badge>
                                 </TableCell>
+                                <TableCell className="text-right tabular-nums">{agent.max_concurrent_tasks}</TableCell>
+                                <TableCell className="text-right tabular-nums text-success">${formatUsd(agent.budget_max_per_task)}</TableCell>
+                                <TableCell className="text-right tabular-nums text-success">${formatUsd(agent.budget_max_per_hour)}</TableCell>
                                 <TableCell className="text-right text-muted-foreground">
                                     {new Date(agent.created_at).toLocaleDateString()}
                                     <br />

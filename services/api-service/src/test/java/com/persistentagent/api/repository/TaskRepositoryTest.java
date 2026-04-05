@@ -66,7 +66,7 @@ class TaskRepositoryTest {
                         Map.entry("updated_at", now)
                 )));
 
-        List<Map<String, Object>> result = taskRepository.listTasks("default", null, null, 50);
+        List<Map<String, Object>> result = taskRepository.listTasks("default", null, null, null, 50);
 
         assertEquals(1, result.size());
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);

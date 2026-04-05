@@ -137,7 +137,7 @@ describe('DashboardPage', () => {
         expect(summaryCard?.querySelector('.rounded-full')).toBeNull();
     });
 
-    it('uses a consistent non-display font treatment for dashboard headings', () => {
+    it('uses font-display for page heading and non-display for section headings', () => {
         overviewMock.mockReturnValue({
             isLoading: false,
             isError: false,
@@ -158,7 +158,7 @@ describe('DashboardPage', () => {
             </MemoryRouter>,
         );
 
-        expect(screen.getByRole('heading', { name: 'Home' }).className).not.toContain('font-display');
+        expect(screen.getByRole('heading', { name: 'Home' }).className).toContain('font-display');
         expect(screen.getByRole('heading', { name: 'Recent Runs' }).className).not.toContain('font-display');
     });
 

@@ -243,6 +243,71 @@ class GraphExecutor:
         output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
         return (int(input_t), int(output_t))
 
+    async def _record_step_cost(
+        self, conn, task_id: str, tenant_id: str, agent_id: str,
+        checkpoint_id: str, cost_microdollars: int,
+    ) -> tuple:
+        """Record step cost in a single transaction.
+
+        1. Update checkpoints.cost_microdollars for the given checkpoint_id
+        2. INSERT into agent_cost_ledger
+        3. UPSERT agent_runtime_state.hour_window_cost_microdollars (increment)
+        4. Return (cumulative_task_cost, hourly_window_cost)
+        """
+        # 1. Update the checkpoint with the step cost
+        await conn.execute(
+            '''UPDATE checkpoints
+               SET cost_microdollars = $1
+               WHERE checkpoint_id = $2
+                 AND task_id = $3::uuid''',
+            cost_microdollars,
+            checkpoint_id,
+            task_id,
+        )
+
+        # 2. Insert into agent_cost_ledger
+        await conn.execute(
+            '''INSERT INTO agent_cost_ledger
+                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+               VALUES ($1, $2, $3::uuid, $4, $5)''',
+            tenant_id,
+            agent_id,
+            task_id,
+            checkpoint_id,
+            cost_microdollars,
+        )
+
+        # 3. Upsert agent_runtime_state, incrementing hour_window_cost_microdollars
+        await conn.execute(
+            '''INSERT INTO agent_runtime_state
+                   (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+               VALUES ($1, $2, 0, $3, '1970-01-01T00:00:00Z', NOW())
+               ON CONFLICT (tenant_id, agent_id) DO UPDATE
+               SET hour_window_cost_microdollars = agent_runtime_state.hour_window_cost_microdollars + $3,
+                   updated_at = NOW()''',
+            tenant_id,
+            agent_id,
+            cost_microdollars,
+        )
+
+        # 4. Return cumulative task cost and hourly window cost
+        cumulative_task_cost = await conn.fetchval(
+            '''SELECT COALESCE(SUM(cost_microdollars), 0)
+               FROM agent_cost_ledger
+               WHERE task_id = $1::uuid''',
+            task_id,
+        )
+
+        hourly_cost = await conn.fetchval(
+            '''SELECT hour_window_cost_microdollars
+               FROM agent_runtime_state
+               WHERE tenant_id = $1 AND agent_id = $2''',
+            tenant_id,
+            agent_id,
+        )
+
+        return (int(cumulative_task_cost), int(hourly_cost or 0))
+
     async def _calculate_step_cost(self, response_metadata: dict, model_name: str) -> tuple[int, dict]:
         """Extract tokens from response metadata and calculate cost in microdollars.
         Returns (cost_microdollars, execution_metadata_dict)."""
@@ -340,12 +405,57 @@ class GraphExecutor:
                             resume_value = payload  # approval payload passed through
                         initial_input = Command(resume=resume_value)
 
+                # Track model name for per-step cost calculation
+                model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
+                # Track cumulative costs for Task 4 budget enforcement (added later)
+                cumulative_task_cost = 0
+                hourly_cost = 0
+
                 # Executing super-steps via astream
                 async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates"):
                     # Step 6: Cancellation Awareness
                     if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
                         return
+
+                    # Per-checkpoint incremental cost tracking
+                    if "agent" in event:
+                        for ai_msg in event["agent"].get("messages", []):
+                            if hasattr(ai_msg, 'response_metadata') and ai_msg.response_metadata:
+                                try:
+                                    step_cost, execution_metadata = await self._calculate_step_cost(
+                                        ai_msg.response_metadata, model_name
+                                    )
+                                    if step_cost > 0:
+                                        async with self.pool.acquire() as cost_conn:
+                                            checkpoint_id = await cost_conn.fetchval(
+                                                '''SELECT checkpoint_id FROM checkpoints
+                                                   WHERE task_id = $1::uuid
+                                                   ORDER BY created_at DESC LIMIT 1''',
+                                                task_id
+                                            )
+                                            if checkpoint_id:
+                                                try:
+                                                    async with cost_conn.transaction():
+                                                        cumulative_task_cost, hourly_cost = await self._record_step_cost(
+                                                            cost_conn, task_id, tenant_id, agent_id, checkpoint_id, step_cost
+                                                        )
+                                                    logger.debug(
+                                                        "Task %s step cost: %d microdollars (cumulative: %d, hourly: %d)",
+                                                        task_id, step_cost, cumulative_task_cost, hourly_cost,
+                                                    )
+                                                except Exception:
+                                                    logger.warning("Per-step cost recording failed for task %s", task_id, exc_info=True)
+                                                    cumulative_task_cost = 0
+                                                # Budget enforcement after checkpoint-cost write
+                                                if cumulative_task_cost > 0:
+                                                    was_paused = await self._check_budget_and_pause(
+                                                        cost_conn, task_data, cumulative_task_cost, worker_id
+                                                    )
+                                                    if was_paused:
+                                                        return  # Stop execution — task is now paused
+                                except Exception:
+                                    logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
 
                 if cancel_event.is_set():
                     return
@@ -382,41 +492,8 @@ class GraphExecutor:
                 messages = final_state.values.get("messages", [])
                 output_content = messages[-1].content if messages else ""
 
-                # Aggregate cost across ALL AI messages (not just the last one)
-                total_cost_microdollars = 0
-                total_input_tokens = 0
-                total_output_tokens = 0
-                last_execution_metadata: dict | None = None
-                model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
-                if messages:
-                    try:
-                        for msg in messages:
-                            metadata = getattr(msg, "response_metadata", {}) or {}
-                            if metadata and getattr(msg, "type", None) == "ai":
-                                step_cost, step_meta = await self._calculate_step_cost(metadata, model_name)
-                                total_cost_microdollars += step_cost
-                                total_input_tokens += step_meta.get("input_tokens", 0)
-                                total_output_tokens += step_meta.get("output_tokens", 0)
-                        if total_cost_microdollars > 0 or total_input_tokens > 0:
-                            last_execution_metadata = {
-                                "input_tokens": total_input_tokens,
-                                "output_tokens": total_output_tokens,
-                                "model": model_name,
-                            }
-                            await self.pool.execute(
-                                '''UPDATE checkpoints
-                                   SET cost_microdollars = $1,
-                                       execution_metadata = $2::jsonb
-                                   WHERE task_id = $3::uuid
-                                   AND created_at = (
-                                       SELECT MAX(created_at) FROM checkpoints WHERE task_id = $3::uuid
-                                   )''',
-                                total_cost_microdollars,
-                                json.dumps(last_execution_metadata),
-                                task_id,
-                            )
-                    except Exception:
-                        logger.warning("Cost calculation failed for task %s", task_id, exc_info=True)
+                # Per-checkpoint cost tracking replaces end-of-task aggregation.
+                # Costs are now written incrementally in the streaming loop above.
 
                 # Step 5: Flush Langfuse traces before marking complete
                 nonlocal per_task_langfuse_client
@@ -450,6 +527,15 @@ class GraphExecutor:
                             worker_id,
                         )
                         if updated is not None:
+                            # Track 3: Decrement running_task_count on completion
+                            await conn.execute(
+                                '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+                                   VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                                   ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                                   SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+                                       updated_at = NOW()''',
+                                tenant_id, agent_id
+                            )
                             await _insert_task_event(
                                 conn, task_id, tenant_id, agent_id,
                                 "task_completed", "running", "completed",
@@ -458,7 +544,7 @@ class GraphExecutor:
                 if updated is None:
                     logger.warning("Task %s completion skipped: lease no longer owned by this worker.", task_id)
                 else:
-                    logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, total_cost_microdollars, langfuse_status)
+                    logger.info("Task %s completed successfully (cost: %d microdollars, langfuse: %s).", task_id, cumulative_task_cost, langfuse_status)
 
             # Step 2: Wrap execution in timeout
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
@@ -609,6 +695,153 @@ class GraphExecutor:
         # For Phase 1, default unknown exceptions to non-retryable
         return False
 
+    async def _check_budget_and_pause(
+        self,
+        conn,
+        task_data: dict,
+        cumulative_task_cost: int,
+        worker_id: str,
+    ) -> bool:
+        """Check budget limits after a checkpoint-cost write. Returns True if task was paused."""
+        tenant_id = task_data["tenant_id"]
+        agent_id = task_data["agent_id"]
+
+        # Re-read agent budget settings (may have changed since task started)
+        agent = await conn.fetchrow(
+            '''SELECT budget_max_per_task, budget_max_per_hour
+               FROM agents WHERE tenant_id = $1 AND agent_id = $2''',
+            tenant_id, agent_id
+        )
+        if not agent:
+            return False
+
+        budget_max_per_task = agent['budget_max_per_task']
+        budget_max_per_hour = agent['budget_max_per_hour']
+
+        # Check per-task budget (takes precedence if both exceeded)
+        per_task_exceeded = cumulative_task_cost > budget_max_per_task
+
+        # Check hourly budget (rolling 60-minute window from canonical ledger)
+        hour_cost = await conn.fetchval(
+            '''SELECT COALESCE(SUM(cost_microdollars), 0)
+               FROM agent_cost_ledger
+               WHERE tenant_id = $1 AND agent_id = $2
+                 AND created_at > NOW() - INTERVAL '60 minutes' ''',
+            tenant_id, agent_id
+        )
+        hourly_exceeded = hour_cost > budget_max_per_hour
+
+        if not per_task_exceeded and not hourly_exceeded:
+            return False
+
+        # Determine pause reason (per-task takes precedence)
+        if per_task_exceeded:
+            pause_reason = 'budget_per_task'
+            pause_details = {
+                'budget_max_per_task': budget_max_per_task,
+                'observed_task_cost_microdollars': cumulative_task_cost,
+                'recovery_mode': 'manual_resume_after_budget_increase',
+            }
+            resume_eligible_at = None
+        else:
+            pause_reason = 'budget_per_hour'
+            pause_details = {
+                'budget_max_per_hour': budget_max_per_hour,
+                'observed_hour_cost_microdollars': hour_cost,
+                'recovery_mode': 'automatic_after_window_clears',
+            }
+            # Estimate when enough spend ages out: find the oldest ledger entry
+            # in the window and add 60 minutes
+            oldest_entry_time = await conn.fetchval(
+                '''SELECT MIN(created_at) FROM agent_cost_ledger
+                   WHERE tenant_id = $1 AND agent_id = $2
+                     AND created_at > NOW() - INTERVAL '60 minutes' ''',
+                tenant_id, agent_id
+            )
+            if oldest_entry_time:
+                resume_eligible_at = oldest_entry_time + timedelta(minutes=60)
+            else:
+                resume_eligible_at = None
+
+        await self._execute_budget_pause(
+            conn, task_data, worker_id, pause_reason, pause_details, resume_eligible_at
+        )
+        return True
+
+    async def _execute_budget_pause(
+        self,
+        conn,
+        task_data: dict,
+        worker_id: str,
+        pause_reason: str,
+        pause_details: dict,
+        resume_eligible_at: datetime | None,
+    ):
+        """Transition a running task to paused for budget exhaustion."""
+        task_id = str(task_data["task_id"])
+        tenant_id = task_data["tenant_id"]
+        agent_id = task_data["agent_id"]
+
+        # Atomically: update task, decrement running_task_count, record event
+        async with conn.transaction():
+            # 1. Transition task to paused (lease-validated)
+            result = await conn.fetchrow(
+                '''UPDATE tasks
+                   SET status = 'paused',
+                       pause_reason = $1,
+                       pause_details = $2::jsonb,
+                       resume_eligible_at = $3,
+                       lease_owner = NULL,
+                       lease_expiry = NULL,
+                       human_response = NULL,
+                       version = version + 1,
+                       updated_at = NOW()
+                   WHERE task_id = $4::uuid
+                     AND lease_owner = $5
+                   RETURNING task_id''',
+                pause_reason,
+                json.dumps(pause_details),
+                resume_eligible_at,
+                task_id,
+                worker_id,
+            )
+
+            if not result:
+                logger.warning("Budget pause failed for task %s: lease no longer owned", task_id)
+                return
+
+            # 2. Decrement running_task_count (use upsert for robustness)
+            await conn.execute(
+                '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+                   VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                   ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                   SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+                       updated_at = NOW()''',
+                tenant_id, agent_id
+            )
+
+            # 3. Record task_paused event
+            # NOTE: _insert_task_event is a MODULE-LEVEL function, not a method
+            event_details = {
+                'pause_reason': pause_reason,
+                **pause_details,
+            }
+            if resume_eligible_at:
+                event_details['resume_eligible_at'] = resume_eligible_at.isoformat()
+            await _insert_task_event(
+                conn, task_id, tenant_id, agent_id,
+                event_type='task_paused',
+                status_before='running',
+                status_after='paused',
+                worker_id=worker_id,
+                details=event_details,
+            )
+
+        logger.info(
+            "Task %s paused: %s (cost: %s)",
+            task_id, pause_reason, pause_details,
+        )
+
     async def _handle_interrupt_from_state(self, task_data: dict, interrupt_data: dict, worker_id: str, *, original_tool_prompt: str | None = None):
         """Handle an interrupt detected via graph state inspection."""
         if not isinstance(interrupt_data, dict):
@@ -670,6 +903,15 @@ class GraphExecutor:
                         timeout_at, task_id, worker_id)
 
                 if updated is not None:
+                    # Track 3: Decrement running_task_count on HITL pause
+                    await conn.execute(
+                        '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+                           VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                           ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                           SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+                               updated_at = NOW()''',
+                        tenant_id, agent_id
+                    )
                     # Insert event in same transaction only if the UPDATE affected a row
                     event_details = None
                     if interrupt_type == "input":
@@ -732,6 +974,15 @@ class GraphExecutor:
                 if updated is None:
                     logger.warning("Task %s retry-requeue skipped: lease no longer owned by this worker.", task_id)
                     return
+                # Track 3: Decrement running_task_count on retry requeue
+                await conn.execute(
+                    '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+                       VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                       ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                       SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+                           updated_at = NOW()''',
+                    tenant_id, agent_id
+                )
                 await _insert_task_event(
                     conn, task_id, tenant_id, agent_id,
                     "task_retry_scheduled", "running", "queued",
@@ -775,6 +1026,15 @@ class GraphExecutor:
                     worker_id,
                 )
                 if updated is not None:
+                    # Track 3: Decrement running_task_count on dead-letter
+                    await conn.execute(
+                        '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
+                           VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                           ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                           SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
+                               updated_at = NOW()''',
+                        tenant_id, agent_id
+                    )
                     await _insert_task_event(
                         conn, task_id, tenant_id, agent_id,
                         "task_dead_lettered", "running", "dead_letter",

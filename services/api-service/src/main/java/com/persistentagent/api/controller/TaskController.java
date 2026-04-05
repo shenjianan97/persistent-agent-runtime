@@ -37,8 +37,9 @@ public class TaskController {
     public ResponseEntity<TaskListResponse> listTasks(
             @RequestParam(name = "status", required = false) String status,
             @RequestParam(name = "agent_id", required = false) String agentId,
+            @RequestParam(name = "pause_reason", required = false) String pauseReason,
             @RequestParam(name = "limit", required = false) Integer limit) {
-        TaskListResponse response = taskService.listTasks(status, agentId, limit);
+        TaskListResponse response = taskService.listTasks(status, agentId, pauseReason, limit);
         return ResponseEntity.ok(response);
     }
 
@@ -99,6 +100,12 @@ public class TaskController {
             @PathVariable UUID taskId,
             @Valid @RequestBody TaskRespondRequest request) {
         RedriveResponse response = taskService.respondToTask(taskId, request.message());
+        return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/{taskId}/resume")
+    public ResponseEntity<RedriveResponse> resumeTask(@PathVariable UUID taskId) {
+        RedriveResponse response = taskService.resumeTask(taskId);
         return ResponseEntity.ok(response);
     }
 

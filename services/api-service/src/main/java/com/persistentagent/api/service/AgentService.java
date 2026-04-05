@@ -14,6 +14,7 @@ import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -22,6 +23,10 @@ import java.util.UUID;
 
 @Service
 public class AgentService {
+
+    private static final int DEFAULT_MAX_CONCURRENT_TASKS = 5;
+    private static final long DEFAULT_BUDGET_MAX_PER_TASK = 500000L;
+    private static final long DEFAULT_BUDGET_MAX_PER_HOUR = 5000000L;
 
     private final AgentRepository agentRepository;
     private final ConfigValidationHelper configValidationHelper;
@@ -35,6 +40,7 @@ public class AgentService {
         this.objectMapper = objectMapper;
     }
 
+    @Transactional
     public AgentResponse createAgent(AgentCreateRequest request) {
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
@@ -44,8 +50,19 @@ public class AgentService {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String agentId = UUID.randomUUID().toString();
 
+        int maxConcurrentTasks = request.maxConcurrentTasks() != null
+                ? request.maxConcurrentTasks() : DEFAULT_MAX_CONCURRENT_TASKS;
+        long budgetMaxPerTask = request.budgetMaxPerTask() != null
+                ? request.budgetMaxPerTask() : DEFAULT_BUDGET_MAX_PER_TASK;
+        long budgetMaxPerHour = request.budgetMaxPerHour() != null
+                ? request.budgetMaxPerHour() : DEFAULT_BUDGET_MAX_PER_HOUR;
+
         Map<String, Object> result = agentRepository.insert(
-                tenantId, agentId, request.displayName(), agentConfigJson);
+                tenantId, agentId, request.displayName(), agentConfigJson,
+                maxConcurrentTasks, budgetMaxPerTask, budgetMaxPerHour);
+
+        // Create agent_runtime_state row in the same transaction
+        agentRepository.insertRuntimeState(tenantId, agentId);
 
         OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(result.get("created_at"));
         OffsetDateTime updatedAt = DateTimeUtil.toOffsetDateTime(result.get("updated_at"));
@@ -57,6 +74,9 @@ public class AgentService {
                 request.displayName(),
                 configObj,
                 ValidationConstants.AGENT_STATUS_ACTIVE,
+                maxConcurrentTasks,
+                budgetMaxPerTask,
+                budgetMaxPerHour,
                 createdAt,
                 updatedAt);
     }
@@ -92,6 +112,9 @@ public class AgentService {
                         (String) row.get("provider"),
                         (String) row.get("model"),
                         (String) row.get("status"),
+                        ((Number) row.get("max_concurrent_tasks")).intValue(),
+                        ((Number) row.get("budget_max_per_task")).longValue(),
+                        ((Number) row.get("budget_max_per_hour")).longValue(),
                         DateTimeUtil.toOffsetDateTime(row.get("created_at")),
                         DateTimeUtil.toOffsetDateTime(row.get("updated_at"))))
                 .toList();
@@ -111,8 +134,23 @@ public class AgentService {
         AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
         String agentConfigJson = serializeConfig(canonicalized);
 
+        // For update, we need current values as defaults if not provided
+        Map<String, Object> existing = agentRepository.findByIdAndTenant(tenantId, agentId)
+                .orElseThrow(() -> new AgentNotFoundException(agentId));
+
+        int maxConcurrentTasks = request.maxConcurrentTasks() != null
+                ? request.maxConcurrentTasks()
+                : ((Number) existing.get("max_concurrent_tasks")).intValue();
+        long budgetMaxPerTask = request.budgetMaxPerTask() != null
+                ? request.budgetMaxPerTask()
+                : ((Number) existing.get("budget_max_per_task")).longValue();
+        long budgetMaxPerHour = request.budgetMaxPerHour() != null
+                ? request.budgetMaxPerHour()
+                : ((Number) existing.get("budget_max_per_hour")).longValue();
+
         Map<String, Object> row = agentRepository.update(
-                tenantId, agentId, request.displayName(), agentConfigJson, request.status())
+                tenantId, agentId, request.displayName(), agentConfigJson, request.status(),
+                maxConcurrentTasks, budgetMaxPerTask, budgetMaxPerHour)
                 .orElseThrow(() -> new AgentNotFoundException(agentId));
 
         return toAgentResponse(row);
@@ -151,6 +189,9 @@ public class AgentService {
                 (String) row.get("display_name"),
                 agentConfig,
                 (String) row.get("status"),
+                ((Number) row.get("max_concurrent_tasks")).intValue(),
+                ((Number) row.get("budget_max_per_task")).longValue(),
+                ((Number) row.get("budget_max_per_hour")).longValue(),
                 DateTimeUtil.toOffsetDateTime(row.get("created_at")),
                 DateTimeUtil.toOffsetDateTime(row.get("updated_at")));
     }
