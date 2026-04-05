@@ -2,7 +2,8 @@
 
 Implementation plans organized by delivery phase.
 
-- `active/` — Plans currently being executed (empty when no phase is in progress)
+- `active/` — Plans currently being executed
+  - [Phase 2 Track 3](./active/phase-2/track-3/plan.md) — Scheduler & Budgets (8 tasks)
 - `completed/` — Archived completed plans, preserving internal structure
   - [Phase 1](./completed/phase-1/plan.md) — Durable Execution MVP (9 tasks)
   - [Phase 2 Track 1](./completed/phase-2/track-1/plan.md) — Agent Control Plane (7 tasks)
