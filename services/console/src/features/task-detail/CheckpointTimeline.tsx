@@ -182,11 +182,11 @@ const EVENT_STYLES: Record<CheckpointEvent['type'], { label: string; chipClassNa
         chipClassName: 'border-border/40 bg-white/5 text-muted-foreground',
     },
     input: {
-        label: 'Input',
+        label: 'Input + Inference',
         chipClassName: 'border-primary/30 bg-primary/10 text-primary',
     },
     tool_call: {
-        label: 'Model → Tool',
+        label: 'Tool Request',
         chipClassName: 'border-warning/30 bg-warning/10 text-warning',
     },
     tool_result: {
@@ -277,6 +277,47 @@ export function CheckpointTimeline({
     // Track previous checkpoint worker for handoff detection
     let lastCheckpointWorkerId: string | null = null;
 
+    // Pre-compute cumulative costs and step durations for checkpoints
+    const cumulativeCosts = new Map<string, number>();
+    const stepDurations = new Map<string, number>();
+    let runningCost = 0;
+    let prevCheckpointTs: number | null = null;
+
+    // Collect pause intervals from HITL events
+    const pauseIntervals: { start: number; end: number }[] = [];
+    let pauseStart: number | null = null;
+    for (const ev of hitlEvents) {
+        if (ev.event_type === 'task_paused') {
+            pauseStart = new Date(ev.created_at).getTime();
+        } else if (ev.event_type === 'task_resumed' && pauseStart !== null) {
+            pauseIntervals.push({ start: pauseStart, end: new Date(ev.created_at).getTime() });
+            pauseStart = null;
+        }
+    }
+
+    for (const entry of timeline) {
+        if (entry.kind === 'checkpoint') {
+            const cp = entry.data as CheckpointResponse;
+            runningCost += cp.cost_microdollars;
+            cumulativeCosts.set(cp.checkpoint_id, runningCost);
+
+            const cpTs = new Date(cp.created_at).getTime();
+            if (prevCheckpointTs !== null) {
+                let delta = cpTs - prevCheckpointTs;
+                // Subtract any pause intervals that overlap this step
+                for (const pause of pauseIntervals) {
+                    const overlapStart = Math.max(pause.start, prevCheckpointTs);
+                    const overlapEnd = Math.min(pause.end, cpTs);
+                    if (overlapStart < overlapEnd) {
+                        delta -= (overlapEnd - overlapStart);
+                    }
+                }
+                stepDurations.set(cp.checkpoint_id, Math.max(0, delta));
+            }
+            prevCheckpointTs = cpTs;
+        }
+    }
+
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -331,9 +372,23 @@ export function CheckpointTimeline({
                                             detailText = `$${formatUsd(observed)} / $${formatUsd(limit)} limit`;
                                         }
                                     } else if (detail?.resume_trigger) {
-                                        detailText = (detail.resume_trigger as string) === 'automatic_hourly_recovery'
-                                            ? 'Hourly budget cleared'
-                                            : 'Operator action';
+                                        if ((detail.resume_trigger as string) === 'automatic_hourly_recovery') {
+                                            detailText = 'Hourly budget window reset';
+                                            if (detail.budget_max_per_hour) {
+                                                detailText += ` — limit $${formatUsd(detail.budget_max_per_hour as number)}/hr`;
+                                            }
+                                        } else {
+                                            // manual_operator_resume
+                                            const budgetAtResume = detail.budget_max_per_task_at_resume as number | undefined;
+                                            const taskCost = detail.task_cost_microdollars as number | undefined;
+                                            if (budgetAtResume && taskCost) {
+                                                detailText = `Budget raised to $${formatUsd(budgetAtResume)} (task cost: $${formatUsd(taskCost)})`;
+                                            } else if (budgetAtResume) {
+                                                detailText = `Budget raised to $${formatUsd(budgetAtResume)}`;
+                                            } else {
+                                                detailText = 'Resumed by operator';
+                                            }
+                                        }
                                     }
 
                                     return (
@@ -410,13 +465,15 @@ export function CheckpointTimeline({
                                                 <div className="flex items-start justify-between gap-3">
                                                     <div>
                                                         <div className="text-sm font-display uppercase tracking-wide text-foreground">
-                                                            {event?.type === 'tool_call'
-                                                                ? 'Model Called'
+                                                            {event?.type === 'input'
+                                                                ? 'Input Sent to Model'
+                                                                : event?.type === 'tool_call'
+                                                                ? 'Model Requested Tool'
                                                                 : (event?.title ?? 'Checkpoint Saved')}
                                                         </div>
                                                         {event?.type === 'tool_call' && event?.tool_name && (
                                                             <p className="mt-1 text-xs text-warning tracking-wider">
-                                                                ↳ Requested tool: <span className="font-semibold">{event.tool_name}</span>
+                                                                ↳ Tool: <span className="font-semibold">{event.tool_name}</span>
                                                             </p>
                                                         )}
                                                         {showSummary && (
@@ -491,14 +548,26 @@ export function CheckpointTimeline({
                                                 </div>
                                             )}
 
-                                            <div className="grid grid-cols-2 gap-3 text-xs font-mono bg-black/50 p-3 border border-border/20">
+                                            <div className="grid grid-cols-4 gap-3 text-xs font-mono bg-black/50 p-3 border border-border/20">
                                                 <div>
                                                     <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Worker</span>
                                                     <span className="break-all opacity-80">{cp.worker_id}</span>
                                                 </div>
                                                 <div>
-                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Cost Delta</span>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Step Cost</span>
                                                     <span className="text-success">+${formatUsd(cp.cost_microdollars)}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Total Cost</span>
+                                                    <span className="text-success">${formatUsd(cumulativeCosts.get(cp.checkpoint_id) ?? 0)}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-wider">Duration</span>
+                                                    <span className="text-primary">
+                                                        {stepDurations.has(cp.checkpoint_id)
+                                                            ? `${((stepDurations.get(cp.checkpoint_id)!) / 1000).toFixed(1)}s`
+                                                            : '—'}
+                                                    </span>
                                                 </div>
                                             </div>
                                         </div>

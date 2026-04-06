@@ -6,6 +6,7 @@ import { useAgents, useAgent } from '@/features/agents/useAgents';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { submitTaskSchema, SubmitTaskFormValues } from './schema';
 import { toast } from 'sonner';
+import { formatUsd } from '@/lib/utils';
 import { useState, useEffect } from 'react';
 
 
@@ -187,6 +188,18 @@ export function SubmitTaskPage() {
                                                         <span className="text-foreground">Enabled</span>
                                                     </div>
                                                 )}
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Max Concurrent Tasks</span>
+                                                    <span className="text-foreground">{selectedAgent.max_concurrent_tasks}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Budget/Task</span>
+                                                    <span className="text-foreground">${formatUsd(selectedAgent.budget_max_per_task)}</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Budget/Hour</span>
+                                                    <span className="text-foreground">${formatUsd(selectedAgent.budget_max_per_hour)}</span>
+                                                </div>
                                             </div>
                                         ) : (
                                             <div className="text-xs text-destructive">Failed to load agent configuration.</div>
