@@ -92,7 +92,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-[600px] console-surface border-white/10 rounded-2xl">
+            <DialogContent className="sm:max-w-[600px] max-h-[85vh] overflow-y-auto console-surface border-white/10 rounded-2xl">
                 <DialogHeader>
                     <DialogTitle className="text-lg font-display uppercase tracking-widest text-primary">
                         Create Agent
@@ -267,15 +267,15 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             )}
                         />
 
-                        <div className="space-y-4">
-                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Scheduling & Budget</FormLabel>
+                        <div className="space-y-3">
+                            <span className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Scheduling & Budget</span>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                                 <FormField
                                     control={form.control}
                                     name="max_concurrent_tasks"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Max Concurrent Tasks</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Max Concurrent Tasks</FormLabel>
                                             <FormControl>
                                                 <Input
                                                     type="number"
@@ -295,7 +295,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                     name="budget_max_per_task"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Budget/Task (microdollars)</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Budget/Task</FormLabel>
                                             <FormControl>
                                                 <Input
                                                     type="number"
@@ -316,7 +316,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                     name="budget_max_per_hour"
                                     render={({ field }) => (
                                         <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Budget/Hour (microdollars)</FormLabel>
+                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Budget/Hour</FormLabel>
                                             <FormControl>
                                                 <Input
                                                     type="number"

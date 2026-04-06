@@ -179,6 +179,7 @@ export function TaskDetailPage() {
                         checkpointCount={task.checkpoint_count}
                         totalCostMicrodollars={task.total_cost_microdollars}
                         task={task}
+                        hitlEvents={eventsData?.events}
                     />
 
                     {(langfuseStatus || task.langfuse_endpoint_id) && (

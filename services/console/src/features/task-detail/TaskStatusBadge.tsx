@@ -14,9 +14,9 @@ export function TaskStatusBadge({ status, pauseReason, className }: { status: Ta
     const getBudgetPauseLabel = (reason: string) => {
         switch (reason) {
             case 'budget_per_task':
-                return 'Budget (Task)';
+                return 'Task Budget Exceeded';
             case 'budget_per_hour':
-                return 'Budget (Hourly)';
+                return 'Hourly Budget Exceeded';
             default:
                 return 'Paused';
         }

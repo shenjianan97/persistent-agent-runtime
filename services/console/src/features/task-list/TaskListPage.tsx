@@ -22,8 +22,8 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
 
 const PAUSE_REASON_OPTIONS: { value: string; label: string }[] = [
     { value: '', label: 'All' },
-    { value: 'budget_per_task', label: 'Budget (Task)' },
-    { value: 'budget_per_hour', label: 'Budget (Hourly)' },
+    { value: 'budget_per_task', label: 'Task Budget Exceeded' },
+    { value: 'budget_per_hour', label: 'Hourly Budget Exceeded' },
 ];
 
 function formatRelativeTime(dateString: string): string {

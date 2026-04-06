@@ -66,11 +66,11 @@ E2E_API_BASE ?= http://localhost:$(E2E_API_PORT)/v1
 E2E_API_LOG ?= $(TMP_DIR)/e2e-api-service.log
 
 # Color Output
-GREEN := \033[0;32m
-YELLOW := \033[0;33m
-RED := \033[0;31m
-CYAN := \033[0;36m
-NC := \033[0m
+GREEN := $(shell printf '\033[0;32m')
+YELLOW := $(shell printf '\033[0;33m')
+RED := $(shell printf '\033[0;31m')
+CYAN := $(shell printf '\033[0;36m')
+NC := $(shell printf '\033[0m')
 
 .PHONY: help init install install-api install-console install-worker \
         start start-with-observability stop restart start-console start-api start-worker stop-console stop-api stop-worker \
@@ -284,7 +284,10 @@ start: check
 			$(MAKE) stop >/dev/null 2>&1 || true; \
 			exit 1; \
 		}; \
-		echo "$(GREEN)✅ All services started in background and passed startup checks. Use 'make logs' to watch output.$(NC)"; \
+		echo "$(GREEN)✅ All services started in background and passed startup checks.$(NC)"; \
+		echo "$(GREEN)   Console: http://localhost:5173$(NC)"; \
+		echo "$(GREEN)   API:     http://localhost:$(SERVER_PORT)$(NC)"; \
+		echo "$(YELLOW)   Use 'make logs' to watch output.$(NC)"; \
 	fi
 
 start-with-observability:

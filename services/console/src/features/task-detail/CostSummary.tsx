@@ -1,4 +1,4 @@
-import { TaskObservabilityResponse, TaskStatusResponse } from '@/types';
+import { TaskEventResponse, TaskObservabilityResponse, TaskStatusResponse } from '@/types';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { DollarSign, Cpu, Timer, Coins } from 'lucide-react';
 import { formatUsd } from '@/lib/utils';
@@ -8,26 +8,51 @@ interface CostSummaryProps {
     checkpointCount: number;
     totalCostMicrodollars: number;
     task?: TaskStatusResponse;
+    hitlEvents?: TaskEventResponse[];
 }
 
-function computeDurationLabel(observability?: TaskObservabilityResponse, task?: TaskStatusResponse): string {
-    if (observability?.duration_ms != null) {
-        return `${observability.duration_ms}ms`;
-    }
-    if (task?.created_at && task?.updated_at) {
-        const delta = new Date(task.updated_at).getTime() - new Date(task.created_at).getTime();
-        if (delta > 0) {
-            return `${delta}ms`;
+function formatDuration(ms: number): string {
+    if (ms < 1000) return `${ms}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds.toFixed(1)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.round(seconds % 60);
+    return `${minutes}m ${remainingSeconds}s`;
+}
+
+function computePausedMs(events: TaskEventResponse[]): number {
+    let pausedMs = 0;
+    let pausedAt: number | null = null;
+    for (const ev of events) {
+        if (ev.event_type === 'task_paused') {
+            pausedAt = new Date(ev.created_at).getTime();
+        } else if (ev.event_type === 'task_resumed' && pausedAt !== null) {
+            pausedMs += new Date(ev.created_at).getTime() - pausedAt;
+            pausedAt = null;
         }
     }
-    return 'N/A';
+    return pausedMs;
 }
 
-export function CostSummary({ observability, checkpointCount, totalCostMicrodollars, task }: CostSummaryProps) {
+function computeDurationLabel(observability?: TaskObservabilityResponse, task?: TaskStatusResponse, hitlEvents?: TaskEventResponse[]): string {
+    let rawMs: number | null = null;
+    if (observability?.duration_ms != null) {
+        rawMs = observability.duration_ms;
+    } else if (task?.created_at && task?.updated_at) {
+        const delta = new Date(task.updated_at).getTime() - new Date(task.created_at).getTime();
+        if (delta > 0) rawMs = delta;
+    }
+    if (rawMs == null) return 'N/A';
+
+    const pausedMs = hitlEvents?.length ? computePausedMs(hitlEvents) : 0;
+    return formatDuration(Math.max(0, rawMs - pausedMs));
+}
+
+export function CostSummary({ observability, checkpointCount, totalCostMicrodollars, task, hitlEvents }: CostSummaryProps) {
     const effectiveCost = observability?.total_cost_microdollars ?? totalCostMicrodollars;
     const formattedCost = formatUsd(effectiveCost);
 
-    const durationLabel = computeDurationLabel(observability, task);
+    const durationLabel = computeDurationLabel(observability, task, hitlEvents);
 
     return (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-6">
@@ -80,7 +105,7 @@ export function CostSummary({ observability, checkpointCount, totalCostMicrodoll
                         {durationLabel}
                     </div>
                     <p className="text-xs text-muted-foreground mt-1 tracking-wider uppercase">
-                        {durationLabel !== 'N/A' ? 'Total runtime' : 'Unavailable'}
+                        {durationLabel !== 'N/A' ? 'Execution time' : 'Unavailable'}
                     </p>
                 </CardContent>
             </Card>
