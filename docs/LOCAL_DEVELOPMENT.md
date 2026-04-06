@@ -241,3 +241,14 @@ npx vitest run --reporter=verbose -t "renders budget fields"
 ### Pre-existing test failures
 
 If tests fail that are unrelated to your change, you must still fix them. Use `git stash` or a separate branch to verify the failure exists on `main` before your changes. If it does, fix it as part of your work — do not leave broken tests behind.
+
+## Browser-Based Console Verification
+
+Automated console tests (Vitest + `@testing-library/react`) verify component rendering in isolation with mocked data. They cannot catch routing bugs, layout issues, or broken user flows that only appear in a real browser with live API data.
+
+For console UI changes, use Playwright MCP browser tools to verify the UI end-to-end against a running instance:
+
+- **Prerequisites:** `make start` must be running (Console at `http://localhost:5173`, API at `http://localhost:8080`)
+- **Scenarios:** See [`docs/CONSOLE_BROWSER_TESTING.md`](./CONSOLE_BROWSER_TESTING.md) for standard verification scenarios
+- **Tools:** `browser_navigate`, `browser_snapshot` for structural assertions, `browser_click`, `browser_take_screenshot` for visual checks, and `browser_console_messages` for error detection
+- **When:** After implementing any console-facing change, run the relevant scenarios from the matrix in the scenarios doc
