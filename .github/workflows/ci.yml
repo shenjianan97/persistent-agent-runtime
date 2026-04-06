@@ -32,6 +32,26 @@ jobs:
         working-directory: infrastructure/cdk
         run: npm test -- --runInBand
 
+  console-tests:
+    name: Console Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/console/package-lock.json
+
+      - name: Install console dependencies
+        working-directory: services/console
+        run: npm ci
+
+      - name: Run console tests
+        working-directory: services/console
+        run: npm test
+
   api-unit-tests:
     name: API Unit Tests
     runs-on: ubuntu-latest
