@@ -77,3 +77,12 @@ See [STATUS.md](./STATUS.md) for phase-level tracking and links to each track's 
 - `make e2e-test` — E2E on isolated infra. **Required after DB/schema or cross-service changes.**
 - `make test-all` — both combined.
 - Run the **narrowest scope** that covers your change. If tests fail — including pre-existing failures — fix them before moving on.
+
+### Browser Verification (Console Changes)
+
+After any change that affects the Console UI, verify it works in an actual browser using Playwright MCP tools (`browser_navigate`, `browser_snapshot`, `browser_click`, etc.). See [CONSOLE_BROWSER_TESTING.md](./docs/CONSOLE_BROWSER_TESTING.md) for standard scenarios and the scenario-selection matrix.
+
+- **Prerequisites:** `make start` must be running (Console at `localhost:5173`, API at `localhost:8080`)
+- Run **Scenario 1** (Navigation Smoke Test) for all console changes, plus any scenario that covers the feature you changed
+- If you implement a new UI feature not covered by existing scenarios, **add a new scenario** to the doc before marking work as done
+- Browser verification is complementary to unit tests (`make test`), not a replacement

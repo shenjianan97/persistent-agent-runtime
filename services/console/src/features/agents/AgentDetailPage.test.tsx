@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -72,24 +72,29 @@ const MOCK_AGENT = {
         allowed_tools: ['web_search'],
     },
     status: 'active' as const,
+    max_concurrent_tasks: 5,
+    budget_max_per_task: 500000,
+    budget_max_per_hour: 5000000,
     created_at: '2026-03-27T18:00:00Z',
     updated_at: '2026-03-27T18:00:00Z',
 };
 
 describe('AgentDetailPage', () => {
-    it('renders agent detail with all form fields', async () => {
+    it('renders agent detail in read-only mode by default', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
 
         render(<AgentDetailPage />, { wrapper: createWrapper() });
 
-        await waitFor(() => {
-            expect(screen.getByText('Research Agent')).toBeInTheDocument();
-        });
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
 
         expect(screen.getByText('research-agent')).toBeInTheDocument();
-        expect(screen.getByText('active')).toBeInTheDocument();
+        expect(screen.getAllByText('active')).not.toHaveLength(0);
         expect(screen.getByText('Configuration')).toBeInTheDocument();
-        expect(screen.getByRole('button', { name: /save changes/i })).toBeInTheDocument();
+        expect(screen.getByText('Scheduling & Budget')).toBeInTheDocument();
+        expect(screen.getByText('$0.50')).toBeInTheDocument();
+        expect(screen.getByText('$5.00')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /edit/i })).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /save changes/i })).not.toBeInTheDocument();
     });
 
     it('shows loading state', () => {
@@ -109,31 +114,30 @@ describe('AgentDetailPage', () => {
         expect(screen.getByText('research-agent')).toBeInTheDocument();
     });
 
-    it('Submit Task CTA is present and enabled for active agent', async () => {
+    it('switches to edit mode when Edit is clicked', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
 
         render(<AgentDetailPage />, { wrapper: createWrapper() });
 
-        await waitFor(() => {
-            expect(screen.getByText('Research Agent')).toBeInTheDocument();
-        });
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
 
-        const submitButton = screen.getByRole('button', { name: /submit task/i });
-        expect(submitButton).toBeInTheDocument();
-        expect(submitButton).not.toBeDisabled();
+        fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+
+        expect(screen.getByRole('button', { name: /save changes/i })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /cancel/i })).toBeInTheDocument();
+        expect(screen.getByDisplayValue('Research Agent')).toBeInTheDocument();
+        expect(screen.getByDisplayValue('You are a research assistant.')).toBeInTheDocument();
     });
 
-    it('Submit Task CTA is disabled when agent is disabled', async () => {
+    it('shows the disabled agent warning in read-only mode', async () => {
         const disabledAgent = { ...MOCK_AGENT, status: 'disabled' as const };
         agentMock.mockReturnValue({ data: disabledAgent, isLoading: false, error: null });
 
         render(<AgentDetailPage />, { wrapper: createWrapper() });
 
-        await waitFor(() => {
-            expect(screen.getByText('Research Agent')).toBeInTheDocument();
-        });
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
 
-        const submitButton = screen.getByRole('button', { name: /submit task/i });
-        expect(submitButton).toBeDisabled();
+        expect(screen.getAllByText('disabled')).not.toHaveLength(0);
+        expect(screen.getByText('Disabled agents cannot be used for new task submissions.')).toBeInTheDocument();
     });
 });
