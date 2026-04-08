@@ -67,18 +67,19 @@ Replace simple FIFO claiming with scheduling that accounts for agent-level concu
 Primary design coverage:
 - [Section 2. Cost-Aware Scheduling](#2-cost-aware-scheduling)
 
-### Track 4 — Secrets and Tool Runtime Foundation
+### Track 4 — Custom Tool Runtime (BYOT)
 
-Harden credential handling and create the runtime abstraction needed before customer-provided tool pools can be added safely.
+Enable customer-provided MCP tool servers so agents can use tools beyond the built-in set.
 
-- Secrets Manager-backed provider/tool credential registry
-- Shared secret resolver used by discovery, workers, built-in tools, and future BYOT runtimes
-- `worker_pool_id` as the routing seam for built-in versus custom tool runtimes
-- Isolation and credential-injection rules for future customer MCP runtimes
+- Tool server registration and management (by HTTP URL)
+- Worker MCP client integration for tool discovery and invocation at task execution time
+- Agent config extension for referencing custom tool servers
+- Bearer token authentication for MCP servers that require it
+
+**Note:** Credential hardening (Secrets Manager migration, unified secret resolver) was originally part of this track but has been deliberately deferred to Phase 3+. See [design-notes.md, Section 8](../phase-3-plus/design-notes.md).
 
 Primary design coverage:
 - [Section 4. Custom Tool Runtime (BYOT — Bring Your Own Tools)](#4-custom-tool-runtime-byot--bring-your-own-tools)
-- [Section 6. LLM Credential Model and Secret Management](#6-llm-credential-model-and-secret-management)
 
 ### Track 5 — Memory and Human Oversight Features
 
@@ -101,7 +102,7 @@ For implementation planning, the safest order is:
 1. Track 1 — Agent Control Plane
 2. Track 2 — Runtime State Model
 3. Track 3 — Scheduler and Budgets
-4. Track 4 — Secrets and Tool Runtime Foundation
+4. Track 4 — Custom Tool Runtime (BYOT)
 5. Track 5 — Memory and Human Oversight Features
 
 This ordering reflects dependency flow rather than strict execution sequencing. Some lower-risk work can overlap later, but Track 1 is the clean starting point because the rest of Phase 2 assumes Agent already exists as a first-class control-plane entity.
@@ -321,6 +322,8 @@ created_at:           timestamp
 ---
 
 ## 6. LLM Credential Model and Secret Management
+
+> **Phase 2 scope note:** The secret management hardening described in this section (Secrets Manager migration, `provider_credentials` / `tool_credentials` registry tables, shared secret resolver) has been deferred to Phase 3+. Phase 2 retains the Phase 1 credential model (`provider_keys` with plaintext keys, built-in tools using env vars). See [Phase 3+ design-notes.md, Section 8](../phase-3-plus/design-notes.md) for the deferred design. The design below is preserved as the reference specification for when this work is picked up.
 
 ### Platform-owns-keys (decided)
 

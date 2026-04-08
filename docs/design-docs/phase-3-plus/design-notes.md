@@ -120,3 +120,71 @@ If performance, concurrency, or footprint becomes a significant issue at scale, 
 - Establishing an IPC or local RPC layer between the Go/Java orchestrator and the Python executor.
 
 This is a heavy architectural shift and should only be pursued if the Python `asyncio` event loop becomes a demonstrable bottleneck.
+
+---
+
+## 8. Secret Management Hardening
+
+This work was originally part of Phase 2 Track 4 ("Secrets and Tool Runtime Foundation") but was deliberately deferred when Track 4 was rescoped to focus on BYOT (custom MCP tool server integration). The full design specification is preserved in [Phase 2 design.md, Section 6](../phase-2/design.md).
+
+### Problem
+
+Phase 1 stores LLM provider API keys as plaintext in the `provider_keys` PostgreSQL table. Built-in tool credentials (e.g., `TAVILY_API_KEY` for `web_search`) are read from worker process environment variables. This is acceptable for local development but inadequate for production:
+
+- plaintext secrets in the database increase blast radius if the DB is compromised
+- environment variables give every tool access to every credential in the worker process
+- key rotation requires redeploying services
+- no audit trail for credential access
+
+### Planned approach
+
+1. **Migrate provider credentials from plaintext to AWS Secrets Manager references.** Introduce a `provider_credentials` registry table that stores `secret_ref` (Secrets Manager ARN) instead of raw `api_key`. The `provider_keys` table is kept read-only during transition and dropped after verification.
+
+2. **Introduce a `tool_credentials` registry table** for tool-specific credentials (built-in tools and future BYOT tool servers). Each row maps `(tenant_id, worker_pool_id, tool_name)` to a `secret_ref` with an `exposure_mode` (env or file).
+
+3. **Shared `SecretResolver` abstraction.** A single Python interface used by model discovery, workers, and built-in tools to resolve credentials:
+   - `SecretsManagerResolver` — production path, fetches from Secrets Manager with in-memory caching (TTL ~300s)
+   - `EnvVarResolver` — local development fallback
+   - `ChainResolver` — tries Secrets Manager first, falls back to env vars
+
+4. **Per-tool credential injection.** When invoking a tool, the worker resolves only the credentials registered for that specific tool. Unrelated credentials are never exposed. This is especially important for customer-provided MCP servers (BYOT), where the tool process must not see the platform's LLM API keys.
+
+5. **Migration path:**
+   - Phase 1 (current): `provider_keys` plaintext + env vars
+   - Phase 3 initial: introduce resolver + Secrets Manager-backed `provider_credentials`; `models` table FK migrates from `provider_keys` to `provider_credentials`
+   - Phase 3 extension: built-in tool credentials and BYOT tool server credentials on the same registry/resolver path
+   - Phase 3+: tenant-scoped secret ownership for BYOK support (see Section 5)
+
+6. **`tool_servers.auth_token` migration.** Phase 2 Track 4 stores MCP server auth tokens as plaintext in the `tool_servers` table. When this hardening work is implemented, `auth_token` should migrate to a `secret_ref` pointing to Secrets Manager.
+
+### Key entities (from Phase 2 design.md Section 6)
+
+```
+provider_credentials
+  provider_id:          text primary key
+  secret_ref:           text not null         -- Secrets Manager ARN/name
+  credential_scope:     enum(platform)
+  status:               enum(active | disabled | invalid)
+  last_validated_at:    timestamptz
+  last_rotated_at:      timestamptz
+  metadata:             jsonb
+
+tool_credentials
+  credential_id:        uuid primary key
+  tenant_id:            text not null
+  worker_pool_id:       text not null
+  tool_name:            text not null
+  secret_ref:           text not null
+  exposure_mode:        enum(env | file)
+  status:               enum(active | disabled | invalid)
+  created_at:           timestamptz
+  updated_at:           timestamptz
+  metadata:             jsonb
+```
+
+### Trigger conditions
+
+This work should be prioritized when:
+- the platform is deployed to a shared or production environment where plaintext DB secrets are a compliance concern
+- BYOT adoption increases and credential isolation between tool servers becomes operationally important
+- key rotation without service restart is required
