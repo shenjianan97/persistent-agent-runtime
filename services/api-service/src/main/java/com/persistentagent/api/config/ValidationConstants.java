@@ -68,4 +68,16 @@ public final class ValidationConstants {
     /** Valid agent statuses. */
     public static final Set<String> VALID_AGENT_STATUSES = Set.of(AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED);
 
+    // Tool server constants
+    public static final String TOOL_SERVER_NAME_PATTERN = "^[a-z0-9][a-z0-9-]*$";
+    public static final String TOOL_SERVER_STATUS_ACTIVE = "active";
+    public static final String TOOL_SERVER_STATUS_DISABLED = "disabled";
+    public static final Set<String> VALID_TOOL_SERVER_STATUSES = Set.of(TOOL_SERVER_STATUS_ACTIVE, TOOL_SERVER_STATUS_DISABLED);
+    public static final String TOOL_SERVER_AUTH_NONE = "none";
+    public static final String TOOL_SERVER_AUTH_BEARER = "bearer_token";
+    public static final Set<String> VALID_TOOL_SERVER_AUTH_TYPES = Set.of(TOOL_SERVER_AUTH_NONE, TOOL_SERVER_AUTH_BEARER);
+    public static final int DEFAULT_TOOL_SERVER_LIST_LIMIT = 50;
+    public static final int MAX_TOOL_SERVER_LIST_LIMIT = 200;
+    public static final int TOOL_SERVER_DISCOVER_TIMEOUT_MS = 10000;
+
 }

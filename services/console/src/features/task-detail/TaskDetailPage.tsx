@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useNavigate, useParams, Link } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
@@ -12,11 +13,14 @@ import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { AlertCircle, Terminal, Ban, RotateCcw, PlayCircle } from 'lucide-react';
+import { Textarea } from '@/components/ui/textarea';
+import { AlertCircle, Terminal, Ban, RotateCcw, PlayCircle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { api, ApiError } from '@/api/client';
 import { CheckpointResponse } from '@/types';
 import { formatUsd } from '@/lib/utils';
+import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
@@ -45,6 +49,29 @@ export function TaskDetailPage() {
             toast.error(error.message || 'Resume failed');
         },
     });
+
+    const [followUpInput, setFollowUpInput] = useState('');
+    const [showFollowUp, setShowFollowUp] = useState(false);
+    const followUpMutation = useMutation({
+        mutationFn: ({ taskId, input }: { taskId: string; input: string }) =>
+            api.followUpTask(taskId, input),
+        onSuccess: () => {
+            queryClient.invalidateQueries({ queryKey: ['task', taskId] });
+            queryClient.invalidateQueries({ queryKey: ['task-events', taskId] });
+            queryClient.invalidateQueries({ queryKey: ['checkpoints', taskId] });
+            setFollowUpInput('');
+            setShowFollowUp(false);
+            toast.success('Follow-up submitted', { description: 'Task will resume with your input.' });
+        },
+        onError: (error: Error) => {
+            toast.error('Follow-up failed', { description: error.message });
+        },
+    });
+
+    const handleFollowUp = () => {
+        if (!taskId || !followUpInput.trim()) return;
+        followUpMutation.mutate({ taskId, input: followUpInput.trim() });
+    };
 
     const isNonTerminal = task?.status === 'queued' || task?.status === 'running' ||
         task?.status === 'waiting_for_approval' || task?.status === 'waiting_for_input' || task?.status === 'paused';
@@ -298,7 +325,7 @@ export function TaskDetailPage() {
                     )}
 
                     <div className={`grid gap-6 ${task.status === 'completed' && task.output ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'}`}>
-                        <Card className="console-surface border-white/10 flex flex-col max-h-[300px]">
+                        <Card className="console-surface border-white/10 flex flex-col max-h-[400px]">
                             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-white/8 shrink-0">
                                 <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-muted-foreground">
                                     <Terminal className="w-4 h-4" /> Input
@@ -312,20 +339,87 @@ export function TaskDetailPage() {
                         </Card>
 
                         {task.status === 'completed' && !!task.output && (
-                            <Card className="console-surface border-success/30 flex flex-col max-h-[300px]">
+                            <Card className="console-surface border-success/30 flex flex-col max-h-[400px]">
                                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5">
                                     <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-success">
                                         <Terminal className="w-4 h-4" /> Output
                                     </CardTitle>
                                 </CardHeader>
                                 <CardContent className="pt-4 flex-1 overflow-auto">
-                                    <pre className="text-xs font-mono text-success whitespace-pre-wrap">
-                                        {formatJson(displayOutput)}
-                                    </pre>
+                                    {parsedOutput?.result && typeof parsedOutput.result === 'string' ? (
+                                        <div className="prose prose-invert prose-sm max-w-none
+                                            prose-headings:text-emerald-300 prose-headings:font-display prose-headings:tracking-wide
+                                            prose-h2:text-base prose-h3:text-sm
+                                            prose-p:text-emerald-100/80 prose-p:leading-relaxed
+                                            prose-strong:text-emerald-200
+                                            prose-li:text-emerald-100/80 prose-li:marker:text-emerald-500
+                                            prose-a:text-emerald-400 prose-a:underline prose-a:underline-offset-2 prose-a:decoration-emerald-500/40 hover:prose-a:text-emerald-300
+                                            prose-code:text-emerald-300 prose-code:bg-emerald-500/10 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:text-xs
+                                            prose-pre:bg-black/50 prose-pre:border prose-pre:border-emerald-500/20
+                                            prose-hr:border-emerald-500/20
+                                        ">
+                                            <Markdown remarkPlugins={[remarkGfm]}>{parsedOutput.result}</Markdown>
+                                        </div>
+                                    ) : (
+                                        <pre className="text-xs font-mono text-success whitespace-pre-wrap">
+                                            {formatJson(displayOutput)}
+                                        </pre>
+                                    )}
                                 </CardContent>
                             </Card>
                         )}
                     </div>
+
+                    {task.status === 'completed' && (
+                        showFollowUp ? (
+                            <Card className="console-surface border-primary/30 relative overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-300">
+                                <div className="absolute top-0 left-0 w-1 h-full bg-primary" />
+                                <CardHeader className="border-b border-primary/20 pb-3">
+                                    <CardTitle className="text-sm font-display uppercase tracking-widest text-primary flex items-center gap-2">
+                                        <MessageSquare className="w-4 h-4" /> Follow Up
+                                    </CardTitle>
+                                </CardHeader>
+                                <CardContent className="pt-4 space-y-4">
+                                    <p className="text-xs text-muted-foreground">
+                                        Continue this task with a follow-up prompt. The agent will resume from its last state with full conversation context.
+                                    </p>
+                                    <Textarea
+                                        className="min-h-[80px] resize-y rounded-none border-border bg-black/50 focus-visible:ring-primary"
+                                        placeholder="Ask a follow-up question or provide additional instructions..."
+                                        value={followUpInput}
+                                        onChange={(e) => setFollowUpInput(e.target.value)}
+                                    />
+                                    <div className="flex justify-end gap-3">
+                                        <Button
+                                            type="button"
+                                            variant="ghost"
+                                            onClick={() => { setShowFollowUp(false); setFollowUpInput(''); }}
+                                            className="uppercase tracking-widest text-xs"
+                                        >
+                                            Cancel
+                                        </Button>
+                                        <Button
+                                            onClick={handleFollowUp}
+                                            disabled={followUpMutation.isPending || !followUpInput.trim()}
+                                            className="font-bold uppercase tracking-widest px-6"
+                                        >
+                                            {followUpMutation.isPending ? 'Submitting...' : 'Continue'}
+                                        </Button>
+                                    </div>
+                                </CardContent>
+                            </Card>
+                        ) : (
+                            <div className="flex justify-center">
+                                <Button
+                                    variant="outline"
+                                    onClick={() => setShowFollowUp(true)}
+                                    className="uppercase tracking-widest text-xs border-primary/30 text-primary hover:bg-primary hover:text-black transition-all"
+                                >
+                                    <MessageSquare className="w-4 h-4 mr-2" /> Follow Up
+                                </Button>
+                            </div>
+                        )
+                    )}
 
             </div>
         </div>

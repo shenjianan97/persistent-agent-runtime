@@ -22,6 +22,8 @@ const HITL_EVENT_TYPES = new Set<TaskEventType>([
     'task_resumed',
     'task_cancelled',
     'task_redriven',
+    'task_completed',
+    'task_follow_up',
 ]);
 
 interface HitlMarkerStyle {
@@ -41,6 +43,8 @@ const HITL_STYLES: Partial<Record<TaskEventType, HitlMarkerStyle>> = {
     task_resumed:            { label: 'Task Resumed',        colorClass: 'text-green-400',  bgClass: 'bg-green-500',  icon: PlayCircle },
     task_cancelled:          { label: 'Task Cancelled',      colorClass: 'text-red-400',    bgClass: 'bg-red-500',    icon: Ban },
     task_redriven:           { label: 'Task Redriven',       colorClass: 'text-blue-400',   bgClass: 'bg-blue-500',   icon: RefreshCw },
+    task_completed:          { label: 'Task Completed',      colorClass: 'text-emerald-400', bgClass: 'bg-emerald-500', icon: ShieldCheck },
+    task_follow_up:          { label: 'Follow Up',           colorClass: 'text-primary',     bgClass: 'bg-primary',     icon: MessageSquare },
 };
 
 // ─── Unified timeline entry ────────────────────────────────────────

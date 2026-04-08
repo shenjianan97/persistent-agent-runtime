@@ -26,6 +26,8 @@ from langgraph.types import Command
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 from core.config import WorkerConfig
 
+from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
+from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from tools.definitions import (
     create_default_dependencies,
     WEB_SEARCH_TOOL,
@@ -75,6 +77,63 @@ class GraphExecutor:
         except Exception:
             logger.warning("Failed to resolve Langfuse credentials for endpoint %s", endpoint_id, exc_info=True)
             return None
+
+    async def _lookup_tool_server_configs(
+        self, conn, tenant_id: str, server_names: list[str]
+    ) -> list[ToolServerConfig]:
+        """Look up tool server configs from the database.
+
+        Args:
+            conn: asyncpg connection
+            tenant_id: tenant ID
+            server_names: list of server names from agent config
+
+        Returns:
+            List of ToolServerConfig objects
+
+        Raises:
+            McpConnectionError: if any server is not found or disabled
+        """
+        if not server_names:
+            return []
+
+        rows = await conn.fetch(
+            """
+            SELECT name, url, auth_type, auth_token, status
+            FROM tool_servers
+            WHERE tenant_id = $1 AND name = ANY($2)
+            """,
+            tenant_id,
+            server_names,
+        )
+
+        found = {row["name"]: row for row in rows}
+
+        configs = []
+        for name in server_names:
+            row = found.get(name)
+            if row is None:
+                raise McpConnectionError(
+                    server_name=name,
+                    server_url="unknown",
+                    message=f"Tool server '{name}' not found in registry",
+                )
+            if row["status"] != "active":
+                raise McpConnectionError(
+                    server_name=name,
+                    server_url=row["url"],
+                    message=f"Tool server '{name}' is disabled",
+                )
+            configs.append(
+                ToolServerConfig(
+                    name=row["name"],
+                    url=row["url"],
+                    auth_type=row["auth_type"],
+                    auth_token=row["auth_token"],
+                )
+            )
+
+        return configs
 
     def _get_tools(
         self,
@@ -158,6 +217,7 @@ class GraphExecutor:
         *,
         cancel_event: asyncio.Event,
         task_id: str,
+        custom_tools: list[StructuredTool] | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -166,10 +226,32 @@ class GraphExecutor:
         allowed_tools = agent_config.get("allowed_tools", [])
         system_prompt = agent_config.get("system_prompt", "")
 
+        # When HITL is enabled, append instruction so the LLM knows to use the tool
+        if "request_human_input" in allowed_tools:
+            hitl_instruction = (
+                "\n\nYou have access to a `request_human_input` tool. "
+                "When you need to ask the user a question, gather clarification, or request any input, "
+                "you MUST call the `request_human_input` tool instead of writing questions in your response. "
+                "The task will pause and wait for the user's answer before you continue."
+            )
+            system_prompt = system_prompt + hitl_instruction
+
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
 
-        # Register the local MCP tools with the LLM
+        # Register built-in tools
         tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id)
+
+        # Merge custom tools from MCP servers
+        if custom_tools:
+            tools = tools + custom_tools
+
+        # Enforce tool count limit
+        if len(tools) > MAX_TOOLS_PER_AGENT:
+            raise ValueError(
+                f"Agent has {len(tools)} tools (max {MAX_TOOLS_PER_AGENT}). "
+                f"Reduce the number of tool servers or use servers with fewer tools."
+            )
+
         if tools:
             llm_with_tools = llm.bind_tools(tools)
         else:
@@ -362,7 +444,84 @@ class GraphExecutor:
                     task_id, exc_info=True,
                 )
 
+        # Extract tool_servers from agent config
+        tool_server_names = agent_config.get("tool_servers", [])
+
+        session_manager: McpSessionManager | None = None
+        custom_tools: list[StructuredTool] = []
+
         try:
+            # Look up and connect to MCP tool servers if configured
+            if tool_server_names:
+                async with self.pool.acquire() as conn:
+                    try:
+                        server_configs = await self._lookup_tool_server_configs(
+                            conn, tenant_id, tool_server_names
+                        )
+                    except McpConnectionError as e:
+                        logger.error(
+                            "tool_server_unavailable",
+                            extra={
+                                "task_id": task_id,
+                                "server_name": e.server_name,
+                                "server_url": e.server_url,
+                                "error": str(e),
+                            },
+                        )
+                        await self._handle_dead_letter(
+                            task_id,
+                            tenant_id,
+                            agent_id,
+                            reason="tool_server_unavailable",
+                            error_msg=str(e),
+                            error_code="tool_server_unavailable",
+                        )
+                        return
+
+                session_manager = McpSessionManager()
+                try:
+                    tools_by_server = await session_manager.connect(server_configs)
+                except McpConnectionError as e:
+                    logger.error(
+                        "tool_server_unavailable",
+                        extra={
+                            "task_id": task_id,
+                            "server_name": e.server_name,
+                            "server_url": e.server_url,
+                            "error": str(e),
+                        },
+                    )
+                    await self._handle_dead_letter(
+                        task_id,
+                        tenant_id,
+                        agent_id,
+                        reason="tool_server_unavailable",
+                        error_msg=str(e),
+                        error_code="tool_server_unavailable",
+                    )
+                    return
+
+                # Convert MCP tool schemas to StructuredTool objects
+                for server_name, tool_schemas in tools_by_server.items():
+                    server_tools = mcp_tools_to_structured_tools(
+                        server_name=server_name,
+                        tool_schemas=tool_schemas,
+                        call_fn=session_manager.call_tool,
+                        cancel_event=cancel_event,
+                        await_or_cancel_fn=self._await_or_cancel,
+                        task_id=task_id,
+                    )
+                    custom_tools.extend(server_tools)
+
+                logger.info(
+                    "custom_tools_discovered",
+                    extra={
+                        "task_id": task_id,
+                        "server_count": len(tools_by_server),
+                        "tool_count": len(custom_tools),
+                    },
+                )
+
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(
                 self.pool,
@@ -371,7 +530,12 @@ class GraphExecutor:
             )
 
             # 3. Build & Compile graph
-            graph = await self._build_graph(agent_config, cancel_event=cancel_event, task_id=task_id)
+            graph = await self._build_graph(
+                agent_config,
+                cancel_event=cancel_event,
+                task_id=task_id,
+                custom_tools=custom_tools if custom_tools else None,
+            )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
             # 4. Config map
@@ -384,6 +548,7 @@ class GraphExecutor:
             )
 
             async def run_astream():
+                nonlocal session_manager, per_task_langfuse_client
                 # For first run, inject HumanMessage based on initial input
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
                 is_first_run = not checkpoint_tuple
@@ -397,13 +562,18 @@ class GraphExecutor:
                     if human_response:
                         payload = json.loads(human_response)
                         # Decode the documented HITL resume payload
+                        # {"kind":"follow_up","message":"..."} -> inject new HumanMessage
                         # {"kind":"input","message":"blue"} -> resume value is the message
                         # {"kind":"approval","approved":true} -> resume value is the payload itself
-                        if payload.get("kind") == "input":
+                        if payload.get("kind") == "follow_up":
+                            # Follow-up: inject new HumanMessage into existing conversation
+                            initial_input = {"messages": [HumanMessage(content=payload.get("message", ""))]}
+                        elif payload.get("kind") == "input":
                             resume_value = payload.get("message", "")
+                            initial_input = Command(resume=resume_value)
                         else:
                             resume_value = payload  # approval payload passed through
-                        initial_input = Command(resume=resume_value)
+                            initial_input = Command(resume=resume_value)
 
                 # Track model name for per-step cost calculation
                 model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
@@ -453,6 +623,10 @@ class GraphExecutor:
                                                         cost_conn, task_data, cumulative_task_cost, worker_id
                                                     )
                                                     if was_paused:
+                                                        # Close MCP sessions before releasing lease on budget pause
+                                                        if session_manager is not None:
+                                                            await session_manager.close("paused")
+                                                            session_manager = None  # Prevent double-close in finally
                                                         return  # Stop execution — task is now paused
                                 except Exception:
                                     logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
@@ -486,6 +660,10 @@ class GraphExecutor:
                                 tool_prompt = interrupt_data.get("prompt", "")
                                 interrupt_data["prompt"] = f"{ai_context}\n\n{tool_prompt}" if tool_prompt else ai_context
                             await self._handle_interrupt_from_state(task_data, interrupt_data, worker_id, original_tool_prompt=original_tool_prompt)
+                            # Close MCP sessions before releasing lease on HITL pause
+                            if session_manager is not None:
+                                await session_manager.close("paused")
+                                session_manager = None  # Prevent double-close in finally
                             return
 
                 # Execution Finished successfully. Compute final output.
@@ -496,7 +674,6 @@ class GraphExecutor:
                 # Costs are now written incrementally in the streaming loop above.
 
                 # Step 5: Flush Langfuse traces before marking complete
-                nonlocal per_task_langfuse_client
                 langfuse_status = "skipped"
                 if per_task_langfuse_client is not None:
                     langfuse_status = await self._flush_langfuse_with_retry(per_task_langfuse_client, task_id)
@@ -571,6 +748,11 @@ class GraphExecutor:
                     per_task_langfuse_client.flush()
                 except Exception:
                     logger.warning("Langfuse flush failed for task %s in finally block", task_id, exc_info=True)
+            if session_manager is not None:
+                try:
+                    await session_manager.close()
+                except Exception:
+                    logger.warning("MCP session close failed for task %s in finally block", task_id, exc_info=True)
 
     def _build_runnable_config(
         self,

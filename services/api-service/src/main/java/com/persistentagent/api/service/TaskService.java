@@ -333,6 +333,34 @@ public class TaskService {
     }
 
     @Transactional
+    public RedriveResponse followUpTask(UUID taskId, String input) {
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String humanResponse;
+        String detailsJson;
+        try {
+            humanResponse = objectMapper.writeValueAsString(Map.of("kind", "follow_up", "message", input));
+            detailsJson = objectMapper.writeValueAsString(Map.of("input", input));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize follow-up payload", e);
+        }
+
+        TaskRepository.HitlMutationResult result = taskRepository.followUpTask(taskId, tenantId, humanResponse);
+        return switch (result.result()) {
+            case UPDATED -> {
+                taskRepository.notifyNewTask(result.workerPoolId());
+                taskEventService.recordEvent(tenantId, taskId, result.agentId(),
+                        "task_follow_up", "completed", "queued",
+                        null, null, null, detailsJson);
+                yield new RedriveResponse(taskId, "queued");
+            }
+            case NOT_FOUND -> throw new TaskNotFoundException(taskId);
+            case WRONG_STATE -> throw new InvalidStateTransitionException(taskId,
+                    "Task " + taskId + " cannot be followed up (must be in completed state)");
+        };
+    }
+
+    @Transactional
     public RedriveResponse resumeTask(UUID taskId) {
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
 

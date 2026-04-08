@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router';
-import { AlertTriangle, PlaySquare, LayoutDashboard, List, Settings, Bot } from 'lucide-react';
+import { AlertTriangle, PlaySquare, LayoutDashboard, List, Settings, Bot, Server } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const NAV_ITEMS = [
     { path: '/', label: 'Home', icon: LayoutDashboard },
     { path: '/agents', label: 'Agents', icon: Bot, end: true },
+    { path: '/tool-servers', label: 'Tool Servers', icon: Server, end: true },
     { path: '/tasks', label: 'Tasks', icon: List, end: true },
     { path: '/tasks/new', label: 'Submit Task', icon: PlaySquare },
     { path: '/dead-letter', label: 'Failed', icon: AlertTriangle },

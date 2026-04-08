@@ -3,7 +3,8 @@ export type TaskStatus = 'queued' | 'running' | 'completed' | 'cancelled' | 'dea
 export type TaskEventType = 'task_submitted' | 'task_claimed' | 'task_retry_scheduled' |
     'task_reclaimed_after_lease_expiry' | 'task_dead_lettered' | 'task_redriven' |
     'task_completed' | 'task_paused' | 'task_resumed' | 'task_approval_requested' |
-    'task_approved' | 'task_rejected' | 'task_input_requested' | 'task_input_received' | 'task_cancelled';
+    'task_approved' | 'task_rejected' | 'task_input_requested' | 'task_input_received' | 'task_cancelled' |
+    'task_follow_up';
 
 export interface TaskEventResponse {
     event_id: string;
@@ -233,6 +234,7 @@ export interface AgentConfig {
     model: string;
     temperature: number;
     allowed_tools: string[];
+    tool_servers?: string[];
 }
 
 export interface AgentResponse {
@@ -249,9 +251,10 @@ export interface AgentResponse {
 
 export interface AgentCreateRequest {
     display_name: string;
-    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools'> & {
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers'> & {
         temperature?: number;
         allowed_tools?: string[];
+        tool_servers?: string[];
     };
     max_concurrent_tasks?: number;
     budget_max_per_task?: number;
@@ -260,12 +263,66 @@ export interface AgentCreateRequest {
 
 export interface AgentUpdateRequest {
     display_name: string;
-    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools'> & {
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers'> & {
         temperature?: number;
         allowed_tools?: string[];
+        tool_servers?: string[];
     };
     status: 'active' | 'disabled';
     max_concurrent_tasks?: number;
     budget_max_per_task?: number;
     budget_max_per_hour?: number;
+}
+
+// Tool Server types
+export interface ToolServerSummaryResponse {
+    server_id: string;
+    tenant_id: string;
+    name: string;
+    url: string;
+    auth_type: 'none' | 'bearer_token';
+    status: 'active' | 'disabled';
+    created_at: string;
+    updated_at: string;
+}
+
+export interface ToolServerResponse {
+    server_id: string;
+    tenant_id: string;
+    name: string;
+    url: string;
+    auth_type: 'none' | 'bearer_token';
+    auth_token: string | null;
+    status: 'active' | 'disabled';
+    created_at: string;
+    updated_at: string;
+}
+
+export interface ToolServerCreateRequest {
+    name: string;
+    url: string;
+    auth_type: 'none' | 'bearer_token';
+    auth_token?: string;
+}
+
+export interface ToolServerUpdateRequest {
+    name?: string;
+    url?: string;
+    auth_type?: 'none' | 'bearer_token';
+    auth_token?: string;
+    status?: 'active' | 'disabled';
+}
+
+export interface DiscoveredToolInfo {
+    name: string;
+    description: string;
+    input_schema: Record<string, unknown> | null;
+}
+
+export interface ToolDiscoverResponse {
+    server_id: string;
+    server_name: string;
+    status: 'reachable' | 'unreachable';
+    error: string | null;
+    tools: DiscoveredToolInfo[];
 }

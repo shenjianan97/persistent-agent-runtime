@@ -6,6 +6,9 @@ from unittest.mock import ANY, AsyncMock, patch, MagicMock
 from core.worker import WorkerService
 from core.config import WorkerConfig
 from executor.graph import GraphExecutor
+from executor.mcp_session import McpConnectionError
+from executor.schema_converter import MAX_TOOLS_PER_AGENT
+from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
 from tools.errors import ToolExecutionError, ToolTransportError
@@ -547,6 +550,198 @@ def test_rate_limit_with_invalid_in_message_is_retryable(mock_worker):
 
     assert executor._is_retryable_error(Exception("invalid request rate exceeded")) is True
     assert executor._is_retryable_error(Exception("429 Too Many Requests")) is True
+
+
+# ─── Custom Tool Integration Tests ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_execute_task_no_tool_servers_unchanged(mock_worker, task_data):
+    """Tasks without tool_servers behave identically to before — no MCP session created."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    # agent_config_snapshot has no tool_servers key
+    assert "tool_servers" not in json.loads(task_data["agent_config_snapshot"])
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def mock_astream(*args, **kwargs):
+                yield {"mock": "event"}
+            mock_compiled.astream = mock_astream
+
+            mock_state = MagicMock()
+            mock_state.values = {"messages": [MagicMock(content="Done")]}
+            mock_state.tasks = []
+            mock_compiled.aget_state.return_value = mock_state
+
+            with patch("executor.graph.McpSessionManager") as MockMcpSessionManager:
+                await executor.execute_task(
+                    task_data,
+                    mock_worker.heartbeat.start_heartbeat.return_value.cancel_event,
+                )
+
+                # McpSessionManager should NOT be instantiated
+                MockMcpSessionManager.assert_not_called()
+
+                # _build_graph should be called with custom_tools=None
+                mock_build.assert_called_once()
+                _, kwargs = mock_build.call_args
+                assert kwargs.get("custom_tools") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_tool_server_not_found_dead_letters(mock_worker, task_data):
+    """Referencing a non-existent tool server causes dead-letter with tool_server_unavailable."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    task_data["agent_config_snapshot"] = json.dumps({
+        "model": "claude-3-5-sonnet-latest",
+        "temperature": 0.5,
+        "allowed_tools": [],
+        "tool_servers": ["missing-server"],
+    })
+
+    # DB returns no rows (server not found)
+    mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+    mock_conn.fetch.return_value = []
+
+    with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+        await executor.execute_task(
+            task_data,
+            mock_worker.heartbeat.start_heartbeat.return_value.cancel_event,
+        )
+
+    mock_dead_letter.assert_called_once()
+    call_kwargs = mock_dead_letter.call_args
+    assert call_kwargs[1].get("error_code") == "tool_server_unavailable" or \
+           (len(call_kwargs[0]) >= 6 and call_kwargs[0][5] == "tool_server_unavailable")
+
+
+@pytest.mark.asyncio
+async def test_execute_task_tool_server_disabled_dead_letters(mock_worker, task_data):
+    """Referencing a disabled tool server causes dead-letter with tool_server_unavailable."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    task_data["agent_config_snapshot"] = json.dumps({
+        "model": "claude-3-5-sonnet-latest",
+        "temperature": 0.5,
+        "allowed_tools": [],
+        "tool_servers": ["my-server"],
+    })
+
+    # DB returns the server but with status='disabled'
+    mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+    disabled_row = {
+        "name": "my-server",
+        "url": "http://my-server:8080/mcp",
+        "auth_type": "none",
+        "auth_token": None,
+        "status": "disabled",
+    }
+    mock_conn.fetch.return_value = [disabled_row]
+
+    with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+        await executor.execute_task(
+            task_data,
+            mock_worker.heartbeat.start_heartbeat.return_value.cancel_event,
+        )
+
+    mock_dead_letter.assert_called_once()
+    # Verify error_code is tool_server_unavailable
+    call_args = mock_dead_letter.call_args
+    # error_code is passed as keyword arg
+    assert call_args[1].get("error_code") == "tool_server_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_build_graph_with_custom_tools_merges(mock_worker):
+    """_build_graph() with custom_tools produces merged tool list."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    cancel_event = asyncio.Event()
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock()
+    llm.bind_tools.return_value = llm
+
+    # Create a dummy custom tool
+    from pydantic import BaseModel as PydanticBaseModel
+
+    class DummyArgs(PydanticBaseModel):
+        x: str
+
+    custom_tool = StructuredTool.from_function(
+        coroutine=AsyncMock(return_value="custom result"),
+        name="my-server__custom_tool",
+        description="A custom tool",
+        args_schema=DummyArgs,
+    )
+
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)):
+        with patch("executor.graph.ToolNode") as MockToolNode:
+            await executor._build_graph(
+                {
+                    "model": "claude-3-5-sonnet-latest",
+                    "temperature": 0.5,
+                    "allowed_tools": ["calculator"],
+                },
+                cancel_event=cancel_event,
+                task_id="task-123",
+                custom_tools=[custom_tool],
+            )
+
+    # ToolNode should be called with both built-in and custom tools
+    assert MockToolNode.called
+    tools_arg = MockToolNode.call_args[0][0]
+    tool_names = [t.name for t in tools_arg]
+    assert "calculator" in tool_names
+    assert "my-server__custom_tool" in tool_names
+
+
+@pytest.mark.asyncio
+async def test_build_graph_exceeds_tool_limit_raises(mock_worker):
+    """More than MAX_TOOLS_PER_AGENT total tools raises ValueError."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    cancel_event = asyncio.Event()
+
+    llm = MagicMock()
+    llm.ainvoke = AsyncMock()
+    llm.bind_tools.return_value = llm
+
+    from pydantic import BaseModel as PydanticBaseModel
+
+    class NoArgs(PydanticBaseModel):
+        pass
+
+    # Create 128 custom tools to exceed the limit (plus 1 built-in = 129)
+    many_tools = [
+        StructuredTool.from_function(
+            coroutine=AsyncMock(return_value="result"),
+            name=f"srv__tool_{i}",
+            description=f"Tool {i}",
+            args_schema=NoArgs,
+        )
+        for i in range(MAX_TOOLS_PER_AGENT)
+    ]
+
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)):
+        with pytest.raises(ValueError, match="max"):
+            await executor._build_graph(
+                {
+                    "model": "claude-3-5-sonnet-latest",
+                    "temperature": 0.5,
+                    "allowed_tools": ["calculator"],  # 1 built-in + 128 custom = 129 > 128
+                },
+                cancel_event=cancel_event,
+                task_id="task-123",
+                custom_tools=many_tools,
+            )
     assert executor._is_retryable_error(Exception("rate limit reached")) is True
 
 

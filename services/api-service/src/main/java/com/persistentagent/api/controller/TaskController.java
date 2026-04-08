@@ -103,6 +103,14 @@ public class TaskController {
         return ResponseEntity.ok(response);
     }
 
+    @PostMapping("/{taskId}/follow-up")
+    public ResponseEntity<RedriveResponse> followUpTask(
+            @PathVariable UUID taskId,
+            @Valid @RequestBody TaskRespondRequest request) {
+        RedriveResponse response = taskService.followUpTask(taskId, request.message());
+        return ResponseEntity.ok(response);
+    }
+
     @PostMapping("/{taskId}/resume")
     public ResponseEntity<RedriveResponse> resumeTask(@PathVariable UUID taskId) {
         RedriveResponse response = taskService.resumeTask(taskId);

@@ -343,6 +343,44 @@ public class TaskRepository {
     }
 
     /**
+     * Follows up a completed task by transitioning it back to queued with a follow-up payload.
+     * Clears output so new output is written on re-completion.
+     */
+    public HitlMutationResult followUpTask(UUID taskId, String tenantId, String humanResponse) {
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+            """
+            UPDATE tasks SET
+                status = 'queued',
+                human_response = ?,
+                output = NULL,
+                lease_owner = NULL,
+                lease_expiry = NULL,
+                version = version + 1,
+                updated_at = NOW()
+            WHERE task_id = ?::uuid AND tenant_id = ? AND status = 'completed'
+            RETURNING task_id, agent_id, worker_pool_id
+            """,
+            humanResponse, taskId.toString(), tenantId
+        );
+        if (rows.isEmpty()) {
+            boolean exists = !jdbcTemplate.queryForList(
+                "SELECT 1 FROM tasks WHERE task_id = ?::uuid AND tenant_id = ?",
+                taskId.toString(), tenantId
+            ).isEmpty();
+            return new HitlMutationResult(
+                exists ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND,
+                null, null
+            );
+        }
+        Map<String, Object> row = rows.get(0);
+        return new HitlMutationResult(
+            MutationResult.UPDATED,
+            row.get("worker_pool_id").toString(),
+            row.get("agent_id").toString()
+        );
+    }
+
+    /**
      * Result of a HITL mutation that also carries the worker_pool_id and agent_id
      * needed for pg_notify and event recording.
      */

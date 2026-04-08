@@ -7,6 +7,7 @@ import { ALLOWED_TOOLS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 import { formatUsd } from '@/lib/utils';
+import { useToolServers } from '../tool-servers/useToolServers';
 
 import {
     Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
@@ -18,6 +19,7 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Badge } from '@/components/ui/badge';
 
 const createAgentSchema = z.object({
     display_name: z.string().min(1, 'Agent name is required').max(200),
@@ -26,6 +28,7 @@ const createAgentSchema = z.object({
     model: z.string().min(1, 'Model is required'),
     temperature: z.number().min(0).max(2).default(0.7),
     allowed_tools: z.array(z.string()).default([]),
+    tool_servers: z.array(z.string()).default([]),
     max_concurrent_tasks: z.number().int().min(1).default(5),
     budget_max_per_task: z.number().int().min(1).default(500000),
     budget_max_per_hour: z.number().int().min(1).default(5000000),
@@ -42,6 +45,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const mutation = useCreateAgent();
     const { data: models = [], isLoading: isLoadingModels } = useModels();
     const modelGroups = groupModelsByProvider(models);
+    const { data: toolServers = [] } = useToolServers('active');
 
     const form = useForm<CreateAgentFormValues>({
         resolver: zodResolver(createAgentSchema),
@@ -52,11 +56,14 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
             model: 'claude-3-5-sonnet-latest',
             temperature: 0.7,
             allowed_tools: ['web_search', 'read_url', 'calculator', 'request_human_input'],
+            tool_servers: [],
             max_concurrent_tasks: 5,
             budget_max_per_task: 500000,
             budget_max_per_hour: 5000000,
         },
     });
+
+    const selectedToolServers = form.watch('tool_servers');
 
     function onSubmit(data: CreateAgentFormValues) {
         mutation.mutate(
@@ -68,6 +75,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                     model: data.model,
                     temperature: data.temperature,
                     allowed_tools: data.allowed_tools,
+                    tool_servers: data.tool_servers,
                 },
                 max_concurrent_tasks: data.max_concurrent_tasks,
                 budget_max_per_task: data.budget_max_per_task,
@@ -236,6 +244,52 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             )}
                         />
 
+                        <div className="space-y-3">
+                            <div className="uppercase tracking-widest text-muted-foreground text-xs">Tool Servers</div>
+                            {toolServers.length === 0 ? (
+                                <p className="text-muted-foreground text-xs">
+                                    No tool servers registered. Register one in Tool Servers to give this agent custom tools.
+                                </p>
+                            ) : (
+                                <div className="space-y-2">
+                                    {toolServers.map((server) => (
+                                        <label
+                                            key={server.server_id}
+                                            className="flex items-center gap-3 p-2 rounded hover:bg-white/5 cursor-pointer"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={selectedToolServers.includes(server.name)}
+                                                onChange={(e) => {
+                                                    const current = form.getValues('tool_servers');
+                                                    if (e.target.checked) {
+                                                        form.setValue('tool_servers', [...current, server.name]);
+                                                    } else {
+                                                        form.setValue('tool_servers', current.filter((n) => n !== server.name));
+                                                    }
+                                                }}
+                                                className="accent-primary"
+                                            />
+                                            <div className="flex items-center gap-2">
+                                                <span className="text-sm font-medium">{server.name}</span>
+                                                <Badge
+                                                    variant={server.status === 'active' ? 'default' : 'secondary'}
+                                                    className={
+                                                        server.status === 'active'
+                                                            ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30 text-[10px] px-1.5 py-0'
+                                                            : 'bg-zinc-500/20 text-zinc-400 border-zinc-500/30 text-[10px] px-1.5 py-0'
+                                                    }
+                                                >
+                                                    {server.status}
+                                                </Badge>
+                                                <span className="text-muted-foreground text-xs">— {server.url}</span>
+                                            </div>
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
                         <FormField
                             control={form.control}
                             name="allowed_tools"
@@ -259,7 +313,8 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                                 Enable Human Input
                                             </FormLabel>
                                             <p className="text-xs text-muted-foreground mt-0.5">
-                                                Allow this agent to pause and request input from a human operator
+                                                Allow this agent to pause and request input from a human operator.
+                                                The agent's system prompt will be augmented to instruct the model to use this tool when it needs user input.
                                             </p>
                                         </div>
                                     </div>

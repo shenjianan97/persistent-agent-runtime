@@ -56,7 +56,7 @@ class AgentServiceTest {
     @Test
     void createAgent_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"));
+                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -86,7 +86,7 @@ class AgentServiceTest {
     @Test
     void createAgent_withCustomBudgetFields_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"));
+                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, 10, 1000000L, 10000000L);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -110,7 +110,7 @@ class AgentServiceTest {
     @Test
     void createAgent_invalidModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "bad-provider", "bad-model", 0.7, List.of());
+                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doThrow(new ValidationException("Unsupported model or provider: bad-provider/bad-model"))
@@ -123,7 +123,7 @@ class AgentServiceTest {
     @Test
     void createAgent_invalidTool_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of("unsupported_tool"));
+                "prompt", "openai", "gpt-4o", 0.7, List.of("unsupported_tool"), null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doThrow(new ValidationException("Unsupported tool: unsupported_tool"))
@@ -138,7 +138,7 @@ class AgentServiceTest {
     @Test
     void createAgent_nullTemperature_defaultsTo0_7() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", null, List.of("web_search"));
+                "prompt", "openai", "gpt-4o", null, List.of("web_search"), null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -161,7 +161,7 @@ class AgentServiceTest {
     @Test
     void createAgent_nullAllowedTools_defaultsToEmptyList() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, null);
+                "prompt", "openai", "gpt-4o", 0.7, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -268,7 +268,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of());
+                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -292,7 +292,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_withBudgetFields_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of());
+                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", 10, 1000000L, 10000000L);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -320,7 +320,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_notFound_throwsAgentNotFoundException() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of());
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -335,7 +335,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_invalidStatus_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of());
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "invalid_status", null, null, null);
 
         assertThrows(ValidationException.class,
@@ -345,7 +345,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_invalidModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "bad-provider", "bad-model", 0.7, List.of());
+                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doThrow(new ValidationException("Unsupported model or provider"))
@@ -358,7 +358,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_configCanonicalization_appliesDefaults() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", null, null);
+                "prompt", "openai", "gpt-4o", null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());

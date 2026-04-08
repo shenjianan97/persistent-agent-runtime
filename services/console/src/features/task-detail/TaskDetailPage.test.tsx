@@ -271,11 +271,36 @@ vi.mock('sonner', () => ({
     },
 }));
 
+vi.mock('@/api/client', async () => {
+    const actual = await vi.importActual<typeof import('@/api/client')>('@/api/client');
+    return {
+        ...actual,
+        api: {
+            ...actual.api,
+            followUpTask: vi.fn(),
+            getTaskEvents: vi.fn().mockResolvedValue({ events: [] }),
+        },
+    };
+});
+
 afterEach(() => {
     cleanup();
     navigateMock.mockReset();
     redriveMutateMock.mockReset();
 });
+
+function renderTaskDetail() {
+    const queryClient = createTestQueryClient();
+    render(
+        <QueryClientProvider client={queryClient}>
+            <MemoryRouter initialEntries={['/tasks/task-1']}>
+                <Routes>
+                    <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
+                </Routes>
+            </MemoryRouter>
+        </QueryClientProvider>,
+    );
+}
 
 describe('TaskDetailPage', () => {
     it('navigates to the returned task after redrive succeeds', () => {
@@ -283,16 +308,7 @@ describe('TaskDetailPage', () => {
             options?.onSuccess?.({ task_id: 'task-2', status: 'queued' });
         });
 
-        const queryClient = createTestQueryClient();
-        render(
-            <QueryClientProvider client={queryClient}>
-                <MemoryRouter initialEntries={['/tasks/task-1']}>
-                    <Routes>
-                        <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
-                    </Routes>
-                </MemoryRouter>
-            </QueryClientProvider>,
-        );
+        renderTaskDetail();
 
         fireEvent.click(screen.getByRole('button', { name: 'Redrive Task' }));
 
@@ -300,18 +316,16 @@ describe('TaskDetailPage', () => {
     });
 
     it('renders persisted checkpoints for dead-lettered tasks', () => {
-        const queryClient = createTestQueryClient();
-        render(
-            <QueryClientProvider client={queryClient}>
-                <MemoryRouter initialEntries={['/tasks/task-1']}>
-                    <Routes>
-                        <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
-                    </Routes>
-                </MemoryRouter>
-            </QueryClientProvider>,
-        );
+        renderTaskDetail();
 
         expect(screen.getByText('Execution Failure')).toBeInTheDocument();
         expect(screen.getByText('CostSummary checkpoints=3')).toBeInTheDocument();
     });
+
+    it('does not show follow-up panel for dead_letter tasks', () => {
+        renderTaskDetail();
+
+        expect(screen.queryByText('Follow Up')).not.toBeInTheDocument();
+    });
 });
+
