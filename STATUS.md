@@ -14,6 +14,7 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 1 | Agent Control Plane | Complete | [plan](docs/exec-plans/completed/phase-2/track-1/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-1/progress.md) |
 | Track 2 | HITL & Unified Timeline | Complete | [plan](docs/exec-plans/completed/phase-2/track-2/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-2/progress.md) |
 | Track 3 | Scheduler & Budgets | Complete | [plan](docs/exec-plans/active/phase-2/track-3/plan.md) | [progress](docs/exec-plans/active/phase-2/track-3/progress.md) |
+| Track 4 | Custom Tool Runtime (BYOT) | Active | [plan](docs/exec-plans/active/phase-2/track-4/plan.md) | [progress](docs/exec-plans/active/phase-2/track-4/progress.md) |
 
 ### Standalone
 
