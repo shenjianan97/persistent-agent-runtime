@@ -182,6 +182,12 @@ export function SubmitTaskPage() {
                                                         <span className="text-foreground">{selectedAgent.agent_config.allowed_tools.filter(t => t !== 'request_human_input').join(', ')}</span>
                                                     </div>
                                                 )}
+                                                {selectedAgent.agent_config.tool_servers && selectedAgent.agent_config.tool_servers.length > 0 && (
+                                                    <div className="md:col-span-2">
+                                                        <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tool Servers</span>
+                                                        <span className="text-foreground">{selectedAgent.agent_config.tool_servers.join(', ')}</span>
+                                                    </div>
+                                                )}
                                                 {selectedAgent.agent_config.allowed_tools?.includes('request_human_input') && (
                                                     <div>
                                                         <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Human-in-the-Loop</span>

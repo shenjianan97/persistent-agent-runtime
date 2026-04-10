@@ -41,6 +41,11 @@ public class GlobalExceptionHandler {
         return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());
     }
 
+    @ExceptionHandler(ToolServerNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleToolServerNotFound(ToolServerNotFoundException ex) {
+        return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+
     @ExceptionHandler(LangfuseEndpointService.NotFoundException.class)
     public ResponseEntity<Map<String, Object>> handleLangfuseEndpointNotFound(LangfuseEndpointService.NotFoundException ex) {
         return buildErrorResponse(HttpStatus.NOT_FOUND, ex.getMessage());

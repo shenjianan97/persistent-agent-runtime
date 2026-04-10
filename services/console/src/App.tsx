@@ -9,6 +9,8 @@ import { DeadLetterPage } from './features/dead-letter/DeadLetterPage';
 import { SettingsPage } from './features/settings/SettingsPage';
 import { AgentsListPage } from './features/agents/AgentsListPage';
 import { AgentDetailPage } from './features/agents/AgentDetailPage';
+import { ToolServersListPage } from './features/tool-servers/ToolServersListPage';
+import { ToolServerDetailPage } from './features/tool-servers/ToolServerDetailPage';
 import { Toaster } from 'sonner';
 
 const queryClient = new QueryClient({
@@ -32,6 +34,8 @@ function App() {
                         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                         <Route path="/agents" element={<AgentsListPage />} />
                         <Route path="/agents/:agentId" element={<AgentDetailPage />} />
+                        <Route path="/tool-servers" element={<ToolServersListPage />} />
+                        <Route path="/tool-servers/:serverId" element={<ToolServerDetailPage />} />
                         <Route path="/dead-letter" element={<DeadLetterPage />} />
                         <Route path="/settings" element={<SettingsPage />} />
                         <Route path="*" element={<Navigate to="/" replace />} />

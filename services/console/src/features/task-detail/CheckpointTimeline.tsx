@@ -3,10 +3,10 @@ import { Card, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
     AlertCircle, BrainCircuit, MoveRight, RotateCcw, User, Wrench, Zap,
-    Pause, PlayCircle, ShieldCheck, ShieldX,
+    Pause, PlayCircle, CheckCircle2, ShieldCheck, ShieldX,
     MessageSquare, MessageCircle, Ban, RefreshCw,
 } from 'lucide-react';
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { TaskStatus } from '@/types';
 
@@ -22,6 +22,8 @@ const HITL_EVENT_TYPES = new Set<TaskEventType>([
     'task_resumed',
     'task_cancelled',
     'task_redriven',
+    'task_completed',
+    'task_follow_up',
 ]);
 
 interface HitlMarkerStyle {
@@ -41,6 +43,8 @@ const HITL_STYLES: Partial<Record<TaskEventType, HitlMarkerStyle>> = {
     task_resumed:            { label: 'Task Resumed',        colorClass: 'text-green-400',  bgClass: 'bg-green-500',  icon: PlayCircle },
     task_cancelled:          { label: 'Task Cancelled',      colorClass: 'text-red-400',    bgClass: 'bg-red-500',    icon: Ban },
     task_redriven:           { label: 'Task Redriven',       colorClass: 'text-blue-400',   bgClass: 'bg-blue-500',   icon: RefreshCw },
+    task_completed:          { label: 'Task Completed',      colorClass: 'text-emerald-400', bgClass: 'bg-emerald-500', icon: CheckCircle2 },
+    task_follow_up:          { label: 'Follow Up',           colorClass: 'text-primary',     bgClass: 'bg-primary',     icon: MessageSquare },
 };
 
 // ─── Unified timeline entry ────────────────────────────────────────
@@ -274,8 +278,22 @@ export function CheckpointTimeline({
 
     const timeline = buildTimeline(checkpoints, hitlEvents);
 
-    // Track previous checkpoint worker for handoff detection
-    let lastCheckpointWorkerId: string | null = null;
+    // Pre-compute handoff markers: for each checkpoint, record whether
+    // the worker changed compared to the previous checkpoint.
+    const handoffMap = useMemo(() => {
+        const map = new Map<string, { prevWorker: string }>();
+        let prevWorkerId: string | null = null;
+        for (const entry of timeline) {
+            if (entry.kind === 'checkpoint') {
+                const cp = entry.data as CheckpointResponse;
+                if (prevWorkerId && prevWorkerId !== cp.worker_id) {
+                    map.set(cp.checkpoint_id, { prevWorker: prevWorkerId });
+                }
+                prevWorkerId = cp.worker_id;
+            }
+        }
+        return map;
+    }, [timeline]);
 
     // Pre-compute cumulative costs and step durations for checkpoints
     const cumulativeCosts = new Map<string, number>();
@@ -418,9 +436,8 @@ export function CheckpointTimeline({
 
                                 // ── Checkpoint row ──
                                 const cp = entry.data;
-                                const prevWorker = lastCheckpointWorkerId;
-                                lastCheckpointWorkerId = cp.worker_id;
-                                const isHandoff = prevWorker && prevWorker !== cp.worker_id;
+                                const handoff = handoffMap.get(cp.checkpoint_id);
+                                const isHandoff = !!handoff;
                                 const resumeMarker = resumeMarkers.get(cp.checkpoint_id);
                                 const event = cp.event;
                                 const style = getEventStyle(event);
@@ -492,8 +509,8 @@ export function CheckpointTimeline({
                                                 <div className="bg-warning/10 border border-warning/20 p-2 text-xs text-warning flex flex-wrap items-start gap-2 min-w-0">
                                                     <MoveRight className="w-3 h-3 shrink-0 mt-0.5" />
                                                     <span className="font-bold tracking-widest uppercase shrink-0">Handoff</span>
-                                                    <span className="opacity-80 min-w-0 flex-1 break-all" title={`${prevWorker} → ${cp.worker_id}`}>
-                                                        {prevWorker} → {cp.worker_id}
+                                                    <span className="opacity-80 min-w-0 flex-1 break-all" title={`${handoff?.prevWorker} → ${cp.worker_id}`}>
+                                                        {handoff?.prevWorker} → {cp.worker_id}
                                                     </span>
                                                 </div>
                                             )}

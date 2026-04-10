@@ -143,6 +143,8 @@ jobs:
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0008_tool_servers.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
       - name: Run API integration tests
@@ -200,6 +202,8 @@ jobs:
             -f infrastructure/database/migrations/0006_runtime_state_model.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0008_tool_servers.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
@@ -272,6 +276,8 @@ jobs:
             -f infrastructure/database/migrations/0006_runtime_state_model.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0008_tool_servers.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
@@ -360,6 +366,8 @@ jobs:
             -f infrastructure/database/migrations/0006_runtime_state_model.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/0008_tool_servers.sql
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 

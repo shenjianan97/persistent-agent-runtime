@@ -391,4 +391,64 @@ class TaskControllerTest {
                 mockMvc.perform(post("/v1/tasks/" + taskId + "/redrive"))
                                 .andExpect(status().isConflict());
         }
+
+        // --- POST /v1/tasks/{taskId}/follow-up ---
+
+        @Test
+        void followUpTask_completed_success() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                RedriveResponse response = new RedriveResponse(taskId, "queued");
+                when(taskService.followUpTask(eq(taskId), eq("What happened next?")))
+                                .thenReturn(response);
+
+                String body = """
+                                {
+                                  "message": "What happened next?"
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks/" + taskId + "/follow-up")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.task_id").value(taskId.toString()))
+                                .andExpect(jsonPath("$.status").value("queued"));
+        }
+
+        @Test
+        void followUpTask_running_fails_returns409() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                when(taskService.followUpTask(eq(taskId), any()))
+                                .thenThrow(new InvalidStateTransitionException(taskId,
+                                                "Task " + taskId + " cannot be followed up (must be in completed state)"));
+
+                String body = """
+                                {
+                                  "message": "follow-up"
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks/" + taskId + "/follow-up")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isConflict());
+        }
+
+        @Test
+        void followUpTask_notFound_returns404() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                when(taskService.followUpTask(eq(taskId), any()))
+                                .thenThrow(new TaskNotFoundException(taskId));
+
+                String body = """
+                                {
+                                  "message": "follow-up"
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks/" + taskId + "/follow-up")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isNotFound());
+        }
 }

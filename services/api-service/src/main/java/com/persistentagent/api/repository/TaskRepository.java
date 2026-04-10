@@ -343,6 +343,57 @@ public class TaskRepository {
     }
 
     /**
+     * Follows up a completed task by transitioning it back to queued with a follow-up payload.
+     * Clears output so new output is written on re-completion.
+     */
+    public HitlMutationResult followUpTask(UUID taskId, String tenantId, String humanResponse) {
+        String sql = """
+                WITH target AS (
+                    SELECT task_id FROM tasks WHERE task_id = ?::uuid AND tenant_id = ?
+                ),
+                updated AS (
+                    UPDATE tasks SET
+                        status = 'queued',
+                        human_response = ?,
+                        output = NULL,
+                        lease_owner = NULL,
+                        lease_expiry = NULL,
+                        timeout_reference_at = NOW(),
+                        version = version + 1,
+                        updated_at = NOW()
+                    WHERE task_id = ?::uuid AND tenant_id = ? AND status = 'completed'
+                    RETURNING task_id, agent_id, worker_pool_id
+                ),
+                notified AS (
+                    SELECT pg_notify('new_task', u.worker_pool_id)
+                    FROM updated u
+                )
+                SELECT
+                    (SELECT COUNT(*) FROM target) AS found,
+                    (SELECT COUNT(*) FROM updated) AS updated,
+                    (SELECT worker_pool_id FROM updated) AS worker_pool_id,
+                    (SELECT agent_id FROM updated) AS agent_id,
+                    n.*
+                FROM notified n
+                RIGHT JOIN (SELECT 1) AS dummy ON true
+                """;
+
+        Map<String, Object> result = jdbcTemplate.queryForMap(sql,
+                taskId.toString(), tenantId,
+                humanResponse,
+                taskId.toString(), tenantId);
+        long updatedCount = ((Number) result.get("updated")).longValue();
+        if (updatedCount > 0) {
+            return new HitlMutationResult(MutationResult.UPDATED,
+                    (String) result.get("worker_pool_id"),
+                    (String) result.get("agent_id"));
+        }
+        long found = ((Number) result.get("found")).longValue();
+        MutationResult mr = found > 0 ? MutationResult.WRONG_STATE : MutationResult.NOT_FOUND;
+        return new HitlMutationResult(mr, null, null);
+    }
+
+    /**
      * Result of a HITL mutation that also carries the worker_pool_id and agent_id
      * needed for pg_notify and event recording.
      */

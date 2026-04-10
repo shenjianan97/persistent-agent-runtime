@@ -422,6 +422,68 @@ Tool server names and URLs may be logged. Auth tokens must never appear in logs.
 2. Should there be a configurable per-server tool call timeout, or is a global default sufficient for Track 4?
 3. Should the agent config support per-server tool allowlists (e.g. `{"server": "jira-tools", "tools": ["create_issue"]}`) or should all discovered tools be available?
 
+## Task Follow-Up (Continue Completed Tasks)
+
+Completed tasks retain their full LangGraph checkpoint history. Track 4 adds the ability to continue a completed task by providing a follow-up prompt, resuming from the last checkpoint state.
+
+### Design
+
+**No new database columns.** The existing `human_response` TEXT column is reused with a new payload kind:
+
+```json
+{"kind": "follow_up", "message": "Now show me the CDK code for that"}
+```
+
+This follows the same pattern as HITL payloads (`{"kind": "input", ...}` and `{"kind": "approval", ...}`).
+
+### API
+
+**`POST /v1/tasks/{task_id}/follow-up`** — Continue a completed task
+
+Request:
+```json
+{"input": "Follow-up prompt text"}
+```
+
+Response: `200 OK`
+```json
+{"task_id": "...", "status": "queued"}
+```
+
+Validation:
+- Task must be in `completed` status
+- `input` must be non-empty
+
+Behavior:
+- Sets `human_response` to `{"kind": "follow_up", "message": "..."}`
+- Transitions `completed` → `queued`
+- Clears `output`, `lease_owner`, `lease_expiry`
+- Increments `version`
+- Records `task_follow_up` event
+- Notifies the worker pool via `NOTIFY`
+
+### Worker
+
+In `run_astream()`, the resume path already checks `human_response` and decodes by `kind`. The follow-up case:
+
+```python
+if payload.get("kind") == "follow_up":
+    initial_input = {"messages": [HumanMessage(content=payload.get("message", ""))]}
+```
+
+This injects a new `HumanMessage` into the existing conversation, and LangGraph continues from the last checkpoint with the full prior context.
+
+### Console
+
+The task detail page shows a "Follow Up" input panel when `status === 'completed'`:
+- Text input + "Continue" button
+- On submit, calls `POST /v1/tasks/{task_id}/follow-up`
+- Task transitions to queued and the page switches to the running view
+
+### Event
+
+New event type: `task_follow_up` with `status_before: completed`, `status_after: queued`, and `details: {"input": "..."}`.
+
 ## Testing Strategy
 
 ### Unit tests

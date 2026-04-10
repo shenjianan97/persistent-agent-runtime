@@ -192,3 +192,4 @@ Same pattern as Tracks 1-3: single coordinated deployment. Migration `0008` is p
 | Task 6 | [task-6-console-tool-servers.md](agent_tasks/task-6-console-tool-servers.md) | Console: Tool Servers list, detail, register dialog, discover UI |
 | Task 7 | [task-7-console-agent-config.md](agent_tasks/task-7-console-agent-config.md) | Console: tool server multi-select in agent create/edit forms |
 | Task 8 | [task-8-integration-tests.md](agent_tasks/task-8-integration-tests.md) | E2E tests for custom tool lifecycle |
+| Task 9 | [task-9-follow-up.md](agent_tasks/task-9-follow-up.md) | Follow-up on completed tasks: API endpoint, worker resume path, Console UI |

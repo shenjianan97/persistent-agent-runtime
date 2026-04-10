@@ -17,5 +17,7 @@ public record AgentConfigRequest(
 
                 @DecimalMin(value = "0.0", message = "temperature must be >= 0.0") @DecimalMax(value = "2.0", message = "temperature must be <= 2.0") Double temperature,
 
-                @JsonProperty("allowed_tools") List<String> allowedTools) {
+                @JsonProperty("allowed_tools") List<String> allowedTools,
+
+                @Size(max = 50, message = "tool_servers must not exceed 50 entries") @JsonProperty("tool_servers") List<String> toolServers) {
 }

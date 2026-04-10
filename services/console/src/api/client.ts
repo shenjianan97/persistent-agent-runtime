@@ -17,6 +17,11 @@ import {
     AgentCreateRequest,
     AgentUpdateRequest,
     TaskEventListResponse,
+    ToolServerSummaryResponse,
+    ToolServerResponse,
+    ToolServerCreateRequest,
+    ToolServerUpdateRequest,
+    ToolDiscoverResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -191,7 +196,46 @@ export const api = {
             body: JSON.stringify({ message }),
         }),
 
+    followUpTask: (taskId: string, input: string) =>
+        fetchApi<RedriveResponse>(`/v1/tasks/${encodeURIComponent(taskId)}/follow-up`, {
+            method: 'POST',
+            body: JSON.stringify({ message: input }),
+        }),
+
     // Task Events
     getTaskEvents: (taskId: string, limit = 100) =>
         fetchApi<TaskEventListResponse>(`/v1/tasks/${taskId}/events?limit=${limit}`),
+
+    // Tool Servers
+    createToolServer: (request: ToolServerCreateRequest) =>
+        fetchApi<ToolServerResponse>('/v1/tool-servers', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        }),
+
+    listToolServers: (status?: string) => {
+        const params = new URLSearchParams();
+        if (status) params.set('status', status);
+        const query = params.toString();
+        return fetchApi<ToolServerSummaryResponse[]>(`/v1/tool-servers${query ? '?' + query : ''}`);
+    },
+
+    getToolServer: (serverId: string) =>
+        fetchApi<ToolServerResponse>(`/v1/tool-servers/${encodeURIComponent(serverId)}`),
+
+    updateToolServer: (serverId: string, request: ToolServerUpdateRequest) =>
+        fetchApi<ToolServerResponse>(`/v1/tool-servers/${encodeURIComponent(serverId)}`, {
+            method: 'PUT',
+            body: JSON.stringify(request),
+        }),
+
+    deleteToolServer: (serverId: string) =>
+        fetchApi<void>(`/v1/tool-servers/${encodeURIComponent(serverId)}`, {
+            method: 'DELETE',
+        }),
+
+    discoverToolServer: (serverId: string) =>
+        fetchApi<ToolDiscoverResponse>(`/v1/tool-servers/${encodeURIComponent(serverId)}/discover`, {
+            method: 'POST',
+        }),
 };

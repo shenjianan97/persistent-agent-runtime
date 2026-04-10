@@ -168,6 +168,9 @@ public class AgentService {
                         : ValidationConstants.DEFAULT_TEMPERATURE,
                 config.allowedTools() != null
                         ? config.allowedTools()
+                        : List.of(),
+                config.toolServers() != null
+                        ? config.toolServers()
                         : List.of());
     }
 

@@ -43,6 +43,13 @@ vi.mock('sonner', () => ({
     },
 }));
 
+vi.mock('../tool-servers/useToolServers', () => ({
+    useToolServers: () => ({
+        data: [],
+        isLoading: false,
+    }),
+}));
+
 function createWrapper() {
     const queryClient = new QueryClient({
         defaultOptions: { queries: { retry: false } },
