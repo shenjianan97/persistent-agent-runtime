@@ -263,9 +263,9 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                                 onChange={(e) => {
                                                     const current = form.getValues('tool_servers');
                                                     if (e.target.checked) {
-                                                        form.setValue('tool_servers', [...current, server.name]);
+                                                        form.setValue('tool_servers', [...current, server.name], { shouldDirty: true, shouldValidate: true });
                                                     } else {
-                                                        form.setValue('tool_servers', current.filter((n) => n !== server.name));
+                                                        form.setValue('tool_servers', current.filter((n) => n !== server.name), { shouldDirty: true, shouldValidate: true });
                                                     }
                                                 }}
                                                 className="accent-primary"

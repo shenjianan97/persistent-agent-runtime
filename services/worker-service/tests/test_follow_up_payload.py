@@ -10,7 +10,11 @@ from langgraph.types import Command
 
 
 def decode_human_response(human_response_json: str):
-    """Replicate the payload decoding logic from run_astream() for unit testing."""
+    """Replicate the payload decoding logic from run_astream() for unit testing.
+
+    NOTE: This duplicates decode logic from GraphExecutor.run_astream() because
+    the production code is embedded in a method and not independently importable.
+    """
     payload = json.loads(human_response_json)
     if payload.get("kind") == "follow_up":
         initial_input = {"messages": [HumanMessage(content=payload.get("message", ""))]}

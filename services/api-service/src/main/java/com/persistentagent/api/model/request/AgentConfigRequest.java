@@ -19,5 +19,5 @@ public record AgentConfigRequest(
 
                 @JsonProperty("allowed_tools") List<String> allowedTools,
 
-                @JsonProperty("tool_servers") List<String> toolServers) {
+                @Size(max = 50, message = "tool_servers must not exceed 50 entries") @JsonProperty("tool_servers") List<String> toolServers) {
 }

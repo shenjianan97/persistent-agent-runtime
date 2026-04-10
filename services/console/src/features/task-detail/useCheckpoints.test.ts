@@ -13,6 +13,12 @@ describe('getCheckpointRefetchInterval', () => {
         expect(getCheckpointRefetchInterval('completed', 5, 3)).toBe(1000);
     });
 
+    it('does not poll during paused or waiting states', () => {
+        expect(getCheckpointRefetchInterval('paused', 2, 2)).toBe(false);
+        expect(getCheckpointRefetchInterval('waiting_for_input', 2, 2)).toBe(false);
+        expect(getCheckpointRefetchInterval('waiting_for_approval', 2, 2)).toBe(false);
+    });
+
     it('stops polling once terminal-state checkpoints are fully loaded', () => {
         expect(getCheckpointRefetchInterval('dead_letter', 2, 2)).toBe(false);
         expect(getCheckpointRefetchInterval('completed', 5, 5)).toBe(false);

@@ -61,7 +61,7 @@ def json_schema_to_pydantic(schema: dict[str, Any], model_name: str = "DynamicMo
     return create_model(model_name, **field_definitions)
 
 
-def _json_type_to_python(schema: dict[str, Any], context: str) -> type | None:
+def _json_type_to_python(schema: dict[str, Any], context: str) -> Any:
     """Map a JSON Schema type to a Python type."""
     if not isinstance(schema, dict):
         return Any

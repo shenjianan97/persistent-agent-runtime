@@ -1,5 +1,6 @@
 package com.persistentagent.api.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.exception.ToolServerNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.ToolServerCreateRequest;
@@ -15,6 +16,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DuplicateKeyException;
 
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
@@ -29,6 +33,8 @@ class ToolServerServiceTest {
     @Mock
     private ToolServerRepository repository;
 
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
     private ToolServerService service;
 
     private static final String TENANT_ID = "default";
@@ -36,7 +42,7 @@ class ToolServerServiceTest {
 
     @BeforeEach
     void setUp() {
-        service = new ToolServerService(repository);
+        service = new ToolServerService(repository, objectMapper);
     }
 
     // --- Helper ---
@@ -230,7 +236,7 @@ class ToolServerServiceTest {
             "updated-server", null, null, null, null
         );
         Map<String, Object> row = buildRow(SERVER_ID, "updated-server", "http://localhost:8080/mcp", "none", null, "active");
-        when(repository.update(eq(TENANT_ID), eq(SERVER_ID), eq("updated-server"), isNull(), isNull(), isNull(), isNull()))
+        when(repository.update(eq(TENANT_ID), eq(SERVER_ID), eq("updated-server"), isNull(), isNull(), isNull(), eq(false), isNull()))
             .thenReturn(Optional.of(row));
 
         ToolServerResponse response = service.updateToolServer(SERVER_ID, request);
@@ -243,7 +249,7 @@ class ToolServerServiceTest {
         ToolServerUpdateRequest request = new ToolServerUpdateRequest(
             "updated-server", null, null, null, null
         );
-        when(repository.update(any(), any(), any(), any(), any(), any(), any()))
+        when(repository.update(any(), any(), any(), any(), any(), any(), anyBoolean(), any()))
             .thenReturn(Optional.empty());
 
         assertThrows(ToolServerNotFoundException.class,
@@ -275,11 +281,27 @@ class ToolServerServiceTest {
         ToolServerUpdateRequest request = new ToolServerUpdateRequest(
             "existing-server", null, null, null, null
         );
-        when(repository.update(any(), any(), any(), any(), any(), any(), any()))
+        when(repository.update(any(), any(), any(), any(), any(), any(), anyBoolean(), any()))
             .thenThrow(new DuplicateKeyException("duplicate key"));
 
         assertThrows(ValidationException.class,
             () -> service.updateToolServer(SERVER_ID, request));
+    }
+
+    @Test
+    void testUpdateToolServer_switchToNone_clearAuthToken() {
+        ToolServerUpdateRequest request = new ToolServerUpdateRequest(
+            null, null, "none", null, null
+        );
+        Map<String, Object> row = buildRow(SERVER_ID, "my-server", "http://localhost:8080/mcp", "none", null, "active");
+        when(repository.update(eq(TENANT_ID), eq(SERVER_ID), isNull(), isNull(), eq("none"), isNull(), eq(true), isNull()))
+            .thenReturn(Optional.of(row));
+
+        ToolServerResponse response = service.updateToolServer(SERVER_ID, request);
+
+        assertNotNull(response);
+        assertNull(response.authToken());
+        verify(repository).update(eq(TENANT_ID), eq(SERVER_ID), isNull(), isNull(), eq("none"), isNull(), eq(true), isNull());
     }
 
     // --- deleteToolServer tests ---
@@ -343,5 +365,87 @@ class ToolServerServiceTest {
         ToolServerResponse response = service.createToolServer(request);
 
         assertNull(response.authToken());
+    }
+
+    // --- discoverTools tests ---
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void testDiscoverTools_reachableServer_returnsTools() throws Exception {
+        Map<String, Object> row = buildRow(SERVER_ID, "my-server", "http://localhost:8080/mcp", "none", null, "active");
+        when(repository.findById(TENANT_ID, SERVER_ID)).thenReturn(Optional.of(row));
+
+        HttpClient mockHttpClient = mock(HttpClient.class);
+        HttpResponse<String> initResponse = mock(HttpResponse.class);
+        when(initResponse.statusCode()).thenReturn(200);
+        when(initResponse.headers()).thenReturn(java.net.http.HttpHeaders.of(Map.of(), (a, b) -> true));
+
+        HttpResponse<String> listResponse = mock(HttpResponse.class);
+        when(listResponse.statusCode()).thenReturn(200);
+        when(listResponse.body()).thenReturn(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echoes input\"}]}}"
+        );
+
+        when(mockHttpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+            .thenReturn(initResponse, listResponse);
+
+        ToolServerService serviceWithMockHttp = new ToolServerService(repository, objectMapper, mockHttpClient);
+        ToolDiscoverResponse response = serviceWithMockHttp.discoverTools(SERVER_ID);
+
+        assertEquals("reachable", response.status());
+        assertNull(response.error());
+        assertEquals(1, response.tools().size());
+        assertEquals("echo", response.tools().get(0).name());
+        assertEquals("Echoes input", response.tools().get(0).description());
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void testDiscoverTools_unreachableServer_http401() throws Exception {
+        Map<String, Object> row = buildRow(SERVER_ID, "my-server", "http://localhost:8080/mcp", "bearer_token", "badtoken", "active");
+        when(repository.findById(TENANT_ID, SERVER_ID)).thenReturn(Optional.of(row));
+
+        HttpClient mockHttpClient = mock(HttpClient.class);
+        HttpResponse<String> initResponse = mock(HttpResponse.class);
+        when(initResponse.statusCode()).thenReturn(401);
+
+        when(mockHttpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+            .thenReturn(initResponse);
+
+        ToolServerService serviceWithMockHttp = new ToolServerService(repository, objectMapper, mockHttpClient);
+        ToolDiscoverResponse response = serviceWithMockHttp.discoverTools(SERVER_ID);
+
+        assertEquals("unreachable", response.status());
+        assertNotNull(response.error());
+        assertTrue(response.error().contains("401"));
+        assertTrue(response.tools().isEmpty());
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    void testDiscoverTools_jsonRpcError_returnsUnreachable() throws Exception {
+        Map<String, Object> row = buildRow(SERVER_ID, "my-server", "http://localhost:8080/mcp", "none", null, "active");
+        when(repository.findById(TENANT_ID, SERVER_ID)).thenReturn(Optional.of(row));
+
+        HttpClient mockHttpClient = mock(HttpClient.class);
+        HttpResponse<String> initResponse = mock(HttpResponse.class);
+        when(initResponse.statusCode()).thenReturn(200);
+        when(initResponse.headers()).thenReturn(java.net.http.HttpHeaders.of(Map.of(), (a, b) -> true));
+
+        HttpResponse<String> listResponse = mock(HttpResponse.class);
+        when(listResponse.statusCode()).thenReturn(200);
+        when(listResponse.body()).thenReturn(
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"
+        );
+
+        when(mockHttpClient.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+            .thenReturn(initResponse, listResponse);
+
+        ToolServerService serviceWithMockHttp = new ToolServerService(repository, objectMapper, mockHttpClient);
+        ToolDiscoverResponse response = serviceWithMockHttp.discoverTools(SERVER_ID);
+
+        assertEquals("unreachable", response.status());
+        assertEquals("Method not found", response.error());
+        assertTrue(response.tools().isEmpty());
     }
 }

@@ -69,7 +69,7 @@ public final class ValidationConstants {
     public static final Set<String> VALID_AGENT_STATUSES = Set.of(AGENT_STATUS_ACTIVE, AGENT_STATUS_DISABLED);
 
     // Tool server constants
-    public static final String TOOL_SERVER_NAME_PATTERN = "^[a-z0-9][a-z0-9-]*$";
+    public static final String TOOL_SERVER_NAME_PATTERN = "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$";
     public static final String TOOL_SERVER_STATUS_ACTIVE = "active";
     public static final String TOOL_SERVER_STATUS_DISABLED = "disabled";
     public static final Set<String> VALID_TOOL_SERVER_STATUSES = Set.of(TOOL_SERVER_STATUS_ACTIVE, TOOL_SERVER_STATUS_DISABLED);

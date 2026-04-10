@@ -25,30 +25,35 @@ vi.mock('react-router', async () => {
     };
 });
 
+const DEAD_LETTER_TASK = {
+    task_id: 'task-1',
+    agent_id: 'agent-1',
+    status: 'dead_letter' as const,
+    input: 'demo input',
+    output: null,
+    retry_count: 2,
+    retry_history: ['2026-03-11T00:00:03Z', '2026-03-11T00:00:05Z'],
+    checkpoint_count: 3,
+    total_cost_microdollars: 0,
+    lease_owner: null,
+    last_error_code: 'retryable_error',
+    last_error_message: 'forced failure',
+    last_worker_id: 'worker-1',
+    dead_letter_reason: 'retries_exhausted',
+    dead_lettered_at: '2026-03-11T00:00:00Z',
+    created_at: '2026-03-11T00:00:00Z',
+    updated_at: '2026-03-11T00:00:00Z',
+};
+
+const taskStatusMock = vi.fn();
+taskStatusMock.mockReturnValue({
+    data: DEAD_LETTER_TASK,
+    isLoading: false,
+    isError: false,
+});
+
 vi.mock('./useTaskStatus', () => ({
-    useTaskStatus: () => ({
-        data: {
-            task_id: 'task-1',
-            agent_id: 'agent-1',
-            status: 'dead_letter',
-            input: 'demo input',
-            output: null,
-            retry_count: 2,
-            retry_history: ['2026-03-11T00:00:03Z', '2026-03-11T00:00:05Z'],
-            checkpoint_count: 3,
-            total_cost_microdollars: 0,
-            lease_owner: null,
-            last_error_code: 'retryable_error',
-            last_error_message: 'forced failure',
-            last_worker_id: 'worker-1',
-            dead_letter_reason: 'retries_exhausted',
-            dead_lettered_at: '2026-03-11T00:00:00Z',
-            created_at: '2026-03-11T00:00:00Z',
-            updated_at: '2026-03-11T00:00:00Z',
-        },
-        isLoading: false,
-        isError: false,
-    }),
+    useTaskStatus: (...args: unknown[]) => taskStatusMock(...args),
     useCancelTask: () => ({
         mutate: vi.fn(),
         isPending: false,
@@ -287,6 +292,11 @@ afterEach(() => {
     cleanup();
     navigateMock.mockReset();
     redriveMutateMock.mockReset();
+    taskStatusMock.mockReturnValue({
+        data: DEAD_LETTER_TASK,
+        isLoading: false,
+        isError: false,
+    });
 });
 
 function renderTaskDetail() {
@@ -326,6 +336,26 @@ describe('TaskDetailPage', () => {
         renderTaskDetail();
 
         expect(screen.queryByText('Follow Up')).not.toBeInTheDocument();
+    });
+
+    it('shows follow-up button for completed tasks', () => {
+        taskStatusMock.mockReturnValue({
+            data: {
+                ...DEAD_LETTER_TASK,
+                status: 'completed',
+                output: '{"result": "done"}',
+                dead_letter_reason: undefined,
+                dead_lettered_at: undefined,
+                last_error_code: undefined,
+                last_error_message: undefined,
+            },
+            isLoading: false,
+            isError: false,
+        });
+
+        renderTaskDetail();
+
+        expect(screen.getByRole('button', { name: /follow up/i })).toBeInTheDocument();
     });
 });
 

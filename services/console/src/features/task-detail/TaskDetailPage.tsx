@@ -358,7 +358,16 @@ export function TaskDetailPage() {
                                             prose-pre:bg-black/50 prose-pre:border prose-pre:border-emerald-500/20
                                             prose-hr:border-emerald-500/20
                                         ">
-                                            <Markdown remarkPlugins={[remarkGfm]}>{parsedOutput.result}</Markdown>
+                                            <Markdown
+                                            remarkPlugins={[remarkGfm]}
+                                            components={{
+                                                a: ({ href, children, ...props }) => (
+                                                    <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+                                                        {children}
+                                                    </a>
+                                                ),
+                                            }}
+                                        >{parsedOutput.result}</Markdown>
                                         </div>
                                     ) : (
                                         <pre className="text-xs font-mono text-success whitespace-pre-wrap">

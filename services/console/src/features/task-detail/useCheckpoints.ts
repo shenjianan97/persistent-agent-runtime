@@ -7,10 +7,8 @@ export function getCheckpointRefetchInterval(
     expectedCheckpointCount: number | undefined,
     loadedCheckpointCount: number,
 ) {
-    // Refetch while the task is actively executing or could resume at any moment
-    if (taskStatus === 'running' || taskStatus === 'queued' ||
-        taskStatus === 'paused' || taskStatus === 'waiting_for_input' ||
-        taskStatus === 'waiting_for_approval') {
+    // Refetch while the task is actively executing
+    if (taskStatus === 'running' || taskStatus === 'queued') {
         return 3000;
     }
 

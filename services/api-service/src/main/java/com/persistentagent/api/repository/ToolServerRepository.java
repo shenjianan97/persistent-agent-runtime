@@ -66,6 +66,7 @@ public class ToolServerRepository {
     public Optional<Map<String, Object>> update(String tenantId, String serverId,
                                                   String name, String url,
                                                   String authType, String authToken,
+                                                  boolean clearAuthToken,
                                                   String status) {
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(
             """
@@ -73,13 +74,17 @@ public class ToolServerRepository {
             SET name = COALESCE(?, name),
                 url = COALESCE(?, url),
                 auth_type = COALESCE(?, auth_type),
-                auth_token = CASE WHEN ? IS NOT NULL THEN ? ELSE auth_token END,
+                auth_token = CASE
+                    WHEN ?::boolean THEN NULL
+                    WHEN ? IS NOT NULL THEN ?
+                    ELSE auth_token
+                END,
                 status = COALESCE(?, status),
                 updated_at = NOW()
             WHERE tenant_id = ? AND server_id = ?::uuid
             RETURNING server_id, tenant_id, name, url, auth_type, auth_token, status, created_at, updated_at
             """,
-            name, url, authType, authToken, authToken, status, tenantId, serverId
+            name, url, authType, clearAuthToken, authToken, authToken, status, tenantId, serverId
         );
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
     }

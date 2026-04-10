@@ -446,6 +446,9 @@ class GraphExecutor:
 
         # Extract tool_servers from agent config
         tool_server_names = agent_config.get("tool_servers", [])
+        if not isinstance(tool_server_names, list) or not all(isinstance(n, str) for n in tool_server_names):
+            logger.error("invalid_tool_servers_config", extra={"task_id": task_id, "tool_servers": tool_server_names})
+            tool_server_names = []
 
         session_manager: McpSessionManager | None = None
         custom_tools: list[StructuredTool] = []
@@ -453,6 +456,7 @@ class GraphExecutor:
         try:
             # Look up and connect to MCP tool servers if configured
             if tool_server_names:
+                dead_letter_info = None
                 async with self.pool.acquire() as conn:
                     try:
                         server_configs = await self._lookup_tool_server_configs(
@@ -468,15 +472,17 @@ class GraphExecutor:
                                 "error": str(e),
                             },
                         )
-                        await self._handle_dead_letter(
-                            task_id,
-                            tenant_id,
-                            agent_id,
-                            reason="non_retryable_error",
-                            error_msg=str(e),
-                            error_code="tool_server_unavailable",
-                        )
-                        return
+                        dead_letter_info = {
+                            "reason": "non_retryable_error",
+                            "error_msg": str(e),
+                            "error_code": "tool_server_unavailable",
+                        }
+
+                if dead_letter_info:
+                    await self._handle_dead_letter(
+                        task_id, tenant_id, agent_id, **dead_letter_info
+                    )
+                    return
 
                 session_manager = McpSessionManager()
                 try:

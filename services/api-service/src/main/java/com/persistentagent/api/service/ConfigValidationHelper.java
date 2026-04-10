@@ -13,9 +13,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 @Component
 public class ConfigValidationHelper {
+
+    private static final Pattern TOOL_SERVER_NAME_PATTERN =
+            Pattern.compile(ValidationConstants.TOOL_SERVER_NAME_PATTERN);
 
     private final ModelRepository modelRepository;
     private final ToolServerRepository toolServerRepository;
@@ -69,7 +73,7 @@ public class ConfigValidationHelper {
 
         // Validate name format
         for (String name : toolServers) {
-            if (!name.matches(ValidationConstants.TOOL_SERVER_NAME_PATTERN)) {
+            if (!TOOL_SERVER_NAME_PATTERN.matcher(name).matches()) {
                 throw new ValidationException("Invalid tool server name: " + name
                         + ". Must match pattern: " + ValidationConstants.TOOL_SERVER_NAME_PATTERN);
             }

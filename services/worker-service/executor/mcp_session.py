@@ -1,7 +1,9 @@
 """MCP session manager for external tool server connections."""
 
 import asyncio
+import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -146,7 +148,7 @@ class McpSessionManager:
                 {
                     "name": tool.name,
                     "description": tool.description or "",
-                    "inputSchema": tool.inputSchema if hasattr(tool, "inputSchema") else {},
+                    "inputSchema": getattr(tool, "inputSchema", {}) or {},
                 }
                 for tool in tools_result.tools
             ]
@@ -178,15 +180,14 @@ class McpSessionManager:
         if sess is None or sess.session is None:
             raise KeyError(f"No active session for server: {server_name}")
 
-        import time as _time
-        start_time = _time.monotonic()
+        start_time = time.monotonic()
 
         try:
             result = await asyncio.wait_for(
                 sess.session.call_tool(tool_name, arguments),
                 timeout=self._call_timeout,
             )
-            duration_ms = int((_time.monotonic() - start_time) * 1000)
+            duration_ms = int((time.monotonic() - start_time) * 1000)
 
             logger.info(
                 "mcp_tool_invoked",
@@ -202,8 +203,7 @@ class McpSessionManager:
             # The SDK may return content via .content (list of content parts)
             # or .structuredContent (dict). Handle both.
             if hasattr(result, "structuredContent") and result.structuredContent:
-                import json as _json
-                output = _json.dumps(result.structuredContent)
+                output = json.dumps(result.structuredContent)
             elif hasattr(result, "content") and result.content:
                 # Return text content joined if multiple parts
                 texts = []

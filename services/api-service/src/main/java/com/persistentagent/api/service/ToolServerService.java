@@ -1,5 +1,7 @@
 package com.persistentagent.api.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.ToolServerNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
@@ -23,13 +25,20 @@ import java.util.*;
 public class ToolServerService {
 
     private final ToolServerRepository repository;
+    private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
 
-    public ToolServerService(ToolServerRepository repository) {
-        this.repository = repository;
-        this.httpClient = HttpClient.newBuilder()
+    public ToolServerService(ToolServerRepository repository, ObjectMapper objectMapper) {
+        this(repository, objectMapper, HttpClient.newBuilder()
             .connectTimeout(Duration.ofMillis(ValidationConstants.TOOL_SERVER_DISCOVER_TIMEOUT_MS))
-            .build();
+            .build());
+    }
+
+    // Package-private constructor for testing
+    ToolServerService(ToolServerRepository repository, ObjectMapper objectMapper, HttpClient httpClient) {
+        this.repository = repository;
+        this.objectMapper = objectMapper;
+        this.httpClient = httpClient;
     }
 
     @Transactional
@@ -100,17 +109,27 @@ public class ToolServerService {
             }
         }
 
-        // Clear auth_token if auth_type is being changed to 'none'
-        String effectiveToken = request.authToken();
-        if (ValidationConstants.TOOL_SERVER_AUTH_NONE.equals(request.authType())) {
-            effectiveToken = "";  // Non-null empty string signals "clear the token"
+        // Reject blank auth_token when effective auth_type is bearer_token
+        if (request.authToken() != null && request.authToken().isBlank()) {
+            String effectiveAuthType = request.authType();
+            if (effectiveAuthType == null) {
+                Map<String, Object> existing = repository.findById(tenantId, serverId)
+                    .orElseThrow(() -> new ToolServerNotFoundException(serverId));
+                effectiveAuthType = (String) existing.get("auth_type");
+            }
+            if (ValidationConstants.TOOL_SERVER_AUTH_BEARER.equals(effectiveAuthType)) {
+                throw new ValidationException("auth_token cannot be empty when auth_type is 'bearer_token'");
+            }
         }
+
+        boolean clearAuthToken = ValidationConstants.TOOL_SERVER_AUTH_NONE.equals(request.authType());
 
         try {
             Map<String, Object> row = repository.update(
                 tenantId, serverId,
                 request.name(), request.url(),
-                request.authType(), effectiveToken,
+                request.authType(), clearAuthToken ? null : request.authToken(),
+                clearAuthToken,
                 request.status()
             ).orElseThrow(() -> new ToolServerNotFoundException(serverId));
             return toMaskedResponse(row);
@@ -200,8 +219,7 @@ public class ToolServerService {
             // Check for JSON-RPC error in response
             if (tools.isEmpty()) {
                 try {
-                    com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-                    com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(listResp.body());
+                    JsonNode root = objectMapper.readTree(listResp.body());
                     if (root.has("error")) {
                         String errorMsg = root.path("error").path("message").asText("Unknown JSON-RPC error");
                         return new ToolDiscoverResponse(
@@ -247,19 +265,18 @@ public class ToolServerService {
         }
 
         try {
-            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
-            com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(jsonBody);
-            com.fasterxml.jackson.databind.JsonNode toolsNode = root.path("result").path("tools");
+            JsonNode root = objectMapper.readTree(jsonBody);
+            JsonNode toolsNode = root.path("result").path("tools");
             if (!toolsNode.isArray()) {
                 return List.of();
             }
 
             List<DiscoveredToolInfo> tools = new ArrayList<>();
-            for (com.fasterxml.jackson.databind.JsonNode toolNode : toolsNode) {
+            for (JsonNode toolNode : toolsNode) {
                 String name = toolNode.path("name").asText("");
                 String description = toolNode.path("description").asText("");
                 Object inputSchema = toolNode.has("inputSchema")
-                    ? mapper.treeToValue(toolNode.get("inputSchema"), Object.class)
+                    ? objectMapper.treeToValue(toolNode.get("inputSchema"), Object.class)
                     : null;
                 tools.add(new DiscoveredToolInfo(name, description, inputSchema));
             }
@@ -301,22 +318,13 @@ public class ToolServerService {
     }
 
     private ToolServerResponse toMaskedResponse(Map<String, Object> row) {
-        ToolServerResponse full = toResponse(row);
-        return new ToolServerResponse(
-            full.serverId(), full.tenantId(), full.name(), full.url(),
-            full.authType(), maskToken(full.authToken()), full.status(),
-            full.createdAt(), full.updatedAt()
-        );
-    }
-
-    private ToolServerResponse toResponse(Map<String, Object> row) {
         return new ToolServerResponse(
             row.get("server_id").toString(),
             (String) row.get("tenant_id"),
             (String) row.get("name"),
             (String) row.get("url"),
             (String) row.get("auth_type"),
-            (String) row.get("auth_token"),
+            maskToken((String) row.get("auth_token")),
             (String) row.get("status"),
             DateTimeUtil.toOffsetDateTime(row.get("created_at")),
             DateTimeUtil.toOffsetDateTime(row.get("updated_at"))

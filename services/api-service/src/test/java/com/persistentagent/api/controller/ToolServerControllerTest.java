@@ -149,6 +149,13 @@ class ToolServerControllerTest {
             .andExpect(jsonPath("$.message").exists());
     }
 
+    @Test
+    void testGetToolServer_invalidUuid_returns400() throws Exception {
+        mockMvc.perform(get("/v1/tool-servers/not-a-uuid"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.message").exists());
+    }
+
     // --- PUT /v1/tool-servers/{serverId} ---
 
     @Test

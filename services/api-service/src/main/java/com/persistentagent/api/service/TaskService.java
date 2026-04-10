@@ -348,7 +348,6 @@ public class TaskService {
         TaskRepository.HitlMutationResult result = taskRepository.followUpTask(taskId, tenantId, humanResponse);
         return switch (result.result()) {
             case UPDATED -> {
-                taskRepository.notifyNewTask(result.workerPoolId());
                 taskEventService.recordEvent(tenantId, taskId, result.agentId(),
                         "task_follow_up", "completed", "queued",
                         null, null, null, detailsJson);

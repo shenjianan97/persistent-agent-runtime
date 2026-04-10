@@ -8,7 +8,7 @@ import jakarta.validation.constraints.Size;
 public record ToolServerCreateRequest(
     @NotBlank(message = "name is required")
     @Size(max = 100, message = "name must not exceed 100 characters")
-    @Pattern(regexp = "^[a-z0-9][a-z0-9-]*$", message = "name must be lowercase alphanumeric with hyphens, not starting with a hyphen")
+    @Pattern(regexp = "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", message = "name must be lowercase alphanumeric with hyphens, not starting or ending with a hyphen")
     String name,
 
     @NotBlank(message = "url is required")
