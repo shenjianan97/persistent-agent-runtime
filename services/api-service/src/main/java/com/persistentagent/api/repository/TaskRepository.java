@@ -355,6 +355,7 @@ public class TaskRepository {
                 output = NULL,
                 lease_owner = NULL,
                 lease_expiry = NULL,
+                timeout_reference_at = NOW(),
                 version = version + 1,
                 updated_at = NOW()
             WHERE task_id = ?::uuid AND tenant_id = ? AND status = 'completed'
