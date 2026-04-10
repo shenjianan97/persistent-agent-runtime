@@ -28,6 +28,7 @@ public class ToolServerService {
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public ToolServerService(ToolServerRepository repository, ObjectMapper objectMapper) {
         this(repository, objectMapper, HttpClient.newBuilder()
             .connectTimeout(Duration.ofMillis(ValidationConstants.TOOL_SERVER_DISCOVER_TIMEOUT_MS))
