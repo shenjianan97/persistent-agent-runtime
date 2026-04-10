@@ -472,7 +472,7 @@ class GraphExecutor:
                             task_id,
                             tenant_id,
                             agent_id,
-                            reason="tool_server_unavailable",
+                            reason="non_retryable_error",
                             error_msg=str(e),
                             error_code="tool_server_unavailable",
                         )
@@ -495,7 +495,7 @@ class GraphExecutor:
                         task_id,
                         tenant_id,
                         agent_id,
-                        reason="tool_server_unavailable",
+                        reason="non_retryable_error",
                         error_msg=str(e),
                         error_code="tool_server_unavailable",
                     )

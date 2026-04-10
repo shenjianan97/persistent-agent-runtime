@@ -34,6 +34,7 @@ class ToolServerControllerTest {
     private ToolServerService toolServerService;
 
     private static final String SERVER_ID = "550e8400-e29b-41d4-a716-446655440000";
+    private static final String MISSING_ID = "00000000-0000-0000-0000-000000000000";
     private static final OffsetDateTime NOW = OffsetDateTime.now(ZoneOffset.UTC);
 
     private ToolServerResponse buildResponse(String name, String authToken) {
@@ -140,10 +141,10 @@ class ToolServerControllerTest {
 
     @Test
     void testGetToolServer_notFound() throws Exception {
-        when(toolServerService.getToolServer("nonexistent"))
-            .thenThrow(new ToolServerNotFoundException("nonexistent"));
+        when(toolServerService.getToolServer(MISSING_ID))
+            .thenThrow(new ToolServerNotFoundException(MISSING_ID));
 
-        mockMvc.perform(get("/v1/tool-servers/nonexistent"))
+        mockMvc.perform(get("/v1/tool-servers/" + MISSING_ID))
             .andExpect(status().isNotFound())
             .andExpect(jsonPath("$.message").exists());
     }
@@ -166,10 +167,10 @@ class ToolServerControllerTest {
 
     @Test
     void testUpdateToolServer_notFound() throws Exception {
-        when(toolServerService.updateToolServer(eq("nonexistent"), any()))
-            .thenThrow(new ToolServerNotFoundException("nonexistent"));
+        when(toolServerService.updateToolServer(eq(MISSING_ID), any()))
+            .thenThrow(new ToolServerNotFoundException(MISSING_ID));
 
-        mockMvc.perform(put("/v1/tool-servers/nonexistent")
+        mockMvc.perform(put("/v1/tool-servers/" + MISSING_ID)
                 .contentType(MediaType.APPLICATION_JSON)
                 .content("""
                     {"name": "updated-server"}
@@ -190,10 +191,10 @@ class ToolServerControllerTest {
 
     @Test
     void testDeleteToolServer_notFound() throws Exception {
-        doThrow(new ToolServerNotFoundException("nonexistent"))
-            .when(toolServerService).deleteToolServer("nonexistent");
+        doThrow(new ToolServerNotFoundException(MISSING_ID))
+            .when(toolServerService).deleteToolServer(MISSING_ID);
 
-        mockMvc.perform(delete("/v1/tool-servers/nonexistent"))
+        mockMvc.perform(delete("/v1/tool-servers/" + MISSING_ID))
             .andExpect(status().isNotFound())
             .andExpect(jsonPath("$.message").exists());
     }
@@ -227,10 +228,10 @@ class ToolServerControllerTest {
 
     @Test
     void testDiscoverTools_serverNotFound() throws Exception {
-        when(toolServerService.discoverTools("nonexistent"))
-            .thenThrow(new ToolServerNotFoundException("nonexistent"));
+        when(toolServerService.discoverTools(MISSING_ID))
+            .thenThrow(new ToolServerNotFoundException(MISSING_ID));
 
-        mockMvc.perform(post("/v1/tool-servers/nonexistent/discover"))
+        mockMvc.perform(post("/v1/tool-servers/" + MISSING_ID + "/discover"))
             .andExpect(status().isNotFound())
             .andExpect(jsonPath("$.message").exists());
     }

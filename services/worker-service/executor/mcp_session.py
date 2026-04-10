@@ -188,20 +188,6 @@ class McpSessionManager:
             )
             duration_ms = int((_time.monotonic() - start_time) * 1000)
 
-            # Check response size
-            result_text = str(result)
-            if len(result_text) > RESPONSE_SIZE_LIMIT:
-                logger.warning(
-                    "mcp_response_truncated",
-                    extra={
-                        "server_name": server_name,
-                        "tool_name": tool_name,
-                        "original_size": len(result_text),
-                        "limit": RESPONSE_SIZE_LIMIT,
-                    },
-                )
-                result_text = result_text[:RESPONSE_SIZE_LIMIT]
-
             logger.info(
                 "mcp_tool_invoked",
                 extra={
@@ -217,9 +203,8 @@ class McpSessionManager:
             # or .structuredContent (dict). Handle both.
             if hasattr(result, "structuredContent") and result.structuredContent:
                 import json as _json
-                return _json.dumps(result.structuredContent)
-
-            if hasattr(result, "content") and result.content:
+                output = _json.dumps(result.structuredContent)
+            elif hasattr(result, "content") and result.content:
                 # Return text content joined if multiple parts
                 texts = []
                 for part in result.content:
@@ -227,9 +212,23 @@ class McpSessionManager:
                         texts.append(part.text)
                     else:
                         texts.append(str(part))
-                return "\n".join(texts) if texts else str(result)
+                output = "\n".join(texts) if texts else str(result)
+            else:
+                output = str(result)
 
-            return str(result)
+            if len(output) > RESPONSE_SIZE_LIMIT:
+                logger.warning(
+                    "mcp_response_truncated",
+                    extra={
+                        "server_name": server_name,
+                        "tool_name": tool_name,
+                        "original_size": len(output),
+                        "limit": RESPONSE_SIZE_LIMIT,
+                    },
+                )
+                output = output[:RESPONSE_SIZE_LIMIT]
+
+            return output
 
         except asyncio.TimeoutError as e:
             logger.error(

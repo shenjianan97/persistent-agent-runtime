@@ -1,5 +1,6 @@
 package com.persistentagent.api.controller;
 
+import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.ToolServerCreateRequest;
 import com.persistentagent.api.model.request.ToolServerUpdateRequest;
 import com.persistentagent.api.model.response.*;
@@ -10,6 +11,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/v1/tool-servers")
@@ -36,6 +38,7 @@ public class ToolServerController {
 
     @GetMapping("/{serverId}")
     public ResponseEntity<ToolServerResponse> get(@PathVariable String serverId) {
+        validateUuid(serverId);
         return ResponseEntity.ok(service.getToolServer(serverId));
     }
 
@@ -43,17 +46,28 @@ public class ToolServerController {
     public ResponseEntity<ToolServerResponse> update(
             @PathVariable String serverId,
             @Valid @RequestBody ToolServerUpdateRequest request) {
+        validateUuid(serverId);
         return ResponseEntity.ok(service.updateToolServer(serverId, request));
     }
 
     @DeleteMapping("/{serverId}")
     public ResponseEntity<Void> delete(@PathVariable String serverId) {
+        validateUuid(serverId);
         service.deleteToolServer(serverId);
         return ResponseEntity.noContent().build();
     }
 
     @PostMapping("/{serverId}/discover")
     public ResponseEntity<ToolDiscoverResponse> discover(@PathVariable String serverId) {
+        validateUuid(serverId);
         return ResponseEntity.ok(service.discoverTools(serverId));
+    }
+
+    private void validateUuid(String id) {
+        try {
+            UUID.fromString(id);
+        } catch (IllegalArgumentException e) {
+            throw new ValidationException("Invalid server ID format: must be a valid UUID");
+        }
     }
 }
