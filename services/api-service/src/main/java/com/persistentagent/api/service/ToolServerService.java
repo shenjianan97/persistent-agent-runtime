@@ -89,6 +89,17 @@ public class ToolServerService {
             validateUrl(request.url());
         }
 
+        // When switching to bearer_token, ensure a token is provided or already exists
+        if (ValidationConstants.TOOL_SERVER_AUTH_BEARER.equals(request.authType())
+                && (request.authToken() == null || request.authToken().isBlank())) {
+            Map<String, Object> existing = repository.findById(tenantId, serverId)
+                .orElseThrow(() -> new ToolServerNotFoundException(serverId));
+            String existingToken = (String) existing.get("auth_token");
+            if (existingToken == null || existingToken.isBlank()) {
+                throw new ValidationException("auth_token is required when auth_type is 'bearer_token'");
+            }
+        }
+
         // Clear auth_token if auth_type is being changed to 'none'
         String effectiveToken = request.authToken();
         if (ValidationConstants.TOOL_SERVER_AUTH_NONE.equals(request.authType())) {
@@ -145,6 +156,13 @@ public class ToolServerService {
 
             HttpResponse<String> initResp = httpClient.send(initReqBuilder.build(), HttpResponse.BodyHandlers.ofString());
 
+            if (initResp.statusCode() >= 400) {
+                return new ToolDiscoverResponse(
+                    row.get("server_id").toString(), serverName, "unreachable",
+                    "Initialize request failed with HTTP " + initResp.statusCode(), List.of()
+                );
+            }
+
             // Extract session ID from response header if present
             String sessionId = initResp.headers().firstValue("mcp-session-id").orElse(null);
 
@@ -169,8 +187,31 @@ public class ToolServerService {
 
             HttpResponse<String> listResp = httpClient.send(listReqBuilder.build(), HttpResponse.BodyHandlers.ofString());
 
+            if (listResp.statusCode() >= 400) {
+                return new ToolDiscoverResponse(
+                    row.get("server_id").toString(), serverName, "unreachable",
+                    "Tools list request failed with HTTP " + listResp.statusCode(), List.of()
+                );
+            }
+
             // Parse the JSON-RPC response to extract tools
             List<DiscoveredToolInfo> tools = parseToolsFromResponse(listResp.body());
+
+            // Check for JSON-RPC error in response
+            if (tools.isEmpty()) {
+                try {
+                    com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+                    com.fasterxml.jackson.databind.JsonNode root = mapper.readTree(listResp.body());
+                    if (root.has("error")) {
+                        String errorMsg = root.path("error").path("message").asText("Unknown JSON-RPC error");
+                        return new ToolDiscoverResponse(
+                            row.get("server_id").toString(), serverName, "unreachable", errorMsg, List.of()
+                        );
+                    }
+                } catch (Exception ignored) {
+                    // If we can't parse, fall through to reachable with empty tools
+                }
+            }
 
             return new ToolDiscoverResponse(
                 row.get("server_id").toString(), serverName, "reachable", null, tools

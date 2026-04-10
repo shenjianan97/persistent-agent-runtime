@@ -31,10 +31,7 @@ const editSchema = z.object({
     auth_type: z.enum(['none', 'bearer_token']),
     auth_token: z.string().optional(),
     status: z.enum(['active', 'disabled']),
-}).refine(
-    (data) => data.auth_type !== 'bearer_token' || (data.auth_token && data.auth_token.length > 0),
-    { message: 'Auth token is required for Bearer Token auth', path: ['auth_token'] }
-);
+});
 
 type EditFormValues = z.infer<typeof editSchema>;
 
