@@ -188,3 +188,67 @@ This work should be prioritized when:
 - the platform is deployed to a shared or production environment where plaintext DB secrets are a compliance concern
 - BYOT adoption increases and credential isolation between tool servers becomes operationally important
 - key rotation without service restart is required
+
+---
+
+## 9. Non-Idempotent Tool Safeguards
+
+Deferred from Phase 2 Track 5 (originally scoped as "Memory and Tool Safety Features", now renamed to just "Memory"). The original design lives in [Phase 2 design.md, Section 4 — Non-idempotent tool safety](../phase-2/design.md).
+
+### Problem
+
+Phase 1 avoids mutable tools entirely. As the platform supports custom tools (BYOT) and sandbox-based execution, some tools will have side effects (send email, create resource, charge payment). Blind re-execution after a crash can cause duplicated side effects.
+
+### Planned approach
+
+- **`idempotent: true|false` on tool schema** — each MCP tool declares whether it is safe to re-execute
+- **Checkpoint-before-call for mutable tools** — the graph executor persists a LangGraph checkpoint before invoking any tool marked `idempotent: false`, recording that a side effect is about to occur
+- **Dead-letter on crash** — if a crash occurs after a non-idempotent tool call started (detected via checkpoint), the task moves to `dead_letter` rather than being automatically retried. A human or operator inspects and decides whether to redrive.
+- **Integration with approval gates** — the existing `waiting_for_approval` HITL flow (delivered in Phase 2 Track 2) can be configured to trigger automatically for non-idempotent tools, requiring human sign-off before side effects happen
+
+### Trigger conditions
+
+This work should be prioritized when:
+- customers begin registering BYOT tools with real-world side effects (payments, notifications, resource provisioning)
+- the platform needs to guarantee at-most-once semantics for mutable operations
+
+---
+
+## 10. Batch, Webhooks, and Structured Output
+
+Deferred from the [agent-capabilities design doc](../agent-capabilities/design.md) to keep initial scope focused on sandbox, artifacts, and file input.
+
+### Batch task API
+
+Atomic submission of multiple tasks in a single request:
+
+- `POST /v1/tasks/batch` — accepts an array of task inputs with shared config
+- Each task independently scheduled and executed
+- `batch_id` stored on each task row for grouping
+- `GET /v1/batches/{batch_id}` — aggregated status (completed/failed/running/queued counts)
+- Max 1000 tasks per batch
+
+### Webhooks
+
+Push notifications on task events, registered at the agent level:
+
+- `POST /v1/agents/{id}/webhooks` — register URL, event types, HMAC signing secret
+- Events: `task.completed`, `task.failed`, `task.waiting_for_input`, `task.waiting_for_approval`, `batch.completed`
+- Delivery: fire-and-forget with retry (3 attempts, exponential backoff)
+- Failed deliveries logged but do not affect task status
+
+### Structured output schemas
+
+Allow agents to specify an expected JSON output schema:
+
+- `output_schema` in agent config — JSON Schema definition
+- Schema included in agent's system prompt so the LLM knows the expected format
+- Worker validates final response against schema
+- If invalid: correction prompt sent to LLM (up to 2 retries), then task fails
+- Valid output stored in `output.structured` alongside `output.result`
+
+### Trigger conditions
+
+- **Batch:** when customers need to process large volumes of similar tasks (document processing, data extraction)
+- **Webhooks:** when polling becomes impractical (high task volume, downstream automation)
+- **Structured output:** when customers need machine-readable results for pipeline integration

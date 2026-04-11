@@ -13,11 +13,15 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 |-------|------|--------|------|----------|
 | Track 1 | Agent Control Plane | Complete | [plan](docs/exec-plans/completed/phase-2/track-1/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-1/progress.md) |
 | Track 2 | HITL & Unified Timeline | Complete | [plan](docs/exec-plans/completed/phase-2/track-2/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-2/progress.md) |
-| Track 3 | Scheduler & Budgets | Complete | [plan](docs/exec-plans/active/phase-2/track-3/plan.md) | [progress](docs/exec-plans/active/phase-2/track-3/progress.md) |
-| Track 4 | Custom Tool Runtime (BYOT) | Active | [plan](docs/exec-plans/active/phase-2/track-4/plan.md) | [progress](docs/exec-plans/active/phase-2/track-4/progress.md) |
+| Track 3 | Scheduler & Budgets | Complete | [plan](docs/exec-plans/completed/phase-2/track-3/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-3/progress.md) |
+| Track 4 | Custom Tool Runtime (BYOT) | Complete | [plan](docs/exec-plans/completed/phase-2/track-4/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-4/progress.md) |
+| Track 5 | Memory | Not started | — | — |
+| Track 6 | GitHub Integration | Not started | — | — |
 
-### Standalone
 
-| Initiative | Status | Plan | Progress |
-|------------|--------|------|----------|
-| Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) | — |
+### Cross-Cutting
+
+| Initiative | Status | Design |
+|------------|--------|--------|
+| Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
+| Agent Capabilities (sandbox, artifacts, file input) | **Next priority** | [design](docs/design-docs/agent-capabilities/design.md) |

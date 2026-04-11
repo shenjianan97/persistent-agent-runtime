@@ -1,6 +1,6 @@
 # Phase 2 Design — Multi-Agent, Memory, and Cost-Aware Scheduling
 
-**Status:** Not started.
+**Status:** In progress (Tracks 1, 2, 3, 4 complete; Tracks 5, 6 upcoming).
 
 **Goal:** Promote Agent to a first-class entity and extend the Phase 1 durable execution runtime with multi-agent scheduling, long-term memory, richer operational history, and customer-provided tools.
 
@@ -15,7 +15,8 @@
 - Long-term memory: append-only S3 entries with LLM-based compaction
 - Custom Tool Runtime (BYOT): customer-provided MCP servers running in platform-managed isolated containers
 - `waiting_for_approval` and `waiting_for_input` task statuses for human-in-the-loop workflows
-- Non-idempotent tool guards: `idempotent: true|false` annotation on MCP tool schema, checkpoint-before-call for mutable tools, dead-letter on re-execution after crash
+- GitHub integration for code agents: GitHub App for repo access, clone/push/PR workflow
+- ~~Non-idempotent tool guards~~ (deferred to Phase 3+)
 - Redrive checkpoint rollback: `rollback_last_checkpoint` option on `POST /redrive`
 - Mid-node task cancellation during in-flight LLM/tool calls
 - Append-only task retry/error event history (`task_events`)
@@ -27,7 +28,7 @@
 
 ## Planning Tracks
 
-Phase 2 spans several loosely coupled subsystems. To keep implementation planning manageable, treat the work as five planning tracks with clear dependencies.
+Phase 2 spans several loosely coupled subsystems. To keep implementation planning manageable, treat the work as six planning tracks with clear dependencies.
 
 ### Track 1 — Agent Control Plane
 
@@ -81,31 +82,45 @@ Enable customer-provided MCP tool servers so agents can use tools beyond the bui
 Primary design coverage:
 - [Section 4. Custom Tool Runtime (BYOT — Bring Your Own Tools)](#4-custom-tool-runtime-byot--bring-your-own-tools)
 
-### Track 5 — Memory and Human Oversight Features
+### Track 5 — Memory
 
-Add the user-facing capabilities that build on the control-plane, scheduler, and runtime-state foundations.
+Add long-term memory capabilities that build on the control-plane and runtime-state foundations.
 
 - Long-term memory extraction and append-only storage
 - Memory compaction flows
-- Human approval and freeform input workflows
-- Non-idempotent tool safeguards and mutable-tool execution policies
+
+**Note:** Human approval and freeform input workflows were originally scoped here but were delivered as part of Track 2 (Runtime State Model) alongside the `waiting_for_approval` / `waiting_for_input` pause states. Non-idempotent tool safeguards were deferred to Phase 3+.
 
 Primary design coverage:
 - [Section 3. Agent Memory Model](#3-agent-memory-model)
-- [Section 4. Custom Tool Runtime (BYOT — Bring Your Own Tools)](#4-custom-tool-runtime-byot--bring-your-own-tools)
-- [Section 7. Human-in-the-Loop Input](#7-human-in-the-loop-input)
+
+### Track 6 — GitHub Integration
+
+Enable code agents to access customer repositories and deliver results as pull requests, following the industry-standard pattern used by all major cloud coding agents (Devin, Codex, Jules, Copilot, etc.).
+
+- GitHub App installation for org/repo access
+- Short-lived installation tokens (no long-lived secrets)
+- Code agent workflow: clone repo into sandbox → work → push branch → open PR
+- Future: GitLab / Bitbucket support
+
+**Depends on:** The cross-cutting [agent-capabilities](../agent-capabilities/design.md) work (E2B sandbox, artifact storage) shipping first — sandbox provides the execution environment where git operations happen.
+
+Primary design coverage:
+- Detailed design TBD (will be developed as a dedicated design doc when this track is planned)
 
 ### Recommended Planning Order
 
 For implementation planning, the safest order is:
 
-1. Track 1 — Agent Control Plane
-2. Track 2 — Runtime State Model
-3. Track 3 — Scheduler and Budgets
-4. Track 4 — Custom Tool Runtime (BYOT)
-5. Track 5 — Memory and Human Oversight Features
+1. Track 1 — Agent Control Plane ✅
+2. Track 2 — Runtime State Model ✅
+3. Track 3 — Scheduler and Budgets ✅
+4. Track 4 — Custom Tool Runtime (BYOT) ✅
+5. **Agent Capabilities (cross-cutting)** — E2B sandbox, artifact storage, file input. See [agent-capabilities/design.md](../agent-capabilities/design.md).
+6. Track 5 — Memory
+7. Track 6 — GitHub Integration
 
-This ordering reflects dependency flow rather than strict execution sequencing. Some lower-risk work can overlap later, but Track 1 is the clean starting point because the rest of Phase 2 assumes Agent already exists as a first-class control-plane entity.
+Tracks 1–4 are complete. The cross-cutting agent-capabilities work is the next priority. It provides the sandbox and artifact foundation that enables the platform to run real workloads (coding agents, document processing). Tracks 5 and 6 build on a platform that can already do meaningful work.
 
 ---
 
@@ -253,11 +268,7 @@ Tasks specify a `worker_pool_id` which doubles as a tool runtime routing key. By
 
 ### Non-idempotent tool safety
 
-Phase 1 avoids mutable tools entirely. Phase 2 adds explicit idempotency metadata and control-plane safeguards:
-
-- `idempotent: true|false` on tool schema
-- checkpoint-before-call for mutable tools
-- dead-letter rather than blind re-execution if a crash occurs after an unsafe side effect
+Deferred to Phase 3+. See [design-notes.md, Section 9](../phase-3-plus/design-notes.md).
 
 ### Customer simplicity
 

@@ -8,7 +8,8 @@ Cloud-Native Persistent Agent Runtime — durable execution for AI agents. See [
 - `docs/design-docs/` — How to build it (phase-based design documents)
   - `docs/design-docs/core-beliefs.md` — Key architectural invariants
   - `docs/design-docs/phase-N/design.md` — Primary design doc per phase
-  - `docs/design-docs/langfuse/` — Standalone initiative design docs
+  - `docs/design-docs/langfuse/` — Langfuse customer integration design
+  - `docs/design-docs/agent-capabilities/` — Sandbox, artifacts, and file input design
   - `docs/design-docs/phase-3-plus/` — Forward-looking design notes
 - `docs/exec-plans/` — Implementation plans
   - `docs/exec-plans/active/` — Plans currently being executed
@@ -45,8 +46,9 @@ When a phase contains too much work for a single planning cycle (e.g., 40+ tasks
 
 Example (Phase 2 has 3 tracks):
 - Spec: Phase 2 sections in `product-specs/vision.md`, `product-specs/user-stories.md`, etc.
-- Design: `design-docs/phase-2/design.md` + `design-docs/phase-2/track-1-agent-control-plane.md` + `design-docs/phase-2/track-3-scheduler-and-budgets.md`
-- Plans: `exec-plans/completed/phase-2/track-1/` · `exec-plans/completed/phase-2/track-2/` · `exec-plans/active/phase-2/track-3/`
+- Design: `design-docs/phase-2/design.md` + `design-docs/phase-2/track-1-agent-control-plane.md` + `design-docs/phase-2/track-3-scheduler-and-budgets.md` + `design-docs/phase-2/track-4-custom-tool-runtime.md`
+- Cross-cutting: `design-docs/agent-capabilities/design.md` + `design-docs/langfuse/design.md`
+- Plans: `exec-plans/completed/phase-2/track-1/` · `exec-plans/completed/phase-2/track-2/` · `exec-plans/completed/phase-2/track-3/` · `exec-plans/completed/phase-2/track-4/`
 
 ## Current Status
 
