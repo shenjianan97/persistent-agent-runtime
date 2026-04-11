@@ -32,7 +32,7 @@ Track 4 does not include:
 - container orchestration (ECS, Docker Compose) for MCP servers — operators run their own servers
 - Secrets Manager migration or credential hardening — deferred to Phase 3+
 - BYOK (Bring Your Own Key) for LLM provider credentials — deferred to Phase 3+
-- non-idempotent tool safeguards (checkpoint-before-call, dead-letter on re-execution) — Track 5
+- non-idempotent tool safeguards (checkpoint-before-call, dead-letter on re-execution) — deferred to Phase 3+
 - per-tool credential injection or isolation — deferred until secrets track
 - multi-tenant MCP server isolation or network policy enforcement
 - MCP server health monitoring, auto-restart, or liveness probes

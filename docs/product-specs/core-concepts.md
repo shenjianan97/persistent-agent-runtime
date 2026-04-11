@@ -73,15 +73,17 @@ This project leverages **LangGraph** as the underlying execution framework but r
 
 ### Phase 2 — Multi-Agent & Cost-Aware Scheduling
 
-**Goal:** Support multiple agents with fair scheduling and budget enforcement.
+**Goal:** Support multiple agents with fair scheduling and budget enforcement, and expand the platform's capabilities so agents can do meaningful work beyond text-in/text-out.
 
-**Scope:** Agent entity, cost-aware scheduler, fair scheduling, worker backpressure, memory compaction, Custom Tool Runtime (BYOT), SQS FIFO migration.
+**Scope:** Agent entity, human-in-the-loop workflows, Custom Tool Runtime (BYOT), cost-aware scheduler, fair scheduling, long-term memory, code execution sandbox (E2B), artifact storage, GitHub integration for code agents.
+
+**Status:** Tracks 1 (Agent Control Plane), 2 (Runtime State Model), 3 (Scheduler and Budgets), and 4 (Custom Tool Runtime) complete. Agent Capabilities (sandbox, artifacts, file input) is next priority, followed by Tracks 5 and 6.
 
 ### Future Directions (Post Phase 2)
 
 - Cross-agent coordination (request-response between agents, deadlock detection)
 - Agent versioning and rolling updates
-- Human-in-the-loop approval workflows
+- Batch task submission, webhooks, structured output schemas
 - Execution history replay debugger
 
 ## Scaling Outlook

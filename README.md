@@ -4,7 +4,7 @@ Durable execution infrastructure for AI agents.
 
 ## Why This Exists
 
-Running AI agents in production — not as chatbots, but as long-running multi-step tasks on remote compute — surfaces infrastructure problems that most agent frameworks don't address:
+Running AI agents in production — not as chatbots, but as programmatic, multi-step tasks on remote compute — surfaces infrastructure problems that most agent frameworks don't address:
 
 - **Crash recovery:** Agent tasks can run for minutes or hours across many LLM calls. On ephemeral compute (containers, spot instances), the process can be killed at any time. Without durable checkpointing, all completed steps are lost and must be re-executed — wasting time and LLM spend.
 
@@ -12,18 +12,19 @@ Running AI agents in production — not as chatbots, but as long-running multi-s
 
 - **Failure management:** At scale, agent task failures need to be inspectable and actionable — structured dead-letter queues with redrive, not just a stack trace in logs.
 
-This project is a portfolio implementation that tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, Langfuse-backed execution observability, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
+This project is developer infrastructure for deploying agents at scale — the layer between "I have an agent" and "I can run 500 of them reliably in production." It tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, per-agent cost tracking and budgets, human-in-the-loop workflows, customer-owned observability, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
 
 ## Current Architecture
 
-Phase 1 uses a database-as-queue model:
+The system uses a stateless worker pool with a database-as-queue model. Workers are interchangeable — any worker can claim any task, and any worker can resume a checkpointed task from another worker. State lives in PostgreSQL (shared), not on local disk, so tasks survive crashes, deployments, and scaling events.
 
-1. Clients submit a task through the API service.
+1. Clients submit a task through the API service, targeting a configured agent.
 2. The task is stored in PostgreSQL in `queued` state.
 3. A worker claims the task with `FOR UPDATE SKIP LOCKED`.
-4. The worker executes the LangGraph workflow and writes checkpoints to PostgreSQL.
+4. The worker loads the agent's configuration (model, tools, system prompt) and executes the LangGraph workflow, writing checkpoints to PostgreSQL.
 5. Heartbeats extend the lease while work is in progress.
-6. A reaper recovers expired leases and handles timeout/dead-letter transitions.
+6. Tasks can pause for human approval or input (`waiting_for_approval`, `waiting_for_input`), releasing the worker. Any worker can resume when the human responds.
+7. A reaper recovers expired leases and handles timeout/dead-letter transitions.
 
 ## Repository Layout
 
@@ -105,43 +106,54 @@ Tip: use `make -n <target>` to preview the shell commands for a target without e
 
 The repo is in active development.
 
-Implemented or substantially defined already:
+### Phase 1 — Durable Execution (complete)
 
-- Phase 1 database schema and verification flow
+- Database schema with lease-based task claiming (`FOR UPDATE SKIP LOCKED`)
 - REST API for task submission, listing, status, checkpoints, cancellation, dead-letter listing, and redrive
 - Worker poller, heartbeat manager, and reaper
 - Worker registry with self-registration, heartbeat, and stale worker cleanup
 - PostgreSQL-backed LangGraph checkpointer
-- In-process MCP server for `web_search`, `read_url`, and `calculator`
+- In-process MCP server for `web_search`, `read_url`, `calculator`, and `request_human_input`
 - Dev-only task controls for forced lease expiry and dead-letter transitions
-- Dev-only `dev_sleep` tool for deterministic timeout and long-running-task testing
-- Dynamic model provider management: database-backed provider/model registry, auto-discovery from API keys, per-model cost tracking, and console model selector via `GET /v1/models`
-- Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue, Langfuse endpoint settings
-- Customer-owned Langfuse integration: per-task Langfuse endpoint configuration, CRUD API, connectivity testing, checkpoint-based cost/token aggregation
+- Dynamic model provider management: database-backed provider/model registry, auto-discovery from API keys, per-model cost tracking
+- Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
 - End-to-end test coverage for crash recovery and lifecycle behavior
 
-AWS deployment (validated end-to-end):
+### Phase 2 — Multi-Agent (in progress)
+
+Completed tracks:
+
+- **Track 1 — Agent Control Plane:** Agent as first-class entity with CRUD, configuration management, and per-agent task routing
+- **Track 2 — Runtime State Model:** Human-in-the-loop workflows (`waiting_for_approval`, `waiting_for_input`), stateless pause/resume, task event history
+- **Track 3 — Scheduler and Budgets:** Agent-aware round-robin scheduling, per-agent budgets, budget-based task pausing, incremental cost tracking
+- **Track 4 — Custom Tool Runtime (BYOT):** Customer-provided MCP tool servers registered by URL, worker-side MCP client integration, bearer token auth
+
+Cross-cutting (completed):
+
+- **Customer-owned Langfuse integration:** per-task Langfuse endpoint configuration, CRUD API, connectivity testing, checkpoint-based cost/token aggregation
+
+Upcoming:
+
+- **Agent Capabilities (cross-cutting, next priority):** E2B sandbox for code execution, artifact storage (S3), file input — see [`docs/design-docs/agent-capabilities/design.md`](./docs/design-docs/agent-capabilities/design.md)
+- **Track 5 — Memory:** long-term memory extraction, append-only storage, compaction
+- **Track 6 — GitHub Integration:** code agent input/output via pull requests
+
+### AWS Deployment (validated end-to-end)
 
 - CDK infrastructure: VPC, Aurora Serverless v2, ECS Fargate, internal ALB, SSM access host
 - Automated schema bootstrap and model discovery on deploy
 - Full deployment walkthrough: see [`infrastructure/README.md`](./infrastructure/README.md)
 
-Still evolving:
-
-- Later-phase multi-agent scheduling and budget enforcement
-
 ## Design Documents
 
 Start here if you want the actual system contract rather than the repo overview:
 
-- [`docs/design-docs/phase-1/design.md`](./docs/design-docs/phase-1/design.md)
-- [`docs/design-docs/phase-2/design.md`](./docs/design-docs/phase-2/design.md)
-- [`docs/design-docs/phase-3-plus/design-notes.md`](./docs/design-docs/phase-3-plus/design-notes.md)
-
-For implementation planning:
-
-- [`docs/exec-plans/completed/phase-1/plan.md`](./docs/exec-plans/completed/phase-1/plan.md)
-- [`docs/exec-plans/completed/phase-1/progress.md`](./docs/exec-plans/completed/phase-1/progress.md)
+- [`docs/design-docs/core-beliefs.md`](./docs/design-docs/core-beliefs.md) — architectural invariants governing all phases
+- [`docs/design-docs/phase-1/design.md`](./docs/design-docs/phase-1/design.md) — durable execution foundation
+- [`docs/design-docs/phase-2/design.md`](./docs/design-docs/phase-2/design.md) — multi-agent, memory, scheduling, custom tools
+- [`docs/design-docs/agent-capabilities/design.md`](./docs/design-docs/agent-capabilities/design.md) — sandbox, artifacts, file input
+- [`docs/design-docs/langfuse/design.md`](./docs/design-docs/langfuse/design.md) — customer-owned Langfuse integration
+- [`docs/design-docs/phase-3-plus/design-notes.md`](./docs/design-docs/phase-3-plus/design-notes.md) — future reference material
 
 ## Testing
 
