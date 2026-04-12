@@ -23,14 +23,18 @@ export function ArtifactsTab({ taskId, artifacts }: ArtifactsTabProps) {
         return null;
     }
 
-    const handleDownload = (filename: string, direction: string) => {
+    const handleDownload = async (filename: string, direction: string) => {
         const url = api.getArtifactDownloadUrl(taskId, filename, direction);
+        const response = await fetch(url);
+        const blob = await response.blob();
+        const blobUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
-        a.href = url;
+        a.href = blobUrl;
         a.download = filename;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
     };
 
     return (
