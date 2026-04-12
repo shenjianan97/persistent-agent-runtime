@@ -228,6 +228,14 @@ export interface AgentSummaryResponse {
     updated_at: string;
 }
 
+export interface SandboxConfig {
+    enabled: boolean;
+    template?: string;
+    vcpu?: number;
+    memory_mb?: number;
+    timeout_seconds?: number;
+}
+
 export interface AgentConfig {
     system_prompt: string;
     provider: string;
@@ -235,6 +243,7 @@ export interface AgentConfig {
     temperature: number;
     allowed_tools: string[];
     tool_servers?: string[];
+    sandbox?: SandboxConfig;
 }
 
 export interface AgentResponse {
@@ -251,10 +260,11 @@ export interface AgentResponse {
 
 export interface AgentCreateRequest {
     display_name: string;
-    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers'> & {
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers' | 'sandbox'> & {
         temperature?: number;
         allowed_tools?: string[];
         tool_servers?: string[];
+        sandbox?: SandboxConfig;
     };
     max_concurrent_tasks?: number;
     budget_max_per_task?: number;
@@ -263,10 +273,11 @@ export interface AgentCreateRequest {
 
 export interface AgentUpdateRequest {
     display_name: string;
-    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers'> & {
+    agent_config: Omit<AgentConfig, 'temperature' | 'allowed_tools' | 'tool_servers' | 'sandbox'> & {
         temperature?: number;
         allowed_tools?: string[];
         tool_servers?: string[];
+        sandbox?: SandboxConfig;
     };
     status: 'active' | 'disabled';
     max_concurrent_tasks?: number;

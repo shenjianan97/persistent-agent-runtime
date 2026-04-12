@@ -1,5 +1,6 @@
 package com.persistentagent.api.config;
 
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -16,8 +17,18 @@ public final class ValidationConstants {
     /** Phase 1 worker pool ID - always "shared". */
     public static final String DEFAULT_WORKER_POOL_ID = "shared";
 
-    /** Stable public tools available in all environments. */
-    public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator", "request_human_input", "upload_artifact");
+    /** All valid tool names accepted by the API (for validation only). */
+    public static final Set<String> ALLOWED_TOOLS = Set.of(
+            "web_search", "read_url", "request_human_input", "upload_artifact",
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download");
+
+    /** Platform tools auto-enabled for every agent. */
+    public static final List<String> BASE_PLATFORM_TOOLS = List.of(
+            "web_search", "read_url", "upload_artifact", "request_human_input");
+
+    /** Sandbox tools auto-enabled when sandbox.enabled is true. */
+    public static final List<String> SANDBOX_TOOLS = List.of(
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download");
 
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
@@ -30,10 +41,23 @@ public final class ValidationConstants {
             "non_retryable_error",
             "max_steps_exceeded",
             "human_input_timeout",
-            "rejected_by_user"
+            "rejected_by_user",
+            "sandbox_lost",
+            "sandbox_provision_failed"
     );
 
     public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";
+
+    // Sandbox config defaults and limits
+    public static final int SANDBOX_VCPU_MIN = 1;
+    public static final int SANDBOX_VCPU_MAX = 8;
+    public static final int SANDBOX_VCPU_DEFAULT = 2;
+    public static final int SANDBOX_MEMORY_MB_MIN = 512;
+    public static final int SANDBOX_MEMORY_MB_MAX = 8192;
+    public static final int SANDBOX_MEMORY_MB_DEFAULT = 2048;
+    public static final int SANDBOX_TIMEOUT_SECONDS_MIN = 60;
+    public static final int SANDBOX_TIMEOUT_SECONDS_MAX = 86400;
+    public static final int SANDBOX_TIMEOUT_SECONDS_DEFAULT = 3600;
 
 
 

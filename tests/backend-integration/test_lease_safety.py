@@ -24,7 +24,7 @@ async def test_3_26_zombie_checkpointer_protection(e2e):
 
     first_turn = AIMessage(
         content="",
-        tool_calls=[ToolCall(name="calculator", args={"expression": "5*5"}, id="call_lease")],
+        tool_calls=[ToolCall(name="web_search", args={"query": "5*5"}, id="call_lease")],
     )
     mock_llm = MagicMock()
     mock_llm.bind_tools.return_value = mock_llm
@@ -79,7 +79,7 @@ async def test_3_26_worker_stop_releases_db_cleanup_after_zombie_revocation(e2e)
 
     first_turn = AIMessage(
         content="",
-        tool_calls=[ToolCall(name="calculator", args={"expression": "6*7"}, id="call_cleanup")],
+        tool_calls=[ToolCall(name="web_search", args={"query": "6*7"}, id="call_cleanup")],
     )
     mock_llm = MagicMock()
     mock_llm.bind_tools.return_value = mock_llm

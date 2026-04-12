@@ -23,9 +23,9 @@ async def test_3_15_input_validation_matrix(e2e):
     # Agent-level config validation cases (now validated at agent creation time)
     from helpers.api_client import ApiError
     agent_bad_cases = [
-        {"agent_config": {"system_prompt": "", "provider": "anthropic", "model": "claude-sonnet-4-6", "temperature": 0.5, "allowed_tools": ["calculator"]}},
-        {"agent_config": {"system_prompt": "test", "provider": "anthropic", "model": "gpt-5-ultra", "temperature": 0.5, "allowed_tools": ["calculator"]}},
-        {"agent_config": {"system_prompt": "test", "provider": "anthropic", "model": "claude-sonnet-4-6", "temperature": 3.0, "allowed_tools": ["calculator"]}},
+        {"agent_config": {"system_prompt": "", "provider": "anthropic", "model": "claude-sonnet-4-6", "temperature": 0.5, "allowed_tools": ["web_search"]}},
+        {"agent_config": {"system_prompt": "test", "provider": "anthropic", "model": "gpt-5-ultra", "temperature": 0.5, "allowed_tools": ["web_search"]}},
+        {"agent_config": {"system_prompt": "test", "provider": "anthropic", "model": "claude-sonnet-4-6", "temperature": 3.0, "allowed_tools": ["web_search"]}},
         {"agent_config": {"system_prompt": "test", "provider": "anthropic", "model": "claude-sonnet-4-6", "temperature": 0.5, "allowed_tools": ["rm_rf"]}},
     ]
 

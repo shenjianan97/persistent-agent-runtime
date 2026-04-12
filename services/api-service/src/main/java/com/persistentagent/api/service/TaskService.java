@@ -21,7 +21,9 @@ import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.io.IOException;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.stream.IntStream;
@@ -41,6 +43,7 @@ public class TaskService {
     private final ObjectMapper objectMapper;
     private final CheckpointEventParser checkpointEventParser;
     private final ConfigValidationHelper configValidationHelper;
+    private final S3StorageService s3StorageService;
     private final boolean devTaskControlsEnabled;
 
     public TaskService(
@@ -54,6 +57,7 @@ public class TaskService {
             ObjectMapper objectMapper,
             CheckpointEventParser checkpointEventParser,
             ConfigValidationHelper configValidationHelper,
+            S3StorageService s3StorageService,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.artifactRepository = artifactRepository;
         this.taskRepository = taskRepository;
@@ -65,6 +69,7 @@ public class TaskService {
         this.objectMapper = objectMapper;
         this.checkpointEventParser = checkpointEventParser;
         this.configValidationHelper = configValidationHelper;
+        this.s3StorageService = s3StorageService;
         this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
@@ -508,6 +513,91 @@ public class TaskService {
                 dbConnected ? "connected" : "disconnected",
                 activeWorkers,
                 queuedTasks);
+    }
+
+    @Transactional
+    public TaskSubmissionResponse submitTaskWithFiles(
+            TaskSubmissionRequest request, List<MultipartFile> files) {
+        // First, submit the task normally (creates the task row)
+        TaskSubmissionResponse response = submitTask(request);
+        UUID taskId = response.taskId();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // If files are present, validate sandbox requirement and upload
+        if (files != null && !files.isEmpty()) {
+            // Look up the agent to check sandbox config
+            Map<String, Object> agentRow = agentRepository.findByIdAndTenant(
+                    tenantId, request.agentId())
+                    .orElseThrow(() -> new ValidationException(
+                            "Agent not found: " + request.agentId()));
+
+            String agentConfigJson = (String) agentRow.get("agent_config");
+            boolean sandboxEnabled = isSandboxEnabled(agentConfigJson);
+
+            if (!sandboxEnabled) {
+                throw new ValidationException(
+                        "File attachments require an agent with sandbox enabled. "
+                        + "Agent '" + request.agentId() + "' does not have sandbox.enabled: true.");
+            }
+
+            // Upload each file to S3 and record as input artifact.
+            // Track uploaded S3 keys so we can clean up orphans if a later step fails
+            // (DB rolls back on exception but S3 writes do not).
+            List<String> uploadedS3Keys = new ArrayList<>();
+            try {
+                for (MultipartFile file : files) {
+                    String filename = file.getOriginalFilename();
+                    if (filename == null || filename.isBlank()) {
+                        filename = "unnamed_file";
+                    }
+
+                    String s3Key = tenantId + "/" + taskId + "/input/" + filename;
+                    String contentType = file.getContentType();
+                    if (contentType == null || contentType.isBlank()) {
+                        contentType = "application/octet-stream";
+                    }
+
+                    try {
+                        byte[] data = file.getBytes();
+                        s3StorageService.upload(s3Key, data, contentType);
+                        uploadedS3Keys.add(s3Key);
+                        artifactRepository.insert(
+                                taskId, tenantId, filename, "input",
+                                contentType, data.length, s3Key);
+                    } catch (IOException e) {
+                        throw new RuntimeException(
+                                "Failed to read uploaded file: " + filename, e);
+                    }
+                }
+            } catch (Exception e) {
+                // Best-effort cleanup: delete any S3 objects already uploaded.
+                // The DB transaction will roll back automatically, but S3 is not transactional.
+                for (String orphanKey : uploadedS3Keys) {
+                    try {
+                        s3StorageService.delete(orphanKey);
+                    } catch (Exception cleanupEx) {
+                        // Log but don't mask the original exception
+                    }
+                }
+                throw e;
+            }
+        }
+
+        return response;
+    }
+
+    private boolean isSandboxEnabled(String agentConfigJson) {
+        try {
+            var configNode = objectMapper.readTree(agentConfigJson);
+            var sandboxNode = configNode.get("sandbox");
+            if (sandboxNode == null || sandboxNode.isNull()) {
+                return false;
+            }
+            var enabledNode = sandboxNode.get("enabled");
+            return enabledNode != null && enabledNode.asBoolean(false);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // --- Validation helpers ---

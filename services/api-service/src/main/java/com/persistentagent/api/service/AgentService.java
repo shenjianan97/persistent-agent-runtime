@@ -8,11 +8,13 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.AgentCreateRequest;
 import com.persistentagent.api.model.request.AgentUpdateRequest;
+import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.model.response.AgentResponse;
 import com.persistentagent.api.model.response.AgentSummaryResponse;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,13 +33,16 @@ public class AgentService {
     private final AgentRepository agentRepository;
     private final ConfigValidationHelper configValidationHelper;
     private final ObjectMapper objectMapper;
+    private final boolean devTaskControlsEnabled;
 
     public AgentService(AgentRepository agentRepository,
             ConfigValidationHelper configValidationHelper,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.agentRepository = agentRepository;
         this.configValidationHelper = configValidationHelper;
         this.objectMapper = objectMapper;
+        this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
     @Transactional
@@ -159,6 +164,41 @@ public class AgentService {
     // --- Config canonicalization ---
 
     private AgentConfigRequest canonicalizeConfig(AgentConfigRequest config) {
+        SandboxConfigRequest sandbox = config.sandbox();
+        SandboxConfigRequest canonicalizedSandbox = null;
+        if (sandbox != null) {
+            boolean enabled = sandbox.enabled() != null && sandbox.enabled();
+            canonicalizedSandbox = new SandboxConfigRequest(
+                    enabled,
+                    enabled ? sandbox.template() : null,
+                    enabled ? (sandbox.vcpu() != null ? sandbox.vcpu() : ValidationConstants.SANDBOX_VCPU_DEFAULT) : null,
+                    enabled ? (sandbox.memoryMb() != null ? sandbox.memoryMb() : ValidationConstants.SANDBOX_MEMORY_MB_DEFAULT) : null,
+                    enabled ? (sandbox.timeoutSeconds() != null ? sandbox.timeoutSeconds() : ValidationConstants.SANDBOX_TIMEOUT_SECONDS_DEFAULT) : null
+            );
+        }
+
+        // Auto-determine allowed tools based on agent config
+        boolean sandboxEnabled = canonicalizedSandbox != null
+                && canonicalizedSandbox.enabled() != null
+                && canonicalizedSandbox.enabled();
+
+        List<String> canonicalizedTools = new java.util.ArrayList<>(
+                ValidationConstants.BASE_PLATFORM_TOOLS);
+        if (sandboxEnabled) {
+            canonicalizedTools.addAll(ValidationConstants.SANDBOX_TOOLS);
+        }
+        // Preserve dev-only tools explicitly requested by the caller (e.g. dev_sleep)
+        // when dev task controls are enabled. These are not added by default to avoid
+        // confusing production agents.
+        if (devTaskControlsEnabled && config.allowedTools() != null) {
+            for (String tool : config.allowedTools()) {
+                if (ValidationConstants.DEV_TASK_CONTROL_TOOLS.contains(tool)
+                        && !canonicalizedTools.contains(tool)) {
+                    canonicalizedTools.add(tool);
+                }
+            }
+        }
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -166,12 +206,11 @@ public class AgentService {
                 config.temperature() != null
                         ? config.temperature()
                         : ValidationConstants.DEFAULT_TEMPERATURE,
-                config.allowedTools() != null
-                        ? config.allowedTools()
-                        : List.of(),
+                canonicalizedTools,
                 config.toolServers() != null
                         ? config.toolServers()
-                        : List.of());
+                        : List.of(),
+                canonicalizedSandbox);
     }
 
     private String serializeConfig(AgentConfigRequest config) {

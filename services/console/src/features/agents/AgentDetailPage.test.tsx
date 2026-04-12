@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -86,7 +86,109 @@ const MOCK_AGENT = {
     updated_at: '2026-03-27T18:00:00Z',
 };
 
+const MOCK_AGENT_WITH_SANDBOX = {
+    ...MOCK_AGENT,
+    agent_config: {
+        ...MOCK_AGENT.agent_config,
+        sandbox: {
+            enabled: true,
+            template: 'python-3.11',
+            vcpu: 2,
+            memory_mb: 2048,
+            timeout_seconds: 3600,
+        },
+    },
+};
+
 describe('AgentDetailPage', () => {
+    it('shows sandbox info in read-only mode when sandbox is enabled', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        expect(screen.getByText('python-3.11')).toBeInTheDocument();
+        expect(screen.getByText('2048 MB')).toBeInTheDocument();
+        expect(screen.getByText('3600s')).toBeInTheDocument();
+    });
+
+    it('does not show sandbox section in read-only mode when sandbox is disabled', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        expect(screen.queryByText('python-3.11')).not.toBeInTheDocument();
+    });
+
+    it('shows sandbox fields in edit mode', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+
+        // Sandbox enable checkbox should appear
+        expect(screen.getByText('Enable Sandbox')).toBeInTheDocument();
+        // Sandbox conditional fields should be visible because sandbox is enabled
+        expect(screen.getByDisplayValue('python-3.11')).toBeInTheDocument();
+    });
+
+    it('includes sandbox config in submit payload when sandbox is enabled', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+        fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+
+        await waitFor(() => expect(updateMock).toHaveBeenCalled());
+
+        expect(updateMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                request: expect.objectContaining({
+                    agent_config: expect.objectContaining({
+                        sandbox: expect.objectContaining({
+                            enabled: true,
+                            template: 'python-3.11',
+                        }),
+                    }),
+                }),
+            }),
+            expect.any(Object),
+        );
+    });
+
+    it('omits sandbox from submit payload when sandbox is disabled', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+        fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+
+        await waitFor(() => expect(updateMock).toHaveBeenCalled());
+
+        expect(updateMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                request: expect.objectContaining({
+                    agent_config: expect.not.objectContaining({
+                        sandbox: expect.anything(),
+                    }),
+                }),
+            }),
+            expect.any(Object),
+        );
+    });
+
     it('renders agent detail in read-only mode by default', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
 

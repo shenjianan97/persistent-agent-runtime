@@ -14,13 +14,28 @@ export const submitTaskSchema = z.object({
 export type SubmitTaskFormValues = z.infer<typeof submitTaskSchema>;
 
 // Capability tools — do external work and return results
+// Only user-selectable tools appear here. Auto-managed tools (upload_artifact, sandbox_*)
+// and removed tools (calculator) are excluded from this list.
 export const ALLOWED_TOOLS = [
     { id: "web_search", label: "Web Search" },
     { id: "read_url", label: "Read URL" },
-    { id: "calculator", label: "Calculator" },
-    { id: "upload_artifact", label: "Upload Artifact" },
     ...(devTaskControlsEnabled ? [{ id: "dev_sleep", label: "Dev Sleep" }] : [])
 ];
+
+// Full label map for display purposes — includes auto-managed and legacy tools
+// so read-only views can show human-readable labels for any stored tool ID.
+export const ALL_TOOL_LABELS: Record<string, string> = {
+    web_search: "Web Search",
+    read_url: "Read URL",
+    calculator: "Calculator",
+    sandbox_exec: "Sandbox Exec",
+    sandbox_read_file: "Sandbox Read File",
+    sandbox_write_file: "Sandbox Write File",
+    sandbox_download: "Sandbox Download",
+    upload_artifact: "Upload Artifact",
+    request_human_input: "Human Input",
+    dev_sleep: "Dev Sleep",
+};
 
 // Runtime tool ID for human-in-the-loop — presented as a separate toggle
 export const HUMAN_INPUT_TOOL_ID = "request_human_input";

@@ -146,6 +146,19 @@ What to verify:
 - After creating an endpoint, it appears in the list
 - Deleting an endpoint removes it from the list
 
+### Scenario 10: Task File Attachments
+
+What it validates: File attachment affordances on task submission work in a real browser.
+
+What to verify:
+
+- `/tasks/new` shows the file attachment drop zone in a disabled state until a sandbox-enabled agent is selected
+- After selecting a sandbox-enabled agent, clicking `Drop files here or click to browse` opens the browser file picker exactly once
+- Choosing a file adds it to the attachment list with filename and size shown
+- Dragging and dropping a file onto the same surface also adds it to the attachment list
+- Disabled state does not open the browser file picker
+- No console errors appear during click-to-browse or drag-and-drop interactions
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -153,6 +166,7 @@ What to verify:
 | Any console change | 1 |
 | Agent management feature | 1, 2, 3 |
 | Task submission feature | 1, 3 |
+| Task submission file attachment feature | 1, 3, 10 |
 | Task detail / timeline feature | 1, 4 |
 | Task list feature | 1, 5 |
 | Budget / pause feature | 1, 4, 6 |

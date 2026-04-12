@@ -42,7 +42,7 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
     const url = baseUrl ? `${baseUrl}${path}` : path;
 
     const headers = new Headers(options?.headers);
-    if (!headers.has('Content-Type') && options?.method !== 'GET' && options?.body) {
+    if (!headers.has('Content-Type') && options?.method !== 'GET' && options?.body && !(options.body instanceof FormData)) {
         headers.set('Content-Type', 'application/json');
     }
 
@@ -80,6 +80,27 @@ export const api = {
                 langfuse_endpoint_id: request.langfuse_endpoint_id,
             }),
         }),
+
+    submitTaskMultipart: (request: TaskSubmissionRequest, files: File[]) => {
+        const formData = new FormData();
+        formData.append('task_request', JSON.stringify({
+            agent_id: request.agent_id,
+            input: request.input,
+            max_steps: request.max_steps,
+            max_retries: request.max_retries,
+            task_timeout_seconds: request.task_timeout_seconds,
+            langfuse_endpoint_id: request.langfuse_endpoint_id,
+        }));
+        for (const file of files) {
+            formData.append('files', file);
+        }
+        // Pass FormData as body; fetchApi will NOT auto-set Content-Type for FormData,
+        // allowing the browser to set the correct multipart boundary.
+        return fetchApi<TaskSubmissionResponse>('/v1/tasks', {
+            method: 'POST',
+            body: formData,
+        });
+    },
 
     listTasks: (status?: string, agentId?: string, limit?: number, pauseReason?: string) => {
         const params = new URLSearchParams();

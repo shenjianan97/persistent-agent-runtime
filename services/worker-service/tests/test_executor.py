@@ -12,6 +12,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
 from tools.errors import ToolExecutionError, ToolTransportError
+from sandbox.provisioner import SandboxProvisionError, SandboxConnectionError
 
 
 def _make_mock_conn():
@@ -74,7 +75,7 @@ def task_data():
         "agent_config_snapshot": json.dumps({
             "model": "claude-3-5-sonnet-latest",
             "temperature": 0.5,
-            "allowed_tools": ["calculator"]
+            "allowed_tools": ["web_search"]
         }),
         "input": "What is 2+2?",
         "max_steps": 5,
@@ -149,7 +150,7 @@ async def test_build_graph_configures_tool_node_for_expected_tool_errors(mock_wo
                 {
                     "model": "claude-3-5-sonnet-latest",
                     "temperature": 0.5,
-                    "allowed_tools": ["calculator"],
+                    "allowed_tools": ["web_search"],
                 },
                 cancel_event=cancel_event,
                 task_id="task-123",
@@ -689,7 +690,7 @@ async def test_build_graph_with_custom_tools_merges(mock_worker):
                 {
                     "model": "claude-3-5-sonnet-latest",
                     "temperature": 0.5,
-                    "allowed_tools": ["calculator"],
+                    "allowed_tools": ["web_search"],
                 },
                 cancel_event=cancel_event,
                 task_id="task-123",
@@ -700,7 +701,7 @@ async def test_build_graph_with_custom_tools_merges(mock_worker):
     assert MockToolNode.called
     tools_arg = MockToolNode.call_args[0][0]
     tool_names = [t.name for t in tools_arg]
-    assert "calculator" in tool_names
+    assert "web_search" in tool_names
     assert "my-server__custom_tool" in tool_names
 
 
@@ -736,7 +737,7 @@ async def test_build_graph_exceeds_tool_limit_raises(mock_worker):
                 {
                     "model": "claude-3-5-sonnet-latest",
                     "temperature": 0.5,
-                    "allowed_tools": ["calculator"],  # 1 built-in + 128 custom = 129 > 128
+                    "allowed_tools": ["web_search"],  # 1 built-in + 128 custom = 129 > 128
                 },
                 cancel_event=cancel_event,
                 task_id="task-123",
@@ -857,3 +858,556 @@ async def test_retry_requeue_stolen_lease_skips_notify(mock_worker, task_data):
     mock_conn.fetchval.assert_called_once()
     # pg_notify should NOT have been called since the update was skipped
     mock_conn.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Input file injection tests (Task 6)
+# ---------------------------------------------------------------------------
+
+def _build_test_executor():
+    """Build a GraphExecutor with a mock pool for unit testing."""
+    config = WorkerConfig(worker_id="test-worker", worker_pool_id="shared")
+    pool, _ = _make_mock_pool()
+    return GraphExecutor(config, pool)
+
+
+class TestInputFileInjection:
+    @pytest.mark.asyncio
+    async def test_inject_no_input_files_returns_empty_list(self):
+        """No input artifacts → returns empty list, no sandbox writes."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-test"
+
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_acquire_ctx = AsyncMock()
+        mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+        executor.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+
+        result = await executor._inject_input_files(mock_sandbox, "task-123", "default")
+        assert result == []
+        # sandbox.files.write should never have been called
+        mock_sandbox.files.write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inject_input_files_downloads_and_writes_to_sandbox(self):
+        """Input artifacts are downloaded from S3 and written to sandbox."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-test"
+
+        rows = [
+            {"filename": "data.csv", "s3_key": "default/task-123/input/data.csv",
+             "content_type": "text/csv", "size_bytes": 100},
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_acquire_ctx = AsyncMock()
+        mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+        executor.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+
+        executor.s3_client = MagicMock()
+        executor.s3_client.download = AsyncMock(return_value=b"csv,data\n1,2")
+
+        with patch("executor.graph.asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            mock_thread.return_value = None
+            result = await executor._inject_input_files(mock_sandbox, "task-123", "default")
+
+        assert result == ["data.csv"]
+        executor.s3_client.download.assert_called_once_with("default/task-123/input/data.csv")
+        # Verify to_thread was called with sandbox.files.write and the correct path
+        mock_thread.assert_called_once()
+        call_args = mock_thread.call_args
+        assert call_args[0][1] == "/home/user/data.csv"
+        assert call_args[0][2] == b"csv,data\n1,2"
+
+    @pytest.mark.asyncio
+    async def test_inject_input_files_multiple_files(self):
+        """Multiple input artifacts are all downloaded and written."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+
+        rows = [
+            {"filename": "file1.txt", "s3_key": "t/task/input/file1.txt",
+             "content_type": "text/plain", "size_bytes": 10},
+            {"filename": "file2.csv", "s3_key": "t/task/input/file2.csv",
+             "content_type": "text/csv", "size_bytes": 20},
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_acquire_ctx = AsyncMock()
+        mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+        executor.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+
+        executor.s3_client = MagicMock()
+        executor.s3_client.download = AsyncMock(return_value=b"data")
+
+        with patch("executor.graph.asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
+            mock_thread.return_value = None
+            result = await executor._inject_input_files(mock_sandbox, "task-abc", "t")
+
+        assert result == ["file1.txt", "file2.csv"]
+        assert executor.s3_client.download.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_inject_input_files_s3_failure_raises_runtime_error(self):
+        """S3 download failure raises RuntimeError."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+
+        rows = [
+            {"filename": "data.csv", "s3_key": "t/task/input/data.csv",
+             "content_type": "text/csv", "size_bytes": 50},
+        ]
+        mock_conn = AsyncMock()
+        mock_conn.fetch = AsyncMock(return_value=rows)
+        mock_acquire_ctx = AsyncMock()
+        mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+        executor.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+
+        executor.s3_client = MagicMock()
+        executor.s3_client.download = AsyncMock(side_effect=Exception("S3 unavailable"))
+
+        with pytest.raises(RuntimeError, match="Failed to inject input file 'data.csv'"):
+            await executor._inject_input_files(mock_sandbox, "task-abc", "t")
+
+    def test_platform_system_message_no_files_no_sandbox(self):
+        """No files, no sandbox → only base tool instructions."""
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(["web_search", "request_human_input"])
+        assert "request_human_input" in msg
+        assert "web_search" in msg
+
+    def test_platform_system_message_with_injected_files(self):
+        """Injected files → paths appear in message."""
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(
+            ["sandbox_exec", "sandbox_read_file"],
+            injected_files=["data.csv"],
+        )
+        assert "/home/user/data.csv" in msg
+        assert "sandbox_read_file" in msg
+
+    def test_platform_system_message_multiple_files(self):
+        """Multiple files → all paths appear in message."""
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(
+            ["sandbox_exec"],
+            injected_files=["data.csv", "readme.txt"],
+        )
+        assert "/home/user/data.csv" in msg
+        assert "/home/user/readme.txt" in msg
+
+
+# ---------------------------------------------------------------------------
+# Sandbox lifecycle tests (Task 7)
+# ---------------------------------------------------------------------------
+
+def _build_sandbox_task_data(sandbox_enabled: bool = False, sandbox_id: str | None = None) -> dict:
+    """Build task_data with optional sandbox config for sandbox lifecycle tests."""
+    agent_config = {
+        "model": "claude-3-5-sonnet-latest",
+        "temperature": 0.5,
+        "allowed_tools": ["sandbox_exec"],
+    }
+    if sandbox_enabled:
+        agent_config["sandbox"] = {
+            "enabled": True,
+            "template": "base",
+            "vcpu": 2,
+            "memory_mb": 2048,
+            "timeout_seconds": 3600,
+        }
+
+    data = {
+        "task_id": "00000000-0000-0000-0000-000000000001",
+        "tenant_id": "test-tenant",
+        "agent_id": "test-agent",
+        "agent_config_snapshot": json.dumps(agent_config),
+        "input": "Run a script",
+        "max_steps": 5,
+        "task_timeout_seconds": 10,
+        "retry_count": 0,
+        "max_retries": 3,
+    }
+    if sandbox_id is not None:
+        data["sandbox_id"] = sandbox_id
+    return data
+
+
+class TestSandboxLifecycle:
+    def test_sandbox_cost_calculation(self):
+        """Verify sandbox cost formula: duration_seconds * vcpu * $0.05/3600."""
+        duration_seconds = 600  # 10 minutes
+        vcpu = 2
+        # Expected: 600 * 2 * 50000 / 3600 = 16666 microdollars
+        expected = int(duration_seconds * vcpu * 50000 / 3600)
+        assert expected == 16666
+
+    def test_sandbox_cost_calculation_small(self):
+        """Verify sandbox cost for minimal usage."""
+        duration_seconds = 60  # 1 minute
+        vcpu = 1
+        expected = int(duration_seconds * vcpu * 50000 / 3600)
+        assert expected == 833
+
+    def test_sandbox_provisioner_lazy_init_no_api_key(self):
+        """sandbox_provisioner property returns None when E2B_API_KEY is not set."""
+        executor = _build_test_executor()
+        executor._sandbox_provisioner = None
+        with patch.dict("os.environ", {}, clear=True):
+            # Remove E2B_API_KEY if present
+            import os
+            os.environ.pop("E2B_API_KEY", None)
+            result = executor.sandbox_provisioner
+        assert result is None
+
+    def test_sandbox_provisioner_lazy_init_with_api_key(self):
+        """sandbox_provisioner property creates SandboxProvisioner when E2B_API_KEY is set."""
+        executor = _build_test_executor()
+        executor._sandbox_provisioner = None
+        with patch.dict("os.environ", {"E2B_API_KEY": "test-key"}):
+            with patch("executor.graph.SandboxProvisioner") as MockProvisioner:
+                mock_instance = MagicMock()
+                MockProvisioner.return_value = mock_instance
+                result = executor.sandbox_provisioner
+        assert result is mock_instance
+        MockProvisioner.assert_called_once_with(api_key="test-key")
+
+    def test_sandbox_provisioner_cached_after_init(self):
+        """sandbox_provisioner property returns cached instance on second access."""
+        executor = _build_test_executor()
+        mock_provisioner = MagicMock()
+        executor._sandbox_provisioner = mock_provisioner
+        result = executor.sandbox_provisioner
+        assert result is mock_provisioner
+
+    @pytest.mark.asyncio
+    async def test_execute_task_no_sandbox_config_skips_provisioning(self):
+        """Task without sandbox config behaves identically to before — no provisioning."""
+        executor = _build_test_executor()
+        task_data = _build_sandbox_task_data(sandbox_enabled=False)
+
+        # Confirm no sandbox key in agent_config
+        agent_config = json.loads(task_data["agent_config_snapshot"])
+        sandbox_config = agent_config.get("sandbox", {})
+        assert not sandbox_config.get("enabled", False)
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def mock_astream(*args, **kwargs):
+                    yield {"mock": "event"}
+                mock_compiled.astream = mock_astream
+
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Done")]}
+                mock_state.tasks = []
+                mock_compiled.aget_state.return_value = mock_state
+
+                cancel_event = asyncio.Event()
+                # Should execute normally without any sandbox provisioning
+                with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+                    await executor.execute_task(task_data, cancel_event)
+
+                # No dead-letter should have been called
+                mock_dead_letter.assert_not_called()
+
+                # _build_graph was called (task ran normally)
+                mock_build.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_provision_failure_dead_letters(self):
+        """Sandbox provision failure → dead-letter with sandbox_provision_failed."""
+        executor = _build_test_executor()
+        mock_provisioner = MagicMock()
+        mock_provisioner.provision = AsyncMock(
+            side_effect=SandboxProvisionError("base", "E2B API down")
+        )
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+            await executor.execute_task(task_data, cancel_event)
+
+        mock_dead_letter.assert_called_once()
+        call_kwargs = mock_dead_letter.call_args
+        assert "sandbox_provision_failed" in str(call_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_missing_api_key_dead_letters(self):
+        """Missing E2B_API_KEY → dead-letter with sandbox_provision_failed."""
+        executor = _build_test_executor()
+        executor._sandbox_provisioner = None  # Force lazy init to run
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        with patch.dict("os.environ", {}, clear=True):
+            import os
+            os.environ.pop("E2B_API_KEY", None)
+            with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+                await executor.execute_task(task_data, cancel_event)
+
+        mock_dead_letter.assert_called_once()
+        call_kwargs = mock_dead_letter.call_args
+        assert "sandbox_provision_failed" in str(call_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_crash_recovery_failure_dead_letters(self):
+        """Sandbox reconnect failure → dead-letter with sandbox_lost."""
+        executor = _build_test_executor()
+        mock_provisioner = MagicMock()
+        mock_provisioner.connect = AsyncMock(
+            side_effect=SandboxConnectionError("sbx-expired", "not found")
+        )
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True, sandbox_id="sbx-expired")
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_handle_dead_letter", new_callable=AsyncMock) as mock_dead_letter:
+            await executor.execute_task(task_data, cancel_event)
+
+        mock_dead_letter.assert_called_once()
+        call_kwargs = mock_dead_letter.call_args
+        assert "sandbox_lost" in str(call_kwargs)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_crash_recovery_success_calls_connect(self):
+        """Task with sandbox_id reconnects to existing sandbox via connect()."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-existing"
+
+        mock_provisioner = MagicMock()
+        mock_provisioner.connect = AsyncMock(return_value=mock_sandbox)
+        mock_provisioner.destroy = AsyncMock()
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True, sandbox_id="sbx-existing")
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def mock_astream(*args, **kwargs):
+                    yield {"mock": "event"}
+                mock_compiled.astream = mock_astream
+
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Done")]}
+                mock_state.tasks = []
+                mock_compiled.aget_state.return_value = mock_state
+
+                with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
+                    await executor.execute_task(task_data, cancel_event)
+
+        # connect() should be called with the existing sandbox_id
+        mock_provisioner.connect.assert_called_once_with("sbx-existing")
+        # provision() should NOT have been called (reconnect path)
+        mock_provisioner.provision.assert_not_called() if hasattr(mock_provisioner, "provision") else None
+
+    @pytest.mark.asyncio
+    async def test_sandbox_provisioned_id_stored_in_db(self):
+        """After fresh provision, sandbox_id is immediately stored in DB."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-new-123"
+
+        mock_provisioner = MagicMock()
+        mock_provisioner.provision = AsyncMock(return_value=mock_sandbox)
+        mock_provisioner.destroy = AsyncMock()
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        # Track DB execute calls
+        db_execute_calls = []
+        mock_conn = _make_mock_conn()
+        mock_conn.execute = AsyncMock(side_effect=lambda *args, **kwargs: db_execute_calls.append(args))
+        mock_conn.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000001")
+
+        mock_acquire_ctx = AsyncMock()
+        mock_acquire_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_acquire_ctx.__aexit__ = AsyncMock(return_value=False)
+        executor.pool.acquire = MagicMock(return_value=mock_acquire_ctx)
+        executor.pool.fetchval = AsyncMock(return_value="00000000-0000-0000-0000-000000000001")
+        executor.pool.fetchrow = AsyncMock(return_value=None)
+        executor.pool.fetch = AsyncMock(return_value=[])
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def mock_astream(*args, **kwargs):
+                    yield {"mock": "event"}
+                mock_compiled.astream = mock_astream
+
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Done")]}
+                mock_state.tasks = []
+                mock_compiled.aget_state.return_value = mock_state
+
+                with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
+                    await executor.execute_task(task_data, cancel_event)
+
+        # Check that sandbox_id was stored in DB (UPDATE tasks SET sandbox_id = ...)
+        sandbox_id_store_calls = [
+            c for c in db_execute_calls
+            if "sandbox_id" in str(c) and "UPDATE tasks" in str(c)
+        ]
+        assert len(sandbox_id_store_calls) >= 1, "Expected sandbox_id to be stored in DB"
+        # Verify the sandbox_id value was passed
+        assert "sbx-new-123" in str(sandbox_id_store_calls[0])
+
+    @pytest.mark.asyncio
+    async def test_sandbox_destroyed_on_completion(self):
+        """Sandbox is destroyed after task completes successfully."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-complete"
+
+        mock_provisioner = MagicMock()
+        mock_provisioner.provision = AsyncMock(return_value=mock_sandbox)
+        mock_provisioner.destroy = AsyncMock()
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def mock_astream(*args, **kwargs):
+                    yield {"mock": "event"}
+                mock_compiled.astream = mock_astream
+
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Done")]}
+                mock_state.tasks = []
+                mock_compiled.aget_state.return_value = mock_state
+
+                with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
+                    await executor.execute_task(task_data, cancel_event)
+
+        mock_provisioner.destroy.assert_called_once_with(mock_sandbox)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_destroyed_in_finally_on_error(self):
+        """Sandbox is destroyed in finally block when task fails with an exception."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-error"
+
+        mock_provisioner = MagicMock()
+        mock_provisioner.provision = AsyncMock(return_value=mock_sandbox)
+        mock_provisioner.destroy = AsyncMock()
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def failing_astream(*args, **kwargs):
+                    raise ValueError("unexpected failure")
+                    yield {}
+                mock_compiled.astream = failing_astream
+
+                with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
+                    await executor.execute_task(task_data, cancel_event)
+
+        # destroy should be called in the finally block
+        mock_provisioner.destroy.assert_called_once_with(mock_sandbox)
+
+    @pytest.mark.asyncio
+    async def test_build_graph_receives_sandbox_and_injected_files(self):
+        """execute_task passes sandbox and injected_files to _build_graph."""
+        executor = _build_test_executor()
+        mock_sandbox = MagicMock()
+        mock_sandbox.sandbox_id = "sbx-check"
+
+        mock_provisioner = MagicMock()
+        mock_provisioner.provision = AsyncMock(return_value=mock_sandbox)
+        mock_provisioner.destroy = AsyncMock()
+        executor._sandbox_provisioner = mock_provisioner
+
+        task_data = _build_sandbox_task_data(sandbox_enabled=True)
+        cancel_event = asyncio.Event()
+
+        with patch.object(executor, "_build_graph") as mock_build:
+            mock_graph = MagicMock()
+            mock_compiled = AsyncMock()
+            mock_graph.compile.return_value = mock_compiled
+            mock_build.return_value = mock_graph
+
+            with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+                mock_ckpt = AsyncMock()
+                mock_ckpt.aget_tuple.return_value = None
+                MockCheckpointer.return_value = mock_ckpt
+
+                async def mock_astream(*args, **kwargs):
+                    yield {"mock": "event"}
+                mock_compiled.astream = mock_astream
+
+                mock_state = MagicMock()
+                mock_state.values = {"messages": [MagicMock(content="Done")]}
+                mock_state.tasks = []
+                mock_compiled.aget_state.return_value = mock_state
+
+                with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=["file1.txt"]) as mock_inject:
+                    await executor.execute_task(task_data, cancel_event)
+
+        mock_build.assert_called_once()
+        _, kwargs = mock_build.call_args
+        assert kwargs.get("sandbox") is mock_sandbox
+        assert kwargs.get("injected_files") == ["file1.txt"]

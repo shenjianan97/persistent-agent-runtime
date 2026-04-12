@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable
 
@@ -26,6 +27,11 @@ from langgraph.types import Command
 
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 from core.config import WorkerConfig
+from sandbox.provisioner import (
+    SandboxProvisioner,
+    SandboxProvisionError,
+    SandboxConnectionError,
+)
 
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
@@ -34,19 +40,30 @@ from tools.definitions import (
     create_default_dependencies,
     WEB_SEARCH_TOOL,
     READ_URL_TOOL,
-    CALCULATOR_TOOL,
     DEV_SLEEP_TOOL,
     REQUEST_HUMAN_INPUT_TOOL,
     UPLOAD_ARTIFACT_TOOL,
+    SANDBOX_EXEC_TOOL,
+    SANDBOX_READ_FILE_TOOL,
+    SANDBOX_WRITE_FILE_TOOL,
+    SANDBOX_DOWNLOAD_TOOL,
     WebSearchArguments,
     ReadUrlArguments,
-    CalculatorArguments,
     DevSleepArguments,
     RequestHumanInputArguments,
     dev_task_controls_enabled,
     request_human_input,
 )
-from tools.calculator import evaluate_expression
+from tools.sandbox_tools import (
+    SandboxExecArguments,
+    SandboxReadFileArguments,
+    SandboxWriteFileArguments,
+    SandboxDownloadArguments,
+    create_sandbox_exec_fn,
+    create_sandbox_read_file_fn,
+    create_sandbox_write_file_fn,
+    create_sandbox_download_fn,
+)
 from tools.errors import ToolExecutionError, ToolTransportError
 
 logger = logging.getLogger(__name__)
@@ -55,18 +72,31 @@ logger = logging.getLogger(__name__)
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
-    def __init__(self, config: WorkerConfig, pool: asyncpg.Pool):
+    def __init__(self, config: WorkerConfig, pool: asyncpg.Pool, deps=None, s3_client=None):
         self.config = config
         self.pool = pool
-        self.deps = create_default_dependencies()
+        self.deps = deps or create_default_dependencies()
         # Per-model cost rate cache: {model_name: (input_rate, output_rate)}
         self._cost_rate_cache: dict[str, tuple[int, int]] = {}
-        s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL")
-        s3_bucket_name = os.environ.get("S3_BUCKET_NAME", "platform-artifacts")
-        self.s3_client = S3Client(
-            endpoint_url=s3_endpoint_url,
-            bucket_name=s3_bucket_name,
-        )
+        if s3_client is not None:
+            self.s3_client = s3_client
+        else:
+            s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+            s3_bucket_name = os.environ.get("S3_BUCKET_NAME", "platform-artifacts")
+            self.s3_client = S3Client(
+                endpoint_url=s3_endpoint_url,
+                bucket_name=s3_bucket_name,
+            )
+        self._sandbox_provisioner: SandboxProvisioner | None = None
+
+    @property
+    def sandbox_provisioner(self) -> SandboxProvisioner | None:
+        """Lazy-initialize the sandbox provisioner (requires E2B_API_KEY)."""
+        if self._sandbox_provisioner is None:
+            api_key = os.environ.get("E2B_API_KEY")
+            if api_key:
+                self._sandbox_provisioner = SandboxProvisioner(api_key=api_key)
+        return self._sandbox_provisioner
 
     async def _resolve_langfuse_credentials(self, endpoint_id: str) -> dict | None:
         """Query langfuse_endpoints table for credentials. Returns {host, public_key, secret_key} or None."""
@@ -151,6 +181,8 @@ class GraphExecutor:
         cancel_event: asyncio.Event,
         task_id: str,
         tenant_id: str = "default",
+        sandbox=None,
+        s3_client=None,
     ) -> list[StructuredTool]:
         tools = []
         if "web_search" in allowed_tools:
@@ -183,16 +215,6 @@ class GraphExecutor:
                 name="read_url",
                 description=READ_URL_TOOL.description,
                 args_schema=ReadUrlArguments
-            ))
-
-        if "calculator" in allowed_tools:
-            async def calculator(expression: str):
-                return {"expression": expression, "result": evaluate_expression(expression)}
-            tools.append(StructuredTool.from_function(
-                coroutine=calculator,
-                name="calculator",
-                description=CALCULATOR_TOOL.description,
-                args_schema=CalculatorArguments
             ))
 
         if "request_human_input" in allowed_tools:
@@ -249,6 +271,85 @@ class GraphExecutor:
                 )
             )
 
+        # --- Sandbox tools (only when sandbox is provisioned) ---
+        if sandbox is not None and "sandbox_exec" in allowed_tools:
+            exec_fn = create_sandbox_exec_fn(sandbox)
+
+            async def sandbox_exec_wrapper(command: str):
+                return await self._await_or_cancel(
+                    exec_fn(command),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="sandbox_exec",
+                )
+
+            tools.append(StructuredTool.from_function(
+                coroutine=sandbox_exec_wrapper,
+                name="sandbox_exec",
+                description=SANDBOX_EXEC_TOOL.description,
+                args_schema=SandboxExecArguments,
+            ))
+
+        if sandbox is not None and "sandbox_read_file" in allowed_tools:
+            read_fn = create_sandbox_read_file_fn(sandbox)
+
+            async def sandbox_read_file_wrapper(path: str):
+                return await self._await_or_cancel(
+                    read_fn(path),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="sandbox_read_file",
+                )
+
+            tools.append(StructuredTool.from_function(
+                coroutine=sandbox_read_file_wrapper,
+                name="sandbox_read_file",
+                description=SANDBOX_READ_FILE_TOOL.description,
+                args_schema=SandboxReadFileArguments,
+            ))
+
+        if sandbox is not None and "sandbox_write_file" in allowed_tools:
+            write_fn = create_sandbox_write_file_fn(sandbox)
+
+            async def sandbox_write_file_wrapper(path: str, content: str):
+                return await self._await_or_cancel(
+                    write_fn(path, content),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="sandbox_write_file",
+                )
+
+            tools.append(StructuredTool.from_function(
+                coroutine=sandbox_write_file_wrapper,
+                name="sandbox_write_file",
+                description=SANDBOX_WRITE_FILE_TOOL.description,
+                args_schema=SandboxWriteFileArguments,
+            ))
+
+        if sandbox is not None and "sandbox_download" in allowed_tools and s3_client is not None:
+            download_fn = create_sandbox_download_fn(
+                sandbox,
+                s3_client=s3_client,
+                pool=self.pool,
+                task_id=task_id,
+                tenant_id=tenant_id,
+            )
+
+            async def sandbox_download_wrapper(path: str, filename: str | None = None):
+                return await self._await_or_cancel(
+                    download_fn(path, filename),
+                    cancel_event,
+                    task_id=task_id,
+                    operation="sandbox_download",
+                )
+
+            tools.append(StructuredTool.from_function(
+                coroutine=sandbox_download_wrapper,
+                name="sandbox_download",
+                description=SANDBOX_DOWNLOAD_TOOL.description,
+                args_schema=SandboxDownloadArguments,
+            ))
+
         return tools
 
     async def _build_graph(
@@ -259,6 +360,9 @@ class GraphExecutor:
         task_id: str,
         tenant_id: str = "default",
         custom_tools: list[StructuredTool] | None = None,
+        sandbox=None,
+        s3_client=None,
+        injected_files: list[str] | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -266,21 +370,26 @@ class GraphExecutor:
         temperature = agent_config.get("temperature", 0.7)
         allowed_tools = agent_config.get("allowed_tools", [])
         system_prompt = agent_config.get("system_prompt", "")
+        sandbox_template = (agent_config.get("sandbox") or {}).get("template")
 
-        # When HITL is enabled, append instruction so the LLM knows to use the tool
-        if "request_human_input" in allowed_tools:
-            hitl_instruction = (
-                "\n\nYou have access to a `request_human_input` tool. "
-                "When you need to ask the user a question, gather clarification, or request any input, "
-                "you MUST call the `request_human_input` tool instead of writing questions in your response. "
-                "The task will pause and wait for the user's answer before you continue."
-            )
-            system_prompt = system_prompt + hitl_instruction
+        # Build a separate platform system message with tool instructions
+        platform_system_msg = self._build_platform_system_message(
+            allowed_tools,
+            injected_files=injected_files,
+            sandbox_template=sandbox_template,
+        )
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
 
-        # Register built-in tools
-        tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id, tenant_id=tenant_id)
+        # Register built-in tools (pass sandbox and s3_client for sandbox tools)
+        tools = self._get_tools(
+            allowed_tools,
+            cancel_event=cancel_event,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            sandbox=sandbox,
+            s3_client=s3_client,
+        )
 
         # Merge custom tools from MCP servers
         if custom_tools:
@@ -300,8 +409,13 @@ class GraphExecutor:
 
         async def agent_node(state: MessagesState, config: RunnableConfig):
             messages = state["messages"]
-            if system_prompt and not any(isinstance(m, SystemMessage) for m in messages):
-                messages = [SystemMessage(content=system_prompt)] + messages
+            if not any(isinstance(m, SystemMessage) for m in messages):
+                sys_messages = []
+                if system_prompt:
+                    sys_messages.append(SystemMessage(content=system_prompt))
+                if platform_system_msg:
+                    sys_messages.append(SystemMessage(content=platform_system_msg))
+                messages = sys_messages + messages
 
             response = await self._await_or_cancel(
                 llm_with_tools.ainvoke(messages, config),
@@ -444,6 +558,140 @@ class GraphExecutor:
         }
         return (cost_microdollars, execution_metadata)
 
+    async def _inject_input_files(self, sandbox, task_id: str, tenant_id: str) -> list[str]:
+        """Download input artifacts from S3 and write them into the sandbox.
+
+        Args:
+            sandbox: E2B Sandbox instance
+            task_id: UUID string
+            tenant_id: tenant ID
+
+        Returns:
+            List of injected filenames (for system message generation)
+        """
+        # Query task_artifacts for input files
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT filename, s3_key, content_type, size_bytes
+                   FROM task_artifacts
+                   WHERE task_id = $1::uuid AND direction = 'input'
+                   ORDER BY created_at""",
+                task_id,
+            )
+
+        if not rows:
+            return []
+
+        injected_files = []
+        for row in rows:
+            filename = row["filename"]
+            s3_key = row["s3_key"]
+            size_bytes = row["size_bytes"]
+
+            try:
+                # Download from S3 via Track 1's S3Client (already async)
+                data = await self.s3_client.download(s3_key)
+
+                # Write into sandbox filesystem
+                sandbox_path = f"/home/user/{filename}"
+                await asyncio.to_thread(sandbox.files.write, sandbox_path, data)
+
+                injected_files.append(filename)
+
+                logger.info(
+                    "input_file_injected",
+                    extra={
+                        "task_id": task_id,
+                        "artifact_filename": filename,
+                        "sandbox_path": sandbox_path,
+                        "size_bytes": size_bytes,
+                    },
+                )
+
+            except Exception as e:
+                logger.error(
+                    "input_file_injection_failed",
+                    extra={
+                        "task_id": task_id,
+                        "artifact_filename": filename,
+                        "s3_key": s3_key,
+                        "error": str(e),
+                    },
+                )
+                raise RuntimeError(
+                    f"Failed to inject input file '{filename}' into sandbox: {str(e)}"
+                ) from e
+
+        logger.info(
+            "input_files_injection_completed",
+            extra={
+                "task_id": task_id,
+                "file_count": len(injected_files),
+                "filenames": injected_files,
+            },
+        )
+
+        return injected_files
+
+    def _build_platform_system_message(
+        self,
+        allowed_tools: list[str],
+        *,
+        injected_files: list[str] | None = None,
+        sandbox_template: str | None = None,
+    ) -> str:
+        """Build platform-generated system message with tool instructions.
+
+        This is injected as a separate SystemMessage, hidden from the customer's
+        system prompt — similar to how Claude Code injects system context.
+        """
+        sections = []
+
+        if "request_human_input" in allowed_tools:
+            sections.append(
+                "You have access to a `request_human_input` tool. "
+                "When you need clarification, additional information, or approval from the user, "
+                "you MUST call the `request_human_input` tool instead of writing questions in your response. "
+                "This will pause execution and wait for the user to respond."
+            )
+
+        sandbox_tools = {"sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download"}
+        if sandbox_tools.intersection(allowed_tools):
+            template_note = f" running the `{sandbox_template}` environment" if sandbox_template else ""
+            sections.append(
+                f"You have access to a sandbox environment{template_note} for code execution. "
+                "Use `sandbox_exec` to run shell commands, `sandbox_write_file` to create files, "
+                "`sandbox_read_file` to read files, and `sandbox_download` to save files as output artifacts. "
+                "Write code to files first, then execute them with sandbox_exec."
+            )
+
+        if "upload_artifact" in allowed_tools:
+            sections.append(
+                "You can save output files using the `upload_artifact` tool. "
+                "Use this to produce reports, data files, or other deliverables."
+            )
+
+        if "web_search" in allowed_tools:
+            sections.append(
+                "You can search the web using the `web_search` tool for up-to-date information."
+            )
+
+        if "read_url" in allowed_tools:
+            sections.append(
+                "You can read web pages using the `read_url` tool to fetch content from URLs."
+            )
+
+        if injected_files:
+            file_list = "\n".join(f"  - /home/user/{f}" for f in injected_files)
+            sections.append(
+                f"The following input files have been provided and are available "
+                f"in the sandbox filesystem:\n{file_list}\n"
+                f"You can read these files using sandbox_read_file or process them "
+                f"with sandbox_exec commands."
+            )
+
+        return "\n\n".join(sections)
+
     async def execute_task(self, task_data: dict[str, Any], cancel_event: asyncio.Event) -> None:
         """Main entrypoint from the executor router."""
         task_id = str(task_data["task_id"])
@@ -493,6 +741,8 @@ class GraphExecutor:
 
         session_manager: McpSessionManager | None = None
         custom_tools: list[StructuredTool] = []
+        sandbox = None
+        provisioner = None
 
         try:
             # Look up and connect to MCP tool servers if configured
@@ -569,6 +819,113 @@ class GraphExecutor:
                     },
                 )
 
+            # --- Sandbox provisioning ---
+            sandbox_config = agent_config.get("sandbox") or {}
+            sandbox_enabled = sandbox_config.get("enabled", False)
+            sandbox = None
+            sandbox_start_time = None
+            injected_files: list[str] = []
+            provisioner = None
+
+            if sandbox_enabled:
+                provisioner = self.sandbox_provisioner
+                if provisioner is None:
+                    logger.error(
+                        "sandbox_provisioner_unavailable",
+                        extra={"task_id": task_id},
+                    )
+                    await self._handle_dead_letter(
+                        task_id, tenant_id, agent_id,
+                        reason="sandbox_provision_failed",
+                        error_msg="E2B_API_KEY not configured. Cannot provision sandbox.",
+                        error_code="sandbox_provision_failed",
+                    )
+                    return
+
+                existing_sandbox_id = task_data.get("sandbox_id")
+
+                if existing_sandbox_id:
+                    # Crash recovery: reconnect to existing sandbox
+                    try:
+                        sandbox = await provisioner.connect(existing_sandbox_id)
+                        logger.info(
+                            "sandbox_crash_recovery_success",
+                            extra={
+                                "task_id": task_id,
+                                "sandbox_id": existing_sandbox_id,
+                            },
+                        )
+                    except SandboxConnectionError as e:
+                        logger.warning(
+                            "sandbox_crash_recovery_failed",
+                            extra={
+                                "task_id": task_id,
+                                "sandbox_id": existing_sandbox_id,
+                                "error": str(e),
+                            },
+                        )
+                        await self._handle_dead_letter(
+                            task_id, tenant_id, agent_id,
+                            reason="sandbox_lost",
+                            error_msg=f"Sandbox '{existing_sandbox_id}' is no longer available: {str(e)}",
+                            error_code="sandbox_lost",
+                        )
+                        return
+                    # Files already present in sandbox from prior run; do not overwrite.
+                    injected_files = []
+                else:
+                    # Fresh provision
+                    template = sandbox_config.get("template", "base")
+                    vcpu = sandbox_config.get("vcpu", 2)
+                    memory_mb = sandbox_config.get("memory_mb", 2048)
+                    timeout_seconds = sandbox_config.get("timeout_seconds", 3600)
+
+                    try:
+                        sandbox = await provisioner.provision(
+                            template=template,
+                            vcpu=vcpu,
+                            memory_mb=memory_mb,
+                            timeout_seconds=timeout_seconds,
+                        )
+                    except SandboxProvisionError as e:
+                        logger.error(
+                            "sandbox_provision_exhausted",
+                            extra={
+                                "task_id": task_id,
+                                "template": template,
+                                "error": str(e),
+                            },
+                        )
+                        await self._handle_dead_letter(
+                            task_id, tenant_id, agent_id,
+                            reason="sandbox_provision_failed",
+                            error_msg=str(e),
+                            error_code="sandbox_provision_failed",
+                        )
+                        return
+
+                    # Store sandbox_id in DB immediately after provisioning
+                    async with self.pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE tasks SET sandbox_id = $1 WHERE task_id = $2::uuid",
+                            sandbox.sandbox_id,
+                            task_id,
+                        )
+
+                    logger.info(
+                        "sandbox_id_persisted",
+                        extra={
+                            "task_id": task_id,
+                            "sandbox_id": sandbox.sandbox_id,
+                        },
+                    )
+
+                    # Inject input files only on fresh provision; on crash recovery
+                    # the sandbox already has the files (possibly modified by the agent).
+                    injected_files = await self._inject_input_files(sandbox, task_id, tenant_id)
+
+                sandbox_start_time = time.monotonic()
+
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(
                 self.pool,
@@ -583,6 +940,9 @@ class GraphExecutor:
                 task_id=task_id,
                 tenant_id=tenant_id,
                 custom_tools=custom_tools if custom_tools else None,
+                sandbox=sandbox,
+                s3_client=self.s3_client,
+                injected_files=injected_files if sandbox_enabled else None,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
@@ -596,7 +956,7 @@ class GraphExecutor:
             )
 
             async def run_astream():
-                nonlocal session_manager, per_task_langfuse_client
+                nonlocal session_manager, per_task_langfuse_client, sandbox
                 # For first run, inject HumanMessage based on initial input
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
                 is_first_run = not checkpoint_tuple
@@ -675,6 +1035,31 @@ class GraphExecutor:
                                                         if session_manager is not None:
                                                             await session_manager.close("paused")
                                                             session_manager = None  # Prevent double-close in finally
+                                                        # Record sandbox cost before pausing
+                                                        if sandbox is not None and sandbox_start_time is not None:
+                                                            elapsed = time.monotonic() - sandbox_start_time
+                                                            pause_sandbox_cost = int(
+                                                                elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                                                            )
+                                                            if pause_sandbox_cost > 0:
+                                                                try:
+                                                                    async with self.pool.acquire() as sc_conn:
+                                                                        await sc_conn.execute(
+                                                                            """INSERT INTO agent_cost_ledger
+                                                                               (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                                                               VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                                                            tenant_id, agent_id, task_id, pause_sandbox_cost,
+                                                                        )
+                                                                except Exception:
+                                                                    logger.warning(
+                                                                        "sandbox_cost_recording_failed_on_budget_pause",
+                                                                        extra={"task_id": task_id},
+                                                                        exc_info=True,
+                                                                    )
+                                                        # Pause sandbox before releasing lease on budget pause
+                                                        if sandbox is not None and provisioner is not None:
+                                                            await provisioner.pause(sandbox)
+                                                            sandbox = None  # Prevent double-destroy in finally
                                                         return  # Stop execution — task is now paused
                                 except Exception:
                                     logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
@@ -712,6 +1097,31 @@ class GraphExecutor:
                             if session_manager is not None:
                                 await session_manager.close("paused")
                                 session_manager = None  # Prevent double-close in finally
+                            # Record sandbox cost before pausing
+                            if sandbox is not None and sandbox_start_time is not None:
+                                elapsed = time.monotonic() - sandbox_start_time
+                                hitl_sandbox_cost = int(
+                                    elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                                )
+                                if hitl_sandbox_cost > 0:
+                                    try:
+                                        async with self.pool.acquire() as sc_conn:
+                                            await sc_conn.execute(
+                                                """INSERT INTO agent_cost_ledger
+                                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                                   VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                                tenant_id, agent_id, task_id, hitl_sandbox_cost,
+                                            )
+                                    except Exception:
+                                        logger.warning(
+                                            "sandbox_cost_recording_failed_on_hitl_pause",
+                                            extra={"task_id": task_id},
+                                            exc_info=True,
+                                        )
+                            # Pause sandbox before releasing lease on HITL pause
+                            if sandbox is not None and provisioner is not None:
+                                await provisioner.pause(sandbox)
+                                sandbox = None  # Prevent double-destroy in finally
                             return
 
                 # Execution Finished successfully. Compute final output.
@@ -720,6 +1130,85 @@ class GraphExecutor:
 
                 # Per-checkpoint cost tracking replaces end-of-task aggregation.
                 # Costs are now written incrementally in the streaming loop above.
+
+                # Sandbox cleanup and cost tracking
+                if sandbox is not None and sandbox_start_time is not None:
+                    sandbox_duration_seconds = time.monotonic() - sandbox_start_time
+                    sandbox_vcpu = sandbox_config.get("vcpu", 2)
+                    # E2B cost: $0.05/hour per vCPU, per-second billing
+                    sandbox_cost_microdollars = int(
+                        sandbox_duration_seconds * sandbox_vcpu * 50000 / 3600
+                    )
+
+                    logger.info(
+                        "sandbox_cost_calculated",
+                        extra={
+                            "task_id": task_id,
+                            "sandbox_id": sandbox.sandbox_id,
+                            "duration_seconds": round(sandbox_duration_seconds, 1),
+                            "vcpu": sandbox_vcpu,
+                            "cost_microdollars": sandbox_cost_microdollars,
+                        },
+                    )
+
+                    # Add sandbox cost to the task's cost via the cost ledger
+                    if sandbox_cost_microdollars > 0:
+                        try:
+                            async with self.pool.acquire() as cost_conn:
+                                await cost_conn.execute(
+                                    """INSERT INTO agent_cost_ledger
+                                       (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                       VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                    tenant_id,
+                                    agent_id,
+                                    task_id,
+                                    sandbox_cost_microdollars,
+                                )
+                                # Also roll sandbox cost into the last checkpoint so that
+                                # total_cost_microdollars (summed from checkpoints by the API) includes it.
+                                await cost_conn.execute(
+                                    """UPDATE checkpoints
+                                       SET cost_microdollars = cost_microdollars + $1
+                                       WHERE checkpoint_id = (
+                                           SELECT checkpoint_id FROM checkpoints
+                                           WHERE task_id = $2::uuid AND checkpoint_ns = ''
+                                           ORDER BY created_at DESC LIMIT 1
+                                       )""",
+                                    sandbox_cost_microdollars,
+                                    task_id,
+                                )
+                        except Exception:
+                            logger.warning(
+                                "sandbox_cost_recording_failed",
+                                extra={"task_id": task_id},
+                                exc_info=True,
+                            )
+
+                    # Destroy sandbox
+                    try:
+                        await provisioner.destroy(sandbox)
+                    except Exception:
+                        logger.warning(
+                            "sandbox_destroy_on_completion_failed",
+                            extra={"task_id": task_id},
+                            exc_info=True,
+                        )
+
+                    # Clear sandbox_id in DB
+                    try:
+                        async with self.pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE tasks SET sandbox_id = NULL WHERE task_id = $1::uuid",
+                                task_id,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "sandbox_id_clear_failed",
+                            extra={"task_id": task_id},
+                            exc_info=True,
+                        )
+
+                    sandbox = None  # Prevent double-destroy in finally
 
                 # Step 5: Flush Langfuse traces before marking complete
                 langfuse_status = "skipped"
@@ -801,6 +1290,18 @@ class GraphExecutor:
                     await session_manager.close()
                 except Exception:
                     logger.warning("MCP session close failed for task %s in finally block", task_id, exc_info=True)
+            if sandbox is not None and provisioner is not None:
+                try:
+                    await provisioner.destroy(sandbox)
+                except Exception:
+                    logger.warning("Sandbox destroy failed for task %s in finally block", task_id, exc_info=True)
+                try:
+                    async with self.pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE tasks SET sandbox_id = NULL WHERE task_id = $1::uuid", task_id
+                        )
+                except Exception:
+                    logger.warning("sandbox_id_clear_failed_in_finally", extra={"task_id": task_id}, exc_info=True)
 
     def _build_runnable_config(
         self,

@@ -49,14 +49,21 @@ def simple_response(content: str = "Hello!") -> MagicMock:
     return mock
 
 
+class _ToolBindableFakeChat(FakeListChatModel):
+    """FakeListChatModel that accepts bind_tools() without raising."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
 def callback_friendly_response(content: str = "Hello!") -> FakeListChatModel:
-    return FakeListChatModel(responses=[content])
+    return _ToolBindableFakeChat(responses=[content])
 
 
 def calculator_tool_call(expression: str = "2 + 2", final_answer: str = "The answer is 4.") -> MagicMock:
     call_msg = AIMessage(
         content="",
-        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_1")],
+        tool_calls=[ToolCall(name="web_search", args={"query": expression}, id="call_1")],
     )
     final_msg = AIMessage(content=final_answer)
     mock = _new_mock()
@@ -92,7 +99,7 @@ def infinite_tool_loop(expression: str = "1+1") -> MagicMock:
         del args, kwargs
         return AIMessage(
             content="",
-            tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id=f"call_{id(object())}")],
+            tool_calls=[ToolCall(name="web_search", args={"query": expression}, id=f"call_{id(object())}")],
         )
 
     mock = _new_mock()
@@ -107,7 +114,7 @@ def tool_then_retryable_then_success(
 ) -> MagicMock:
     call_msg = AIMessage(
         content="",
-        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_resume")],
+        tool_calls=[ToolCall(name="web_search", args={"query": expression}, id="call_resume")],
     )
     mock = _new_mock()
     mock.ainvoke = AsyncMock(side_effect=[call_msg, Exception(retryable_error), AIMessage(content=final_answer)])
@@ -117,7 +124,7 @@ def tool_then_retryable_then_success(
 def tool_then_slow_final(expression: str = "5*5", delay: float = 30.0) -> MagicMock:
     call_msg = AIMessage(
         content="",
-        tool_calls=[ToolCall(name="calculator", args={"expression": expression}, id="call_lease")],
+        tool_calls=[ToolCall(name="web_search", args={"query": expression}, id="call_lease")],
     )
 
     async def _slow(*args: Any, **kwargs: Any) -> AIMessage:

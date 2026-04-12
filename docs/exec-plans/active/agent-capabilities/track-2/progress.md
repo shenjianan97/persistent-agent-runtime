@@ -2,15 +2,15 @@
 
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
-| Task 1 | DB Migration + Sandbox Config | Pending | `sandbox_id` column, `dead_letter_reason` extension, agent sandbox config validation |
-| Task 2 | Sandbox Provisioner + Lifecycle | Pending | E2B SDK setup, provision/pause/resume/destroy |
-| Task 3 | sandbox_exec Tool | Pending | Shell command execution in sandbox |
-| Task 4 | sandbox_read_file + sandbox_write_file | Pending | File I/O tools in sandbox |
-| Task 5 | sandbox_download Tool | Pending | Sandbox file → S3 output artifact |
-| Task 6 | Multipart Submission + File Injection | Pending | File upload on submit, inject into sandbox at task start |
-| Task 7 | Crash Recovery + Cost Tracking | Pending | Reconnect by sandbox_id, E2B cost integration |
-| Task 8 | Console UI | Pending | File attachment on submit, sandbox config in agent form |
-| Task 9 | Integration Tests | Pending | End-to-end sandbox + file input flow |
+| Task 1 | DB Migration + Sandbox Config | Done | `sandbox_id` column, `dead_letter_reason` extension, agent sandbox config validation |
+| Task 2 | Sandbox Provisioner + Lifecycle | Done | E2B SDK setup, provision/pause/resume/destroy |
+| Task 3 | sandbox_exec Tool | Done | Shell command execution in sandbox |
+| Task 4 | sandbox_read_file + sandbox_write_file | Done | File I/O tools in sandbox |
+| Task 5 | sandbox_download Tool | Done | Sandbox file → S3 output artifact |
+| Task 6 | Multipart Submission + File Injection | Done | File upload on submit, inject into sandbox at task start |
+| Task 7 | Crash Recovery + Cost Tracking | Done | Reconnect by sandbox_id, E2B cost integration |
+| Task 8 | Console UI | Done | File attachment on submit, sandbox config in agent form |
+| Task 9 | Integration Tests | Done | End-to-end sandbox + file input flow |
 
 ## Notes
 

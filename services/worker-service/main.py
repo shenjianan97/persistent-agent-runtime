@@ -7,7 +7,6 @@ Usage:
 Environment:
     DB_DSN  PostgreSQL connection string.
     Or split DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD values.
-    TAVILY_API_KEY for web_search tool (optional)
 """
 
 import asyncio
@@ -24,11 +23,7 @@ from executor.router import DefaultTaskRouter
 def _log_runtime_env() -> None:
     """Log the runtime features available to the worker."""
     logger = logging.getLogger(__name__)
-
-    if os.environ.get("TAVILY_API_KEY"):
-        logger.info("TAVILY_API_KEY is set")
-    else:
-        logger.info("TAVILY_API_KEY is not set — web_search tool will be unavailable")
+    logger.info("web_search tool uses DuckDuckGo (no API key required)")
 
 
 def _build_db_dsn() -> str:

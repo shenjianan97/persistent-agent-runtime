@@ -71,6 +71,15 @@ See [STATUS.md](./STATUS.md) for phase-level tracking and links to each track's 
 3. **Priority order**: User instructions > Superpowers skills > Default system behavior.
 4. **Do not rationalize skipping skills.** "This is just a simple question" or "Let me explore first" are not valid reasons. The skill tells you *how* to explore or answer.
 
+## Parallel Subagent Safety
+
+When orchestrating parallel subagents via the Agent tool, **always use `isolation: "worktree"`** if there is any chance two agents modify the same file — even different methods in the same file. Without worktrees, concurrent Edit tool calls on the same file can clobber each other (last writer wins, or `old_string` match fails silently).
+
+- Before launching parallel agents, check "Affected Component / File paths" for overlap.
+- If ANY file appears in both agents' scope, use `isolation: "worktree"` on at least one agent.
+- After worktree agents complete, merge their branches into the main working tree.
+- Only skip worktrees when agents have truly zero file overlap (e.g., Python worker vs React console).
+
 ## Local Validation Notes
 
 - For local testing, follow `README.md` and `docs/LOCAL_DEVELOPMENT.md`.
