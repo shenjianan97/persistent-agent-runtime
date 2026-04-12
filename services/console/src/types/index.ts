@@ -326,3 +326,14 @@ export interface ToolDiscoverResponse {
     error: string | null;
     tools: DiscoveredToolInfo[];
 }
+
+// Artifact types
+export interface ArtifactMetadata {
+    artifactId: string;
+    taskId: string;
+    filename: string;
+    direction: 'input' | 'output';
+    contentType: string;
+    sizeBytes: number;
+    createdAt: string;
+}

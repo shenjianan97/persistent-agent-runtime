@@ -44,6 +44,11 @@ API_PORT = int(os.getenv("E2E_API_PORT", "8081"))
 API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
 
 os.environ.setdefault("APP_DEV_TASK_CONTROLS_ENABLED", "true")
+os.environ.setdefault("S3_ENDPOINT_URL", "http://localhost:4566")
+os.environ.setdefault("S3_BUCKET_NAME", "platform-artifacts")
+os.environ.setdefault("AWS_ACCESS_KEY_ID", "test")
+os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
+os.environ.setdefault("AWS_REGION", "us-east-1")
 
 PG_CONTAINER = os.getenv("E2E_PG_CONTAINER", "par-e2e-postgres")
 PG_IMAGE = os.getenv("E2E_PG_IMAGE", "postgres:16")
@@ -126,6 +131,11 @@ def _start_api_process() -> subprocess.Popen[str]:
             "LANGFUSE_HOST": os.getenv("E2E_LANGFUSE_HOST", os.getenv("LANGFUSE_HOST", "http://127.0.0.1:3300")),
             "LANGFUSE_PUBLIC_KEY": os.getenv("E2E_LANGFUSE_PUBLIC_KEY", os.getenv("LANGFUSE_PUBLIC_KEY", "pk-lf-local")),
             "LANGFUSE_SECRET_KEY": os.getenv("E2E_LANGFUSE_SECRET_KEY", os.getenv("LANGFUSE_SECRET_KEY", "sk-lf-local")),
+            "S3_ENDPOINT_URL": os.getenv("S3_ENDPOINT_URL", "http://localhost:4566"),
+            "S3_BUCKET_NAME": os.getenv("S3_BUCKET_NAME", "platform-artifacts"),
+            "AWS_ACCESS_KEY_ID": os.getenv("AWS_ACCESS_KEY_ID", "test"),
+            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+            "AWS_REGION": os.getenv("AWS_REGION", "us-east-1"),
         }
     )
     log_file = REPO_ROOT / ".tmp" / "e2e-api-service.log"
@@ -347,6 +357,7 @@ async def _do_clean(conn: asyncpg.Connection) -> None:
     await conn.execute("DELETE FROM task_events")
     await conn.execute("DELETE FROM checkpoint_writes")
     await conn.execute("DELETE FROM checkpoints")
+    await conn.execute("DELETE FROM task_artifacts")
     await conn.execute("DELETE FROM tasks")
     await conn.execute("DELETE FROM agent_runtime_state")
     await conn.execute("DELETE FROM agents")

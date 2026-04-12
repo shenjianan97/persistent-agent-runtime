@@ -18,7 +18,7 @@ import pytest_asyncio
 
 DB_DSN = os.getenv(
     "E2E_DB_DSN",
-    "postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime",
+    "postgresql://postgres:postgres@localhost:55433/persistent_agent_runtime_e2e",
 )
 
 

@@ -139,3 +139,24 @@ def dev_sleep_tool_call(seconds: int = 10, final_answer: str = "done after sleep
     mock = _new_mock()
     mock.ainvoke = AsyncMock(side_effect=[call_msg, final_msg])
     return mock
+
+
+def upload_artifact_call(filename: str, content: str, content_type: str = "text/plain",
+                         final_answer: str = "Artifact uploaded successfully.") -> MagicMock:
+    """Create a mock LLM that calls upload_artifact, then responds with a final answer."""
+    call_msg = AIMessage(
+        content="",
+        tool_calls=[ToolCall(
+            name="upload_artifact",
+            args={
+                "filename": filename,
+                "content": content,
+                "content_type": content_type,
+            },
+            id="call_upload_artifact",
+        )],
+    )
+    final_msg = AIMessage(content=final_answer)
+    mock = _new_mock()
+    mock.ainvoke = AsyncMock(side_effect=[call_msg, final_msg])
+    return mock

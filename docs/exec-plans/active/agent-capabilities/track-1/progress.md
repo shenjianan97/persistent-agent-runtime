@@ -2,14 +2,14 @@
 
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
-| Task 1 | Database Migration | Pending | `task_artifacts` table |
-| Task 2 | LocalStack Docker Setup | Pending | LocalStack S3 container with bucket init |
-| Task 3 | Worker S3 Client | Pending | boto3 S3 wrapper (upload/download/delete) |
-| Task 4 | API Artifact Repo + S3 Service | Pending | JDBC queries for `task_artifacts` + S3 streaming |
-| Task 5 | API Artifact Endpoints | Pending | GET artifact list + download endpoints |
-| Task 6 | upload_artifact Tool | Pending | Built-in agent tool for output artifact production |
-| Task 7 | Console Artifacts Tab | Pending | Artifact list + download in task detail view |
-| Task 8 | Integration Tests | Pending | End-to-end output artifact flow tests |
+| Task 1 | Database Migration | Done | `task_artifacts` table |
+| Task 2 | LocalStack Docker Setup | Done | LocalStack S3 container with bucket init |
+| Task 3 | Worker S3 Client | Done | boto3 S3 wrapper (upload/download/delete) |
+| Task 4 | API Artifact Repo + S3 Service | Done | JDBC queries for `task_artifacts` + S3 streaming |
+| Task 5 | API Artifact Endpoints | Done | GET artifact list + download endpoints |
+| Task 6 | upload_artifact Tool | Done | Built-in agent tool for output artifact production |
+| Task 7 | Console Artifacts Tab | Done | Artifact list + download in task detail view |
+| Task 8 | Integration Tests | Done | End-to-end output artifact flow tests |
 
 ## Notes
 

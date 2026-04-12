@@ -11,6 +11,8 @@ import { CostSummary } from './CostSummary';
 import { CheckpointTimeline } from './CheckpointTimeline';
 import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
+import { ArtifactsTab } from './ArtifactsTab';
+import { useTaskArtifacts } from './useArtifacts';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
@@ -28,6 +30,7 @@ export function TaskDetailPage() {
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
     const { data: observability } = useTaskObservability(taskId!, task?.status);
     const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
+    const { data: artifactsData } = useTaskArtifacts(taskId!, task?.status);
 
     const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
     const langfuseEndpoint = task?.langfuse_endpoint_id
@@ -378,6 +381,10 @@ export function TaskDetailPage() {
                             </Card>
                         )}
                     </div>
+
+                    {artifactsData && artifactsData.length > 0 && (
+                        <ArtifactsTab taskId={taskId!} artifacts={artifactsData} />
+                    )}
 
                     {task.status === 'completed' && (
                         showFollowUp ? (

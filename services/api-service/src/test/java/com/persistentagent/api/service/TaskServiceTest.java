@@ -10,6 +10,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.AgentRepository;
+import com.persistentagent.api.repository.ArtifactRepository;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.TaskRepository;
@@ -35,6 +36,9 @@ import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 class TaskServiceTest {
+
+    @Mock
+    private ArtifactRepository artifactRepository;
 
     @Mock
     private TaskRepository taskRepository;
@@ -66,6 +70,7 @@ class TaskServiceTest {
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
         taskService = new TaskService(
+                artifactRepository,
                 taskRepository,
                 agentRepository,
                 modelRepository,

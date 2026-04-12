@@ -35,6 +35,13 @@ PYTHON ?= $(shell \
 	done)
 
 DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
+COMPOSE_FILE := $(ROOT_DIR)/docker-compose.yml
+LOCALSTACK_CONTAINER_NAME ?= persistent-agent-runtime-localstack
+S3_ENDPOINT_URL ?= http://localhost:4566
+S3_BUCKET_NAME ?= platform-artifacts
+AWS_ACCESS_KEY_ID ?= test
+AWS_SECRET_ACCESS_KEY ?= test
+AWS_REGION ?= us-east-1
 DB_DSN ?= postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
 DB_HOST ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).hostname or "localhost")' "$(DB_DSN)"),localhost)
 DB_PORT ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse; print(urlparse(sys.argv[1]).port or 55432)' "$(DB_DSN)"),55432)
@@ -677,19 +684,14 @@ status:
 # ============================================================
 
 db-up:
-	@echo "$(YELLOW)🐳 Ensuring Database Container is running...$(NC)"
+	@echo "$(YELLOW)🐳 Ensuring Database and LocalStack containers are running...$(NC)"
 	@docker info >/dev/null 2>&1 || (echo "$(RED)❌ Docker daemon is not running. Please start Docker Desktop.$(NC)" && exit 1)
 	@if [ "$(DB_HOST)" != "localhost" ] && [ "$(DB_HOST)" != "127.0.0.1" ]; then \
-		echo "$(RED)❌ db-up only manages a Docker PostgreSQL instance on localhost. Current DB_DSN host is '$(DB_HOST)'. Start that database manually instead.$(NC)"; \
+		echo "$(RED)❌ db-up only manages Docker instances on localhost. Current DB_DSN host is '$(DB_HOST)'. Start that database manually instead.$(NC)"; \
 		exit 1; \
 	fi
-	@if ! docker ps -a --format '{{.Names}}' | grep -Eq "^$(DB_CONTAINER_NAME)$$"; then \
-		echo "$(YELLOW)Container $(DB_CONTAINER_NAME) does not exist. Creating it...$(NC)"; \
-		docker run -d --name $(DB_CONTAINER_NAME) -e POSTGRES_USER="$(DB_USER)" -e POSTGRES_PASSWORD="$(DB_PASSWORD)" -e POSTGRES_DB="$(DB_NAME)" -p $(DB_PORT):5432 postgres:16 postgres -c log_statement=all >/dev/null; \
-	fi
-	@if [ "$$(docker inspect -f '{{.State.Running}}' $(DB_CONTAINER_NAME) 2>/dev/null)" != "true" ]; then \
-		docker start $(DB_CONTAINER_NAME) >/dev/null 2>&1 || (echo "$(RED)❌ Failed to start container $(DB_CONTAINER_NAME)$(NC)" && exit 1); \
-	fi
+	@DB_USER="$(DB_USER)" DB_PASSWORD="$(DB_PASSWORD)" DB_NAME="$(DB_NAME)" DB_PORT="$(DB_PORT)" \
+		docker compose -f $(COMPOSE_FILE) up -d postgres localstack
 	@echo "$(YELLOW)⏳ Waiting for PostgreSQL to accept connections...$(NC)"
 	@attempts=0; \
 	until docker exec $(DB_CONTAINER_NAME) env PGPASSWORD="$(DB_PASSWORD)" pg_isready -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" >/dev/null 2>&1; do \
@@ -700,15 +702,25 @@ db-up:
 		fi; \
 		sleep 1; \
 	done
-	@echo "$(GREEN)✅ DB is up$(NC)"
+	@echo "$(YELLOW)⏳ Waiting for LocalStack to be ready...$(NC)"
+	@attempts=0; \
+	until docker exec $(LOCALSTACK_CONTAINER_NAME) awslocal s3 ls >/dev/null 2>&1; do \
+		attempts=$$((attempts + 1)); \
+		if [ $$attempts -ge 30 ]; then \
+			echo "$(RED)❌ LocalStack did not become ready within 30 seconds$(NC)"; \
+			exit 1; \
+		fi; \
+		sleep 1; \
+	done
+	@echo "$(GREEN)✅ DB and LocalStack are up$(NC)"
 
 db-down:
-	@echo "$(YELLOW)🛑 Stopping Database Container...$(NC)"
-	@docker stop $(DB_CONTAINER_NAME) >/dev/null
-	@echo "$(GREEN)✅ DB stopped$(NC)"
+	@echo "$(YELLOW)🛑 Stopping Database and LocalStack containers...$(NC)"
+	@docker compose -f $(COMPOSE_FILE) down
+	@echo "$(GREEN)✅ Containers stopped$(NC)"
 
 db-status:
-	@docker ps -a --filter "name=$(DB_CONTAINER_NAME)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+	@docker compose -f $(COMPOSE_FILE) ps
 
 db-migrate: db-up
 	@echo "$(YELLOW)🛠️  Applying migrations to Database...$(NC)"
@@ -749,9 +761,9 @@ api-test:
 	@echo "$(CYAN)🧪 Running API tests...$(NC)"
 	@cd $(API_DIR) && ./gradlew test
 
-worker-test:
+worker-test: test-db-up
 	@echo "$(CYAN)🧪 Running Worker tests...$(NC)"
-	@$(WORKER_VENV_PYTHON) -m pytest $(WORKER_DIR)/tests -q
+	@E2E_DB_DSN=$(E2E_DB_DSN) $(WORKER_VENV_PYTHON) -m pytest $(WORKER_DIR)/tests -q
 
 console-test:
 	@echo "$(CYAN)🧪 Running Console tests...$(NC)"
@@ -789,18 +801,15 @@ test-e2e-langfuse: ## Run Langfuse E2E tests (requires: make test-langfuse-up &&
 # E2E Infrastructure (isolated from local dev)
 # ============================================================
 
-e2e-up:
-	@command -v docker >/dev/null 2>&1 || { echo "$(RED)❌ Docker is required for E2E tests$(NC)"; exit 1; }
-	@mkdir -p $(TMP_DIR)
-	@echo "$(YELLOW)🧪 Starting E2E infrastructure (DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))...$(NC)"
-	@# --- Postgres ---
+test-db-up:
+	@command -v docker >/dev/null 2>&1 || { echo "$(RED)❌ Docker is required for tests$(NC)"; exit 1; }
+	@# --- Test Postgres ---
 	@if docker ps --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
-		echo "  $(GREEN)✓ E2E Postgres already running$(NC)"; \
+		true; \
 	elif docker ps -a --format '{{.Names}}' | grep -qx '$(E2E_PG_CONTAINER)'; then \
-		echo "  $(YELLOW)▶ Starting existing E2E Postgres container...$(NC)"; \
 		docker start $(E2E_PG_CONTAINER); \
 	else \
-		echo "  $(YELLOW)▶ Creating E2E Postgres container...$(NC)"; \
+		echo "$(YELLOW)▶ Creating test Postgres container (port $(E2E_DB_PORT))...$(NC)"; \
 		docker run -d --name $(E2E_PG_CONTAINER) \
 			-e POSTGRES_USER=$(E2E_DB_USER) \
 			-e POSTGRES_PASSWORD=$(E2E_DB_PASSWORD) \
@@ -808,25 +817,42 @@ e2e-up:
 			-p $(E2E_DB_PORT):5432 \
 			$(E2E_PG_IMAGE); \
 	fi
-	@echo "  $(YELLOW)⏳ Waiting for E2E Postgres...$(NC)"
 	@for i in $$(seq 1 60); do \
 		docker exec $(E2E_PG_CONTAINER) pg_isready -U $(E2E_DB_USER) >/dev/null 2>&1 && break; \
 		sleep 0.5; \
 	done
 	@docker exec $(E2E_PG_CONTAINER) pg_isready -U $(E2E_DB_USER) >/dev/null 2>&1 || \
-		(echo "$(RED)❌ E2E Postgres did not become ready$(NC)" && exit 1)
-	@echo "  $(GREEN)✓ E2E Postgres ready$(NC)"
+		(echo "$(RED)❌ Test Postgres did not become ready$(NC)" && exit 1)
 	@# --- Migrations ---
-	@echo "  $(YELLOW)▶ Applying migrations to E2E database...$(NC)"
 	@for f in $(MIGRATION_FILES); do \
 		PGPASSWORD=$(E2E_DB_PASSWORD) psql -h $(E2E_DB_HOST) -p $(E2E_DB_PORT) -U $(E2E_DB_USER) -d $(E2E_DB_NAME) -f "$$f" -q 2>/dev/null || true; \
 	done
-	@echo "  $(GREEN)✓ E2E migrations applied$(NC)"
-	@# --- Seed test models (no API keys needed) ---
-	@echo "  $(YELLOW)▶ Seeding test models...$(NC)"
+	@# --- Seed test models ---
 	@PGPASSWORD=$(E2E_DB_PASSWORD) psql -h $(E2E_DB_HOST) -p $(E2E_DB_PORT) -U $(E2E_DB_USER) -d $(E2E_DB_NAME) -q \
 		-c "INSERT INTO provider_keys (provider_id, api_key) VALUES ('anthropic', 'e2e-placeholder') ON CONFLICT (provider_id) DO NOTHING;" \
 		-c "INSERT INTO models (model_id, provider_id, display_name, is_active, input_microdollars_per_million, output_microdollars_per_million) VALUES ('claude-sonnet-4-6', 'anthropic', 'Claude Sonnet 4.6', true, 3000000, 15000000) ON CONFLICT (provider_id, model_id) DO NOTHING;"
+	@# --- LocalStack (shared, for S3 artifact storage) ---
+	@if docker ps --format '{{.Names}}' | grep -qx '$(LOCALSTACK_CONTAINER_NAME)'; then \
+		true; \
+	else \
+		DB_USER="$(DB_USER)" DB_PASSWORD="$(DB_PASSWORD)" DB_NAME="$(DB_NAME)" DB_PORT="$(DB_PORT)" \
+			docker compose -f $(COMPOSE_FILE) up -d localstack; \
+		attempts=0; \
+		until docker exec $(LOCALSTACK_CONTAINER_NAME) awslocal s3 ls >/dev/null 2>&1; do \
+			attempts=$$((attempts + 1)); \
+			if [ $$attempts -ge 30 ]; then \
+				echo "$(RED)❌ LocalStack did not become ready$(NC)"; \
+				exit 1; \
+			fi; \
+			sleep 1; \
+		done; \
+	fi
+
+e2e-up: test-db-up
+	@mkdir -p $(TMP_DIR)
+	@echo "$(YELLOW)🧪 Starting E2E infrastructure (DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))...$(NC)"
+	@echo "  $(GREEN)✓ E2E Postgres ready$(NC)"
+	@echo "  $(GREEN)✓ E2E migrations applied$(NC)"
 	@echo "  $(GREEN)✓ E2E test models seeded$(NC)"
 	@# --- API ---
 	@if curl -sf http://localhost:$(E2E_API_PORT)/v1/health >/dev/null 2>&1; then \

@@ -28,6 +28,28 @@ public class CheckpointEventParser {
             Object metadataPayload,
             String fallbackNodeName,
             String checkpointId) {
+
+        // Detect follow-up resume checkpoints: source="input" with step > 0
+        // These are __start__ nodes from follow-up submissions that replay prior messages.
+        // Without this check, the last AI message from the previous run gets rendered
+        // as a duplicate "Agent Response" step.
+        Object parsedMetadata = parseJson(metadataPayload, "metadata_payload", checkpointId);
+        if (parsedMetadata instanceof Map<?, ?> metaMap) {
+            String source = asString(metaMap.get("source"));
+            Object stepObj = metaMap.get("step");
+            if ("input".equals(source) && stepObj instanceof Number step && step.intValue() > 0) {
+                return new CheckpointEventResponse(
+                        "system",
+                        "Follow-Up Received",
+                        "A follow-up message was submitted and execution resumed.",
+                        null,
+                        null,
+                        null,
+                        null,
+                        null);
+            }
+        }
+
         Object parsedPayload = parseJson(checkpointPayload, "checkpoint_payload", checkpointId);
         if (parsedPayload instanceof Map<?, ?> payloadMap) {
             Object channelValues = payloadMap.get("channel_values");

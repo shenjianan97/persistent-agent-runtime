@@ -128,22 +128,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0002_worker_registry.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0003_dynamic_models.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0004_timeout_reference.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0005_agents_table.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0006_runtime_state_model.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0008_tool_servers.sql
+          for f in infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+            psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime -f "$f"
+          done
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
@@ -188,22 +175,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0002_worker_registry.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0003_dynamic_models.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0004_timeout_reference.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0005_agents_table.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0006_runtime_state_model.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0008_tool_servers.sql
+          for f in infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+            psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime -f "$f"
+          done
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
@@ -237,6 +211,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: s3
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        ports:
+          - 4566:4566
 
     steps:
       - uses: actions/checkout@v4
@@ -262,24 +245,18 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0002_worker_registry.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0003_dynamic_models.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0004_timeout_reference.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0005_agents_table.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0006_runtime_state_model.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0008_tool_servers.sql
+          for f in infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+            psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime -f "$f"
+          done
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
+
+      - name: Create S3 bucket in LocalStack
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url=http://localhost:4566 s3 mb s3://platform-artifacts
 
       - name: Pre-build API service
         working-directory: services/api-service
@@ -295,6 +272,11 @@ jobs:
           E2E_DB_PASSWORD: postgres
           APP_DEV_TASK_CONTROLS_ENABLED: "true"
           LANGFUSE_ENABLED: "false"
+          S3_ENDPOINT_URL: http://localhost:4566
+          S3_BUCKET_NAME: platform-artifacts
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
           # conftest will auto-start the API via ./gradlew bootRun
         run: |
           set -o pipefail
@@ -352,22 +334,9 @@ jobs:
         env:
           PGPASSWORD: postgres
         run: |
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0001_phase1_durable_execution.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0002_worker_registry.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0003_dynamic_models.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0004_timeout_reference.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0005_agents_table.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0006_runtime_state_model.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0007_scheduler_and_budgets.sql
-          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
-            -f infrastructure/database/migrations/0008_tool_servers.sql
+          for f in infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+            psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime -f "$f"
+          done
           psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
             -f infrastructure/database/migrations/test_seed.sql
 
