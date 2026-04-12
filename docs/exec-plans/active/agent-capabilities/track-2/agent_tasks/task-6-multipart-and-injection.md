@@ -49,7 +49,7 @@ The existing JSON-only task submission endpoint remains unchanged.
 - **File paths:**
   - `services/api-service/src/main/java/com/persistentagent/api/controller/TaskController.java` (modify)
   - `services/api-service/src/main/java/com/persistentagent/api/service/TaskService.java` (modify)
-  - `services/api-service/src/main/resources/application.properties` (modify)
+  - `services/api-service/src/main/resources/application.yml` (modify)
   - `services/worker-service/executor/graph.py` (modify — input file injection)
   - `services/api-service/src/test/java/com/persistentagent/api/controller/TaskControllerTest.java` (new or modify)
   - `services/worker-service/tests/test_executor.py` (modify — injection tests)
@@ -65,12 +65,14 @@ The existing JSON-only task submission endpoint remains unchanged.
 
 ### Step 1: Configure multipart size limits
 
-Modify `services/api-service/src/main/resources/application.properties` to add multipart settings:
+Modify `services/api-service/src/main/resources/application.yml` to add multipart settings under the existing `spring` key:
 
-```properties
-# Multipart file upload limits (Track 2: file input)
-spring.servlet.multipart.max-file-size=50MB
-spring.servlet.multipart.max-request-size=200MB
+```yaml
+spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 200MB
 ```
 
 ### Step 2: Update existing JSON endpoint and add multipart endpoint to TaskController
@@ -513,7 +515,7 @@ class TestInputFileInjection:
 
 ## Acceptance Criteria
 
-- [ ] `application.properties` has `spring.servlet.multipart.max-file-size=50MB` and `max-request-size=200MB`
+- [ ] `application.yml` has `spring.servlet.multipart.max-file-size=50MB` and `max-request-size=200MB`
 - [ ] `TaskController` has `submitTaskMultipart()` accepting `@RequestPart("task_request")` and `@RequestPart("files")`
 - [ ] Multipart endpoint parses task_request JSON and files list
 - [ ] `TaskService.submitTaskWithFiles()` validates sandbox enabled when files are present
