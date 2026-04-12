@@ -24,4 +24,11 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Initiative | Status | Design |
 |------------|--------|--------|
 | Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
-| Agent Capabilities (sandbox, artifacts, file input) | **Next priority** | [design](docs/design-docs/agent-capabilities/design.md) |
+| Agent Capabilities (sandbox, artifacts, file input) | **In progress** | [design](docs/design-docs/agent-capabilities/design.md) |
+
+#### Agent Capabilities Tracks
+
+| Track | Name | Status | Plan | Progress |
+|-------|------|--------|------|----------|
+| Track 1 | Output Artifact Storage | Not started | [plan](docs/exec-plans/active/agent-capabilities/track-1/plan.md) | [progress](docs/exec-plans/active/agent-capabilities/track-1/progress.md) |
+| Track 2 | E2B Sandbox & File Input | Not started | [plan](docs/exec-plans/active/agent-capabilities/track-2/plan.md) | [progress](docs/exec-plans/active/agent-capabilities/track-2/progress.md) |
