@@ -30,7 +30,7 @@ export function TaskDetailPage() {
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
     const { data: observability } = useTaskObservability(taskId!, task?.status);
     const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
-    const { data: artifactsData } = useTaskArtifacts(taskId!, !!task);
+    const { data: artifactsData } = useTaskArtifacts(taskId!, task?.status);
 
     const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
     const langfuseEndpoint = task?.langfuse_endpoint_id
