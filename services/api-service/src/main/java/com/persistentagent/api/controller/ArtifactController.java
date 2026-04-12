@@ -46,8 +46,15 @@ public class ArtifactController {
             contentType = contentType + "; charset=utf-8";
         }
 
+        MediaType mediaType;
+        try {
+            mediaType = MediaType.parseMediaType(contentType);
+        } catch (Exception e) {
+            mediaType = MediaType.APPLICATION_OCTET_STREAM;
+        }
+
         return ResponseEntity.ok()
-                .contentType(MediaType.parseMediaType(contentType))
+                .contentType(mediaType)
                 .contentLength(metadata.sizeBytes())
                 .header(HttpHeaders.CONTENT_DISPOSITION,
                         "attachment; filename=\"" + metadata.filename() + "\"")
