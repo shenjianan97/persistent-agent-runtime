@@ -363,7 +363,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                             name="sandbox_timeout_seconds"
                                             render={({ field }) => (
                                                 <FormItem className="md:col-span-2">
-                                                    <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Timeout (seconds, 60-86400)</FormLabel>
+                                                    <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Sandbox Lifetime (seconds)</FormLabel>
                                                     <FormControl>
                                                         <Input
                                                             type="number"
@@ -375,6 +375,11 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                                             onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 60)}
                                                         />
                                                     </FormControl>
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                        The sandbox stays alive while the task is running. This timeout only applies after
+                                                        a crash — if no one redrives within this window, the sandbox and its files are lost.
+                                                        Default: 1 hour.
+                                                    </p>
                                                     <FormMessage className="text-destructive font-bold text-xs" />
                                                 </FormItem>
                                             )}

@@ -996,6 +996,14 @@ class GraphExecutor:
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
                         return
 
+                    # Refresh sandbox timeout to prevent expiry during long tasks
+                    if sandbox is not None:
+                        try:
+                            sandbox_timeout = sandbox_config.get("timeout_seconds", 3600)
+                            await asyncio.to_thread(sandbox.set_timeout, sandbox_timeout)
+                        except Exception:
+                            logger.debug("sandbox_timeout_refresh_failed", extra={"task_id": task_id})
+
                     # Per-checkpoint incremental cost tracking
                     if "agent" in event:
                         for ai_msg in event["agent"].get("messages", []):

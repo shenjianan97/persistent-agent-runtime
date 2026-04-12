@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -35,6 +36,7 @@ class DuckDuckGoSearchProvider:
 
     def __init__(self, *, timeout_seconds: float = 10.0) -> None:
         self._timeout_seconds = timeout_seconds
+        self._lock = threading.Lock()
 
     @property
     def provider_name(self) -> str:
@@ -53,7 +55,7 @@ class DuckDuckGoSearchProvider:
             raise ToolTransportError(f"DuckDuckGo search failed: {str(exc)}") from exc
 
     def _search_sync(self, query: str, max_results: int) -> list[SearchResult]:
-        with DDGS() as ddgs:
+        with self._lock, DDGS() as ddgs:
             raw_results = list(ddgs.text(query, max_results=max_results))
 
         results = []
