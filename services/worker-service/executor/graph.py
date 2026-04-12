@@ -417,13 +417,33 @@ class GraphExecutor:
                     sys_messages.append(SystemMessage(content=platform_system_msg))
                 messages = sys_messages + messages
 
-            response = await self._await_or_cancel(
-                llm_with_tools.ainvoke(messages, config),
-                cancel_event,
-                task_id=task_id,
-                operation="agent",
-            )
-            return {"messages": [response]}
+            # Retry on rate limits inside the execution loop instead of
+            # crashing and burning a task-level retry.
+            max_rate_limit_retries = 5
+            for attempt in range(max_rate_limit_retries + 1):
+                try:
+                    response = await self._await_or_cancel(
+                        llm_with_tools.ainvoke(messages, config),
+                        cancel_event,
+                        task_id=task_id,
+                        operation="agent",
+                    )
+                    return {"messages": [response]}
+                except Exception as e:
+                    if self._is_rate_limit_error(e) and attempt < max_rate_limit_retries:
+                        backoff = self._get_retry_after(e) or min(30, 5 * (2 ** attempt))
+                        logger.warning(
+                            "rate_limit_retry",
+                            extra={
+                                "task_id": task_id,
+                                "attempt": attempt + 1,
+                                "backoff_seconds": backoff,
+                                "error": str(e)[:200],
+                            },
+                        )
+                        await asyncio.sleep(backoff)
+                        continue
+                    raise
 
         # Define the Graph layout
         workflow = StateGraph(MessagesState)
@@ -1391,6 +1411,36 @@ class GraphExecutor:
         finally:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
+
+    def _get_retry_after(self, e: Exception) -> float | None:
+        """Extract retry-after seconds from the error's HTTP response headers."""
+        # Walk the exception chain to find an API error with a response
+        current = e
+        for _ in range(5):
+            resp = getattr(current, "response", None)
+            if resp is not None:
+                retry_after = getattr(resp, "headers", {}).get("retry-after")
+                if retry_after:
+                    try:
+                        return float(retry_after)
+                    except (ValueError, TypeError):
+                        pass
+                return None
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+            if current is None:
+                break
+        return None
+
+    def _is_rate_limit_error(self, e: Exception) -> bool:
+        """Check if the exception is a rate limit error (429)."""
+        error_str = str(e).lower()
+        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
+            return True
+        # Check for Anthropic/OpenAI RateLimitError types
+        type_name = type(e).__name__
+        if "RateLimit" in type_name:
+            return True
+        return False
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
