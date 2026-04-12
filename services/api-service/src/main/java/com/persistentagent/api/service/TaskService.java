@@ -3,6 +3,8 @@ package com.persistentagent.api.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.AgentNotFoundException;
+import com.persistentagent.api.model.ArtifactMetadata;
+import com.persistentagent.api.repository.ArtifactRepository;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
@@ -29,6 +31,7 @@ public class TaskService {
 
     private static final Set<String> VALID_PAUSE_REASONS = Set.of("budget_per_task", "budget_per_hour");
 
+    private final ArtifactRepository artifactRepository;
     private final TaskRepository taskRepository;
     private final AgentRepository agentRepository;
     private final ModelRepository modelRepository;
@@ -41,6 +44,7 @@ public class TaskService {
     private final boolean devTaskControlsEnabled;
 
     public TaskService(
+            ArtifactRepository artifactRepository,
             TaskRepository taskRepository,
             AgentRepository agentRepository,
             ModelRepository modelRepository,
@@ -51,6 +55,7 @@ public class TaskService {
             CheckpointEventParser checkpointEventParser,
             ConfigValidationHelper configValidationHelper,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
+        this.artifactRepository = artifactRepository;
         this.taskRepository = taskRepository;
         this.agentRepository = agentRepository;
         this.modelRepository = modelRepository;
@@ -144,6 +149,8 @@ public class TaskService {
         Object pauseDetails = JsonParseUtil.parseJson(objectMapper, task.get("pause_details"), "pause_details",
                 taskId.toString());
 
+        List<ArtifactMetadata> artifacts = artifactRepository.findByTaskId(taskId, tenantId, "output");
+
         return new TaskStatusResponse(
                 (UUID) task.get("task_id"),
                 (String) task.get("agent_id"),
@@ -169,7 +176,8 @@ public class TaskService {
                 DateTimeUtil.toOffsetDateTime(task.get("human_input_timeout_at")),
                 (String) task.get("pause_reason"),
                 pauseDetails,
-                DateTimeUtil.toOffsetDateTime(task.get("resume_eligible_at")));
+                DateTimeUtil.toOffsetDateTime(task.get("resume_eligible_at")),
+                artifacts);
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {

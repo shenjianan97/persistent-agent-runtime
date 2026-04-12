@@ -284,6 +284,47 @@ class ApiClient:
         """GET /v1/tasks/{task_id}/events"""
         return self._request("GET", f"/tasks/{task_id}/events?limit={limit}", expected_status=expected_status, raise_for_status=raise_for_status)
 
+    def list_artifacts(self, task_id, direction=None, expected_status=200, raise_for_status=True):
+        """List artifacts for a task."""
+        params = {}
+        if direction:
+            params["direction"] = direction
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/tasks/{task_id}/artifacts{'?' + query if query else ''}"
+        return self._request("GET", path, expected_status=expected_status,
+                           raise_for_status=raise_for_status)
+
+    def download_artifact(self, task_id, filename, direction="output",
+                         expected_status=200, raise_for_status=True):
+        """Download an artifact file. Returns dict with status_code, body (bytes), content_type."""
+        params = {"direction": direction}
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/tasks/{task_id}/artifacts/{filename}?{query}"
+
+        url = f"{self.base}{path}"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+                status_code = response.status
+                content_type = response.headers.get("Content-Type", "")
+                body = response.read()
+                if raise_for_status and status_code != expected_status:
+                    raise ApiError(status_code, {"error": body.decode("utf-8", errors="replace")})
+                return {
+                    "status_code": status_code,
+                    "body": body,
+                    "content_type": content_type,
+                }
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            if raise_for_status and exc.code != expected_status:
+                raise ApiError(exc.code, {"error": body.decode("utf-8", errors="replace")})
+            return {
+                "status_code": exc.code,
+                "body": body,
+                "content_type": "",
+            }
+
     def poll_until(
         self,
         task_id: str,

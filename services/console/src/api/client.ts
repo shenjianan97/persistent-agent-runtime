@@ -1,3 +1,4 @@
+import type { ArtifactMetadata } from '@/types';
 import {
     TaskStatusResponse,
     TaskSubmissionRequest,
@@ -238,4 +239,20 @@ export const api = {
         fetchApi<ToolDiscoverResponse>(`/v1/tool-servers/${encodeURIComponent(serverId)}/discover`, {
             method: 'POST',
         }),
+
+    // Artifacts
+    listArtifacts: (taskId: string, direction?: string) => {
+        const params = new URLSearchParams();
+        if (direction) params.append('direction', direction);
+        const query = params.toString();
+        return fetchApi<ArtifactMetadata[]>(
+            `/v1/tasks/${taskId}/artifacts${query ? `?${query}` : ''}`
+        );
+    },
+
+    getArtifactDownloadUrl: (taskId: string, filename: string, direction: string = 'output') => {
+        const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+        const params = new URLSearchParams({ direction });
+        return `${baseUrl}/v1/tasks/${taskId}/artifacts/${encodeURIComponent(filename)}?${params}`;
+    },
 };

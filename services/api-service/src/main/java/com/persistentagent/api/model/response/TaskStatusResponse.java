@@ -2,6 +2,7 @@ package com.persistentagent.api.model.response;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.persistentagent.api.model.ArtifactMetadata;
 
 import java.time.OffsetDateTime;
 import java.util.List;
@@ -32,6 +33,7 @@ public record TaskStatusResponse(
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("human_input_timeout_at") OffsetDateTime humanInputTimeoutAt,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_reason") String pauseReason,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_details") Object pauseDetails,
-        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("resume_eligible_at") OffsetDateTime resumeEligibleAt
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("resume_eligible_at") OffsetDateTime resumeEligibleAt,
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("artifacts") List<ArtifactMetadata> artifacts
 ) {
 }

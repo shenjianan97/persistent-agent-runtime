@@ -15,6 +15,7 @@ from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
 from tools.providers.search import SearchProvider, SearchResult, TavilySearchProvider
 from tools.read_url import ReadUrlFetcher
 from tools.runtime_logging import get_tools_logger
+from tools.upload_artifact import UploadArtifactArguments, UploadArtifactResult
 
 
 SEARCH_QUERY = Annotated[
@@ -171,6 +172,12 @@ DEV_SLEEP_TOOL = ToolDefinition(
     description="Dev-only control tool that sleeps for a bounded duration before returning.",
     input_model=DevSleepArguments,
     output_model=DevSleepResult,
+)
+UPLOAD_ARTIFACT_TOOL = ToolDefinition(
+    name="upload_artifact",
+    description="Save content as an output artifact file. The file will be available for download via the API after task completion.",
+    input_model=UploadArtifactArguments,
+    output_model=UploadArtifactResult,
 )
 
 TOOL_DEFINITIONS = (WEB_SEARCH_TOOL, READ_URL_TOOL, CALCULATOR_TOOL)

@@ -238,6 +238,14 @@ npx vitest run src/features/agents/AgentDetailPage.test.tsx
 npx vitest run --reporter=verbose -t "renders budget fields"
 ```
 
+### Infrastructure prerequisites for tests
+
+**All tests use an isolated test database — never the local dev database.** Worker integration tests and E2E tests both connect to a dedicated test PostgreSQL container (`par-e2e-postgres`) on port **55433**, separate from the local dev DB on port 55432. This ensures tests never destroy your local development data.
+
+`make worker-test` automatically starts the test database container and applies migrations via the `test-db-up` dependency. If you see `N passed, 12 skipped` in worker test output, it means Docker is not running — start Docker Desktop and re-run.
+
+`make e2e-test` also depends on the test database (via `e2e-up → test-db-up`) plus an API service on port 8081. LocalStack on port 4566 must be running for artifact-related E2E tests — `make db-up` starts both the dev PostgreSQL and LocalStack containers.
+
 ### Pre-existing test failures
 
 If tests fail that are unrelated to your change, you must still fix them. Use `git stash` or a separate branch to verify the failure exists on `main` before your changes. If it does, fix it as part of your work — do not leave broken tests behind.

@@ -6,6 +6,7 @@ Builds and executes the LangGraph state machine with the given agent configurati
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable
@@ -28,6 +29,7 @@ from core.config import WorkerConfig
 
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
+from storage.s3_client import S3Client
 from tools.definitions import (
     create_default_dependencies,
     WEB_SEARCH_TOOL,
@@ -35,6 +37,7 @@ from tools.definitions import (
     CALCULATOR_TOOL,
     DEV_SLEEP_TOOL,
     REQUEST_HUMAN_INPUT_TOOL,
+    UPLOAD_ARTIFACT_TOOL,
     WebSearchArguments,
     ReadUrlArguments,
     CalculatorArguments,
@@ -58,6 +61,12 @@ class GraphExecutor:
         self.deps = create_default_dependencies()
         # Per-model cost rate cache: {model_name: (input_rate, output_rate)}
         self._cost_rate_cache: dict[str, tuple[int, int]] = {}
+        s3_endpoint_url = os.environ.get("S3_ENDPOINT_URL")
+        s3_bucket_name = os.environ.get("S3_BUCKET_NAME", "platform-artifacts")
+        self.s3_client = S3Client(
+            endpoint_url=s3_endpoint_url,
+            bucket_name=s3_bucket_name,
+        )
 
     async def _resolve_langfuse_credentials(self, endpoint_id: str) -> dict | None:
         """Query langfuse_endpoints table for credentials. Returns {host, public_key, secret_key} or None."""
@@ -141,6 +150,7 @@ class GraphExecutor:
         *,
         cancel_event: asyncio.Event,
         task_id: str,
+        tenant_id: str = "default",
     ) -> list[StructuredTool]:
         tools = []
         if "web_search" in allowed_tools:
@@ -209,6 +219,36 @@ class GraphExecutor:
                 args_schema=DevSleepArguments
             ))
 
+        if "upload_artifact" in allowed_tools:
+            from tools.upload_artifact import (
+                UploadArtifactArguments,
+                execute_upload_artifact,
+            )
+
+            async def upload_artifact(
+                filename: str,
+                content: str,
+                content_type: str = "text/plain",
+            ):
+                return await execute_upload_artifact(
+                    filename=filename,
+                    content=content,
+                    content_type=content_type,
+                    s3_client=self.s3_client,
+                    pool=self.pool,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                )
+
+            tools.append(
+                StructuredTool.from_function(
+                    coroutine=upload_artifact,
+                    name="upload_artifact",
+                    description=UPLOAD_ARTIFACT_TOOL.description,
+                    args_schema=UploadArtifactArguments,
+                )
+            )
+
         return tools
 
     async def _build_graph(
@@ -217,6 +257,7 @@ class GraphExecutor:
         *,
         cancel_event: asyncio.Event,
         task_id: str,
+        tenant_id: str = "default",
         custom_tools: list[StructuredTool] | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
@@ -239,7 +280,7 @@ class GraphExecutor:
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
 
         # Register built-in tools
-        tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id)
+        tools = self._get_tools(allowed_tools, cancel_event=cancel_event, task_id=task_id, tenant_id=tenant_id)
 
         # Merge custom tools from MCP servers
         if custom_tools:
@@ -540,6 +581,7 @@ class GraphExecutor:
                 agent_config,
                 cancel_event=cancel_event,
                 task_id=task_id,
+                tenant_id=tenant_id,
                 custom_tools=custom_tools if custom_tools else None,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)

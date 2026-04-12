@@ -18,6 +18,7 @@ export const ALLOWED_TOOLS = [
     { id: "web_search", label: "Web Search" },
     { id: "read_url", label: "Read URL" },
     { id: "calculator", label: "Calculator" },
+    { id: "upload_artifact", label: "Upload Artifact" },
     ...(devTaskControlsEnabled ? [{ id: "dev_sleep", label: "Dev Sleep" }] : [])
 ];
 

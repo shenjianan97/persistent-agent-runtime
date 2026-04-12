@@ -23,3 +23,8 @@ server:
 app:
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:3000}
+
+s3:
+  endpoint-url: ${S3_ENDPOINT_URL:#{null}}
+  bucket-name: ${S3_BUCKET_NAME:platform-artifacts}
+  region: ${AWS_REGION:us-east-1}

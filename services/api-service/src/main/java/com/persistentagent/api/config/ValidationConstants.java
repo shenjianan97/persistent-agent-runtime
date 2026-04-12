@@ -17,7 +17,7 @@ public final class ValidationConstants {
     public static final String DEFAULT_WORKER_POOL_ID = "shared";
 
     /** Stable public tools available in all environments. */
-    public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator", "request_human_input");
+    public static final Set<String> ALLOWED_TOOLS = Set.of("web_search", "read_url", "calculator", "request_human_input", "upload_artifact");
 
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
