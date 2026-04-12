@@ -61,6 +61,9 @@ class TaskServiceTest {
     @Mock
     private ConfigValidationHelper configValidationHelper;
 
+    @Mock
+    private S3StorageService s3StorageService;
+
     private TaskService taskService;
     private ObjectMapper objectMapper;
 
@@ -80,6 +83,7 @@ class TaskServiceTest {
                 objectMapper,
                 new CheckpointEventParser(objectMapper),
                 configValidationHelper,
+                s3StorageService,
                 false
         );
     }

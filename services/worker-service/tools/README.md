@@ -60,9 +60,7 @@ Structured outputs are returned for all three tools so the executor can consume 
 
 ## Configuration
 
-Live `web_search` calls require:
-
-- `TAVILY_API_KEY`
+`web_search` uses DuckDuckGo and requires no API key or credentials.
 
 The tools package will load `.env` files automatically for local development:
 
@@ -72,13 +70,7 @@ The tools package will load `.env` files automatically for local development:
 
 Shell environment variables still win because `.env` values do not override an already-set variable.
 
-`read_url` and `calculator` do not require external credentials.
-
-Example `services/worker-service/tools/.env`:
-
-```dotenv
-TAVILY_API_KEY=your-key-here
-```
+`read_url` and `calculator` also do not require external credentials.
 
 ## How To Test
 

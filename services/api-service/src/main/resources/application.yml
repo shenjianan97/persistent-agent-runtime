@@ -1,6 +1,10 @@
 spring:
   application:
     name: persistent-agent-api
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 200MB
   datasource:
     url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:55432}/${DB_NAME:persistent_agent_runtime}
     username: ${DB_USER:postgres}

@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-import os
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-import httpx
+from ddgs import DDGS
 
-from tools.env import load_worker_env
-from tools.errors import ToolExecutionError, ToolTransportError
-
-
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+from tools.errors import ToolTransportError
 
 
 @dataclass(frozen=True)
@@ -34,88 +30,40 @@ class SearchProvider(Protocol):
         """Run a search query and return normalized results."""
 
 
-class TavilySearchProvider:
-    """Tavily-backed default implementation for web search."""
+class DuckDuckGoSearchProvider:
+    """DuckDuckGo-backed default implementation for web search."""
 
-    def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        endpoint: str = TAVILY_SEARCH_URL,
-        timeout_seconds: float = 10.0,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        load_worker_env()
-        self._api_key = api_key or os.getenv("TAVILY_API_KEY")
-        self._endpoint = endpoint
+    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
         self._timeout_seconds = timeout_seconds
-        self._client = client
 
     @property
     def provider_name(self) -> str:
-        return "tavily"
+        return "duckduckgo"
 
     async def search(self, query: str, max_results: int) -> Sequence[SearchResult]:
-        if not self._api_key:
-            raise ToolExecutionError("TAVILY_API_KEY is not configured.")
-
-        payload = {
-            "api_key": self._api_key,
-            "query": query,
-            "max_results": max_results,
-            "search_depth": "basic",
-            "include_answer": False,
-            "include_images": False,
-            "include_raw_content": False,
-        }
-        headers = {"Content-Type": "application/json"}
-
         try:
-            response = await self._post(payload, headers)
-        except httpx.TimeoutException as exc:
-            raise ToolTransportError("Search request timed out.") from exc
-        except httpx.HTTPError as exc:
-            raise ToolTransportError("Search provider request failed.") from exc
+            results = await asyncio.to_thread(self._search_sync, query, max_results)
+            return results
+        except Exception as exc:
+            raise ToolTransportError(f"DuckDuckGo search failed: {str(exc)}") from exc
 
-        if response.status_code in {408, 429} or response.status_code >= 500:
-            raise ToolTransportError(
-                f"Search provider temporarily failed with status {response.status_code}."
-            )
-        if response.status_code >= 400:
-            raise ToolExecutionError(
-                f"Search provider rejected the request with status {response.status_code}."
-            )
+    def _search_sync(self, query: str, max_results: int) -> list[SearchResult]:
+        with DDGS() as ddgs:
+            raw_results = list(ddgs.text(query, max_results=max_results))
 
-        data = response.json()
-        results: list[SearchResult] = []
-        for item in data.get("results", [])[:max_results]:
-            url = str(item.get("url", "")).strip()
+        results = []
+        for item in raw_results[:max_results]:
+            url = str(item.get("href", "")).strip()
             if not url:
                 continue
             results.append(
                 SearchResult(
                     title=_trim_text(item.get("title"), fallback=url, limit=200),
                     url=url,
-                    snippet=_trim_text(
-                        item.get("content") or item.get("snippet"),
-                        fallback="",
-                        limit=600,
-                    ),
+                    snippet=_trim_text(item.get("body"), fallback="", limit=600),
                 )
             )
         return results
-
-    async def _post(self, payload: dict[str, object], headers: dict[str, str]) -> httpx.Response:
-        if self._client is not None:
-            return await self._client.post(
-                self._endpoint,
-                json=payload,
-                headers=headers,
-                timeout=self._timeout_seconds,
-            )
-
-        async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
-            return await client.post(self._endpoint, json=payload, headers=headers)
 
 
 def _trim_text(value: object, *, fallback: str, limit: int) -> str:

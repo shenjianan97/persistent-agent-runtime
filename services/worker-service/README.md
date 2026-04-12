@@ -49,7 +49,6 @@ Create a `.env` file in `services/worker-service/` or export directly:
 | `AWS_ACCESS_KEY_ID` | Bedrock models | — |
 | `AWS_SECRET_ACCESS_KEY` | Bedrock models | — |
 | `AWS_REGION` | Bedrock models | — |
-| `TAVILY_API_KEY` | `web_search` tool | — |
 | `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | Dev-only task controls and `dev_sleep` tool | `false` |
 
@@ -65,7 +64,6 @@ cd services/worker-service
 source .venv/bin/activate
 export DB_DSN="postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime"
 export ANTHROPIC_API_KEY="sk-ant-..."
-export TAVILY_API_KEY="tvly-..."
 
 python main.py
 ```
@@ -90,7 +88,7 @@ The `GraphExecutor` calls tool functions directly as in-process LangGraph `Struc
 
 | Tool | Description | Credentials |
 |------|-------------|-------------|
-| `web_search(query, max_results=5)` | Tavily-backed web search | `TAVILY_API_KEY` |
+| `web_search(query, max_results=5)` | DuckDuckGo-backed web search | None |
 | `read_url(url, max_chars=5000)` | Bounded URL fetch with SSRF guards | None |
 | `calculator(expression)` | Safe AST-based arithmetic | None |
 

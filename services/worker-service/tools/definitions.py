@@ -12,10 +12,20 @@ from pydantic import BaseModel, Field
 from langgraph.types import interrupt
 
 from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
-from tools.providers.search import SearchProvider, SearchResult, TavilySearchProvider
+from tools.providers.search import DuckDuckGoSearchProvider, SearchProvider, SearchResult
 from tools.read_url import ReadUrlFetcher
 from tools.runtime_logging import get_tools_logger
 from tools.upload_artifact import UploadArtifactArguments, UploadArtifactResult
+from tools.sandbox_tools import (
+    SandboxExecArguments,
+    SandboxExecResult,
+    SandboxReadFileArguments,
+    SandboxReadFileResult,
+    SandboxWriteFileArguments,
+    SandboxWriteFileResult,
+    SandboxDownloadArguments,
+    SandboxDownloadResult,
+)
 
 
 SEARCH_QUERY = Annotated[
@@ -179,6 +189,30 @@ UPLOAD_ARTIFACT_TOOL = ToolDefinition(
     input_model=UploadArtifactArguments,
     output_model=UploadArtifactResult,
 )
+SANDBOX_EXEC_TOOL = ToolDefinition(
+    name="sandbox_exec",
+    description="Execute a shell command in the sandbox environment. Returns stdout, stderr, and exit code.",
+    input_model=SandboxExecArguments,
+    output_model=SandboxExecResult,
+)
+SANDBOX_READ_FILE_TOOL = ToolDefinition(
+    name="sandbox_read_file",
+    description="Read the content of a file from the sandbox filesystem. Returns the file content as text.",
+    input_model=SandboxReadFileArguments,
+    output_model=SandboxReadFileResult,
+)
+SANDBOX_WRITE_FILE_TOOL = ToolDefinition(
+    name="sandbox_write_file",
+    description="Write content to a file in the sandbox filesystem. Creates the file if it does not exist, overwrites if it does.",
+    input_model=SandboxWriteFileArguments,
+    output_model=SandboxWriteFileResult,
+)
+SANDBOX_DOWNLOAD_TOOL = ToolDefinition(
+    name="sandbox_download",
+    description="Download a file from the sandbox and save it as an output artifact. The file will be available via the task artifacts API.",
+    input_model=SandboxDownloadArguments,
+    output_model=SandboxDownloadResult,
+)
 
 TOOL_DEFINITIONS = (WEB_SEARCH_TOOL, READ_URL_TOOL, CALCULATOR_TOOL)
 TOOL_NAMES = tuple(definition.name for definition in TOOL_DEFINITIONS)
@@ -187,7 +221,7 @@ LOGGER = get_tools_logger()
 
 def create_default_dependencies() -> ToolDependencies:
     return ToolDependencies(
-        search_provider=TavilySearchProvider(),
+        search_provider=DuckDuckGoSearchProvider(),
         read_url_fetcher=ReadUrlFetcher(),
     )
 

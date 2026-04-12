@@ -28,7 +28,7 @@ async def _ensure_agent(pool: asyncpg.Pool, *, tenant_id: str = "default", agent
         "system_prompt": "You are a test assistant.",
         "model": "claude-3-5-sonnet-latest",
         "temperature": 0.5,
-        "allowed_tools": ["calculator"],
+        "allowed_tools": ["web_search"],
     })
     async with pool.acquire() as conn:
         await conn.execute(
@@ -59,7 +59,7 @@ async def setup_test_task(pool: asyncpg.Pool) -> str:
             "system_prompt": "You are a test assistant.",
             "model": "claude-3-5-sonnet-latest",
             "temperature": 0.5,
-            "allowed_tools": ["calculator"]
+            "allowed_tools": ["web_search"]
         }
         await conn.execute("""
             INSERT INTO tasks (
@@ -248,16 +248,16 @@ async def test_worker_mcp_tool_execution_integration():
     worker = WorkerService(config, pool, router)
     
     from unittest.mock import AsyncMock
-    # We patch create_llm to simulate an LLM deciding to call the calculator tool
+    # We patch create_llm to simulate an LLM deciding to call the web_search tool
     with patch("executor.providers.create_llm", new_callable=AsyncMock) as MockChat:
         mock_llm = MagicMock()
         mock_ainvoke = AsyncMock()
         
         # We need the mock to iterate twice. 
-        # 1. First invocation: LLM asks to use calculator
+        # 1. First invocation: LLM asks to use web_search
         call_msg = AIMessage(
             content="",
-            tool_calls=[ToolCall(name="calculator", args={"expression": "5 * 5"}, id="call_123")]
+            tool_calls=[ToolCall(name="web_search", args={"query": "test query"}, id="call_123")]
         )
         
         # 2. Second invocation: LLM sees tool result and outputs the final answer
@@ -271,7 +271,7 @@ async def test_worker_mcp_tool_execution_integration():
         await worker.start()
         
         try:
-            # We setup a task allowing the 'calculator' tool
+            # We setup a task allowing the 'web_search' tool
             t1 = await setup_test_task(pool)
             
             # Allow time for polling, graph building, tool execution via MCP, and DB commits
@@ -285,7 +285,7 @@ async def test_worker_mcp_tool_execution_integration():
                 assert output["result"] == "The result is 25!"
                 
                 # Verify that checkpointer saved the tool execution
-                # The checkpoint blobs should contain the 'ToolMessage' result returned by calculator
+                # The checkpoint blobs should contain the 'ToolMessage' result returned by web_search
                 checkpoint_rows = await conn.fetch("SELECT checkpoint_payload, metadata_payload FROM checkpoints WHERE task_id=$1::uuid", t1)
                 assert len(checkpoint_rows) > 0
                 

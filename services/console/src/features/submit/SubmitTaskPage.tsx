@@ -4,7 +4,8 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { useSubmitTask } from './useSubmitTask';
 import { useAgents, useAgent } from '@/features/agents/useAgents';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
-import { submitTaskSchema, SubmitTaskFormValues } from './schema';
+import { submitTaskSchema, SubmitTaskFormValues, ALL_TOOL_LABELS } from './schema';
+import { FileAttachment } from './FileAttachment';
 import { toast } from 'sonner';
 import { formatUsd } from '@/lib/utils';
 import { useState, useEffect } from 'react';
@@ -29,6 +30,7 @@ export function SubmitTaskPage() {
     const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
 
     const [queryParamError, setQueryParamError] = useState<string | null>(null);
+    const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
 
     const form = useForm<SubmitTaskFormValues>({
         resolver: zodResolver(submitTaskSchema),
@@ -44,6 +46,8 @@ export function SubmitTaskPage() {
     const selectedAgentId = form.watch('agent_id');
 
     const { data: selectedAgent, isLoading: isLoadingAgent } = useAgent(selectedAgentId);
+
+    const sandboxEnabled = selectedAgent?.agent_config?.sandbox?.enabled === true;
 
     // Validate query param agent_id against loaded agents
     useEffect(() => {
@@ -61,19 +65,28 @@ export function SubmitTaskPage() {
     }, [queryAgentId, agents, isLoadingAgents, form]);
 
     function onSubmit(data: SubmitTaskFormValues) {
-        mutation.mutate(data, {
-            onSuccess: (response) => {
-                toast.success(`Task ${response.task_id} submitted`, {
-                    description: "Execution initialized.",
-                });
-                navigate(`/tasks/${response.task_id}`);
+        mutation.mutate(
+            {
+                request: data,
+                files: attachedFiles.length > 0 ? attachedFiles : undefined,
             },
-            onError: (error: Error) => {
-                toast.error("Submission failed", {
-                    description: error.message || "Unknown error occurred.",
-                });
+            {
+                onSuccess: (response) => {
+                    toast.success(`Task ${response.task_id} submitted`, {
+                        description: attachedFiles.length > 0
+                            ? `Execution initialized with ${attachedFiles.length} file(s).`
+                            : "Execution initialized.",
+                    });
+                    setAttachedFiles([]);
+                    navigate(`/tasks/${response.task_id}`);
+                },
+                onError: (error: Error) => {
+                    toast.error("Submission failed", {
+                        description: error.message || "Unknown error occurred.",
+                    });
+                },
             }
-        });
+        );
     }
 
     const noAgentsExist = !isLoadingAgents && agents.length === 0;
@@ -176,22 +189,20 @@ export function SubmitTaskPage() {
                                                     <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">System Prompt</span>
                                                     <span className="text-foreground/80 whitespace-pre-wrap line-clamp-3">{selectedAgent.agent_config.system_prompt}</span>
                                                 </div>
-                                                {selectedAgent.agent_config.allowed_tools && selectedAgent.agent_config.allowed_tools.filter(t => t !== 'request_human_input').length > 0 && (
-                                                    <div className="md:col-span-2">
-                                                        <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tools</span>
-                                                        <span className="text-foreground">{selectedAgent.agent_config.allowed_tools.filter(t => t !== 'request_human_input').join(', ')}</span>
-                                                    </div>
-                                                )}
+                                                {(() => {
+                                                    const autoManaged = new Set(['request_human_input', 'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'sandbox_download']);
+                                                    const userTools = (selectedAgent.agent_config.allowed_tools ?? []).filter(t => !autoManaged.has(t));
+                                                    return userTools.length > 0 ? (
+                                                        <div className="md:col-span-2">
+                                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tools</span>
+                                                            <span className="text-foreground">{userTools.map(id => ALL_TOOL_LABELS[id] ?? id).join(', ')}</span>
+                                                        </div>
+                                                    ) : null;
+                                                })()}
                                                 {selectedAgent.agent_config.tool_servers && selectedAgent.agent_config.tool_servers.length > 0 && (
                                                     <div className="md:col-span-2">
                                                         <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Tool Servers</span>
                                                         <span className="text-foreground">{selectedAgent.agent_config.tool_servers.join(', ')}</span>
-                                                    </div>
-                                                )}
-                                                {selectedAgent.agent_config.allowed_tools?.includes('request_human_input') && (
-                                                    <div>
-                                                        <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Human-in-the-Loop</span>
-                                                        <span className="text-foreground">Enabled</span>
                                                     </div>
                                                 )}
                                                 <div>
@@ -238,6 +249,27 @@ export function SubmitTaskPage() {
                                             <FormMessage className="text-destructive font-bold text-xs" />
                                         </FormItem>
                                     )}
+                                />
+                            </CardContent>
+                        </Card>
+
+                        {/* File Attachments */}
+                        <Card className="console-surface border-white/10">
+                            <CardHeader className="border-b border-white/8 pb-3">
+                                <CardTitle className="text-sm font-display uppercase tracking-widest">File Attachments</CardTitle>
+                            </CardHeader>
+                            <CardContent className="pt-4">
+                                <FileAttachment
+                                    files={attachedFiles}
+                                    onFilesChange={setAttachedFiles}
+                                    disabled={!sandboxEnabled}
+                                    disabledReason={
+                                        !selectedAgentId
+                                            ? "Select an agent first"
+                                            : !sandboxEnabled
+                                            ? "File upload requires an agent with sandbox enabled"
+                                            : undefined
+                                    }
                                 />
                             </CardContent>
                         </Card>

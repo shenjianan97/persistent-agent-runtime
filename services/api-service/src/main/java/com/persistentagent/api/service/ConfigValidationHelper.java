@@ -3,6 +3,7 @@ package com.persistentagent.api.service;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
+import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -100,9 +101,63 @@ public class ConfigValidationHelper {
         }
     }
 
+    public void validateSandboxConfig(SandboxConfigRequest sandbox) {
+        if (sandbox == null) {
+            return; // No sandbox config is valid — defaults to disabled
+        }
+
+        // enabled defaults to false if null
+        boolean enabled = sandbox.enabled() != null && sandbox.enabled();
+
+        if (!enabled) {
+            return; // Disabled sandbox — no further validation needed
+        }
+
+        // template is required when sandbox is enabled
+        if (sandbox.template() == null || sandbox.template().isBlank()) {
+            throw new ValidationException("sandbox.template is required when sandbox is enabled");
+        }
+
+        // vcpu validation
+        if (sandbox.vcpu() != null) {
+            if (sandbox.vcpu() < ValidationConstants.SANDBOX_VCPU_MIN
+                    || sandbox.vcpu() > ValidationConstants.SANDBOX_VCPU_MAX) {
+                throw new ValidationException("sandbox.vcpu must be between "
+                        + ValidationConstants.SANDBOX_VCPU_MIN + " and "
+                        + ValidationConstants.SANDBOX_VCPU_MAX);
+            }
+        }
+
+        // memory_mb validation
+        if (sandbox.memoryMb() != null) {
+            if (sandbox.memoryMb() < ValidationConstants.SANDBOX_MEMORY_MB_MIN
+                    || sandbox.memoryMb() > ValidationConstants.SANDBOX_MEMORY_MB_MAX) {
+                throw new ValidationException("sandbox.memory_mb must be between "
+                        + ValidationConstants.SANDBOX_MEMORY_MB_MIN + " and "
+                        + ValidationConstants.SANDBOX_MEMORY_MB_MAX);
+            }
+        }
+
+        // timeout_seconds validation
+        if (sandbox.timeoutSeconds() != null) {
+            if (sandbox.timeoutSeconds() < ValidationConstants.SANDBOX_TIMEOUT_SECONDS_MIN
+                    || sandbox.timeoutSeconds() > ValidationConstants.SANDBOX_TIMEOUT_SECONDS_MAX) {
+                throw new ValidationException("sandbox.timeout_seconds must be between "
+                        + ValidationConstants.SANDBOX_TIMEOUT_SECONDS_MIN + " and "
+                        + ValidationConstants.SANDBOX_TIMEOUT_SECONDS_MAX);
+            }
+        }
+
+        // Note: sandbox.timeout_seconds is validated here to be a reasonable minimum (>= 60s).
+        // The runtime cross-validation (sandbox timeout >= task timeout) happens at task
+        // submission time in Track 2 Task 6, because task_timeout_seconds is per-task,
+        // not per-agent. At agent config time we can only validate the range.
+    }
+
     public void validateAgentConfig(AgentConfigRequest config) {
         validateModel(config.provider(), config.model());
         validateAllowedTools(config.allowedTools());
         validateToolServers(config.toolServers());
+        validateSandboxConfig(config.sandbox());
     }
 }

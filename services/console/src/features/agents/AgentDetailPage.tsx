@@ -4,7 +4,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAgent, useUpdateAgent } from './useAgents';
 import { useModels } from '@/features/submit/useModels';
-import { ALLOWED_TOOLS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
+import { ALL_TOOL_LABELS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 import { useEffect, useState } from 'react';
@@ -28,12 +28,16 @@ const agentDetailSchema = z.object({
     provider: z.string().min(1, 'Provider is required'),
     model: z.string().min(1, 'Model is required'),
     temperature: z.number().min(0).max(2).default(0.7),
-    allowed_tools: z.array(z.string()).default([]),
     tool_servers: z.array(z.string()).default([]),
     status: z.enum(['active', 'disabled']),
     max_concurrent_tasks: z.number().int().min(1).default(5),
     budget_max_per_task: z.number().int().min(1).default(500000),
     budget_max_per_hour: z.number().int().min(1).default(5000000),
+    sandbox_enabled: z.boolean().default(false),
+    sandbox_template: z.string().default(''),
+    sandbox_vcpu: z.number().int().min(1).max(8).default(2),
+    sandbox_memory_mb: z.number().int().min(512).max(8192).default(2048),
+    sandbox_timeout_seconds: z.number().int().min(60).max(86400).default(3600),
 });
 
 type AgentDetailFormValues = z.infer<typeof agentDetailSchema>;
@@ -56,12 +60,16 @@ export function AgentDetailPage() {
             provider: '',
             model: '',
             temperature: 0.7,
-            allowed_tools: [],
             tool_servers: [],
             status: 'active',
             max_concurrent_tasks: 5,
             budget_max_per_task: 500000,
             budget_max_per_hour: 5000000,
+            sandbox_enabled: false,
+            sandbox_template: '',
+            sandbox_vcpu: 2,
+            sandbox_memory_mb: 2048,
+            sandbox_timeout_seconds: 3600,
         },
     });
 
@@ -73,18 +81,31 @@ export function AgentDetailPage() {
                 provider: agent.agent_config.provider,
                 model: agent.agent_config.model,
                 temperature: agent.agent_config.temperature,
-                allowed_tools: agent.agent_config.allowed_tools ?? [],
                 tool_servers: agent.agent_config.tool_servers ?? [],
                 status: agent.status,
                 max_concurrent_tasks: agent.max_concurrent_tasks ?? 5,
                 budget_max_per_task: agent.budget_max_per_task ?? 500000,
                 budget_max_per_hour: agent.budget_max_per_hour ?? 5000000,
+                sandbox_enabled: agent.agent_config.sandbox?.enabled ?? false,
+                sandbox_template: agent.agent_config.sandbox?.template ?? '',
+                sandbox_vcpu: agent.agent_config.sandbox?.vcpu ?? 2,
+                sandbox_memory_mb: agent.agent_config.sandbox?.memory_mb ?? 2048,
+                sandbox_timeout_seconds: agent.agent_config.sandbox?.timeout_seconds ?? 3600,
             });
         }
     }, [agent, form]);
 
     function onSubmit(data: AgentDetailFormValues) {
         if (!agentId) return;
+        const sandboxConfig = data.sandbox_enabled
+            ? {
+                enabled: true,
+                template: data.sandbox_template,
+                vcpu: data.sandbox_vcpu,
+                memory_mb: data.sandbox_memory_mb,
+                timeout_seconds: data.sandbox_timeout_seconds,
+            }
+            : undefined;
         mutation.mutate(
             {
                 agentId,
@@ -95,8 +116,8 @@ export function AgentDetailPage() {
                         provider: data.provider,
                         model: data.model,
                         temperature: data.temperature,
-                        allowed_tools: data.allowed_tools,
                         tool_servers: data.tool_servers,
+                        ...(sandboxConfig ? { sandbox: sandboxConfig } : {}),
                     },
                     status: data.status,
                     max_concurrent_tasks: data.max_concurrent_tasks,
@@ -145,16 +166,21 @@ export function AgentDetailPage() {
 
     const isDisabled = form.watch('status') === 'disabled';
     const selectedToolServers = form.watch('tool_servers');
+    const sandboxEnabled = form.watch('sandbox_enabled');
 
     function handleCancel() {
         form.reset();
         setIsEditing(false);
     }
 
+    // Auto-managed tools are implied by sandbox/HITL config — don't clutter the overview
+    const AUTO_MANAGED_TOOLS = new Set([
+        HUMAN_INPUT_TOOL_ID,
+        'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'sandbox_download',
+    ]);
     const toolLabels = (agent.agent_config.allowed_tools ?? [])
-        .filter(t => t !== HUMAN_INPUT_TOOL_ID)
-        .map(id => ALLOWED_TOOLS.find(t => t.id === id)?.label ?? id);
-    const hasHumanInput = (agent.agent_config.allowed_tools ?? []).includes(HUMAN_INPUT_TOOL_ID);
+        .filter(t => !AUTO_MANAGED_TOOLS.has(t))
+        .map(id => ALL_TOOL_LABELS[id] ?? id);
 
     const readOnlyField = (label: string, value: React.ReactNode) => (
         <div>
@@ -214,7 +240,17 @@ export function AgentDetailPage() {
                             </div>
                             {readOnlyField('Temperature', agent.agent_config.temperature)}
                             {toolLabels.length > 0 && readOnlyField('Tools', toolLabels.join(', '))}
-                            {readOnlyField('Human-in-the-Loop', hasHumanInput ? 'Enabled' : 'Disabled')}
+                            {agent.agent_config.sandbox?.enabled && (
+                                <div className="space-y-2">
+                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Sandbox</span>
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm font-mono">
+                                        <div><span className="text-muted-foreground text-[10px] uppercase block">Template</span>{agent.agent_config.sandbox.template}</div>
+                                        <div><span className="text-muted-foreground text-[10px] uppercase block">vCPU</span>{agent.agent_config.sandbox.vcpu}</div>
+                                        <div><span className="text-muted-foreground text-[10px] uppercase block">Memory</span>{agent.agent_config.sandbox.memory_mb} MB</div>
+                                        <div><span className="text-muted-foreground text-[10px] uppercase block">Timeout</span>{agent.agent_config.sandbox.timeout_seconds}s</div>
+                                    </div>
+                                </div>
+                            )}
                             {agent?.agent_config?.tool_servers && agent.agent_config.tool_servers.length > 0 && (
                                 <div className="space-y-2">
                                     <div className="uppercase tracking-widest text-muted-foreground text-[10px]">Tool Servers</div>
@@ -361,44 +397,6 @@ export function AgentDetailPage() {
                                     )}
                                 />
 
-                                <FormField
-                                    control={form.control}
-                                    name="allowed_tools"
-                                    render={() => (
-                                        <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Tools</FormLabel>
-                                            <div className="flex flex-wrap gap-4 mt-2">
-                                                {ALLOWED_TOOLS.map((item) => (
-                                                    <FormField
-                                                        key={item.id}
-                                                        control={form.control}
-                                                        name="allowed_tools"
-                                                        render={({ field }) => (
-                                                            <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-                                                                <FormControl>
-                                                                    <Checkbox
-                                                                        className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
-                                                                        checked={field.value?.includes(item.id)}
-                                                                        onCheckedChange={(checked) =>
-                                                                            checked
-                                                                                ? field.onChange([...(field.value || []), item.id])
-                                                                                : field.onChange(field.value?.filter((v) => v !== item.id))
-                                                                        }
-                                                                    />
-                                                                </FormControl>
-                                                                <FormLabel className="font-normal font-mono cursor-pointer text-sm">
-                                                                    {item.label}
-                                                                </FormLabel>
-                                                            </FormItem>
-                                                        )}
-                                                    />
-                                                ))}
-                                            </div>
-                                            <FormMessage className="text-destructive font-bold text-xs" />
-                                        </FormItem>
-                                    )}
-                                />
-
                                 <div className="space-y-3">
                                     <div className="uppercase tracking-widest text-muted-foreground text-xs">Tool Servers</div>
                                     {toolServers.length === 0 ? (
@@ -445,37 +443,119 @@ export function AgentDetailPage() {
                                     )}
                                 </div>
 
-                                <FormField
-                                    control={form.control}
-                                    name="allowed_tools"
-                                    render={({ field }) => (
-                                        <FormItem>
-                                            <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Human-in-the-Loop</FormLabel>
-                                            <div className="flex items-center gap-3 mt-2 p-3 border border-border rounded-none bg-black/30">
-                                                <FormControl>
-                                                    <Checkbox
-                                                        className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
-                                                        checked={field.value?.includes(HUMAN_INPUT_TOOL_ID)}
-                                                        onCheckedChange={(checked) =>
-                                                            checked
-                                                                ? field.onChange([...(field.value || []), HUMAN_INPUT_TOOL_ID])
-                                                                : field.onChange(field.value?.filter((v) => v !== HUMAN_INPUT_TOOL_ID))
-                                                        }
-                                                    />
-                                                </FormControl>
-                                                <div>
-                                                    <FormLabel className="font-normal font-mono cursor-pointer text-sm">
-                                                        Enable Human Input
-                                                    </FormLabel>
-                                                    <p className="text-xs text-muted-foreground mt-0.5">
-                                                        Allow this agent to pause and request input from a human operator.
-                                                        The agent's system prompt will be augmented to instruct the model to use this tool when it needs user input.
-                                                    </p>
-                                                </div>
+                                <div className="space-y-3">
+                                    <span className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Sandbox (Code Execution)</span>
+                                    <div className="p-3 border border-border rounded-none bg-black/30 space-y-4">
+                                        <FormField
+                                            control={form.control}
+                                            name="sandbox_enabled"
+                                            render={({ field }) => (
+                                                <FormItem className="flex flex-row items-center gap-3">
+                                                    <FormControl>
+                                                        <Checkbox
+                                                            className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
+                                                            checked={field.value}
+                                                            onCheckedChange={field.onChange}
+                                                        />
+                                                    </FormControl>
+                                                    <div>
+                                                        <FormLabel className="font-normal font-mono cursor-pointer text-sm">
+                                                            Enable Sandbox
+                                                        </FormLabel>
+                                                        <p className="text-xs text-muted-foreground mt-0.5">
+                                                            Provision an E2B sandbox for code execution. Required for file input.
+                                                        </p>
+                                                    </div>
+                                                </FormItem>
+                                            )}
+                                        />
+
+                                        {sandboxEnabled && (
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                                                <FormField
+                                                    control={form.control}
+                                                    name="sandbox_template"
+                                                    render={({ field }) => (
+                                                        <FormItem className="md:col-span-2">
+                                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Template</FormLabel>
+                                                            <FormControl>
+                                                                <Input
+                                                                    className="rounded-none border-border bg-black/50 w-full"
+                                                                    placeholder="e.g., python-3.11"
+                                                                    {...field}
+                                                                />
+                                                            </FormControl>
+                                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                                        </FormItem>
+                                                    )}
+                                                />
+                                                <FormField
+                                                    control={form.control}
+                                                    name="sandbox_vcpu"
+                                                    render={({ field }) => (
+                                                        <FormItem>
+                                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">vCPU (1-8)</FormLabel>
+                                                            <FormControl>
+                                                                <Input
+                                                                    type="number"
+                                                                    min="1"
+                                                                    max="8"
+                                                                    step="1"
+                                                                    className="rounded-none border-border bg-black/50 w-full"
+                                                                    {...field}
+                                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 1)}
+                                                                />
+                                                            </FormControl>
+                                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                                        </FormItem>
+                                                    )}
+                                                />
+                                                <FormField
+                                                    control={form.control}
+                                                    name="sandbox_memory_mb"
+                                                    render={({ field }) => (
+                                                        <FormItem>
+                                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Memory MB (512-8192)</FormLabel>
+                                                            <FormControl>
+                                                                <Input
+                                                                    type="number"
+                                                                    min="512"
+                                                                    max="8192"
+                                                                    step="256"
+                                                                    className="rounded-none border-border bg-black/50 w-full"
+                                                                    {...field}
+                                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 512)}
+                                                                />
+                                                            </FormControl>
+                                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                                        </FormItem>
+                                                    )}
+                                                />
+                                                <FormField
+                                                    control={form.control}
+                                                    name="sandbox_timeout_seconds"
+                                                    render={({ field }) => (
+                                                        <FormItem className="md:col-span-2">
+                                                            <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Timeout (seconds, 60-86400)</FormLabel>
+                                                            <FormControl>
+                                                                <Input
+                                                                    type="number"
+                                                                    min="60"
+                                                                    max="86400"
+                                                                    step="60"
+                                                                    className="rounded-none border-border bg-black/50 w-full"
+                                                                    {...field}
+                                                                    onChange={(e) => field.onChange(parseInt(e.target.value, 10) || 60)}
+                                                                />
+                                                            </FormControl>
+                                                            <FormMessage className="text-destructive font-bold text-xs" />
+                                                        </FormItem>
+                                                    )}
+                                                />
                                             </div>
-                                        </FormItem>
-                                    )}
-                                />
+                                        )}
+                                    </div>
+                                </div>
                             </CardContent>
                         </Card>
 

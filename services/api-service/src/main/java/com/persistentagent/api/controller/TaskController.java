@@ -1,5 +1,6 @@
 package com.persistentagent.api.controller;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.model.request.TaskRejectRequest;
 import com.persistentagent.api.model.request.TaskRespondRequest;
@@ -7,12 +8,19 @@ import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
+import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Valid;
+import jakarta.validation.Validator;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/v1/tasks")
@@ -20,17 +28,47 @@ public class TaskController {
 
     private final TaskService taskService;
     private final TaskEventService taskEventService;
+    private final ObjectMapper objectMapper;
+    private final Validator validator;
 
-    public TaskController(TaskService taskService, TaskEventService taskEventService) {
+    public TaskController(TaskService taskService, TaskEventService taskEventService,
+                          ObjectMapper objectMapper, Validator validator) {
         this.taskService = taskService;
         this.taskEventService = taskEventService;
+        this.objectMapper = objectMapper;
+        this.validator = validator;
     }
 
-    @PostMapping
+    @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<TaskSubmissionResponse> submitTask(
             @Valid @RequestBody TaskSubmissionRequest request) {
         TaskSubmissionResponse response = taskService.submitTask(request);
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
+    }
+
+    @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<TaskSubmissionResponse> submitTaskMultipart(
+            @RequestPart("task_request") String taskRequestJson,
+            @RequestPart(value = "files", required = false) List<MultipartFile> files) {
+        try {
+            TaskSubmissionRequest request = objectMapper.readValue(taskRequestJson, TaskSubmissionRequest.class);
+
+            // Programmatically validate — the JSON endpoint gets this for free via @Valid,
+            // but manual deserialization skips it. This ensures identical validation behavior.
+            Set<ConstraintViolation<TaskSubmissionRequest>> violations = validator.validate(request);
+            if (!violations.isEmpty()) {
+                String errors = violations.stream()
+                        .map(v -> v.getPropertyPath() + ": " + v.getMessage())
+                        .collect(Collectors.joining(", "));
+                throw new com.persistentagent.api.exception.ValidationException(errors);
+            }
+
+            TaskSubmissionResponse response = taskService.submitTaskWithFiles(request, files);
+            return ResponseEntity.status(HttpStatus.CREATED).body(response);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            throw new com.persistentagent.api.exception.ValidationException(
+                    "Invalid task_request JSON: " + e.getMessage());
+        }
     }
 
     @GetMapping
