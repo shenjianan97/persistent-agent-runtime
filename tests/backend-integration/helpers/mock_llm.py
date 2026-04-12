@@ -49,8 +49,15 @@ def simple_response(content: str = "Hello!") -> MagicMock:
     return mock
 
 
+class _ToolBindableFakeChat(FakeListChatModel):
+    """FakeListChatModel that accepts bind_tools() without raising."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
 def callback_friendly_response(content: str = "Hello!") -> FakeListChatModel:
-    return FakeListChatModel(responses=[content])
+    return _ToolBindableFakeChat(responses=[content])
 
 
 def calculator_tool_call(expression: str = "2 + 2", final_answer: str = "The answer is 4.") -> MagicMock:
