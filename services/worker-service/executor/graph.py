@@ -1192,31 +1192,23 @@ class GraphExecutor:
                                 exc_info=True,
                             )
 
-                    # Destroy sandbox
+                    # Pause sandbox (not destroy) so follow-ups can reconnect.
+                    # The sandbox_id stays in DB. E2B auto-destroys after the
+                    # configured timeout if no follow-up arrives.
                     try:
-                        await provisioner.destroy(sandbox)
+                        await provisioner.pause(sandbox)
+                        logger.info(
+                            "sandbox_paused_on_completion",
+                            extra={"task_id": task_id, "sandbox_id": sandbox.sandbox_id},
+                        )
                     except Exception:
                         logger.warning(
-                            "sandbox_destroy_on_completion_failed",
+                            "sandbox_pause_on_completion_failed",
                             extra={"task_id": task_id},
                             exc_info=True,
                         )
 
-                    # Clear sandbox_id in DB
-                    try:
-                        async with self.pool.acquire() as conn:
-                            await conn.execute(
-                                "UPDATE tasks SET sandbox_id = NULL WHERE task_id = $1::uuid",
-                                task_id,
-                            )
-                    except Exception:
-                        logger.warning(
-                            "sandbox_id_clear_failed",
-                            extra={"task_id": task_id},
-                            exc_info=True,
-                        )
-
-                    sandbox = None  # Prevent double-destroy in finally
+                    sandbox = None  # Prevent double-action in finally
 
                 # Step 5: Flush Langfuse traces before marking complete
                 langfuse_status = "skipped"
@@ -1300,16 +1292,10 @@ class GraphExecutor:
                     logger.warning("MCP session close failed for task %s in finally block", task_id, exc_info=True)
             if sandbox is not None and provisioner is not None:
                 try:
-                    await provisioner.destroy(sandbox)
+                    await provisioner.pause(sandbox)
+                    logger.info("Sandbox paused for task %s in finally block", task_id)
                 except Exception:
-                    logger.warning("Sandbox destroy failed for task %s in finally block", task_id, exc_info=True)
-                try:
-                    async with self.pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE tasks SET sandbox_id = NULL WHERE task_id = $1::uuid", task_id
-                        )
-                except Exception:
-                    logger.warning("sandbox_id_clear_failed_in_finally", extra={"task_id": task_id}, exc_info=True)
+                    logger.warning("Sandbox pause failed for task %s in finally block", task_id, exc_info=True)
 
     def _build_runnable_config(
         self,

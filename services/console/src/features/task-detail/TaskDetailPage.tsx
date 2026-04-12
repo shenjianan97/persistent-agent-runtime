@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useNavigate, useParams, Link } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
+import { useAgent } from '@/features/agents/useAgents';
 import { useTaskObservability } from './useTaskObservability';
 import { useCheckpoints } from './useCheckpoints';
 import { useRedriveTask } from '@/features/dead-letter/useDeadLetter';
@@ -52,6 +53,19 @@ export function TaskDetailPage() {
             toast.error(error.message || 'Resume failed');
         },
     });
+
+    const { data: agent } = useAgent(task?.agent_id ?? '');
+    const sandboxTimeoutSeconds = agent?.agent_config?.sandbox?.timeout_seconds ?? 3600;
+    const sandboxEnabled = agent?.agent_config?.sandbox?.enabled === true;
+
+    const sandboxExpired = useMemo(() => {
+        if (!sandboxEnabled || !task?.updated_at) return false;
+        const completedAt = new Date(task.updated_at).getTime();
+        const expiresAt = completedAt + sandboxTimeoutSeconds * 1000;
+        return Date.now() > expiresAt;
+    }, [sandboxEnabled, task?.updated_at, sandboxTimeoutSeconds]);
+
+    const canFollowUp = task?.status === 'completed' && (!sandboxEnabled || !sandboxExpired);
 
     const [followUpInput, setFollowUpInput] = useState('');
     const [showFollowUp, setShowFollowUp] = useState(false);
@@ -386,7 +400,7 @@ export function TaskDetailPage() {
                         <ArtifactsTab taskId={taskId!} artifacts={artifactsData} />
                     )}
 
-                    {task.status === 'completed' && (
+                    {task.status === 'completed' && canFollowUp && (
                         showFollowUp ? (
                             <Card className="console-surface border-primary/30 relative overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-300">
                                 <div className="absolute top-0 left-0 w-1 h-full bg-primary" />
@@ -396,6 +410,12 @@ export function TaskDetailPage() {
                                     </CardTitle>
                                 </CardHeader>
                                 <CardContent className="pt-4 space-y-4">
+                                    {sandboxEnabled && (
+                                        <p className="text-xs text-amber-400">
+                                            Sandbox environment expires {Math.round(sandboxTimeoutSeconds / 60)} minutes after task completion.
+                                            Follow up before then to retain access to sandbox files.
+                                        </p>
+                                    )}
                                     <p className="text-xs text-muted-foreground">
                                         Continue this task with a follow-up prompt. The agent will resume from its last state with full conversation context.
                                     </p>
@@ -435,6 +455,15 @@ export function TaskDetailPage() {
                                 </Button>
                             </div>
                         )
+                    )}
+
+                    {task.status === 'completed' && sandboxEnabled && sandboxExpired && (
+                        <div className="text-center py-4">
+                            <p className="text-xs text-muted-foreground">
+                                Sandbox environment has expired. Follow-up is no longer available for this task.
+                                Submit a new task to start fresh.
+                            </p>
+                        </div>
                     )}
 
             </div>

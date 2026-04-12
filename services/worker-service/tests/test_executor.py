@@ -1293,8 +1293,8 @@ class TestSandboxLifecycle:
         assert "sbx-new-123" in str(sandbox_id_store_calls[0])
 
     @pytest.mark.asyncio
-    async def test_sandbox_destroyed_on_completion(self):
-        """Sandbox is destroyed after task completes successfully."""
+    async def test_sandbox_paused_on_completion(self):
+        """Sandbox is paused (not destroyed) after task completes so follow-ups can reconnect."""
         executor = _build_test_executor()
         mock_sandbox = MagicMock()
         mock_sandbox.sandbox_id = "sbx-complete"
@@ -1330,11 +1330,11 @@ class TestSandboxLifecycle:
                 with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
                     await executor.execute_task(task_data, cancel_event)
 
-        mock_provisioner.destroy.assert_called_once_with(mock_sandbox)
+        mock_provisioner.pause.assert_called_once_with(mock_sandbox)
 
     @pytest.mark.asyncio
-    async def test_sandbox_destroyed_in_finally_on_error(self):
-        """Sandbox is destroyed in finally block when task fails with an exception."""
+    async def test_sandbox_paused_in_finally_on_error(self):
+        """Sandbox is paused in finally block when task fails with an exception."""
         executor = _build_test_executor()
         mock_sandbox = MagicMock()
         mock_sandbox.sandbox_id = "sbx-error"
@@ -1366,8 +1366,8 @@ class TestSandboxLifecycle:
                 with patch.object(executor, "_inject_input_files", new_callable=AsyncMock, return_value=[]):
                     await executor.execute_task(task_data, cancel_event)
 
-        # destroy should be called in the finally block
-        mock_provisioner.destroy.assert_called_once_with(mock_sandbox)
+        # pause should be called in the finally block
+        mock_provisioner.pause.assert_called_once_with(mock_sandbox)
 
     @pytest.mark.asyncio
     async def test_build_graph_receives_sandbox_and_injected_files(self):
