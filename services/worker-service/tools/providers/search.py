@@ -42,8 +42,13 @@ class DuckDuckGoSearchProvider:
 
     async def search(self, query: str, max_results: int) -> Sequence[SearchResult]:
         try:
-            results = await asyncio.to_thread(self._search_sync, query, max_results)
+            results = await asyncio.wait_for(
+                asyncio.to_thread(self._search_sync, query, max_results),
+                timeout=self._timeout_seconds,
+            )
             return results
+        except asyncio.TimeoutError as exc:
+            raise ToolTransportError("Search request timed out.") from exc
         except Exception as exc:
             raise ToolTransportError(f"DuckDuckGo search failed: {str(exc)}") from exc
 

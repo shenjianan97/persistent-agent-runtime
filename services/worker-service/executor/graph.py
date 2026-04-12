@@ -871,6 +871,8 @@ class GraphExecutor:
                             error_code="sandbox_lost",
                         )
                         return
+                    # Files already present in sandbox from prior run; do not overwrite.
+                    injected_files = []
                 else:
                     # Fresh provision
                     template = sandbox_config.get("template", "base")
@@ -918,10 +920,11 @@ class GraphExecutor:
                         },
                     )
 
-                sandbox_start_time = time.monotonic()
+                    # Inject input files only on fresh provision; on crash recovery
+                    # the sandbox already has the files (possibly modified by the agent).
+                    injected_files = await self._inject_input_files(sandbox, task_id, tenant_id)
 
-                # Inject input files into sandbox
-                injected_files = await self._inject_input_files(sandbox, task_id, tenant_id)
+                sandbox_start_time = time.monotonic()
 
             # 2. Init checkpointer
             checkpointer = PostgresDurableCheckpointer(

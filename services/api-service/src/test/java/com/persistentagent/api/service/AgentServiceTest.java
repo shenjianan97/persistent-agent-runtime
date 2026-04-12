@@ -48,7 +48,7 @@ class AgentServiceTest {
         objectMapper = new ObjectMapper();
         objectMapper.registerModule(new JavaTimeModule());
         objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
-        agentService = new AgentService(agentRepository, configValidationHelper, objectMapper);
+        agentService = new AgentService(agentRepository, configValidationHelper, objectMapper, true);
     }
 
     // --- createAgent tests ---

@@ -14,6 +14,7 @@ import com.persistentagent.api.model.response.AgentSummaryResponse;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -32,13 +33,16 @@ public class AgentService {
     private final AgentRepository agentRepository;
     private final ConfigValidationHelper configValidationHelper;
     private final ObjectMapper objectMapper;
+    private final boolean devTaskControlsEnabled;
 
     public AgentService(AgentRepository agentRepository,
             ConfigValidationHelper configValidationHelper,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.agentRepository = agentRepository;
         this.configValidationHelper = configValidationHelper;
         this.objectMapper = objectMapper;
+        this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
     @Transactional
@@ -182,6 +186,17 @@ public class AgentService {
                 ValidationConstants.BASE_PLATFORM_TOOLS);
         if (sandboxEnabled) {
             canonicalizedTools.addAll(ValidationConstants.SANDBOX_TOOLS);
+        }
+        // Preserve dev-only tools explicitly requested by the caller (e.g. dev_sleep)
+        // when dev task controls are enabled. These are not added by default to avoid
+        // confusing production agents.
+        if (devTaskControlsEnabled && config.allowedTools() != null) {
+            for (String tool : config.allowedTools()) {
+                if (ValidationConstants.DEV_TASK_CONTROL_TOOLS.contains(tool)
+                        && !canonicalizedTools.contains(tool)) {
+                    canonicalizedTools.add(tool);
+                }
+            }
         }
 
         return new AgentConfigRequest(
