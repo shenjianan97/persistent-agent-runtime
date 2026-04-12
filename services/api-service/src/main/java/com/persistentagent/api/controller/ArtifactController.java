@@ -40,8 +40,14 @@ public class ArtifactController {
         ArtifactMetadata metadata = download.metadata();
         InputStreamResource resource = new InputStreamResource(download.stream());
 
+        // Always include charset=utf-8 for text types since upload_artifact encodes as UTF-8
+        String contentType = metadata.contentType();
+        if (contentType.startsWith("text/") && !contentType.contains("charset")) {
+            contentType = contentType + "; charset=utf-8";
+        }
+
         return ResponseEntity.ok()
-                .contentType(MediaType.parseMediaType(metadata.contentType()))
+                .contentType(MediaType.parseMediaType(contentType))
                 .contentLength(metadata.sizeBytes())
                 .header(HttpHeaders.CONTENT_DISPOSITION,
                         "attachment; filename=\"" + metadata.filename() + "\"")
