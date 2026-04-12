@@ -1032,6 +1032,27 @@ class GraphExecutor:
                                                         if session_manager is not None:
                                                             await session_manager.close("paused")
                                                             session_manager = None  # Prevent double-close in finally
+                                                        # Record sandbox cost before pausing
+                                                        if sandbox is not None and sandbox_start_time is not None:
+                                                            elapsed = time.monotonic() - sandbox_start_time
+                                                            pause_sandbox_cost = int(
+                                                                elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                                                            )
+                                                            if pause_sandbox_cost > 0:
+                                                                try:
+                                                                    async with self.pool.acquire() as sc_conn:
+                                                                        await sc_conn.execute(
+                                                                            """INSERT INTO agent_cost_ledger
+                                                                               (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                                                               VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                                                            tenant_id, agent_id, task_id, pause_sandbox_cost,
+                                                                        )
+                                                                except Exception:
+                                                                    logger.warning(
+                                                                        "sandbox_cost_recording_failed_on_budget_pause",
+                                                                        extra={"task_id": task_id},
+                                                                        exc_info=True,
+                                                                    )
                                                         # Pause sandbox before releasing lease on budget pause
                                                         if sandbox is not None and provisioner is not None:
                                                             await provisioner.pause(sandbox)
@@ -1073,6 +1094,27 @@ class GraphExecutor:
                             if session_manager is not None:
                                 await session_manager.close("paused")
                                 session_manager = None  # Prevent double-close in finally
+                            # Record sandbox cost before pausing
+                            if sandbox is not None and sandbox_start_time is not None:
+                                elapsed = time.monotonic() - sandbox_start_time
+                                hitl_sandbox_cost = int(
+                                    elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                                )
+                                if hitl_sandbox_cost > 0:
+                                    try:
+                                        async with self.pool.acquire() as sc_conn:
+                                            await sc_conn.execute(
+                                                """INSERT INTO agent_cost_ledger
+                                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                                   VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                                tenant_id, agent_id, task_id, hitl_sandbox_cost,
+                                            )
+                                    except Exception:
+                                        logger.warning(
+                                            "sandbox_cost_recording_failed_on_hitl_pause",
+                                            extra={"task_id": task_id},
+                                            exc_info=True,
+                                        )
                             # Pause sandbox before releasing lease on HITL pause
                             if sandbox is not None and provisioner is not None:
                                 await provisioner.pause(sandbox)
@@ -1118,6 +1160,19 @@ class GraphExecutor:
                                     agent_id,
                                     task_id,
                                     sandbox_cost_microdollars,
+                                )
+                                # Also roll sandbox cost into the last checkpoint so that
+                                # total_cost_microdollars (summed from checkpoints by the API) includes it.
+                                await cost_conn.execute(
+                                    """UPDATE checkpoints
+                                       SET cost_microdollars = cost_microdollars + $1
+                                       WHERE checkpoint_id = (
+                                           SELECT checkpoint_id FROM checkpoints
+                                           WHERE task_id = $2::uuid AND checkpoint_ns = ''
+                                           ORDER BY created_at DESC LIMIT 1
+                                       )""",
+                                    sandbox_cost_microdollars,
+                                    task_id,
                                 )
                         except Exception:
                             logger.warning(
@@ -1237,6 +1292,13 @@ class GraphExecutor:
                     await provisioner.destroy(sandbox)
                 except Exception:
                     logger.warning("Sandbox destroy failed for task %s in finally block", task_id, exc_info=True)
+                try:
+                    async with self.pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE tasks SET sandbox_id = NULL WHERE task_id = $1::uuid", task_id
+                        )
+                except Exception:
+                    logger.warning("sandbox_id_clear_failed_in_finally", extra={"task_id": task_id}, exc_info=True)
 
     def _build_runnable_config(
         self,

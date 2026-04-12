@@ -11,7 +11,7 @@ DEFAULT_CONFIG = {
     "provider": "anthropic",
     "model": "claude-sonnet-4-6",
     "temperature": 0.5,
-    "allowed_tools": ["calculator"],
+    "allowed_tools": ["web_search"],
 }
 
 
