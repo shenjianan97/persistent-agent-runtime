@@ -209,6 +209,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
@@ -288,6 +289,25 @@ public class S3StorageService {
 
         s3Client.putObject(request, software.amazon.awssdk.core.sync.RequestBody.fromBytes(data));
         logger.info("S3 upload completed: bucket={}, key={}, size={}", bucketName, s3Key, data.length);
+    }
+
+    /**
+     * Deletes an object from S3. Best-effort — logs but does not throw on failure.
+     * Used by Track 2 for cleaning up orphaned S3 objects when DB writes fail
+     * after files have already been uploaded.
+     */
+    public void delete(String s3Key) {
+        try {
+            DeleteObjectRequest request = DeleteObjectRequest.builder()
+                    .bucket(bucketName)
+                    .key(s3Key)
+                    .build();
+            s3Client.deleteObject(request);
+            logger.info("S3 delete completed: bucket={}, key={}", bucketName, s3Key);
+        } catch (Exception e) {
+            logger.warn("S3 delete failed (best-effort): bucket={}, key={}, error={}",
+                    bucketName, s3Key, e.getMessage());
+        }
     }
 }
 ```

@@ -92,24 +92,30 @@ import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.multipart.MultipartFile;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.Validator;
+import jakarta.validation.ConstraintViolation;
 
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 ```
 
-Add a new field and constructor parameter:
+Add new fields and constructor parameters:
 
 ```java
     private final ObjectMapper objectMapper;
+    private final Validator validator;
 
     public TaskController(TaskService taskService, TaskEventService taskEventService,
-                          ObjectMapper objectMapper) {
+                          ObjectMapper objectMapper, Validator validator) {
         this.taskService = taskService;
         this.taskEventService = taskEventService;
         this.objectMapper = objectMapper;
+        this.validator = validator;
     }
 ```
 
-Add the multipart endpoint:
+Add the multipart endpoint. Note: since the `task_request` JSON part is deserialized manually (not via `@Valid @RequestBody`), we must programmatically run Bean Validation to enforce the same constraints as the JSON endpoint:
 
 ```java
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -118,6 +124,17 @@ Add the multipart endpoint:
             @RequestPart(value = "files", required = false) List<MultipartFile> files) {
         try {
             TaskSubmissionRequest request = objectMapper.readValue(taskRequestJson, TaskSubmissionRequest.class);
+
+            // Programmatically validate — the JSON endpoint gets this for free via @Valid,
+            // but manual deserialization skips it. This ensures identical validation behavior.
+            Set<ConstraintViolation<TaskSubmissionRequest>> violations = validator.validate(request);
+            if (!violations.isEmpty()) {
+                String errors = violations.stream()
+                        .map(v -> v.getPropertyPath() + ": " + v.getMessage())
+                        .collect(Collectors.joining(", "));
+                throw new com.persistentagent.api.exception.ValidationException(errors);
+            }
+
             TaskSubmissionResponse response = taskService.submitTaskWithFiles(request, files);
             return ResponseEntity.status(HttpStatus.CREATED).body(response);
         } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
@@ -173,29 +190,46 @@ Add the new method:
                         + "Agent '" + request.agentId() + "' does not have sandbox.enabled: true.");
             }
 
-            // Upload each file to S3 and record as input artifact
-            for (MultipartFile file : files) {
-                String filename = file.getOriginalFilename();
-                if (filename == null || filename.isBlank()) {
-                    filename = "unnamed_file";
-                }
+            // Upload each file to S3 and record as input artifact.
+            // Track uploaded S3 keys so we can clean up orphans if a later step fails
+            // (DB rolls back on exception but S3 writes do not).
+            List<String> uploadedS3Keys = new java.util.ArrayList<>();
+            try {
+                for (MultipartFile file : files) {
+                    String filename = file.getOriginalFilename();
+                    if (filename == null || filename.isBlank()) {
+                        filename = "unnamed_file";
+                    }
 
-                String s3Key = tenantId + "/" + taskId + "/input/" + filename;
-                String contentType = file.getContentType();
-                if (contentType == null || contentType.isBlank()) {
-                    contentType = "application/octet-stream";
-                }
+                    String s3Key = tenantId + "/" + taskId + "/input/" + filename;
+                    String contentType = file.getContentType();
+                    if (contentType == null || contentType.isBlank()) {
+                        contentType = "application/octet-stream";
+                    }
 
-                try {
-                    byte[] data = file.getBytes();
-                    s3StorageService.upload(s3Key, data, contentType);
-                    artifactRepository.insert(
-                            taskId, tenantId, filename, "input",
-                            contentType, data.length, s3Key);
-                } catch (IOException e) {
-                    throw new RuntimeException(
-                            "Failed to read uploaded file: " + filename, e);
+                    try {
+                        byte[] data = file.getBytes();
+                        s3StorageService.upload(s3Key, data, contentType);
+                        uploadedS3Keys.add(s3Key);
+                        artifactRepository.insert(
+                                taskId, tenantId, filename, "input",
+                                contentType, data.length, s3Key);
+                    } catch (IOException e) {
+                        throw new RuntimeException(
+                                "Failed to read uploaded file: " + filename, e);
+                    }
                 }
+            } catch (Exception e) {
+                // Best-effort cleanup: delete any S3 objects already uploaded.
+                // The DB transaction will roll back automatically, but S3 is not transactional.
+                for (String orphanKey : uploadedS3Keys) {
+                    try {
+                        s3StorageService.delete(orphanKey);
+                    } catch (Exception cleanupEx) {
+                        // Log but don't mask the original exception
+                    }
+                }
+                throw e;
             }
         }
 
