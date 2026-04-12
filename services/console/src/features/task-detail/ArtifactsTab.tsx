@@ -25,7 +25,12 @@ export function ArtifactsTab({ taskId, artifacts }: ArtifactsTabProps) {
 
     const handleDownload = (filename: string, direction: string) => {
         const url = api.getArtifactDownloadUrl(taskId, filename, direction);
-        window.open(url, '_blank');
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
     };
 
     return (
