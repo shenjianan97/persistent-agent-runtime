@@ -32,6 +32,14 @@ When starting a new phase (e.g., Phase 3), follow this order:
 2. **Design second** → Create `docs/design-docs/phase-3/design.md` as the primary design doc
 3. **Plan third** → Create `docs/exec-plans/active/phase-3/` with plan.md, progress.md, and agent_tasks/
 4. **Execute** → Implement per the task specs in agent_tasks/
+
+### Task spec detail level
+
+Task specs in `agent_tasks/` define **what** to build, not **how** to build it. They are contracts, not implementation blueprints.
+
+**Include:** inputs, outputs, API contracts, schema changes, affected files, dependency graph, constraints (what NOT to do), existing code to reference as patterns, and acceptance criteria as observable behaviors.
+
+**Do NOT include:** full source code, copy-paste SQL/Java/Python/TypeScript blocks, or line-by-line implementation. The implementing agent should read existing code, understand patterns, and write the implementation itself. Over-specified plans produce copy-paste work that misses integration bugs and becomes stale if the codebase evolves.
 5. **Archive** → When done, move `docs/exec-plans/active/phase-3/` → `docs/exec-plans/completed/phase-3/`
 6. **Update status** → Update [STATUS.md](./STATUS.md) to reflect the phase/track state
 
@@ -69,6 +77,7 @@ See [STATUS.md](./STATUS.md) for phase-level tracking and links to each track's 
 - The `Makefile` has wrapper targets for setup and testing (`make init`, `make install`, `make test`, `make start`, `make stop`, `make status`). Use these as the primary entry point.
 - When validating background `Makefile` targets (`make start`, `make status`, `make stop`), prefer an interactive shell / PTY.
 - **Python:** Always use the worker virtualenv at `services/worker-service/.venv/`. Run Python commands via `services/worker-service/.venv/bin/python` or activate with `source services/worker-service/.venv/bin/activate`. Do NOT use bare `python3` or `uv run` — the venv has all dependencies pinned.
+- **Test isolation:** All tests (worker integration, E2E) use a dedicated test database on port **55433** (`par-e2e-postgres`), never the local dev database on port 55432. This is enforced by `make worker-test` (passes `E2E_DB_DSN`) and `make e2e-test` (passes `E2E_DB_*` vars). Do NOT add tests that default to the dev DB — they will corrupt local development data.
 
 ## Testing (Mandatory)
 
@@ -79,12 +88,16 @@ See [STATUS.md](./STATUS.md) for phase-level tracking and links to each track's 
 - `make e2e-test` — E2E on isolated infra. **Required after DB/schema or cross-service changes.**
 - `make test-all` — both combined.
 - Run the **narrowest scope** that covers your change. If tests fail — including pre-existing failures — fix them before moving on.
+- **CI maintenance:** When adding database migrations, new service containers, or infrastructure dependencies, verify `.github/workflows/ci.yml` picks them up. Migrations use a glob pattern (`[0-9][0-9][0-9][0-9]_*.sql`) so new migrations are auto-applied, but new services (e.g., LocalStack) must be added as CI service containers manually.
 
-### Browser Verification (Console Changes)
+### Browser Verification (Console Changes) — BLOCKING
 
-After any change that affects the Console UI, verify it works in an actual browser using Playwright MCP tools (`browser_navigate`, `browser_snapshot`, `browser_click`, etc.). See [CONSOLE_BROWSER_TESTING.md](./docs/CONSOLE_BROWSER_TESTING.md) for standard scenarios and the scenario-selection matrix.
+**Console changes are not done until verified in a real browser.** This is a blocking gate, not a suggestion. Unit tests with mocked data cannot catch cross-origin issues, encoding problems, stale data display, or broken download flows. Skip this and users will find the bugs instead.
 
-- **Prerequisites:** `make start` must be running (Console at `localhost:5173`, API at `localhost:8080`)
-- Run **Scenario 1** (Navigation Smoke Test) for all console changes, plus any scenario that covers the feature you changed
-- If you implement a new UI feature not covered by existing scenarios, **add a new scenario** to the doc before marking work as done
-- Browser verification is complementary to unit tests (`make test`), not a replacement
+After any change that affects the Console UI, verify it works using Playwright MCP tools (`browser_navigate`, `browser_snapshot`, `browser_click`, etc.). See [CONSOLE_BROWSER_TESTING.md](./docs/CONSOLE_BROWSER_TESTING.md) for standard scenarios and the scenario-selection matrix.
+
+1. **Start the stack:** `make start` must be running (Console at `localhost:5173`, API at `localhost:8080`)
+2. **Run Scenario 1** (Navigation Smoke Test) for all console changes
+3. **Run the feature scenario** that covers the UI you changed — exercise the actual user flow end-to-end (submit data, wait for results, click buttons, verify downloads work)
+4. **New features:** If your change adds UI not covered by existing scenarios, **add a new scenario** to the doc
+5. **Mark done only after browser verification passes** — do not commit or create a PR with untested Console UI
