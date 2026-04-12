@@ -323,15 +323,50 @@ The API service (Java/Spring Boot) needs these changes:
 - Toggle for `enabled`, fields for `template`, `vcpu`, `memory_mb`, `timeout_seconds`
 - Sensible defaults pre-filled (2 vCPU, 2048 MB, 3600s)
 
-## Implementation Priority
+## Implementation Tracks
 
-```
-1. Artifact storage — LocalStack setup + S3 client + API endpoints
-2. File input — multipart task submission, files stored as input artifacts
-3. E2B integration — sandbox lifecycle + built-in tools + artifact upload on completion
-```
+Implementation is split into two sequential tracks. Track 2 depends on Track 1.
 
-These are sequential: artifact storage is the foundation that file input and sandbox output both depend on.
+### Track 1 — Output Artifact Storage
+
+Delivers end-to-end output artifact support: agents can produce files via `upload_artifact`, users can list and download them. Establishes the S3/LocalStack infrastructure and `task_artifacts` schema that Track 2 builds on.
+
+| # | Task | Service | Description |
+|---|------|---------|-------------|
+| 1 | DB migration | Database | `task_artifacts` table |
+| 2 | LocalStack Docker setup | Infrastructure | S3 emulation + bucket init |
+| 3 | Worker S3 client | Worker | boto3 upload/download/delete wrapper |
+| 4 | API artifact repository + S3 service | API | JDBC queries for `task_artifacts`, S3 client |
+| 5 | API artifact endpoints | API | `GET /v1/tasks/{id}/artifacts`, `GET /v1/tasks/{id}/artifacts/{filename}` |
+| 6 | `upload_artifact` built-in tool | Worker | Agent produces output artifacts (works without sandbox) |
+| 7 | Console: artifacts tab | Console | Artifact list + download in task detail view |
+| 8 | Integration tests | Cross-service | End-to-end output artifact flow |
+
+**Exec plan:** `docs/exec-plans/active/agent-capabilities/track-1/`
+
+### Track 2 — E2B Sandbox & File Input
+
+Delivers sandbox code execution and file input. Agents can receive files, execute code, and produce artifacts from sandbox. Depends on Track 1 for S3 infrastructure and artifact storage.
+
+| # | Task | Service | Description |
+|---|------|---------|-------------|
+| 1 | DB migration + agent sandbox config | Database + API | `sandbox_id` column, `dead_letter_reason` extension, sandbox config validation |
+| 2 | E2B SDK + sandbox provisioner + lifecycle | Worker | Provision, pause, resume, destroy sandbox |
+| 3 | `sandbox_exec` tool | Worker | Shell command execution in sandbox |
+| 4 | `sandbox_read_file` + `sandbox_write_file` tools | Worker | File I/O in sandbox |
+| 5 | `sandbox_download` tool | Worker | Sandbox file → S3 output artifact |
+| 6 | Multipart task submission + input file injection | API + Worker | File upload on submit, inject into sandbox |
+| 7 | Crash recovery + sandbox cost tracking | Worker | Reconnect by sandbox_id, cost integration |
+| 8 | Console: file attachment + sandbox config | Console | File upload on submit, sandbox config in agent form |
+| 9 | Integration tests | Cross-service | End-to-end sandbox + file input flow |
+
+**Exec plan:** `docs/exec-plans/active/agent-capabilities/track-2/`
+
+### Track sequencing
+
+Track 1 is self-contained — when complete, agents can produce output artifacts and users can download them. No sandbox concepts leak into Track 1.
+
+Track 2 adds sandbox and file input. It uses Track 1's S3 client for `sandbox_download` and artifact storage for input file injection. The `sandbox_id` column, `dead_letter_reason` extension, sandbox agent config, multipart submission, and file attachment UI all live in Track 2.
 
 ## Dependencies
 
