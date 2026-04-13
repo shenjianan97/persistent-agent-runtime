@@ -6,7 +6,7 @@ from unittest.mock import ANY, AsyncMock, patch, MagicMock
 from core.worker import WorkerService
 from core.config import WorkerConfig
 from executor.graph import GraphExecutor, _handle_tool_error
-from executor.mcp_session import McpConnectionError
+from executor.mcp_session import McpConnectionError, McpToolCallError
 from executor.schema_converter import MAX_TOOLS_PER_AGENT
 from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
@@ -832,6 +832,12 @@ def test_handle_tool_error_returns_message_for_generic_exception():
     """Generic exceptions during tool execution are sent back to the LLM."""
     result = _handle_tool_error(Exception("something unexpected"))
     assert "something unexpected" in result
+
+
+def test_handle_tool_error_reraises_mcp_tool_call_errors():
+    """MCP tool call failures (timeouts, network) propagate for task-level retry."""
+    with pytest.raises(McpToolCallError):
+        _handle_tool_error(McpToolCallError("my-server", "my-tool", "timeout"))
 
 
 # ─── _get_retry_after tests ─────────────────────────────────────────────────

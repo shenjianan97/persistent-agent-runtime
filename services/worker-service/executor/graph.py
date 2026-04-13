@@ -65,6 +65,7 @@ from tools.sandbox_tools import (
     create_sandbox_download_fn,
 )
 from tools.errors import ToolExecutionError, ToolTransportError
+from executor.mcp_session import McpToolCallError
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ logger = logging.getLogger(__name__)
 def _handle_tool_error(e: Exception) -> str:
     """Route tool errors: re-raise infra failures for task-level retry,
     return user-fixable errors as messages so the LLM can self-correct."""
-    if isinstance(e, ToolTransportError):
+    if isinstance(e, (ToolTransportError, McpToolCallError)):
         raise e
     return f"Error: {e}\nPlease fix the error and try again."
 
@@ -1465,7 +1466,7 @@ class GraphExecutor:
             return True
         # Fallback: string heuristics for wrapped/unknown providers
         error_str = str(e).lower()
-        if "rate limit" in error_str or "rate exceeded" in error_str:
+        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         return False
 
