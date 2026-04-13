@@ -5,13 +5,13 @@ from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 from core.worker import WorkerService
 from core.config import WorkerConfig
-from executor.graph import GraphExecutor
-from executor.mcp_session import McpConnectionError
+from executor.graph import GraphExecutor, _handle_tool_error
+from executor.mcp_session import McpConnectionError, McpToolCallError
 from executor.schema_converter import MAX_TOOLS_PER_AGENT
 from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
-from tools.errors import ToolExecutionError, ToolTransportError
+from tools.errors import ToolExecutionError, ToolInputError, ToolTransportError
 from sandbox.provisioner import SandboxProvisionError, SandboxConnectionError
 
 
@@ -157,7 +157,26 @@ async def test_build_graph_configures_tool_node_for_expected_tool_errors(mock_wo
             )
 
     _, kwargs = MockToolNode.call_args
-    assert kwargs["handle_tool_errors"] is ToolExecutionError
+    assert kwargs["handle_tool_errors"] is _handle_tool_error
+
+
+def test_handle_tool_error_returns_message_for_validation_errors():
+    """Validation errors (e.g. missing tool args) are fed back to the LLM."""
+    result = _handle_tool_error(ValueError("content: Field required"))
+    assert "Field required" in result
+    assert "fix the error" in result.lower()
+
+
+def test_handle_tool_error_reraises_transport_errors():
+    """Infrastructure errors propagate for task-level retry."""
+    with pytest.raises(ToolTransportError):
+        _handle_tool_error(ToolTransportError("S3 unreachable"))
+
+
+def test_handle_tool_error_returns_message_for_tool_execution_errors():
+    """Non-transport ToolExecutionError is recoverable by the LLM."""
+    result = _handle_tool_error(ToolExecutionError("invalid file path"))
+    assert "invalid file path" in result
 
 
 @pytest.mark.asyncio
@@ -753,6 +772,232 @@ def test_real_validation_errors_are_not_retryable(mock_worker):
     assert executor._is_retryable_error(ValueError("pydantic validation error")) is False
     assert executor._is_retryable_error(ValueError("invalid schema property")) is False
     assert executor._is_retryable_error(ValueError("unsupported model")) is False
+
+
+def _make_api_error(status_code: int, message: str = "error") -> Exception:
+    """Create a fake provider exception with a status_code, wrapped by LangChain."""
+    class FakeAPIStatusError(Exception):
+        pass
+    inner = FakeAPIStatusError(message)
+    inner.status_code = status_code
+    outer = Exception(f"Error code: {status_code} - {message}")
+    outer.__cause__ = inner
+    return outer
+
+
+def test_extract_status_code_from_cause_chain(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    assert executor._extract_status_code(_make_api_error(429)) == 429
+    assert executor._extract_status_code(_make_api_error(400)) == 400
+    assert executor._extract_status_code(_make_api_error(500)) == 500
+    assert executor._extract_status_code(ValueError("no status code")) is None
+
+
+def test_retryable_by_status_code(mock_worker):
+    """Status codes from provider exceptions take precedence over string heuristics."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    # Retryable status codes
+    for code in [429, 500, 502, 503, 504, 529]:
+        assert executor._is_retryable_error(_make_api_error(code)) is True, f"{code} should be retryable"
+    # Non-retryable status codes
+    for code in [400, 401, 403, 404, 422]:
+        assert executor._is_retryable_error(_make_api_error(code)) is False, f"{code} should not be retryable"
+
+
+def test_rate_limit_by_status_code(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    assert executor._is_rate_limit_error(_make_api_error(429)) is True
+    assert executor._is_rate_limit_error(_make_api_error(400)) is False
+    assert executor._is_rate_limit_error(_make_api_error(500)) is False
+
+
+def test_out_of_credits_is_not_retryable(mock_worker):
+    """Anthropic out-of-credits returns 400 — must not retry."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = _make_api_error(400, "Your credit balance is too low to access the Anthropic API")
+    assert executor._is_retryable_error(err) is False
+    assert executor._is_rate_limit_error(err) is False
+
+
+# ─── _handle_tool_error edge cases ──────────────────────────────────────────
+
+
+def test_handle_tool_error_returns_message_for_tool_input_error():
+    """ToolInputError (tool-specific validation) is recoverable by the LLM."""
+    result = _handle_tool_error(ToolInputError("filename must end with .py"))
+    assert "filename must end with .py" in result
+
+
+def test_handle_tool_error_returns_message_for_generic_exception():
+    """Generic exceptions during tool execution are sent back to the LLM."""
+    result = _handle_tool_error(Exception("something unexpected"))
+    assert "something unexpected" in result
+
+
+def test_handle_tool_error_reraises_mcp_tool_call_errors():
+    """MCP tool call failures (timeouts, network) propagate for task-level retry."""
+    with pytest.raises(McpToolCallError):
+        _handle_tool_error(McpToolCallError("my-server", "my-tool", "timeout"))
+
+
+# ─── _get_retry_after tests ─────────────────────────────────────────────────
+
+
+def _make_api_error_with_retry_after(retry_after_value: str) -> Exception:
+    """Create a fake provider exception with a response carrying a Retry-After header."""
+    class FakeResponse:
+        headers = {"retry-after": retry_after_value}
+    class FakeAPIError(Exception):
+        pass
+    inner = FakeAPIError("rate limited")
+    inner.response = FakeResponse()
+    outer = Exception("Error code: 429")
+    outer.__cause__ = inner
+    return outer
+
+
+def test_get_retry_after_extracts_header(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = _make_api_error_with_retry_after("30")
+    assert executor._get_retry_after(err) == 30.0
+
+
+def test_get_retry_after_handles_float_header(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = _make_api_error_with_retry_after("2.5")
+    assert executor._get_retry_after(err) == 2.5
+
+
+def test_get_retry_after_returns_none_for_invalid_header(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = _make_api_error_with_retry_after("not-a-number")
+    assert executor._get_retry_after(err) is None
+
+
+def test_get_retry_after_returns_none_when_no_response(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    assert executor._get_retry_after(ValueError("plain error")) is None
+
+
+# ─── String fallback tests (no status_code) ─────────────────────────────────
+
+
+def test_retryable_string_fallback_without_status_code(mock_worker):
+    """When no status_code is available, string heuristics still work."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    # These are plain exceptions — no __cause__ with status_code
+    assert executor._is_retryable_error(Exception("502 Bad Gateway")) is True
+    assert executor._is_retryable_error(Exception("503 Service Unavailable")) is True
+    assert executor._is_retryable_error(Exception("504 Gateway Timeout")) is True
+    assert executor._is_retryable_error(Exception("rate limit exceeded")) is True
+
+
+def test_non_retryable_string_fallback_without_status_code(mock_worker):
+    """Plain exceptions with 4xx messages are non-retryable via fallback."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    assert executor._is_retryable_error(Exception("401 Unauthorized")) is False
+    assert executor._is_retryable_error(Exception("403 Forbidden")) is False
+
+
+def test_rate_limit_string_fallback_without_status_code(mock_worker):
+    """_is_rate_limit_error falls back to string matching without status_code."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    assert executor._is_rate_limit_error(Exception("rate limit exceeded")) is True
+    assert executor._is_rate_limit_error(Exception("rate exceeded for model")) is True
+    assert executor._is_rate_limit_error(Exception("something else")) is False
+
+
+# ─── _extract_status_code edge cases ────────────────────────────────────────
+
+
+def test_extract_status_code_ignores_non_int_status_code(mock_worker):
+    """Non-integer status_code attributes are ignored."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = Exception("error")
+    err.status_code = "not-an-int"
+    assert executor._extract_status_code(err) is None
+
+
+def test_extract_status_code_deeply_nested(mock_worker):
+    """Status code found multiple levels deep in the cause chain."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    inner = Exception("root cause")
+    inner.status_code = 503
+    mid = Exception("wrapped")
+    mid.__cause__ = inner
+    outer = Exception("top level")
+    outer.__cause__ = mid
+    assert executor._extract_status_code(outer) == 503
+
+
+# ─── providers.py tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_llm_passes_retry_and_timeout():
+    """Verify max_retries=0 and timeout=300 are passed to init_chat_model."""
+    with patch("executor.providers.init_chat_model") as mock_init:
+        mock_init.return_value = MagicMock()
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value="fake-api-key")
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = mock_cm
+
+        from executor.providers import create_llm
+        await create_llm(mock_pool, "anthropic", "claude-3-5-sonnet-latest", 0.5)
+
+        mock_init.assert_called_once_with(
+            model="claude-3-5-sonnet-latest",
+            model_provider="anthropic",
+            temperature=0.5,
+            api_key="fake-api-key",
+            max_retries=0,
+            timeout=300,
+        )
+
+
+# ─── durability="sync" test ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_astream_called_with_sync_durability(mock_worker, task_data):
+    """Verify astream is called with durability='sync' to prevent checkpoint race."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = MagicMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            astream_kwargs_capture = {}
+
+            async def mock_astream(*args, **kwargs):
+                astream_kwargs_capture.update(kwargs)
+                return
+                yield  # make it an async generator
+
+            mock_compiled.astream = mock_astream
+
+            mock_state = MagicMock()
+            mock_state.values = {"messages": [MagicMock(content="done")]}
+            mock_state.tasks = []
+            mock_compiled.aget_state = AsyncMock(return_value=mock_state)
+
+            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
+
+            assert astream_kwargs_capture.get("durability") == "sync"
 
 
 @pytest.mark.asyncio
