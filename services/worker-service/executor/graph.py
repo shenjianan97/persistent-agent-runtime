@@ -69,6 +69,14 @@ from tools.errors import ToolExecutionError, ToolTransportError
 logger = logging.getLogger(__name__)
 
 
+def _handle_tool_error(e: Exception) -> str:
+    """Route tool errors: re-raise infra failures for task-level retry,
+    return user-fixable errors as messages so the LLM can self-correct."""
+    if isinstance(e, ToolTransportError):
+        raise e
+    return f"Error: {e}\nPlease fix the error and try again."
+
+
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
@@ -451,7 +459,7 @@ class GraphExecutor:
 
         if tools:
             # LangGraph handles routing the LLM's ToolCall directly to our python functions
-            tool_node = ToolNode(tools, handle_tool_errors=ToolExecutionError)
+            tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
             workflow.add_conditional_edges("agent", tools_condition)
@@ -1010,7 +1018,9 @@ class GraphExecutor:
                 hourly_cost = 0
 
                 # Executing super-steps via astream
-                async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates"):
+                # durability="sync" ensures checkpoints are committed before astream
+                # yields, so the cost-ledger SELECT always finds the correct checkpoint_id.
+                async for event in compiled_graph.astream(initial_input, config=config, stream_mode="updates", durability="sync"):
                     # Step 6: Cancellation Awareness
                     if cancel_event.is_set():
                         logger.warning("Task %s cancelled or lease revoked during execution.", task_id)
@@ -1412,12 +1422,29 @@ class GraphExecutor:
             cancel_task.cancel()
             await asyncio.gather(cancel_task, return_exceptions=True)
 
-    def _get_retry_after(self, e: Exception) -> float | None:
-        """Extract retry-after seconds from the error's HTTP response headers."""
-        # Walk the exception chain to find an API error with a response
+    @staticmethod
+    def _walk_exception_chain(e: Exception):
+        """Yield each exception in the __cause__/__context__ chain (including e itself)."""
         current = e
         for _ in range(5):
-            resp = getattr(current, "response", None)
+            if current is None:
+                break
+            yield current
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+
+    def _extract_status_code(self, e: Exception) -> int | None:
+        """Walk the exception chain to find an HTTP status code.
+        Works with both anthropic.APIStatusError and openai.APIStatusError."""
+        for exc in self._walk_exception_chain(e):
+            code = getattr(exc, "status_code", None)
+            if isinstance(code, int):
+                return code
+        return None
+
+    def _get_retry_after(self, e: Exception) -> float | None:
+        """Extract retry-after seconds from the error's HTTP response headers."""
+        for exc in self._walk_exception_chain(e):
+            resp = getattr(exc, "response", None)
             if resp is not None:
                 retry_after = getattr(resp, "headers", {}).get("retry-after")
                 if retry_after:
@@ -1426,19 +1453,19 @@ class GraphExecutor:
                     except (ValueError, TypeError):
                         pass
                 return None
-            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
-            if current is None:
-                break
         return None
+
+    # Status codes that are safe to retry (transient server / rate-limit errors)
+    _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504, 529}
 
     def _is_rate_limit_error(self, e: Exception) -> bool:
         """Check if the exception is a rate limit error (429)."""
-        error_str = str(e).lower()
-        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
+        status = self._extract_status_code(e)
+        if status == 429:
             return True
-        # Check for Anthropic/OpenAI RateLimitError types
-        type_name = type(e).__name__
-        if "RateLimit" in type_name:
+        # Fallback: string heuristics for wrapped/unknown providers
+        error_str = str(e).lower()
+        if "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         return False
 
@@ -1450,24 +1477,24 @@ class GraphExecutor:
         if isinstance(e, (ConnectionError, TimeoutError)):
             return True
 
+        # Use HTTP status code from the provider exception if available
+        status = self._extract_status_code(e)
+        if status is not None:
+            return status in self._RETRYABLE_STATUS_CODES
+
+        # Fallback: string heuristics for errors without a status code
         error_str = str(e).lower()
 
-        # 429 and 5xx are retryable — checked before string heuristics to avoid
-        # false negatives (e.g. "invalid request rate exceeded" contains "invalid")
         if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         if re.search(r'\b50[0234]\b', error_str):
             return True
-
-        # Non-retryable validation and client errors
         if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
             return False
-
-        # 4xx HTTP responses (usually fatal)
         if re.search(r'\b40[0-4]\b', error_str):
             return False
 
-        # For Phase 1, default unknown exceptions to non-retryable
+        # Default unknown exceptions to non-retryable
         return False
 
     async def _check_budget_and_pause(

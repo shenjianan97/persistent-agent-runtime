@@ -23,5 +23,7 @@ async def create_llm(
         model=model_name,
         model_provider=provider,
         temperature=temperature,
-        api_key=api_key
+        api_key=api_key,
+        max_retries=0,
+        timeout=300,
     )
