@@ -190,7 +190,7 @@ export function SubmitTaskPage() {
                                                     <span className="text-foreground/80 whitespace-pre-wrap line-clamp-3">{selectedAgent.agent_config.system_prompt}</span>
                                                 </div>
                                                 {(() => {
-                                                    const autoManaged = new Set(['request_human_input', 'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'export_sandbox_file']);
+                                                    const autoManaged = new Set(['request_human_input', 'web_search', 'read_url', 'create_text_artifact', 'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'export_sandbox_file']);
                                                     const userTools = (selectedAgent.agent_config.allowed_tools ?? []).filter(t => !autoManaged.has(t));
                                                     return userTools.length > 0 ? (
                                                         <div className="md:col-span-2">

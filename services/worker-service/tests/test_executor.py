@@ -1221,6 +1221,14 @@ class TestInputFileInjection:
         with pytest.raises(RuntimeError, match="Failed to inject input file 'data.csv'"):
             await executor._inject_input_files(mock_sandbox, "task-abc", "t")
 
+    def test_platform_system_message_includes_current_date(self):
+        """Platform system message always includes today's date."""
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(["web_search"])
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        assert f"Today's date is {today}" in msg
+
     def test_platform_system_message_no_files_no_sandbox(self):
         """No files, no sandbox → only base tool instructions."""
         executor = _build_test_executor()

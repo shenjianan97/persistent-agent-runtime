@@ -684,6 +684,8 @@ class GraphExecutor:
         """
         sections = []
 
+        sections.append(f"Today's date is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}.")
+
         if "request_human_input" in allowed_tools:
             sections.append(
                 "You have access to a `request_human_input` tool. "
@@ -1048,8 +1050,15 @@ class GraphExecutor:
                         for ai_msg in event["agent"].get("messages", []):
                             if hasattr(ai_msg, 'response_metadata') and ai_msg.response_metadata:
                                 try:
+                                    # Merge usage_metadata from the message object into
+                                    # response_metadata so _extract_tokens can find it
+                                    # (Bedrock Converse puts tokens in usage_metadata on
+                                    # the message, not inside response_metadata).
+                                    resp_meta = dict(ai_msg.response_metadata)
+                                    if hasattr(ai_msg, 'usage_metadata') and ai_msg.usage_metadata:
+                                        resp_meta.setdefault("usage_metadata", ai_msg.usage_metadata)
                                     step_cost, execution_metadata = await self._calculate_step_cost(
-                                        ai_msg.response_metadata, model_name
+                                        resp_meta, model_name
                                     )
                                     async with self.pool.acquire() as cost_conn:
                                         checkpoint_id = await cost_conn.fetchval(
