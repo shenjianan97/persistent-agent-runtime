@@ -516,23 +516,27 @@ class GraphExecutor:
     async def _record_step_cost(
         self, conn, task_id: str, tenant_id: str, agent_id: str,
         checkpoint_id: str, cost_microdollars: int,
+        execution_metadata: dict | None = None,
     ) -> tuple:
         """Record step cost in a single transaction.
 
-        1. Update checkpoints.cost_microdollars for the given checkpoint_id
+        1. Update checkpoints.cost_microdollars and execution_metadata for the given checkpoint_id
         2. INSERT into agent_cost_ledger
         3. UPSERT agent_runtime_state.hour_window_cost_microdollars (increment)
         4. Return (cumulative_task_cost, hourly_window_cost)
         """
-        # 1. Update the checkpoint with the step cost
+        # 1. Update the checkpoint with the step cost and execution metadata
+        import json as _json
         await conn.execute(
             '''UPDATE checkpoints
-               SET cost_microdollars = $1
+               SET cost_microdollars = $1,
+                   execution_metadata = $4::jsonb
                WHERE checkpoint_id = $2
                  AND task_id = $3::uuid''',
             cost_microdollars,
             checkpoint_id,
             task_id,
+            _json.dumps(execution_metadata) if execution_metadata else None,
         )
 
         # 2. Insert into agent_cost_ledger
@@ -1059,7 +1063,8 @@ class GraphExecutor:
                                                 try:
                                                     async with cost_conn.transaction():
                                                         cumulative_task_cost, hourly_cost = await self._record_step_cost(
-                                                            cost_conn, task_id, tenant_id, agent_id, checkpoint_id, step_cost
+                                                            cost_conn, task_id, tenant_id, agent_id, checkpoint_id, step_cost,
+                                                            execution_metadata=execution_metadata,
                                                         )
                                                     logger.debug(
                                                         "Task %s step cost: %d microdollars (cumulative: %d, hourly: %d)",
