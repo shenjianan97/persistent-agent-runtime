@@ -24,6 +24,22 @@ PRICING_DEFAULTS = {
     "o1": {"input": 15_000_000, "output": 60_000_000},
     "o1-mini": {"input": 3_000_000, "output": 12_000_000},
     "o3-mini": {"input": 1_100_000, "output": 4_400_000},
+    # Bedrock (Anthropic models via Bedrock use the same pricing)
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 1_000_000, "output": 5_000_000},
+    "anthropic.claude-3-opus-20240229-v1:0": {"input": 15_000_000, "output": 75_000_000},
+    "anthropic.claude-3-7-sonnet-20250219-v1:0": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-sonnet-4-6": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 1_000_000, "output": 5_000_000},
+    "anthropic.claude-opus-4-20250514-v1:0": {"input": 15_000_000, "output": 75_000_000},
+    "anthropic.claude-opus-4-1-20250805-v1:0": {"input": 15_000_000, "output": 75_000_000},
+    "anthropic.claude-opus-4-5-20251101-v1:0": {"input": 15_000_000, "output": 75_000_000},
+    "anthropic.claude-opus-4-6-v1": {"input": 15_000_000, "output": 75_000_000},
+    "amazon.nova-pro-v1:0": {"input": 800_000, "output": 3_200_000},
+    "amazon.nova-lite-v1:0": {"input": 60_000, "output": 240_000},
+    "amazon.nova-micro-v1:0": {"input": 35_000, "output": 140_000},
 }
 
 GLOBAL_FALLBACK_PRICING = {"input": 15_000_000, "output": 75_000_000}
@@ -34,6 +50,7 @@ GLOBAL_FALLBACK_PRICING = {"input": 15_000_000, "output": 75_000_000}
 PRICING_FALLBACKS = {
     "anthropic": {"input": 15_000_000, "output": 75_000_000},
     "openai": {"input": 15_000_000, "output": 60_000_000},
+    "bedrock": {"input": 15_000_000, "output": 75_000_000},
 }
 
 LOCK_ID = 543210987
@@ -41,7 +58,11 @@ DB_CREDENTIALS_SECRET_ENV = "DB_CREDENTIALS_SECRET_ARN"
 PROVIDER_SOURCES = (
     ("anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_SECRET_ARN"),
     ("openai", "OPENAI_API_KEY", "OPENAI_API_KEY_SECRET_ARN"),
+    ("bedrock", "AWS_BEARER_TOKEN_BEDROCK", "AWS_BEARER_TOKEN_BEDROCK_SECRET_ARN"),
 )
+
+AWS_BEDROCK_REGION_ENV = "AWS_BEDROCK_REGION"
+AWS_BEDROCK_DEFAULT_REGION = "us-east-1"
 
 
 def resolve_model_pricing(provider_id, model_id):
@@ -201,11 +222,53 @@ def fetch_openai_models(api_key):
     return models
 
 
+def fetch_bedrock_models(api_key):
+    """Fetch available foundation models from AWS Bedrock using a bearer token (API key)."""
+    region = os.environ.get(AWS_BEDROCK_REGION_ENV, AWS_BEDROCK_DEFAULT_REGION)
+    print(f"[Discovery] Querying Bedrock models in {region}...")
+    url = f"https://bedrock.{region}.amazonaws.com/foundation-models"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    models = []
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            for m in data.get("modelSummaries", []):
+                model_id = m.get("modelId", "")
+                # Only include models that support on-demand or inference-profile invocation
+                inference_types = set(m.get("inferenceTypesSupported", []))
+                if not inference_types.intersection({"ON_DEMAND", "INFERENCE_PROFILE"}):
+                    continue
+                # Only include models that support the Converse API (used by ChatBedrockConverse)
+                if not m.get("converse"):
+                    continue
+                # Only include text-generating models
+                output_modalities = m.get("outputModalities", [])
+                if "TEXT" not in output_modalities:
+                    continue
+                display_name = m.get("modelName", model_id)
+                provider_name = m.get("providerName", "")
+                if provider_name:
+                    display_name = f"{provider_name} {display_name}"
+                models.append({"id": model_id, "display_name": display_name})
+    except HTTPError as e:
+        print(f"[Discovery] Failed to fetch Bedrock models: HTTP {e.code}")
+    except Exception as e:
+        print(f"[Discovery] Failed to fetch Bedrock models: {e}")
+    return models
+
+
 def _fetch_models(provider_id: str, api_key: str) -> list[dict[str, str]]:
     if provider_id == "anthropic":
         return fetch_anthropic_models(api_key)
     if provider_id == "openai":
         return fetch_openai_models(api_key)
+    if provider_id == "bedrock":
+        return fetch_bedrock_models(api_key)
     print(f"[Discovery] Skipping unsupported provider: {provider_id}")
     return []
 

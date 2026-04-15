@@ -173,9 +173,10 @@ export function AgentDetailPage() {
         setIsEditing(false);
     }
 
-    // Auto-managed tools are implied by sandbox/HITL config — don't clutter the overview
+    // Platform-managed tools are auto-added by the API — don't clutter the overview
     const AUTO_MANAGED_TOOLS = new Set([
         HUMAN_INPUT_TOOL_ID,
+        'web_search', 'read_url', 'create_text_artifact',
         'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'export_sandbox_file',
     ]);
     const toolLabels = (agent.agent_config.allowed_tools ?? [])

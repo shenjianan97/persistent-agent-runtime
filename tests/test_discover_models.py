@@ -30,9 +30,17 @@ def test_resolve_model_pricing_uses_provider_fallback_for_unknown_model():
     assert pricing == discover_models.PRICING_FALLBACKS["openai"]
 
 
-def test_resolve_model_pricing_uses_global_fallback_for_unknown_provider():
+def test_resolve_model_pricing_uses_provider_fallback_for_bedrock():
     discover_models = load_discover_models_module()
 
     pricing = discover_models.resolve_model_pricing("bedrock", "future-model")
+
+    assert pricing == discover_models.PRICING_FALLBACKS["bedrock"]
+
+
+def test_resolve_model_pricing_uses_global_fallback_for_unknown_provider():
+    discover_models = load_discover_models_module()
+
+    pricing = discover_models.resolve_model_pricing("some-unknown-provider", "some-model")
 
     assert pricing == discover_models.GLOBAL_FALLBACK_PRICING
