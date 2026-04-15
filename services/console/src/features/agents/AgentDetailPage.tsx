@@ -176,7 +176,7 @@ export function AgentDetailPage() {
     // Auto-managed tools are implied by sandbox/HITL config — don't clutter the overview
     const AUTO_MANAGED_TOOLS = new Set([
         HUMAN_INPUT_TOOL_ID,
-        'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'sandbox_download',
+        'sandbox_exec', 'sandbox_read_file', 'sandbox_write_file', 'export_sandbox_file',
     ]);
     const toolLabels = (agent.agent_config.allowed_tools ?? [])
         .filter(t => !AUTO_MANAGED_TOOLS.has(t))

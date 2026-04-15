@@ -15,7 +15,7 @@ from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
 from tools.providers.search import DuckDuckGoSearchProvider, SearchProvider, SearchResult
 from tools.read_url import ReadUrlFetcher
 from tools.runtime_logging import get_tools_logger
-from tools.upload_artifact import UploadArtifactArguments, UploadArtifactResult
+from tools.upload_artifact import CreateTextArtifactArguments, CreateTextArtifactResult
 from tools.sandbox_tools import (
     SandboxExecArguments,
     SandboxExecResult,
@@ -23,8 +23,8 @@ from tools.sandbox_tools import (
     SandboxReadFileResult,
     SandboxWriteFileArguments,
     SandboxWriteFileResult,
-    SandboxDownloadArguments,
-    SandboxDownloadResult,
+    ExportSandboxFileArguments,
+    ExportSandboxFileResult,
 )
 
 
@@ -183,11 +183,11 @@ DEV_SLEEP_TOOL = ToolDefinition(
     input_model=DevSleepArguments,
     output_model=DevSleepResult,
 )
-UPLOAD_ARTIFACT_TOOL = ToolDefinition(
-    name="upload_artifact",
-    description="Save content as an output artifact file. The file will be available for download via the API after task completion.",
-    input_model=UploadArtifactArguments,
-    output_model=UploadArtifactResult,
+CREATE_TEXT_ARTIFACT_TOOL = ToolDefinition(
+    name="create_text_artifact",
+    description="Create an output artifact from inline text content. The file will be available for download via the API after task completion. Only use this when you need to produce a file from content you composed — if a sandbox is available, write the file there and use export_sandbox_file instead.",
+    input_model=CreateTextArtifactArguments,
+    output_model=CreateTextArtifactResult,
 )
 SANDBOX_EXEC_TOOL = ToolDefinition(
     name="sandbox_exec",
@@ -207,11 +207,11 @@ SANDBOX_WRITE_FILE_TOOL = ToolDefinition(
     input_model=SandboxWriteFileArguments,
     output_model=SandboxWriteFileResult,
 )
-SANDBOX_DOWNLOAD_TOOL = ToolDefinition(
-    name="sandbox_download",
-    description="Download a file from the sandbox and save it as an output artifact. The file will be available via the task artifacts API.",
-    input_model=SandboxDownloadArguments,
-    output_model=SandboxDownloadResult,
+EXPORT_SANDBOX_FILE_TOOL = ToolDefinition(
+    name="export_sandbox_file",
+    description="Export a file from the sandbox and save it as an output artifact. The file will be available via the task artifacts API.",
+    input_model=ExportSandboxFileArguments,
+    output_model=ExportSandboxFileResult,
 )
 
 TOOL_DEFINITIONS = (WEB_SEARCH_TOOL, READ_URL_TOOL, CALCULATOR_TOOL)

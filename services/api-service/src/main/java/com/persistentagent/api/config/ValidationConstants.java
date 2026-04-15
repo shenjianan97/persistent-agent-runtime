@@ -19,16 +19,16 @@ public final class ValidationConstants {
 
     /** All valid tool names accepted by the API (for validation only). */
     public static final Set<String> ALLOWED_TOOLS = Set.of(
-            "web_search", "read_url", "request_human_input", "upload_artifact",
-            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download");
+            "web_search", "read_url", "request_human_input", "create_text_artifact",
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file");
 
     /** Platform tools auto-enabled for every agent. */
     public static final List<String> BASE_PLATFORM_TOOLS = List.of(
-            "web_search", "read_url", "upload_artifact", "request_human_input");
+            "web_search", "read_url", "create_text_artifact", "request_human_input");
 
     /** Sandbox tools auto-enabled when sandbox.enabled is true. */
     public static final List<String> SANDBOX_TOOLS = List.of(
-            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download");
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file");
 
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");

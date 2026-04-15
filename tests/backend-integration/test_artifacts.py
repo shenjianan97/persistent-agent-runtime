@@ -1,25 +1,25 @@
 """Integration tests for Track 1: Output Artifact Storage.
 
 Tests the end-to-end artifact flow:
-1. Agent calls upload_artifact tool during task execution
+1. Agent calls create_text_artifact tool during task execution
 2. Artifact metadata appears in list endpoint
 3. Artifact file can be downloaded with correct content
 """
 
 import pytest
 
-from helpers.mock_llm import upload_artifact_call, simple_response
+from helpers.mock_llm import create_text_artifact_call, simple_response
 
 
 @pytest.mark.asyncio
 async def test_upload_and_list_artifact(e2e):
-    """Agent uploads an artifact via upload_artifact tool.
+    """Agent uploads an artifact via create_text_artifact tool.
     Verify it appears in the artifact list endpoint."""
 
     artifact_content = "# Analysis Report\n\nThis is a test report.\n"
     artifact_filename = "report.md"
 
-    e2e.use_llm(upload_artifact_call(
+    e2e.use_llm(create_text_artifact_call(
         filename=artifact_filename,
         content=artifact_content,
         content_type="text/markdown",
@@ -32,7 +32,7 @@ async def test_upload_and_list_artifact(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["upload_artifact"],
+        "allowed_tools": ["create_text_artifact"],
     })
 
     task_id = e2e.submit_task(input="Write a short analysis report.")
@@ -59,7 +59,7 @@ async def test_download_artifact_content(e2e):
     artifact_content = "col1,col2,col3\n1,2,3\n4,5,6\n"
     artifact_filename = "data.csv"
 
-    e2e.use_llm(upload_artifact_call(
+    e2e.use_llm(create_text_artifact_call(
         filename=artifact_filename,
         content=artifact_content,
         content_type="text/csv",
@@ -71,7 +71,7 @@ async def test_download_artifact_content(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["upload_artifact"],
+        "allowed_tools": ["create_text_artifact"],
     })
 
     task_id = e2e.submit_task(input="Generate a CSV file.")
@@ -140,7 +140,7 @@ async def test_list_artifacts_with_direction_filter(e2e):
 
     artifact_content = "Test content"
 
-    e2e.use_llm(upload_artifact_call(
+    e2e.use_llm(create_text_artifact_call(
         filename="filtered.txt",
         content=artifact_content,
         content_type="text/plain",
@@ -152,7 +152,7 @@ async def test_list_artifacts_with_direction_filter(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["upload_artifact"],
+        "allowed_tools": ["create_text_artifact"],
     })
 
     task_id = e2e.submit_task(input="Create a text file.")

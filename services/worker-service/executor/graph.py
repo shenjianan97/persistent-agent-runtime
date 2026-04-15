@@ -42,11 +42,11 @@ from tools.definitions import (
     READ_URL_TOOL,
     DEV_SLEEP_TOOL,
     REQUEST_HUMAN_INPUT_TOOL,
-    UPLOAD_ARTIFACT_TOOL,
+    CREATE_TEXT_ARTIFACT_TOOL,
     SANDBOX_EXEC_TOOL,
     SANDBOX_READ_FILE_TOOL,
     SANDBOX_WRITE_FILE_TOOL,
-    SANDBOX_DOWNLOAD_TOOL,
+    EXPORT_SANDBOX_FILE_TOOL,
     WebSearchArguments,
     ReadUrlArguments,
     DevSleepArguments,
@@ -58,11 +58,11 @@ from tools.sandbox_tools import (
     SandboxExecArguments,
     SandboxReadFileArguments,
     SandboxWriteFileArguments,
-    SandboxDownloadArguments,
+    ExportSandboxFileArguments,
     create_sandbox_exec_fn,
     create_sandbox_read_file_fn,
     create_sandbox_write_file_fn,
-    create_sandbox_download_fn,
+    create_export_sandbox_file_fn,
 )
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
@@ -250,18 +250,22 @@ class GraphExecutor:
                 args_schema=DevSleepArguments
             ))
 
-        if "upload_artifact" in allowed_tools:
+        # create_text_artifact is only offered when there is NO sandbox.
+        # When a sandbox is available, the agent should use export_sandbox_file instead
+        # to avoid sending file content through the LLM context window.
+        has_sandbox = sandbox is not None and "export_sandbox_file" in allowed_tools
+        if "create_text_artifact" in allowed_tools and not has_sandbox:
             from tools.upload_artifact import (
-                UploadArtifactArguments,
-                execute_upload_artifact,
+                CreateTextArtifactArguments,
+                execute_create_text_artifact,
             )
 
-            async def upload_artifact(
+            async def create_text_artifact(
                 filename: str,
                 content: str,
                 content_type: str = "text/plain",
             ):
-                return await execute_upload_artifact(
+                return await execute_create_text_artifact(
                     filename=filename,
                     content=content,
                     content_type=content_type,
@@ -273,10 +277,10 @@ class GraphExecutor:
 
             tools.append(
                 StructuredTool.from_function(
-                    coroutine=upload_artifact,
-                    name="upload_artifact",
-                    description=UPLOAD_ARTIFACT_TOOL.description,
-                    args_schema=UploadArtifactArguments,
+                    coroutine=create_text_artifact,
+                    name="create_text_artifact",
+                    description=CREATE_TEXT_ARTIFACT_TOOL.description,
+                    args_schema=CreateTextArtifactArguments,
                 )
             )
 
@@ -335,8 +339,8 @@ class GraphExecutor:
                 args_schema=SandboxWriteFileArguments,
             ))
 
-        if sandbox is not None and "sandbox_download" in allowed_tools and s3_client is not None:
-            download_fn = create_sandbox_download_fn(
+        if sandbox is not None and "export_sandbox_file" in allowed_tools and s3_client is not None:
+            export_fn = create_export_sandbox_file_fn(
                 sandbox,
                 s3_client=s3_client,
                 pool=self.pool,
@@ -344,19 +348,19 @@ class GraphExecutor:
                 tenant_id=tenant_id,
             )
 
-            async def sandbox_download_wrapper(path: str, filename: str | None = None):
+            async def export_sandbox_file_wrapper(path: str, filename: str | None = None):
                 return await self._await_or_cancel(
-                    download_fn(path, filename),
+                    export_fn(path, filename),
                     cancel_event,
                     task_id=task_id,
-                    operation="sandbox_download",
+                    operation="export_sandbox_file",
                 )
 
             tools.append(StructuredTool.from_function(
-                coroutine=sandbox_download_wrapper,
-                name="sandbox_download",
-                description=SANDBOX_DOWNLOAD_TOOL.description,
-                args_schema=SandboxDownloadArguments,
+                coroutine=export_sandbox_file_wrapper,
+                name="export_sandbox_file",
+                description=EXPORT_SANDBOX_FILE_TOOL.description,
+                args_schema=ExportSandboxFileArguments,
             ))
 
         return tools
@@ -684,19 +688,19 @@ class GraphExecutor:
                 "This will pause execution and wait for the user to respond."
             )
 
-        sandbox_tools = {"sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download"}
+        sandbox_tools = {"sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file"}
         if sandbox_tools.intersection(allowed_tools):
             template_note = f" running the `{sandbox_template}` environment" if sandbox_template else ""
             sections.append(
                 f"You have access to a sandbox environment{template_note} for code execution. "
                 "Use `sandbox_exec` to run shell commands, `sandbox_write_file` to create files, "
-                "`sandbox_read_file` to read files, and `sandbox_download` to save files as output artifacts. "
+                "`sandbox_read_file` to read files, and `export_sandbox_file` to save files as output artifacts. "
                 "Write code to files first, then execute them with sandbox_exec."
             )
 
-        if "upload_artifact" in allowed_tools:
+        if "create_text_artifact" in allowed_tools and not sandbox_tools.intersection(allowed_tools):
             sections.append(
-                "You can save output files using the `upload_artifact` tool. "
+                "You can save output files using the `create_text_artifact` tool. "
                 "Use this to produce reports, data files, or other deliverables."
             )
 
