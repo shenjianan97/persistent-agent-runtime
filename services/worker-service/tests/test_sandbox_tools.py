@@ -207,7 +207,7 @@ class TestCreateSandboxReadFileFn:
             result = await read_fn("/home/user/image.png")
 
         assert "Binary file" in result["content"]
-        assert "sandbox_download" in result["content"]
+        assert "export_sandbox_file" in result["content"]
 
     @pytest.mark.asyncio
     async def test_read_bytes_utf8_decodable(self):

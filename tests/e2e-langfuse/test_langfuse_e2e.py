@@ -118,7 +118,7 @@ async def test_traces_published_to_langfuse(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["web_search", "read_url", "upload_artifact", "request_human_input"],
+        "allowed_tools": ["web_search", "read_url", "create_text_artifact", "request_human_input"],
     })
     task_id = e2e.submit_task(
         input="Say hello for trace verification",
@@ -153,7 +153,7 @@ async def test_task_without_langfuse_completes_with_cost(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["web_search", "read_url", "upload_artifact", "request_human_input"],
+        "allowed_tools": ["web_search", "read_url", "create_text_artifact", "request_human_input"],
     })
     task_id = e2e.submit_task(
         input="Hello without observability",
@@ -200,7 +200,7 @@ async def test_bad_credentials_task_still_completes(e2e):
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
         "temperature": 0.5,
-        "allowed_tools": ["web_search", "read_url", "upload_artifact", "request_human_input"],
+        "allowed_tools": ["web_search", "read_url", "create_text_artifact", "request_human_input"],
     })
     task_id = e2e.submit_task(
         input="Test graceful degradation",

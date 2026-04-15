@@ -308,7 +308,7 @@ class TestNonSandboxAgentIntegration:
         agent_config = {
             "allowed_tools": ["web_search", "calculator"],
         }
-        sandbox_tools = {"sandbox_exec", "sandbox_read_file", "sandbox_write_file", "sandbox_download"}
+        sandbox_tools = {"sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file"}
         agent_tools = set(agent_config.get("allowed_tools", []))
         assert agent_tools.isdisjoint(sandbox_tools)
 

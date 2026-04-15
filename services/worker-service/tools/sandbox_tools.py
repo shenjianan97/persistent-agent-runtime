@@ -150,7 +150,7 @@ def create_sandbox_read_file_fn(sandbox):
                 try:
                     content = content.decode("utf-8")
                 except UnicodeDecodeError:
-                    content = f"[Binary file: {len(content)} bytes. Use sandbox_download to retrieve binary files.]"
+                    content = f"[Binary file: {len(content)} bytes. Use export_sandbox_file to retrieve binary files.]"
 
             logger.info(
                 "sandbox_read_file_completed",
@@ -263,15 +263,15 @@ def create_sandbox_write_file_fn(sandbox):
     return sandbox_write_file
 
 
-# --- sandbox_download ---
+# --- export_sandbox_file ---
 
-class SandboxDownloadArguments(BaseModel):
+class ExportSandboxFileArguments(BaseModel):
     path: Annotated[
         str,
         Field(
             min_length=1,
             max_length=1000,
-            description="Path in the sandbox filesystem to download as an output artifact.",
+            description="Path in the sandbox filesystem to export as an output artifact.",
         ),
     ]
     filename: Annotated[
@@ -284,14 +284,21 @@ class SandboxDownloadArguments(BaseModel):
     ] = None
 
 
-class SandboxDownloadResult(BaseModel):
+# Keep old name as alias for backward compatibility in tests
+SandboxDownloadArguments = ExportSandboxFileArguments
+
+
+class ExportSandboxFileResult(BaseModel):
     filename: str
     size_bytes: int
     content_type: str
 
 
-def create_sandbox_download_fn(sandbox, *, s3_client, pool, task_id: str, tenant_id: str):
-    """Create the sandbox_download async function with dependencies bound via closure.
+SandboxDownloadResult = ExportSandboxFileResult
+
+
+def create_export_sandbox_file_fn(sandbox, *, s3_client, pool, task_id: str, tenant_id: str):
+    """Create the export_sandbox_file async function with dependencies bound via closure.
 
     Args:
         sandbox: E2B Sandbox instance
@@ -305,7 +312,7 @@ def create_sandbox_download_fn(sandbox, *, s3_client, pool, task_id: str, tenant
     """
     import os
 
-    async def sandbox_download(path: str, filename: str | None = None) -> dict:
+    async def export_sandbox_file(path: str, filename: str | None = None) -> dict:
         start_time = time.monotonic()
         try:
             # 1. Read file from sandbox
@@ -351,7 +358,7 @@ def create_sandbox_download_fn(sandbox, *, s3_client, pool, task_id: str, tenant
             duration_ms = int((time.monotonic() - start_time) * 1000)
 
             logger.info(
-                "sandbox_download_completed",
+                "export_sandbox_file_completed",
                 extra={
                     "sandbox_id": sandbox.sandbox_id,
                     "task_id": task_id,
@@ -372,7 +379,7 @@ def create_sandbox_download_fn(sandbox, *, s3_client, pool, task_id: str, tenant
         except Exception as e:
             duration_ms = int((time.monotonic() - start_time) * 1000)
             logger.error(
-                "sandbox_download_error",
+                "export_sandbox_file_error",
                 extra={
                     "sandbox_id": sandbox.sandbox_id,
                     "task_id": task_id,
@@ -387,4 +394,8 @@ def create_sandbox_download_fn(sandbox, *, s3_client, pool, task_id: str, tenant
                 "content_type": "application/octet-stream",
             }
 
-    return sandbox_download
+    return export_sandbox_file
+
+
+# Keep old factory name as alias for backward compatibility
+create_sandbox_download_fn = create_export_sandbox_file_fn

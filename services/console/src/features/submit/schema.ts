@@ -31,8 +31,8 @@ export const ALL_TOOL_LABELS: Record<string, string> = {
     sandbox_exec: "Sandbox Exec",
     sandbox_read_file: "Sandbox Read File",
     sandbox_write_file: "Sandbox Write File",
-    sandbox_download: "Sandbox Download",
-    upload_artifact: "Upload Artifact",
+    export_sandbox_file: "Export Sandbox File",
+    create_text_artifact: "Create Text Artifact",
     request_human_input: "Human Input",
     dev_sleep: "Dev Sleep",
 };

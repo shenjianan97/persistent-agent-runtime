@@ -1,4 +1,4 @@
-"""upload_artifact built-in tool — allows agents to produce output files."""
+"""create_text_artifact built-in tool — allows agents to produce output files from inline content."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ MAX_FILENAME_LENGTH = 255
 MAX_CONTENT_TYPE_LENGTH = 100
 
 
-class UploadArtifactArguments(BaseModel):
+class CreateTextArtifactArguments(BaseModel):
     filename: Annotated[
         str,
         Field(
@@ -43,13 +43,20 @@ class UploadArtifactArguments(BaseModel):
     ]
 
 
-class UploadArtifactResult(BaseModel):
+# Keep old names as aliases for backward compatibility
+UploadArtifactArguments = CreateTextArtifactArguments
+
+
+class CreateTextArtifactResult(BaseModel):
     filename: str
     size_bytes: int
     content_type: str
 
 
-async def execute_upload_artifact(
+UploadArtifactResult = CreateTextArtifactResult
+
+
+async def execute_create_text_artifact(
     *,
     filename: str,
     content: str,
@@ -59,7 +66,7 @@ async def execute_upload_artifact(
     task_id: str,
     tenant_id: str,
 ) -> dict:
-    """Execute the upload_artifact tool."""
+    """Execute the create_text_artifact tool."""
     # Encode content to bytes
     data = content.encode("utf-8")
     size_bytes = len(data)
@@ -80,7 +87,7 @@ async def execute_upload_artifact(
     )
 
     logger.info(
-        "upload_artifact_started",
+        "create_text_artifact_started",
         task_id=task_id,
         tenant_id=tenant_id,
         filename=filename,
@@ -114,7 +121,7 @@ async def execute_upload_artifact(
         )
 
     logger.info(
-        "upload_artifact_completed",
+        "create_text_artifact_completed",
         task_id=task_id,
         tenant_id=tenant_id,
         filename=filename,
@@ -126,3 +133,7 @@ async def execute_upload_artifact(
         "size_bytes": size_bytes,
         "content_type": content_type,
     }
+
+
+# Keep old name as alias for backward compatibility
+execute_upload_artifact = execute_create_text_artifact
