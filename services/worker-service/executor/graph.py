@@ -1051,15 +1051,15 @@ class GraphExecutor:
                                     step_cost, execution_metadata = await self._calculate_step_cost(
                                         ai_msg.response_metadata, model_name
                                     )
-                                    if step_cost > 0:
-                                        async with self.pool.acquire() as cost_conn:
-                                            checkpoint_id = await cost_conn.fetchval(
-                                                '''SELECT checkpoint_id FROM checkpoints
-                                                   WHERE task_id = $1::uuid
-                                                   ORDER BY created_at DESC LIMIT 1''',
-                                                task_id
-                                            )
-                                            if checkpoint_id:
+                                    async with self.pool.acquire() as cost_conn:
+                                        checkpoint_id = await cost_conn.fetchval(
+                                            '''SELECT checkpoint_id FROM checkpoints
+                                               WHERE task_id = $1::uuid
+                                               ORDER BY created_at DESC LIMIT 1''',
+                                            task_id
+                                        )
+                                        if checkpoint_id:
+                                            if step_cost > 0:
                                                 try:
                                                     async with cost_conn.transaction():
                                                         cumulative_task_cost, hourly_cost = await self._record_step_cost(
@@ -1073,42 +1073,61 @@ class GraphExecutor:
                                                 except Exception:
                                                     logger.warning("Per-step cost recording failed for task %s", task_id, exc_info=True)
                                                     cumulative_task_cost = 0
-                                                # Budget enforcement after checkpoint-cost write
-                                                if cumulative_task_cost > 0:
-                                                    was_paused = await self._check_budget_and_pause(
-                                                        cost_conn, task_data, cumulative_task_cost, worker_id
+                                            else:
+                                                # Cost is zero (unknown model or rounding), but still persist token metadata
+                                                try:
+                                                    await cost_conn.execute(
+                                                        '''UPDATE checkpoints
+                                                           SET execution_metadata = $1::jsonb
+                                                           WHERE checkpoint_id = $2
+                                                             AND task_id = $3::uuid''',
+                                                        json.dumps(execution_metadata),
+                                                        checkpoint_id,
+                                                        task_id,
                                                     )
-                                                    if was_paused:
-                                                        # Close MCP sessions before releasing lease on budget pause
-                                                        if session_manager is not None:
-                                                            await session_manager.close("paused")
-                                                            session_manager = None  # Prevent double-close in finally
-                                                        # Record sandbox cost before pausing
-                                                        if sandbox is not None and sandbox_start_time is not None:
-                                                            elapsed = time.monotonic() - sandbox_start_time
-                                                            pause_sandbox_cost = int(
-                                                                elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
-                                                            )
-                                                            if pause_sandbox_cost > 0:
-                                                                try:
-                                                                    async with self.pool.acquire() as sc_conn:
-                                                                        await sc_conn.execute(
-                                                                            """INSERT INTO agent_cost_ledger
-                                                                               (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                                                                               VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
-                                                                            tenant_id, agent_id, task_id, pause_sandbox_cost,
-                                                                        )
-                                                                except Exception:
-                                                                    logger.warning(
-                                                                        "sandbox_cost_recording_failed_on_budget_pause",
-                                                                        extra={"task_id": task_id},
-                                                                        exc_info=True,
+                                                    logger.debug(
+                                                        "Task %s step cost: 0 microdollars (metadata persisted)",
+                                                        task_id,
+                                                    )
+                                                except Exception:
+                                                    logger.warning("Execution metadata write failed for task %s", task_id, exc_info=True)
+                                                cumulative_task_cost = 0
+                                            # Budget enforcement after checkpoint-cost write
+                                            if cumulative_task_cost > 0:
+                                                was_paused = await self._check_budget_and_pause(
+                                                    cost_conn, task_data, cumulative_task_cost, worker_id
+                                                )
+                                                if was_paused:
+                                                    # Close MCP sessions before releasing lease on budget pause
+                                                    if session_manager is not None:
+                                                        await session_manager.close("paused")
+                                                        session_manager = None  # Prevent double-close in finally
+                                                    # Record sandbox cost before pausing
+                                                    if sandbox is not None and sandbox_start_time is not None:
+                                                        elapsed = time.monotonic() - sandbox_start_time
+                                                        pause_sandbox_cost = int(
+                                                            elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                                                        )
+                                                        if pause_sandbox_cost > 0:
+                                                            try:
+                                                                async with self.pool.acquire() as sc_conn:
+                                                                    await sc_conn.execute(
+                                                                        """INSERT INTO agent_cost_ledger
+                                                                           (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                                                                           VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
+                                                                        tenant_id, agent_id, task_id, pause_sandbox_cost,
                                                                     )
-                                                        # Pause sandbox before releasing lease on budget pause
-                                                        if sandbox is not None and provisioner is not None:
-                                                            await provisioner.pause(sandbox)
-                                                            sandbox = None  # Prevent double-destroy in finally
-                                                        return  # Stop execution — task is now paused
+                                                            except Exception:
+                                                                logger.warning(
+                                                                    "sandbox_cost_recording_failed_on_budget_pause",
+                                                                    extra={"task_id": task_id},
+                                                                    exc_info=True,
+                                                                )
+                                                    # Pause sandbox before releasing lease on budget pause
+                                                    if sandbox is not None and provisioner is not None:
+                                                        await provisioner.pause(sandbox)
+                                                        sandbox = None  # Prevent double-destroy in finally
+                                                    return  # Stop execution — task is now paused
                                 except Exception:
                                     logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
 
