@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -11,6 +10,13 @@ from typing import Protocol
 from ddgs import DDGS
 
 from tools.errors import ToolTransportError
+
+
+# Cap concurrent searches from a single worker. Upstream ddgs >= 9.12.1 gives each
+# call its own ThreadPoolExecutor, so we no longer need the process-wide lock that
+# guarded the previously-shared executor. We still cap concurrency to avoid
+# triggering DuckDuckGo's per-IP rate limit under bursty load.
+DEFAULT_MAX_CONCURRENT_SEARCHES = 3
 
 
 @dataclass(frozen=True)
@@ -34,9 +40,16 @@ class SearchProvider(Protocol):
 class DuckDuckGoSearchProvider:
     """DuckDuckGo-backed default implementation for web search."""
 
-    def __init__(self, *, timeout_seconds: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+        max_concurrent: int = DEFAULT_MAX_CONCURRENT_SEARCHES,
+    ) -> None:
+        if max_concurrent < 1:
+            raise ValueError("max_concurrent must be >= 1")
         self._timeout_seconds = timeout_seconds
-        self._lock = threading.Lock()
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     @property
     def provider_name(self) -> str:
@@ -44,10 +57,11 @@ class DuckDuckGoSearchProvider:
 
     async def search(self, query: str, max_results: int) -> Sequence[SearchResult]:
         try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(self._search_sync, query, max_results),
-                timeout=self._timeout_seconds,
-            )
+            async with self._semaphore:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(self._search_sync, query, max_results),
+                    timeout=self._timeout_seconds,
+                )
             return results
         except asyncio.TimeoutError as exc:
             raise ToolTransportError("Search request timed out.") from exc
@@ -55,7 +69,7 @@ class DuckDuckGoSearchProvider:
             raise ToolTransportError(f"DuckDuckGo search failed: {str(exc)}") from exc
 
     def _search_sync(self, query: str, max_results: int) -> list[SearchResult]:
-        with self._lock, DDGS() as ddgs:
+        with DDGS() as ddgs:
             raw_results = list(ddgs.text(query, max_results=max_results))
 
         results = []
