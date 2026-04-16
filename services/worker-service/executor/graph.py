@@ -517,15 +517,36 @@ class GraphExecutor:
         self, conn, task_id: str, tenant_id: str, agent_id: str,
         checkpoint_id: str, cost_microdollars: int,
         execution_metadata: dict | None = None,
+        *,
+        worker_id: str,
     ) -> tuple:
         """Record step cost in a single transaction.
 
-        1. Update checkpoints.cost_microdollars and execution_metadata for the given checkpoint_id
-        2. INSERT into agent_cost_ledger
-        3. UPSERT agent_runtime_state.hour_window_cost_microdollars (increment)
-        4. Return (cumulative_task_cost, hourly_window_cost)
+        Gated on the worker still owning the task lease. If the lease has been
+        revoked or reassigned (heartbeat missed → scheduler evicted this worker)
+        the function raises LeaseRevokedException without writing anything. Must
+        be called inside an active transaction on `conn`.
+
+        1. Validate lease (SELECT ... FOR UPDATE on tasks)
+        2. Update checkpoints.cost_microdollars and execution_metadata for the given checkpoint_id
+        3. INSERT into agent_cost_ledger
+        4. UPSERT agent_runtime_state.hour_window_cost_microdollars (increment)
+        5. Return (cumulative_task_cost, hourly_window_cost)
         """
-        # 1. Update the checkpoint with the step cost and execution metadata
+        lease_ok = await conn.fetchval(
+            '''SELECT 1 FROM tasks
+               WHERE task_id = $1::uuid
+                 AND tenant_id = $2
+                 AND status = 'running'
+                 AND lease_owner = $3
+               FOR UPDATE''',
+            task_id, tenant_id, worker_id,
+        )
+        if lease_ok is None:
+            raise LeaseRevokedException(
+                f"Lease revoked before cost write for task {task_id}"
+            )
+
         import json as _json
         await conn.execute(
             '''UPDATE checkpoints
@@ -1074,30 +1095,49 @@ class GraphExecutor:
                                                         cumulative_task_cost, hourly_cost = await self._record_step_cost(
                                                             cost_conn, task_id, tenant_id, agent_id, checkpoint_id, step_cost,
                                                             execution_metadata=execution_metadata,
+                                                            worker_id=worker_id,
                                                         )
                                                     logger.debug(
                                                         "Task %s step cost: %d microdollars (cumulative: %d, hourly: %d)",
                                                         task_id, step_cost, cumulative_task_cost, hourly_cost,
                                                     )
+                                                except LeaseRevokedException:
+                                                    raise
                                                 except Exception:
                                                     logger.warning("Per-step cost recording failed for task %s", task_id, exc_info=True)
                                                     cumulative_task_cost = 0
                                             else:
                                                 # Cost is zero (unknown model or rounding), but still persist token metadata
                                                 try:
-                                                    await cost_conn.execute(
-                                                        '''UPDATE checkpoints
-                                                           SET execution_metadata = $1::jsonb
-                                                           WHERE checkpoint_id = $2
-                                                             AND task_id = $3::uuid''',
-                                                        json.dumps(execution_metadata),
-                                                        checkpoint_id,
-                                                        task_id,
-                                                    )
+                                                    async with cost_conn.transaction():
+                                                        lease_ok = await cost_conn.fetchval(
+                                                            '''SELECT 1 FROM tasks
+                                                               WHERE task_id = $1::uuid
+                                                                 AND tenant_id = $2
+                                                                 AND status = 'running'
+                                                                 AND lease_owner = $3
+                                                               FOR UPDATE''',
+                                                            task_id, tenant_id, worker_id,
+                                                        )
+                                                        if lease_ok is None:
+                                                            raise LeaseRevokedException(
+                                                                f"Lease revoked before metadata write for task {task_id}"
+                                                            )
+                                                        await cost_conn.execute(
+                                                            '''UPDATE checkpoints
+                                                               SET execution_metadata = $1::jsonb
+                                                               WHERE checkpoint_id = $2
+                                                                 AND task_id = $3::uuid''',
+                                                            json.dumps(execution_metadata),
+                                                            checkpoint_id,
+                                                            task_id,
+                                                        )
                                                     logger.debug(
                                                         "Task %s step cost: 0 microdollars (metadata persisted)",
                                                         task_id,
                                                     )
+                                                except LeaseRevokedException:
+                                                    raise
                                                 except Exception:
                                                     logger.warning("Execution metadata write failed for task %s", task_id, exc_info=True)
                                                 cumulative_task_cost = 0
