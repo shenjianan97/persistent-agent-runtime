@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -49,7 +50,15 @@ class DuckDuckGoSearchProvider:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be >= 1")
         self._timeout_seconds = timeout_seconds
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self.max_concurrent = max_concurrent
+        # threading.BoundedSemaphore (not asyncio.Semaphore) because the real DDG
+        # work runs in a worker thread via asyncio.to_thread. An asyncio semaphore
+        # would release as soon as asyncio.wait_for times out, but the underlying
+        # thread keeps running until _do_search returns — so new searches could
+        # acquire a slot while orphaned threads are still hitting DDG, defeating
+        # the rate-limit cap. Holding a thread-level semaphore inside the worker
+        # thread keeps the slot reserved for the thread's actual lifetime.
+        self._semaphore = threading.BoundedSemaphore(max_concurrent)
 
     @property
     def provider_name(self) -> str:
@@ -57,11 +66,10 @@ class DuckDuckGoSearchProvider:
 
     async def search(self, query: str, max_results: int) -> Sequence[SearchResult]:
         try:
-            async with self._semaphore:
-                results = await asyncio.wait_for(
-                    asyncio.to_thread(self._search_sync, query, max_results),
-                    timeout=self._timeout_seconds,
-                )
+            results = await asyncio.wait_for(
+                asyncio.to_thread(self._search_sync, query, max_results),
+                timeout=self._timeout_seconds,
+            )
             return results
         except asyncio.TimeoutError as exc:
             raise ToolTransportError("Search request timed out.") from exc
@@ -69,6 +77,10 @@ class DuckDuckGoSearchProvider:
             raise ToolTransportError(f"DuckDuckGo search failed: {str(exc)}") from exc
 
     def _search_sync(self, query: str, max_results: int) -> list[SearchResult]:
+        with self._semaphore:
+            return self._do_search(query, max_results)
+
+    def _do_search(self, query: str, max_results: int) -> list[SearchResult]:
         with DDGS() as ddgs:
             raw_results = list(ddgs.text(query, max_results=max_results))
 

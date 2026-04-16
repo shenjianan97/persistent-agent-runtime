@@ -7,7 +7,8 @@ own per-call executor, so the lock is no longer needed — but we still want
 bounded concurrency to avoid triggering DuckDuckGo's per-IP rate limit.
 
 These tests exercise the bounded-concurrency contract without touching the real
-DDG network: a subclass replaces _search_sync with an instrumented fake.
+DDG network: a subclass replaces _do_search with an instrumented fake while the
+base class's _search_sync continues to hold the thread-level semaphore.
 """
 
 from __future__ import annotations
@@ -18,11 +19,12 @@ import time
 
 import pytest
 
+from tools.errors import ToolTransportError
 from tools.providers.search import DuckDuckGoSearchProvider, SearchResult
 
 
 class _InstrumentedProvider(DuckDuckGoSearchProvider):
-    """Records peak concurrent in-flight _search_sync calls."""
+    """Records peak concurrent in-flight _do_search calls."""
 
     def __init__(self, *, sleep_seconds: float = 0.2, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -32,7 +34,7 @@ class _InstrumentedProvider(DuckDuckGoSearchProvider):
         self.peak_in_flight = 0
         self.completed = 0
 
-    def _search_sync(self, query: str, max_results: int) -> list[SearchResult]:
+    def _do_search(self, query: str, max_results: int) -> list[SearchResult]:
         with self._counter_lock:
             self.in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
@@ -90,19 +92,69 @@ class TestSearchProviderConcurrency:
 
     @pytest.mark.asyncio
     async def test_no_threading_lock_on_provider(self) -> None:
-        """Regression: the threading.Lock workaround must be replaced, not kept in addition."""
+        """The legacy threading.Lock name must be gone; concurrency cap must be a
+        thread-level semaphore so it stays held across asyncio.wait_for timeouts."""
         provider = DuckDuckGoSearchProvider()
         assert not hasattr(provider, "_lock"), (
-            "threading.Lock should be removed; use asyncio.Semaphore instead"
+            "legacy threading.Lock workaround should be removed"
         )
-        assert hasattr(provider, "_semaphore"), (
-            "asyncio.Semaphore should gate concurrent searches"
+        # Must be a threading-layer semaphore, not asyncio.Semaphore, so the
+        # worker thread holds the slot for its full lifetime.
+        bounded_type = type(threading.BoundedSemaphore(1))
+        assert isinstance(provider._semaphore, bounded_type), (
+            "concurrency cap must be threading.BoundedSemaphore, not asyncio.Semaphore"
         )
 
     @pytest.mark.asyncio
     async def test_default_max_concurrent_is_bounded(self) -> None:
         """Default must leave enough headroom to avoid triggering DDG rate limits."""
         provider = DuckDuckGoSearchProvider()
-        # Sanity: semaphore exists and has a reasonable default bound
-        # (not unbounded, not 1). Exact value is a product tuning knob.
-        assert 1 < provider._semaphore._value <= 10  # type: ignore[attr-defined]
+        assert 1 < provider.max_concurrent <= 10
+
+    @pytest.mark.asyncio
+    async def test_semaphore_stays_held_after_asyncio_wait_for_timeout(self) -> None:
+        """Regression for PR review: asyncio.wait_for timeout must NOT release
+        the concurrency slot while the underlying thread is still running DDG
+        work.
+
+        Previously the provider used asyncio.Semaphore around asyncio.wait_for —
+        when wait_for timed out the semaphore released immediately, allowing a
+        new search to start while the orphaned thread kept hitting DDG. That
+        defeated the rate-limit cap. The fix moves the semaphore inside the
+        worker thread so the slot stays reserved until _do_search returns.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+
+        class _HangingProvider(DuckDuckGoSearchProvider):
+            def _do_search(self, query: str, max_results: int) -> list[SearchResult]:
+                entered.set()
+                release.wait(timeout=3.0)
+                return []
+
+        provider = _HangingProvider(max_concurrent=1, timeout_seconds=0.1)
+
+        search_task = asyncio.create_task(provider.search("q1", 1))
+        # Wait until the worker thread actually entered _do_search (→ semaphore acquired).
+        await asyncio.to_thread(entered.wait, 1.0)
+        assert entered.is_set(), "worker thread never entered _do_search"
+
+        # asyncio.wait_for should time out; the caller sees a ToolTransportError.
+        with pytest.raises(ToolTransportError):
+            await search_task
+
+        # The thread is still in _do_search. A new search must NOT be able to
+        # acquire the semaphore, because that would allow simultaneous DDG
+        # requests in excess of max_concurrent=1.
+        acquired = provider._semaphore.acquire(blocking=False)
+        try:
+            assert not acquired, (
+                "semaphore was released prematurely on wait_for timeout — "
+                "orphaned threads could exceed the concurrency cap"
+            )
+        finally:
+            if acquired:
+                provider._semaphore.release()
+            # Let the hanging thread finish so the test cleans up.
+            release.set()
+            await asyncio.sleep(0.2)
