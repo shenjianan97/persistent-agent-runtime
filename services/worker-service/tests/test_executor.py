@@ -261,6 +261,94 @@ async def test_execute_task_persists_checkpoint_cost(mock_worker, task_data):
 
 
 @pytest.mark.asyncio
+async def test_lease_revoked_during_cost_tracking_stops_execution(mock_worker, task_data):
+    """Regression: LeaseRevokedException from _record_step_cost must propagate
+    past the cost-tracking block's outer `except Exception`, not be swallowed.
+
+    Without the explicit `except LeaseRevokedException: raise` guard before the
+    generic handler, an evicted worker would log the failure and continue running
+    subsequent super-steps — defeating the lease gate and producing duplicate
+    external side effects.
+    """
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            # Build AI messages for two super-steps; after the first one raises
+            # LeaseRevokedException the second must NOT be processed.
+            def _make_msg():
+                msg = MagicMock()
+                msg.type = "ai"
+                msg.content = "partial"
+                msg.response_metadata = {"usage": {"input_tokens": 10, "output_tokens": 5}}
+                return msg
+
+            events_yielded = 0
+
+            async def mock_astream(*args, **kwargs):
+                nonlocal events_yielded
+                events_yielded += 1
+                yield {"agent": {"messages": [_make_msg()]}}
+                events_yielded += 1
+                yield {"agent": {"messages": [_make_msg()]}}
+
+            mock_compiled.astream = mock_astream
+            mock_state = MagicMock()
+            mock_state.values = {"messages": []}
+            mock_state.tasks = []
+            mock_compiled.aget_state.return_value = mock_state
+
+            with patch.object(
+                executor,
+                "_calculate_step_cost",
+                new_callable=AsyncMock,
+                return_value=(150, {"input_tokens": 10, "output_tokens": 5, "model": "claude-3-5-sonnet-latest"}),
+            ):
+                with patch.object(
+                    executor,
+                    "_record_step_cost",
+                    new_callable=AsyncMock,
+                    side_effect=LeaseRevokedException("lease stripped"),
+                ) as mock_record:
+                    # execute_task must not raise: the top-level
+                    # `except LeaseRevokedException` catches and stops gracefully.
+                    await executor.execute_task(
+                        task_data,
+                        mock_worker.heartbeat.start_heartbeat.return_value.cancel_event,
+                    )
+
+                    # _record_step_cost was called once (on the first event) and raised.
+                    assert mock_record.call_count == 1
+
+            # Only the first super-step yielded; astream was abandoned after the
+            # exception instead of running through both events.
+            assert events_yielded == 1, (
+                f"astream processed {events_yielded} events; expected 1 before bailing"
+            )
+
+            # Completion UPDATE must NOT have been issued — the evicted worker
+            # cannot mark the task completed.
+            mock_conn = mock_worker.pool.acquire.return_value.__aenter__.return_value
+            fetchval_calls = mock_conn.fetchval.call_args_list
+            completion_calls = [
+                c for c in fetchval_calls
+                if "UPDATE tasks" in str(c) and "status='completed'" in str(c)
+            ]
+            assert len(completion_calls) == 0, (
+                "evicted worker must not issue completion UPDATE after LeaseRevokedException"
+            )
+
+
+@pytest.mark.asyncio
 async def test_timeout_dead_letter(mock_worker, task_data):
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
     task_data["task_timeout_seconds"] = 1

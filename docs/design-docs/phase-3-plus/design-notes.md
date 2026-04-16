@@ -252,3 +252,43 @@ Allow agents to specify an expected JSON output schema:
 - **Batch:** when customers need to process large volumes of similar tasks (document processing, data extraction)
 - **Webhooks:** when polling becomes impractical (high task volume, downstream automation)
 - **Structured output:** when customers need machine-readable results for pipeline integration
+
+---
+
+## 11. Lease Race Hardening Under Load
+
+Follow-ups to the lease-CAS work already in place on cost-ledger writes, checkpoint writes, and task state transitions. All the items below are load-triggered: they don't bite until worker concurrency or DB contention crosses a threshold we haven't hit yet. The theme is: instrument first, fix second.
+
+### 11.1 Heartbeat pool isolation
+
+**Risk.** `HeartbeatManager` and the `GraphExecutor` share the same `asyncpg.Pool`. Under heavy worker concurrency or slow DB writes, executor transactions can hold all connections long enough for the heartbeat's `pool.acquire()` to miss its window. The scheduler then evicts a healthy worker — a false-positive lease revocation that forces an unnecessary handoff and duplicates any mid-flight work.
+
+**Planned approach.**
+1. Add a structured warning log and a `heartbeat.acquire_wait_ms` gauge at `core/heartbeat.py` when acquire latency exceeds a fraction of `heartbeat_interval_seconds`.
+2. If the metric shows the symptom under real load, give `HeartbeatManager` its own 1–2 connection pool at worker startup. Mechanically small (additive constructor arg); the reason to defer is sizing and Postgres `max_connections` budgeting at fleet scale.
+
+**Trigger conditions.** Observed false-positive evictions correlated with pool saturation, or onboarding a customer whose concurrency projection pushes worker pool sizing beyond current defaults.
+
+### 11.2 Pre-action lease check for high-stakes tools
+
+**Risk.** Between a heartbeat miss and the executor noticing the `cancel_event`, an in-flight tool call will run to completion. For idempotent tools that's fine — the new owner replays the step and nothing is double-counted. For tools with unrecoverable external effects (send email, charge card, webhook POST) the evicted worker's call is a duplicate side effect.
+
+**Planned approach.** Extend the tool schema with an `idempotent: true | false` flag (tracked in Section 9). For tools declared non-idempotent, the executor performs an explicit `SELECT lease_expiry, lease_owner` immediately before firing the call and aborts if the lease is already gone or within a small safety margin. This dramatically shrinks the race window without touching the global lease duration. This is *complementary* to the dead-letter-on-crash approach in Section 9, not a replacement.
+
+**Trigger conditions.** First customer registering a BYOT tool with unrecoverable side effects. Until then the platform keeps its "idempotent tools only" contract.
+
+### 11.3 Metrics export
+
+**Risk.** `MetricsCollector` at `core/logging.py` collects counters and gauges in-process but there is no exporter wired up — only structured JSON logs reach operators. Any leading-indicator metric we add today (e.g., 11.1's acquire-wait gauge) is invisible until an exporter exists.
+
+**Planned approach.** Add an OpenTelemetry exporter (OTLP → Prometheus or hosted collector) at worker startup. A few hours of work; deferred because the log-based observability story is sufficient for current scale.
+
+**Trigger conditions.** First real operational use that requires dashboards or alerts on worker health (paid customer SLAs, on-call rotation).
+
+### 11.4 Idempotency keys on the tool protocol
+
+**Risk.** Even with 11.2's pre-action check, a tool call initiated in the final milliseconds before eviction can reach the downstream service twice (once from evicted worker, once from new owner's replay). A protocol-level idempotency key would let the downstream service dedupe.
+
+**Planned approach.** Every tool call carries `(task_id, checkpoint_id, tool_call_id)` as an idempotency key in the tool invocation contract. MCP clients and the built-in tool runtime forward it to the downstream service as an `Idempotency-Key` header or equivalent. Cross-service change; document before implementing.
+
+**Trigger conditions.** Sufficient non-idempotent-tool volume that duplicate side effects (from the narrow remaining race window) become a real operational concern.
