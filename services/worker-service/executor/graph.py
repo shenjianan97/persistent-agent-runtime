@@ -1177,6 +1177,11 @@ class GraphExecutor:
                                                         await provisioner.pause(sandbox)
                                                         sandbox = None  # Prevent double-destroy in finally
                                                     return  # Stop execution — task is now paused
+                                except LeaseRevokedException:
+                                    # Propagate to the outer astream handler so the evicted worker
+                                    # stops all further model/tool work instead of silently eating
+                                    # the lease check and continuing the loop.
+                                    raise
                                 except Exception:
                                     logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
 
