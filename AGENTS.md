@@ -80,6 +80,18 @@ When orchestrating parallel subagents via the Agent tool, **always use `isolatio
 - After worktree agents complete, merge their branches into the main working tree.
 - Only skip worktrees when agents have truly zero file overlap (e.g., Python worker vs React console).
 
+## External Pull Request References
+
+**Do not link to pull requests in other people's repositories** from commit messages or PR descriptions. GitHub creates a cross-reference timeline event on the target PR, which typically surfaces as a notification to its author — unsolicited noise once the upstream work has shipped.
+
+Allowed references:
+- PRs and commits in this repository
+- PRs that *you* authored on any repository
+
+When citing an upstream fix from an OSS dependency, refer to the released **version** that contains it (e.g., "`ddgs 9.12.1` replaced the shared executor with a per-call one") rather than the PR URL. The version pin in `pyproject.toml` / `build.gradle` / `package.json` is the technical guarantee; the URL is just provenance and can be dropped. If the *why* matters, summarize it inline in prose rather than linking out.
+
+If an external PR reference slips in, rewrite the commit message and update the PR description before merge. Force-push is acceptable here — the rewrite is process hygiene, not content change.
+
 ## Local Validation Notes
 
 - For local testing, follow `README.md` and `docs/LOCAL_DEVELOPMENT.md`.
