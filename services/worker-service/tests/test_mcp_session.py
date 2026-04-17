@@ -127,6 +127,63 @@ class TestMcpSessionManagerCallTool:
 
         await manager.close()
 
+    @pytest.mark.asyncio
+    async def test_call_tool_truncates_with_visible_marker(self):
+        """Oversized responses keep the size limit but surface a marker so the LLM
+        and any human reader know data was dropped — silent truncation hides bugs."""
+        from executor.mcp_session import RESPONSE_SIZE_LIMIT, _ServerSession
+
+        manager = McpSessionManager()
+        sess = _ServerSession()
+        mock_session = AsyncMock()
+
+        oversized = "A" * (RESPONSE_SIZE_LIMIT + 10_000)
+        mock_result = MagicMock()
+        mock_result.structuredContent = None
+        mock_result.content = [MagicMock(text=oversized)]
+        mock_result.isError = False
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+
+        sess.session = mock_session
+        manager._sessions["big-server"] = sess
+
+        output = await manager.call_tool("big-server", "big-tool", {})
+
+        assert len(output) == RESPONSE_SIZE_LIMIT
+        assert "truncated" in output
+        # Marker carries both the cap and the original size so an operator reading
+        # the tail of the output can see exactly how much was dropped.
+        assert str(RESPONSE_SIZE_LIMIT) in output
+        assert str(len(oversized)) in output
+
+        await manager.close()
+
+    @pytest.mark.asyncio
+    async def test_call_tool_within_limit_not_modified(self):
+        """Responses under the limit pass through untouched — no marker appended."""
+        from executor.mcp_session import _ServerSession
+
+        manager = McpSessionManager()
+        sess = _ServerSession()
+        mock_session = AsyncMock()
+
+        payload = "hello world"
+        mock_result = MagicMock()
+        mock_result.structuredContent = None
+        mock_result.content = [MagicMock(text=payload)]
+        mock_result.isError = False
+        mock_session.call_tool = AsyncMock(return_value=mock_result)
+
+        sess.session = mock_session
+        manager._sessions["ok-server"] = sess
+
+        output = await manager.call_tool("ok-server", "ok-tool", {})
+
+        assert output == payload
+        assert "truncated" not in output
+
+        await manager.close()
+
 
 class TestMcpSessionManagerClose:
     @pytest.mark.asyncio
