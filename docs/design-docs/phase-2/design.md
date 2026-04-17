@@ -116,11 +116,18 @@ For implementation planning, the safest order is:
 2. Track 2 — Runtime State Model ✅
 3. Track 3 — Scheduler and Budgets ✅
 4. Track 4 — Custom Tool Runtime (BYOT) ✅
-5. **Agent Capabilities (cross-cutting)** — E2B sandbox, artifact storage, file input. See [agent-capabilities/design.md](../agent-capabilities/design.md).
+5. **Agent Capabilities (cross-cutting)** — see [agent-capabilities/design.md](../agent-capabilities/design.md):
+   - AC Track 1 — Output Artifact Storage ✅
+   - AC Track 2 — E2B Sandbox & File Input ✅
+   - **AC Track 3 — Coding-Agent Primitives (proposed; must land before Phase 3)**
 6. Track 5 — Memory
 7. Track 6 — GitHub Integration
 
-Tracks 1–4 are complete. The cross-cutting agent-capabilities work is the next priority. It provides the sandbox and artifact foundation that enables the platform to run real workloads (coding agents, document processing). Tracks 5 and 6 build on a platform that can already do meaningful work.
+Phase 2 Tracks 1–4 and Agent Capabilities Tracks 1 & 2 are complete — the platform can now run coding and document-processing workloads end-to-end with sandbox execution and artifact storage.
+
+**AC Track 3 is gating for Phase 3.** The Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [agent-capabilities/design.md#track-3-coding-agent-primitives-proposed](../agent-capabilities/design.md) for the detailed proposal.
+
+Tracks 5 (Memory) and 6 (GitHub Integration) can be sequenced alongside AC Track 3 as independent initiatives — they have no blocking dependency in either direction.
 
 ---
 
