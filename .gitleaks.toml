@@ -1,0 +1,20 @@
+# Gitleaks configuration — extends the default ruleset with targeted
+# allowlist entries for known false positives in this repo.
+#
+# Keep allowlist entries narrow (specific regexes / paths) so the default
+# ruleset still catches real leaks. When adding an entry, note *why* the
+# match is safe so future readers can audit it.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives"
+
+# `EXCLUDED.s3_key` appears in SQL `ON CONFLICT DO UPDATE` clauses
+# (services/worker-service/tools/sandbox_tools.py and the matching exec
+# plan doc). The generic-api-key entropy rule scores the token high
+# enough to trip. Not a secret.
+regexes = [
+    '''EXCLUDED\.s3_key''',
+]
