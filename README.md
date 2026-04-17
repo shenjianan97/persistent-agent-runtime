@@ -12,7 +12,21 @@ Running AI agents in production — not as chatbots, but as programmatic, multi-
 
 - **Failure management:** At scale, agent task failures need to be inspectable and actionable — structured dead-letter queues with redrive, not just a stack trace in logs.
 
-This project is developer infrastructure for deploying agents at scale — the layer between "I have an agent" and "I can run 500 of them reliably in production." It tackles these problems end-to-end: a checkpoint-resume execution model (not deterministic replay), lease-based crash recovery, per-agent cost tracking and budgets, human-in-the-loop workflows, customer-owned observability, and dead-letter with redrive — built as a working system with a Java API, Python worker, React console, and PostgreSQL backing store.
+This project is developer infrastructure for deploying agents at scale — the layer between "I have an agent" and "I can run 500 of them reliably in production." Target use cases are coding agents, batch document processing, and research tasks.
+
+Key capabilities:
+
+- **Checkpoint-resume execution** — Postgres-backed LangGraph checkpointer; tasks survive worker crashes at node boundaries (not deterministic replay)
+- **Lease-based crash recovery** — any worker can resume any task; a reaper recovers expired leases
+- **Multi-provider LLM** — Anthropic, OpenAI, Google, and AWS Bedrock, auto-discovered from configured API keys
+- **Per-agent cost tracking and budgets** — incremental per-step cost, budget-based task pausing
+- **Human-in-the-loop** — `waiting_for_approval` and `waiting_for_input` states with stateless pause/resume
+- **Customer-owned observability** — per-task Langfuse endpoints, checkpoint-based cost/token aggregation
+- **Dead-letter with redrive** — structured failure inspection, not log scraping
+- **Bring-your-own-tools (BYOT)** — customer-provided MCP tool servers registered by URL
+- **Sandboxed code execution** — E2B-backed shell, file I/O, and artifact export; file input via multipart upload
+
+Built as a working system with a Java/Spring Boot API, Python worker, React/Vite console, and PostgreSQL state store, deployable on ECS Fargate + Aurora Serverless v2.
 
 ## Current Architecture
 
@@ -25,6 +39,18 @@ The system uses a stateless worker pool with a database-as-queue model. Workers 
 5. Heartbeats extend the lease while work is in progress.
 6. Tasks can pause for human approval or input (`waiting_for_approval`, `waiting_for_input`), releasing the worker. Any worker can resume when the human responds.
 7. A reaper recovers expired leases and handles timeout/dead-letter transitions.
+
+## Built-in Agent Tools
+
+Agents have access to these tools at runtime, wired directly into the LangGraph executor. Actual availability per task depends on the agent's `allowed_tools` config and whether a sandbox is provisioned:
+
+- `web_search` — web search via DuckDuckGo
+- `read_url` — fetch and extract text from a public URL
+- `request_human_input` — pause the task and wait for a human operator response
+- `create_text_artifact` — save text output as a downloadable task artifact (S3). Available only to **non-sandbox agents**; sandbox-enabled agents use `export_sandbox_file` for output files instead
+- `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`, `export_sandbox_file` — shell and file I/O inside an E2B sandbox (available when the agent is configured with `sandbox.enabled: true`)
+
+Agents configured with a **custom MCP tool server URL** (BYOT) get the server's tools merged into the same tool list at task start.
 
 ## Repository Layout
 
@@ -113,7 +139,7 @@ The repo is in active development.
 - Worker poller, heartbeat manager, and reaper
 - Worker registry with self-registration, heartbeat, and stale worker cleanup
 - PostgreSQL-backed LangGraph checkpointer
-- In-process MCP server for `web_search`, `read_url`, `calculator`, and `request_human_input`
+- Built-in tools: `web_search`, `read_url`, `request_human_input`, plus a standalone FastMCP server exposing `web_search`, `read_url`, `calculator` for external use
 - Dev-only task controls for forced lease expiry and dead-letter transitions
 - Dynamic model provider management: database-backed provider/model registry, auto-discovery from API keys, per-model cost tracking
 - Console frontend: dashboard, task list, task dispatcher, execution telemetry, dead letter queue
@@ -131,10 +157,10 @@ Completed tracks:
 Cross-cutting (completed):
 
 - **Customer-owned Langfuse integration:** per-task Langfuse endpoint configuration, CRUD API, connectivity testing, checkpoint-based cost/token aggregation
+- **Agent Capabilities:** E2B sandbox integration (provision / pause / resume / destroy lifecycle, crash recovery via `sandbox_id` reconnect), sandbox tools (`sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`, `export_sandbox_file`), output artifact storage on S3 (LocalStack locally), `create_text_artifact` tool, and multipart file-input task submission — see [`docs/design-docs/agent-capabilities/design.md`](./docs/design-docs/agent-capabilities/design.md)
 
 Upcoming:
 
-- **Agent Capabilities (cross-cutting, next priority):** E2B sandbox for code execution, artifact storage (S3), file input — see [`docs/design-docs/agent-capabilities/design.md`](./docs/design-docs/agent-capabilities/design.md)
 - **Track 5 — Memory:** long-term memory extraction, append-only storage, compaction
 - **Track 6 — GitHub Integration:** code agent input/output via pull requests
 

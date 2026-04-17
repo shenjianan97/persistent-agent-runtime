@@ -342,7 +342,7 @@ Delivers end-to-end output artifact support: agents can produce files via `uploa
 | 7 | Console: artifacts tab | Console | Artifact list + download in task detail view |
 | 8 | Integration tests | Cross-service | End-to-end output artifact flow |
 
-**Exec plan:** `docs/exec-plans/active/agent-capabilities/track-1/`
+**Exec plan:** `docs/exec-plans/completed/agent-capabilities/track-1/`
 
 ### Track 2 — E2B Sandbox & File Input
 
@@ -360,7 +360,7 @@ Delivers sandbox code execution and file input. Agents can receive files, execut
 | 8 | Console: file attachment + sandbox config | Console | File upload on submit, sandbox config in agent form |
 | 9 | Integration tests | Cross-service | End-to-end sandbox + file input flow |
 
-**Exec plan:** `docs/exec-plans/active/agent-capabilities/track-2/`
+**Exec plan:** `docs/exec-plans/completed/agent-capabilities/track-2/`
 
 ### Track sequencing
 
