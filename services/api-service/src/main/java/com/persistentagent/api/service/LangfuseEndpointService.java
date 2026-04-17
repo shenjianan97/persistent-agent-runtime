@@ -6,6 +6,7 @@ import com.persistentagent.api.model.request.LangfuseEndpointRequest;
 import com.persistentagent.api.model.response.LangfuseEndpointResponse;
 import com.persistentagent.api.model.response.LangfuseEndpointTestResponse;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
+import com.persistentagent.api.util.UrlSafetyValidator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DuplicateKeyException;
@@ -120,6 +121,9 @@ public class LangfuseEndpointService {
 
     private LangfuseEndpointTestResponse doTestConnectivity(String host, String publicKey, String secretKey) {
         String url = host.endsWith("/") ? host + "api/public/health" : host + "/api/public/health";
+        // Reject private/loopback/metadata hosts before sending Basic Auth credentials.
+        // Let ValidationException propagate so the caller returns 400, not a misleading "unreachable".
+        UrlSafetyValidator.validate(url);
         String credentials = Base64.getEncoder().encodeToString((publicKey + ":" + secretKey).getBytes());
 
         try {

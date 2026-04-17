@@ -10,6 +10,7 @@ import com.persistentagent.api.model.request.ToolServerUpdateRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.ToolServerRepository;
 import com.persistentagent.api.util.DateTimeUtil;
+import com.persistentagent.api.util.UrlSafetyValidator;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -300,15 +301,7 @@ public class ToolServerService {
     }
 
     private void validateUrl(String url) {
-        try {
-            URI uri = URI.create(url);
-            String scheme = uri.getScheme();
-            if (scheme == null || (!scheme.equals("http") && !scheme.equals("https"))) {
-                throw new ValidationException("url must use http or https scheme");
-            }
-        } catch (IllegalArgumentException e) {
-            throw new ValidationException("Invalid url: " + e.getMessage());
-        }
+        UrlSafetyValidator.validate(url);
     }
 
     private String maskToken(String token) {
