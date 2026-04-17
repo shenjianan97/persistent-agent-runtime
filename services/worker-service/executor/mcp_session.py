@@ -217,16 +217,21 @@ class McpSessionManager:
                 output = str(result)
 
             if len(output) > RESPONSE_SIZE_LIMIT:
+                original_size = len(output)
                 logger.warning(
                     "mcp_response_truncated",
                     extra={
                         "server_name": server_name,
                         "tool_name": tool_name,
-                        "original_size": len(output),
+                        "original_size": original_size,
                         "limit": RESPONSE_SIZE_LIMIT,
                     },
                 )
-                output = output[:RESPONSE_SIZE_LIMIT]
+                marker = (
+                    f"\n\n[MCP response truncated to {RESPONSE_SIZE_LIMIT} bytes; "
+                    f"original size was {original_size} bytes]"
+                )
+                output = output[: RESPONSE_SIZE_LIMIT - len(marker)] + marker
 
             return output
 

@@ -10,6 +10,7 @@ import com.persistentagent.api.model.request.ToolServerUpdateRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.ToolServerRepository;
 import com.persistentagent.api.util.DateTimeUtil;
+import com.persistentagent.api.util.UrlSafetyValidator;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -158,6 +159,12 @@ public class ToolServerService {
         String authToken = (String) row.get("auth_token");
 
         try {
+            // Re-validate at request time. A DNS-based URL saved as safe could have
+            // been rebound to a metadata / internal address before this call runs;
+            // without this check, a tenant-controlled hostname plus a bearer token
+            // in auth_token can exfiltrate the token via DNS rebinding (TOCTOU).
+            UrlSafetyValidator.validate(serverUrl);
+
             // Step 1: Send MCP initialize request
             String initBody = """
                 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"persistent-agent-runtime","version":"1.0.0"}}}
@@ -300,15 +307,7 @@ public class ToolServerService {
     }
 
     private void validateUrl(String url) {
-        try {
-            URI uri = URI.create(url);
-            String scheme = uri.getScheme();
-            if (scheme == null || (!scheme.equals("http") && !scheme.equals("https"))) {
-                throw new ValidationException("url must use http or https scheme");
-            }
-        } catch (IllegalArgumentException e) {
-            throw new ValidationException("Invalid url: " + e.getMessage());
-        }
+        UrlSafetyValidator.validate(url);
     }
 
     private String maskToken(String token) {

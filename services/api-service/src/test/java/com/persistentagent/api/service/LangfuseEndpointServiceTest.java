@@ -63,14 +63,14 @@ class LangfuseEndpointServiceTest {
         stubSuccessfulConnectivity();
 
         LangfuseEndpointRequest request = new LangfuseEndpointRequest(
-                "my-langfuse", "https://langfuse.example.com", "pk-123", "sk-456");
+                "my-langfuse", "http://127.0.0.1:3300", "pk-123", "sk-456");
 
         Map<String, Object> repoResult = new LinkedHashMap<>();
         repoResult.put("endpoint_id", ENDPOINT_ID);
         repoResult.put("created_at", Timestamp.from(Instant.now()));
 
         when(langfuseEndpointRepository.insert(TENANT_ID, "my-langfuse",
-                "https://langfuse.example.com", "pk-123", "sk-456")).thenReturn(repoResult);
+                "http://127.0.0.1:3300", "pk-123", "sk-456")).thenReturn(repoResult);
 
         LangfuseEndpointResponse response = langfuseEndpointService.create(TENANT_ID, request);
 
@@ -78,7 +78,7 @@ class LangfuseEndpointServiceTest {
         assertEquals(ENDPOINT_ID, response.endpointId());
         assertEquals(TENANT_ID, response.tenantId());
         assertEquals("my-langfuse", response.name());
-        assertEquals("https://langfuse.example.com", response.host());
+        assertEquals("http://127.0.0.1:3300", response.host());
         assertNotNull(response.createdAt());
     }
 
@@ -87,7 +87,7 @@ class LangfuseEndpointServiceTest {
         stubSuccessfulConnectivity();
 
         LangfuseEndpointRequest request = new LangfuseEndpointRequest(
-                "duplicate-name", "https://langfuse.example.com", "pk-123", "sk-456");
+                "duplicate-name", "http://127.0.0.1:3300", "pk-123", "sk-456");
 
         when(langfuseEndpointRepository.insert(anyString(), anyString(), anyString(), anyString(), anyString()))
                 .thenThrow(new DuplicateKeyException("duplicate key value violates unique constraint"));
@@ -132,7 +132,7 @@ class LangfuseEndpointServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void testConnectivity_success() throws Exception {
-        Map<String, Object> row = buildEndpointRow("https://langfuse.example.com", "pk-123", "sk-456");
+        Map<String, Object> row = buildEndpointRow("http://127.0.0.1:3300", "pk-123", "sk-456");
         when(langfuseEndpointRepository.findByIdAndTenant(ENDPOINT_ID, TENANT_ID))
                 .thenReturn(Optional.of(row));
 
@@ -150,7 +150,7 @@ class LangfuseEndpointServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void testConnectivity_authFailure() throws Exception {
-        Map<String, Object> row = buildEndpointRow("https://langfuse.example.com", "pk-bad", "sk-bad");
+        Map<String, Object> row = buildEndpointRow("http://127.0.0.1:3300", "pk-bad", "sk-bad");
         when(langfuseEndpointRepository.findByIdAndTenant(ENDPOINT_ID, TENANT_ID))
                 .thenReturn(Optional.of(row));
 
@@ -168,7 +168,7 @@ class LangfuseEndpointServiceTest {
     @Test
     @SuppressWarnings("unchecked")
     void testConnectivity_unreachable() throws Exception {
-        Map<String, Object> row = buildEndpointRow("https://unreachable.example.com", "pk-123", "sk-456");
+        Map<String, Object> row = buildEndpointRow("http://127.0.0.1:3301", "pk-123", "sk-456");
         when(langfuseEndpointRepository.findByIdAndTenant(ENDPOINT_ID, TENANT_ID))
                 .thenReturn(Optional.of(row));
 
