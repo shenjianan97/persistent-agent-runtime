@@ -24,7 +24,7 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Initiative | Status | Design |
 |------------|--------|--------|
 | Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
-| Agent Capabilities (sandbox, artifacts, file input) | Complete | [design](docs/design-docs/agent-capabilities/design.md) |
+| Agent Capabilities (sandbox, artifacts, file input, coding primitives) | Tracks 1 & 2 complete; Track 3 proposed | [design](docs/design-docs/agent-capabilities/design.md) |
 
 #### Agent Capabilities Tracks
 
@@ -32,3 +32,4 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 |-------|------|--------|------|----------|
 | Track 1 | Output Artifact Storage | Complete | [plan](docs/exec-plans/completed/agent-capabilities/track-1/plan.md) | [progress](docs/exec-plans/completed/agent-capabilities/track-1/progress.md) |
 | Track 2 | E2B Sandbox & File Input | Complete | [plan](docs/exec-plans/completed/agent-capabilities/track-2/plan.md) | [progress](docs/exec-plans/completed/agent-capabilities/track-2/progress.md) |
+| Track 3 | Coding-Agent Primitives | Proposed (design only) | — | — |
