@@ -42,12 +42,12 @@ The system uses a stateless worker pool with a database-as-queue model. Workers 
 
 ## Built-in Agent Tools
 
-Every agent has access to these tools at runtime, wired directly into the LangGraph executor:
+Agents have access to these tools at runtime, wired directly into the LangGraph executor. Actual availability per task depends on the agent's `allowed_tools` config and whether a sandbox is provisioned:
 
-- `web_search` — web search via Tavily (or the configured provider)
+- `web_search` — web search via DuckDuckGo
 - `read_url` — fetch and extract text from a public URL
 - `request_human_input` — pause the task and wait for a human operator response
-- `create_text_artifact` — save text output as a downloadable task artifact (S3)
+- `create_text_artifact` — save text output as a downloadable task artifact (S3). Available only to **non-sandbox agents**; sandbox-enabled agents use `export_sandbox_file` for output files instead
 - `sandbox_exec`, `sandbox_read_file`, `sandbox_write_file`, `export_sandbox_file` — shell and file I/O inside an E2B sandbox (available when the agent is configured with `sandbox.enabled: true`)
 
 Agents configured with a **custom MCP tool server URL** (BYOT) get the server's tools merged into the same tool list at task start.
