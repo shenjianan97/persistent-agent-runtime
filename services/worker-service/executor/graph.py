@@ -35,6 +35,7 @@ from sandbox.provisioner import (
 
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
+from executor import url_safety
 from storage.s3_client import S3Client
 from tools.definitions import (
     create_default_dependencies,
@@ -117,8 +118,21 @@ class GraphExecutor:
             if row is None:
                 logger.warning("Langfuse endpoint %s not found in database", endpoint_id)
                 return None
+            host = row["host"]
+            # Re-validate at trace time. The API blocks unsafe hosts on save, but a
+            # DNS-based host saved as safe can be rebound to a metadata / internal
+            # address before this worker ships traces + Basic Auth credentials to it.
+            # Bail with None so the task still runs — tracing just degrades off.
+            try:
+                url_safety.validate(host)
+            except url_safety.UrlSafetyError as exc:
+                logger.warning(
+                    "Langfuse endpoint %s host rejected by url safety check; disabling tracing: %s",
+                    endpoint_id, exc,
+                )
+                return None
             return {
-                "host": row["host"],
+                "host": host,
                 "public_key": row["public_key"],
                 "secret_key": row["secret_key"],
             }
