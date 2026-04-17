@@ -159,6 +159,12 @@ public class ToolServerService {
         String authToken = (String) row.get("auth_token");
 
         try {
+            // Re-validate at request time. A DNS-based URL saved as safe could have
+            // been rebound to a metadata / internal address before this call runs;
+            // without this check, a tenant-controlled hostname plus a bearer token
+            // in auth_token can exfiltrate the token via DNS rebinding (TOCTOU).
+            UrlSafetyValidator.validate(serverUrl);
+
             // Step 1: Send MCP initialize request
             String initBody = """
                 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"persistent-agent-runtime","version":"1.0.0"}}}

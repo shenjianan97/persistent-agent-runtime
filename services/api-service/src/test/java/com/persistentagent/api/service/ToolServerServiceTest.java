@@ -423,6 +423,31 @@ class ToolServerServiceTest {
 
     @SuppressWarnings("unchecked")
     @Test
+    void testDiscoverTools_urlNowResolvesToMetadata_refusedWithoutHttpCall() throws Exception {
+        // TOCTOU guard: URL was safe at save time, but the stored row now points
+        // at a metadata IP (either DNS-rebound or a literal entered via direct DB
+        // access). discoverTools must reject before sending the Authorization header.
+        Map<String, Object> row = buildRow(
+            SERVER_ID, "rebound", "http://169.254.169.254/mcp",
+            "bearer_token", "supersecrettoken12345678", "active"
+        );
+        when(repository.findById(TENANT_ID, SERVER_ID)).thenReturn(Optional.of(row));
+
+        HttpClient mockHttpClient = mock(HttpClient.class);
+        ToolServerService serviceWithMockHttp = new ToolServerService(repository, objectMapper, mockHttpClient);
+
+        ToolDiscoverResponse response = serviceWithMockHttp.discoverTools(SERVER_ID);
+
+        assertEquals("unreachable", response.status());
+        assertNotNull(response.error());
+        assertTrue(response.error().toLowerCase().contains("reserved"),
+            "error should mention the reserved-range rejection, got: " + response.error());
+        assertTrue(response.tools().isEmpty());
+        verifyNoInteractions(mockHttpClient);
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
     void testDiscoverTools_jsonRpcError_returnsUnreachable() throws Exception {
         Map<String, Object> row = buildRow(SERVER_ID, "my-server", "http://localhost:8080/mcp", "none", null, "active");
         when(repository.findById(TENANT_ID, SERVER_ID)).thenReturn(Optional.of(row));
