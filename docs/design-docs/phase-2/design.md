@@ -114,6 +114,21 @@ Enable code agents to access customer repositories and deliver results as pull r
 Primary design coverage:
 - Detailed design TBD (will be developed as a dedicated design doc when this track is planned)
 
+### Track 8 — Coding-Agent Primitives
+
+Extend the sandbox tool surface so agents doing real iterative coding (edit → run test → read stack trace → edit again) can work without blowing through the context window on every turn. The Agent Capabilities Track 2 tools are sufficient to "run a script"; Track 8 is what makes "iterate on a codebase" practical.
+
+- `sandbox_edit` (surgical string-replace, not full-file rewrite)
+- `sandbox_read_file` with `offset` + `limit` (partial reads)
+- `sandbox_grep` + `sandbox_glob` (first-class ripgrep/glob surfaces, not shell-wrapped)
+- `sandbox_exec` output truncation + background mode with `sandbox_process_read` / `sandbox_process_kill`
+
+**Depends on:** Agent Capabilities Track 2 (E2B Sandbox & File Input) — already complete.
+
+**Relocated from Agent Capabilities Track 3** on 2026-04-18 — coding primitives are platform surface area, not a cross-cutting capability add-on.
+
+**Status:** Design proposed — see [track-8-coding-primitives.md](./track-8-coding-primitives.md). Implementation plan TBD.
+
 ### Track 7 — Context Window Management
 
 Keep long-running tasks viable by bounding the in-task message-history growth that otherwise pushes tasks into context-limit or cost-limit failure.
@@ -140,16 +155,16 @@ For implementation planning, the safest order is:
 5. **Agent Capabilities (cross-cutting)** — see [agent-capabilities/design.md](../agent-capabilities/design.md):
    - AC Track 1 — Output Artifact Storage ✅
    - AC Track 2 — E2B Sandbox & File Input ✅
-   - **AC Track 3 — Coding-Agent Primitives (proposed; must land before Phase 3)**
-6. Track 7 — Context Window Management (recommended ahead of Track 5: long tasks must be able to finish before cross-task memory is useful)
-7. Track 5 — Memory
-8. Track 6 — GitHub Integration
+6. **Track 8 — Coding-Agent Primitives (proposed; must land before Phase 3)** — relocated from AC Track 3
+7. Track 7 — Context Window Management (recommended ahead of Track 5: long tasks must be able to finish before cross-task memory is useful)
+8. Track 5 — Memory
+9. Track 6 — GitHub Integration
 
 Phase 2 Tracks 1–4 and Agent Capabilities Tracks 1 & 2 are complete — the platform can now run coding and document-processing workloads end-to-end with sandbox execution and artifact storage.
 
-**AC Track 3 is gating for Phase 3.** The Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [agent-capabilities/design.md#track-3-coding-agent-primitives-proposed](../agent-capabilities/design.md) for the detailed proposal.
+**Track 8 is gating for Phase 3.** The Agent Capabilities Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [track-8-coding-primitives.md](./track-8-coding-primitives.md) for the detailed proposal.
 
-Tracks 5 (Memory), 6 (GitHub Integration), and 7 (Context Window Management) can be sequenced alongside AC Track 3 as independent initiatives — they have no blocking dependency in either direction. Track 7 is recommended ahead of Track 5 on the grounds that cross-task memory is less useful if long-running tasks cannot complete.
+Tracks 5 (Memory), 6 (GitHub Integration), 7 (Context Window Management), and 8 (Coding-Agent Primitives) can be sequenced as independent initiatives — they have no blocking dependency in either direction. Track 7 is recommended ahead of Track 5 on the grounds that cross-task memory is less useful if long-running tasks cannot complete.
 
 ---
 
