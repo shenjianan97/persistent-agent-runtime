@@ -18,10 +18,14 @@
 --   - ``outcome`` CHECK (outcome IN ('succeeded', 'failed'))
 --
 -- New outer bounds added here:
---   - ``summary`` length <= 8192 (2x design-expected ~4 KB; format headroom)
+--   - ``summary`` octet length <= 8192 bytes (2x design-expected ~4 KB;
+--     format headroom). Uses ``octet_length`` not ``length`` so a
+--     multibyte-UTF-8 summary cannot exceed the storage envelope while
+--     still appearing "under" the cap by character count.
 --   - ``observations`` cardinality <= 1000 (an agent emitting >1000 notes for
 --     a single task has bigger problems)
---   - per-element ``observations`` length <= 4096 (2x the 2 KB tool cap)
+--   - per-element ``observations`` octet length <= 4096 bytes (2x the 2 KB
+--     tool cap). Byte-based for the same reason as ``summary``.
 --
 -- Postgres CHECK constraints must be IMMUTABLE and cannot use subqueries, but
 -- they CAN call IMMUTABLE SQL helper functions. Migration 0011 already uses
@@ -35,16 +39,18 @@
 -- not an operator problem to work around. Current deployments have no such
 -- rows (the tool-layer caps at 2 KB / per-call prevent them).
 
--- Step 1: IMMUTABLE helper for per-element length — returns the max length of
--- any element in the array (0 for NULL/empty). Composed entirely of IMMUTABLE
--- primitives so it can be safely marked IMMUTABLE and referenced from a CHECK.
-CREATE OR REPLACE FUNCTION immutable_array_max_element_length(arr TEXT[])
+-- Step 1: IMMUTABLE helper for per-element octet length — returns the max
+-- byte length of any element in the array (0 for NULL/empty). Composed
+-- entirely of IMMUTABLE primitives so it can be safely marked IMMUTABLE
+-- and referenced from a CHECK. Byte-based (not character-based) so the
+-- constraint measures storage size, not glyph count.
+CREATE OR REPLACE FUNCTION immutable_array_max_element_octet_length(arr TEXT[])
 RETURNS INT
 LANGUAGE sql
 IMMUTABLE
 PARALLEL SAFE
 AS $$
-    SELECT coalesce(max(length(elem)), 0)
+    SELECT coalesce(max(octet_length(elem)), 0)
     FROM unnest(arr) AS elem;
 $$;
 
@@ -54,7 +60,7 @@ $$;
 
 ALTER TABLE agent_memory_entries
     ADD CONSTRAINT agent_memory_entries_summary_length_chk
-    CHECK (length(summary) <= 8192);
+    CHECK (octet_length(summary) <= 8192);
 
 ALTER TABLE agent_memory_entries
     ADD CONSTRAINT agent_memory_entries_observations_cardinality_chk
@@ -62,4 +68,4 @@ ALTER TABLE agent_memory_entries
 
 ALTER TABLE agent_memory_entries
     ADD CONSTRAINT agent_memory_entries_observation_element_length_chk
-    CHECK (immutable_array_max_element_length(observations) <= 4096);
+    CHECK (immutable_array_max_element_octet_length(observations) <= 4096);

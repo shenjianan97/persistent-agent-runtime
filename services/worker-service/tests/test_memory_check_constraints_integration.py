@@ -180,6 +180,34 @@ class TestObservationElementLengthConstraint:
                     observations=["short", "also short", "x" * 4097],
                 )
 
+    @pytest.mark.asyncio
+    async def test_multibyte_summary_enforces_byte_cap_not_char_cap(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        """CJK/emoji text encoded as UTF-8 is 3-4 bytes per character.
+
+        A string of 3000 CJK characters is ~9000 bytes — well over the
+        8192-byte cap even though it's under 8192 *characters*. The
+        constraint uses ``octet_length`` so storage size, not glyph count,
+        governs the bound.
+        """
+        cjk_over_cap = "日" * 3000  # 3 bytes each in UTF-8 → 9000 bytes
+        async with integration_pool.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await _insert(conn, summary=cjk_over_cap, observations=[])
+
+    @pytest.mark.asyncio
+    async def test_multibyte_observation_element_enforces_byte_cap(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        """Same byte-vs-character distinction for the per-observation cap."""
+        cjk_over_cap = "日" * 1500  # 3 bytes each → 4500 bytes, > 4096
+        async with integration_pool.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await _insert(
+                    conn, summary="ok", observations=[cjk_over_cap]
+                )
+
 
 class TestValidRowStillAccepted:
     @pytest.mark.asyncio

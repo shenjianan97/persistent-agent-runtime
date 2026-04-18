@@ -1520,17 +1520,14 @@ class GraphExecutor:
 
             async def run_astream():
                 nonlocal session_manager, per_task_langfuse_client, sandbox
-                # For first run, inject HumanMessage based on initial input
+                # For first run, inject HumanMessage based on initial input.
+                # ``first_execution`` is the single predicate used to gate
+                # initial-state setup: True when there is no checkpoint tuple
+                # at all AND when a checkpoint tuple exists but has no prior
+                # messages. (LangGraph durability can persist an empty
+                # checkpoint before the first super-step in some modes; both
+                # scenarios want identical first-run handling.)
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
-                is_first_run = not checkpoint_tuple
-
-                # Phase 2 Track 5 Task 8 — first-execution predicate shared
-                # with attached-memory injection. ``is_first_run`` above tests
-                # "no checkpoint tuple at all"; ``has_prior_history`` is the
-                # stronger variant ("checkpoint exists AND messages list is
-                # non-empty"). Empty initial checkpoints (LangGraph durability
-                # can persist one before the first super-step in some modes)
-                # still count as first-run so the injection fires exactly once.
                 has_prior_history = checkpoint_tuple_has_prior_history(
                     checkpoint_tuple
                 )
@@ -1629,11 +1626,11 @@ class GraphExecutor:
                         initial_messages.append(
                             SystemMessage(content=platform_system_msg)
                         )
-                if is_first_run:
+                if first_execution:
                     initial_messages.append(HumanMessage(content=task_input))
 
                 initial_input: Any
-                if is_first_run:
+                if first_execution:
                     _payload: dict[str, Any] = {"messages": initial_messages}
                     if memory_enabled_for_task and seeded_observations:
                         _payload["observations"] = list(seeded_observations)
@@ -1642,7 +1639,7 @@ class GraphExecutor:
                     initial_input = None
 
                 # Resume path: if this is a resumed task with a human response, use Command(resume=...)
-                if not is_first_run:
+                if not first_execution:
                     human_response = await self.pool.fetchval(
                         'SELECT human_response FROM tasks WHERE task_id = $1::uuid', task_id
                     )
