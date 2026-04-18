@@ -37,10 +37,14 @@ from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnect
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
 from executor.memory_graph import (
+    DEAD_LETTER_REASON_CANCELLED_BY_USER,
     MemoryEnabledState,
     MEMORY_WRITE_NODE_NAME,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     SummarizerResult,
+    build_attached_memories_preamble,
+    build_pending_memory_dead_letter_template,
+    checkpoint_tuple_has_prior_history,
     effective_memory_enabled,
     memory_write_node,
 )
@@ -49,7 +53,9 @@ from core.memory_repository import (
     count_entries_for_agent,
     max_entries_for_agent,
     pending_memory_log_preview,
+    read_memory_observations_by_task_id,
     read_pending_memory_from_state_values,
+    resolve_attached_memories_for_task,
     trim_oldest,
     upsert_memory_entry,
 )
@@ -1289,6 +1295,11 @@ class GraphExecutor:
         custom_tools: list[StructuredTool] = []
         sandbox = None
         provisioner = None
+        # Initialized below in the try block; predeclared so the
+        # ``except`` handlers can pass it into ``_handle_dead_letter`` even
+        # when a pre-graph failure (tool servers, sandbox) triggers dead-
+        # letter before the checkpointer is wired up.
+        checkpointer: PostgresDurableCheckpointer | None = None
 
         try:
             # Look up and connect to MCP tool servers if configured
@@ -1509,7 +1520,123 @@ class GraphExecutor:
                 # For first run, inject HumanMessage based on initial input
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
                 is_first_run = not checkpoint_tuple
-                initial_input = {"messages": [HumanMessage(content=task_input)]} if is_first_run else None
+
+                # Phase 2 Track 5 Task 8 — first-execution predicate shared
+                # with attached-memory injection. ``is_first_run`` above tests
+                # "no checkpoint tuple at all"; ``has_prior_history`` is the
+                # stronger variant ("checkpoint exists AND messages list is
+                # non-empty"). Empty initial checkpoints (LangGraph durability
+                # can persist one before the first super-step in some modes)
+                # still count as first-run so the injection fires exactly once.
+                has_prior_history = checkpoint_tuple_has_prior_history(
+                    checkpoint_tuple
+                )
+                first_execution = not has_prior_history
+
+                # Phase 2 Track 5 Task 8 — resolve attached memories (first
+                # execution only) + seed observations from the existing memory
+                # row (first-execution-with-memory-row, i.e. redrive after a
+                # prior dead-letter template write). Attachments are
+                # immutable after task creation, so we only resolve on first
+                # execution; the injected preamble is captured in the first
+                # super-step checkpoint and implicit for subsequent resumes.
+                attached_preamble: str | None = None
+                seeded_observations: list[str] | None = None
+                if first_execution:
+                    async with self.pool.acquire() as _attach_conn:
+                        if memory_enabled_for_task:
+                            seeded_observations = (
+                                await read_memory_observations_by_task_id(
+                                    _attach_conn, tenant_id, agent_id, task_id,
+                                )
+                            )
+                        # Attach injection runs regardless of
+                        # ``effective_memory_enabled`` — see design doc §
+                        # "Read Path → Retrieval is always explicit". Console
+                        # gates this UI-side when the agent has memory
+                        # disabled; the worker does not additionally gate.
+                        resolved_entries = (
+                            await resolve_attached_memories_for_task(
+                                _attach_conn, tenant_id, agent_id, task_id,
+                            )
+                        )
+                    attached_preamble = build_attached_memories_preamble(
+                        resolved_entries
+                    )
+                    if attached_preamble is not None:
+                        approx_bytes = len(
+                            attached_preamble.encode("utf-8", errors="replace")
+                        )
+                        logger.info(
+                            "memory.attach.injected tenant_id=%s agent_id=%s "
+                            "task_id=%s count=%d approx_bytes=%d",
+                            tenant_id, agent_id, task_id,
+                            len(resolved_entries), approx_bytes,
+                        )
+                    if seeded_observations:
+                        logger.info(
+                            "memory.seeding.applied tenant_id=%s agent_id=%s "
+                            "task_id=%s observation_count=%d",
+                            tenant_id, agent_id, task_id,
+                            len(seeded_observations),
+                        )
+
+                # Build initial message list. Attachment preamble (when
+                # present) is prepended as a SystemMessage BEFORE the agent's
+                # own system prompt — the distinction between "agent rules"
+                # and "customer-attached memory" must be preserved. Because
+                # the ``agent_node`` only auto-synthesizes system prompts
+                # when NO SystemMessage is present in state, we explicitly
+                # include the agent's system prompt + platform system
+                # message here when we're also injecting the preamble, so
+                # those aren't silently dropped on the first super-step.
+                initial_messages: list[Any] = []
+                if attached_preamble is not None:
+                    initial_messages.append(
+                        SystemMessage(
+                            content=(
+                                "The following memory entries have been "
+                                "attached to this task by the customer. "
+                                "Use them as reference context:\n\n"
+                                f"{attached_preamble}"
+                            )
+                        )
+                    )
+                    # Reconstruct the agent's system prompts that
+                    # ``agent_node`` would normally synthesise on the first
+                    # super-step — see agent_node's "no SystemMessage"
+                    # branch in _build_graph.
+                    agent_system_prompt = agent_config.get("system_prompt", "")
+                    allowed_tools_for_sys = agent_config.get("allowed_tools", [])
+                    sandbox_template_for_sys = (
+                        agent_config.get("sandbox") or {}
+                    ).get("template")
+                    platform_system_msg = self._build_platform_system_message(
+                        allowed_tools_for_sys,
+                        injected_files=(
+                            injected_files if sandbox_enabled else None
+                        ),
+                        sandbox_template=sandbox_template_for_sys,
+                    )
+                    if agent_system_prompt:
+                        initial_messages.append(
+                            SystemMessage(content=agent_system_prompt)
+                        )
+                    if platform_system_msg:
+                        initial_messages.append(
+                            SystemMessage(content=platform_system_msg)
+                        )
+                if is_first_run:
+                    initial_messages.append(HumanMessage(content=task_input))
+
+                initial_input: Any
+                if is_first_run:
+                    _payload: dict[str, Any] = {"messages": initial_messages}
+                    if memory_enabled_for_task and seeded_observations:
+                        _payload["observations"] = list(seeded_observations)
+                    initial_input = _payload
+                else:
+                    initial_input = None
 
                 # Resume path: if this is a resumed task with a human response, use Command(resume=...)
                 if not is_first_run:
@@ -1913,9 +2040,26 @@ class GraphExecutor:
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
 
         except asyncio.TimeoutError:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "task_timeout", "Execution exceeded task logic timeout")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "task_timeout", "Execution exceeded task logic timeout",
+                memory_enabled=memory_enabled_for_task,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except GraphRecursionError:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "max_steps_exceeded", f"Execution exceeded max_steps ({max_steps})")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "max_steps_exceeded",
+                f"Execution exceeded max_steps ({max_steps})",
+                memory_enabled=memory_enabled_for_task,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except GraphInterrupt as gi:
             await self._handle_interrupt(task_data, gi, worker_id)
         except LeaseRevokedException:
@@ -1925,9 +2069,25 @@ class GraphExecutor:
         except Exception as e:
             # Step 4: Failure classification
             if self._is_retryable_error(e):
-                await self._handle_retryable_error(task_data, e)
+                await self._handle_retryable_error(
+                    task_data,
+                    e,
+                    memory_enabled=memory_enabled_for_task,
+                    agent_config=agent_config,
+                    task_input=task_input,
+                    checkpointer=checkpointer,
+                )
             else:
-                await self._handle_dead_letter(task_id, tenant_id, agent_id, "non_retryable_error", str(e), error_code="fatal_error")
+                await self._handle_dead_letter(
+                    task_id, tenant_id, agent_id,
+                    "non_retryable_error", str(e),
+                    error_code="fatal_error",
+                    memory_enabled=memory_enabled_for_task,
+                    agent_config=agent_config,
+                    task_input=task_input,
+                    retry_count=task_data.get("retry_count", 0),
+                    checkpointer=checkpointer,
+                )
         finally:
             if per_task_langfuse_client is not None:
                 try:
@@ -2351,7 +2511,16 @@ class GraphExecutor:
         else:
             logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
 
-    async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
+    async def _handle_retryable_error(
+        self,
+        task_data: dict[str, Any],
+        e: Exception,
+        *,
+        memory_enabled: bool = False,
+        agent_config: dict[str, Any] | None = None,
+        task_input: str | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
+    ):
         task_id = str(task_data["task_id"])
         tenant_id = task_data.get("tenant_id", "default")
         agent_id = task_data.get("agent_id") or "unknown"
@@ -2360,7 +2529,16 @@ class GraphExecutor:
         worker_pool_id = self.config.worker_pool_id
 
         if retry_count >= max_retries:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "retries_exhausted",
+                f"Max retries reached. Last error: {e}",
+                memory_enabled=memory_enabled,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=retry_count,
+                checkpointer=checkpointer,
+            )
             return
 
         new_retry_count = retry_count + 1
@@ -2416,37 +2594,208 @@ class GraphExecutor:
 
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
-    async def _handle_dead_letter(self, task_id: str, tenant_id: str, agent_id: str,
-                                   reason: str, error_msg: str, error_code: str | None = None):
+    async def _handle_dead_letter(
+        self,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        reason: str,
+        error_msg: str,
+        error_code: str | None = None,
+        *,
+        memory_enabled: bool = False,
+        agent_config: dict[str, Any] | None = None,
+        task_input: str | None = None,
+        retry_count: int | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
+    ):
+        """Transition a task to ``dead_letter`` with lease validation.
+
+        Phase 2 Track 5 Task 8 adds an optional memory-write branch **inside
+        the same transaction** as the task UPDATE. Gating rules (all must
+        hold to write a row):
+
+        * ``memory_enabled`` is True (agent.memory.enabled AND NOT
+          tasks.skip_memory_write — caller's pre-computed decision).
+        * ``reason != 'cancelled_by_user'`` — cancellation writes nothing.
+        * At least one observation recorded in the most recent checkpoint.
+
+        The row is template-only (``summarizer_model_id='template:dead_letter'``,
+        ``outcome='failed'``) — no LLM call. Embedding is still attempted when
+        a ``pool`` / embedding client is available; on provider failure the
+        row is written with ``content_vec=NULL``.
+
+        On lease loss at step (5) below, the whole transaction rolls back —
+        no orphan memory row.
+        """
         worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
         effective_error_code = error_code or reason
 
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                updated = await conn.fetchval(
-                    '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
-                    reason,
-                    error_msg,
-                    effective_error_code,
-                    worker_id,
-                    task_id,
-                    worker_id,
+        # Phase 2 Track 5 Task 8 — memory hook pre-work (outside tx).
+        #
+        # We resolve the observations + template pending_memory BEFORE opening
+        # the transaction so the transaction body stays tight around the DB
+        # writes. The embedding call (if any) also happens here because it is
+        # a network call that we don't want wrapped inside a DB transaction.
+        pending_memory: dict[str, Any] | None = None
+        memory_write_attempted = False
+        if (
+            memory_enabled
+            and reason != DEAD_LETTER_REASON_CANCELLED_BY_USER
+            and checkpointer is not None
+        ):
+            observations = await self._read_observations_from_checkpoint(
+                checkpointer, task_id
+            )
+            if observations:
+                memory_write_attempted = True
+                pending_memory = build_pending_memory_dead_letter_template(
+                    task_input=task_input,
+                    observations=observations,
+                    retry_count=retry_count,
+                    last_error_code=effective_error_code,
+                    last_error_message=error_msg,
                 )
-                if updated is not None:
+                # Best-effort embedding. A failure here must NOT sink the
+                # memory row — invariant: observations-bearing genuine
+                # failures always produce a row.
+                try:
+                    embed_result = await _default_compute_embedding(
+                        _build_dead_letter_embedding_text(pending_memory),
+                        pool=self.pool,
+                    )
+                except Exception:
+                    logger.warning(
+                        "memory.deadletter.embedding_unexpected_exception "
+                        "task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    embed_result = None
+                if embed_result is None:
+                    pending_memory["content_vec"] = None
+                    pending_memory["embedding_tokens"] = 0
+                    pending_memory["embedding_cost_microdollars"] = 0
+                else:
+                    pending_memory["content_vec"] = list(embed_result.vector)
+                    pending_memory["embedding_tokens"] = embed_result.tokens
+                    pending_memory["embedding_cost_microdollars"] = (
+                        embed_result.cost_microdollars
+                    )
+
+        memory_id: Any = None
+        trim_evicted = 0
+        memory_written = False
+        lease_lost = False
+
+        class _DeadLetterLeaseLost(Exception):
+            """Internal sentinel used to roll back the dead-letter tx
+            atomically when the lease-validated UPDATE returns no row."""
+
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # 1. Memory UPSERT (if any) runs FIRST inside the tx so
+                    # a lease mismatch on the task UPDATE below rolls back
+                    # the memory row atomically — no orphan row survives.
+                    if pending_memory is not None:
+                        max_entries = max_entries_for_agent(agent_config)
+                        entry = {
+                            "tenant_id": tenant_id,
+                            "agent_id": agent_id,
+                            "task_id": task_id,
+                            "title": pending_memory["title"],
+                            "summary": pending_memory["summary"],
+                            "observations": list(
+                                pending_memory.get("observations_snapshot") or []
+                            ),
+                            "outcome": pending_memory.get("outcome", "failed"),
+                            "tags": list(pending_memory.get("tags") or []),
+                            "content_vec": pending_memory.get("content_vec"),
+                            "summarizer_model_id": pending_memory.get(
+                                "summarizer_model_id"
+                            ),
+                        }
+                        upserted = await upsert_memory_entry(conn, entry)
+                        memory_id = upserted["memory_id"]
+                        inserted_branch = upserted["inserted"]
+                        memory_written = True
+
+                        if inserted_branch:
+                            post_insert_count = await count_entries_for_agent(
+                                conn, tenant_id, agent_id
+                            )
+                            if post_insert_count > max_entries:
+                                trim_evicted = await trim_oldest(
+                                    conn,
+                                    tenant_id=tenant_id,
+                                    agent_id=agent_id,
+                                    max_entries=max_entries,
+                                    keep_memory_id=memory_id,
+                                )
+
+                        # Embedding cost ledger (template write has zero
+                        # summarizer cost — no LLM call). Only recorded when
+                        # an embedding was actually computed.
+                        if pending_memory.get("content_vec") is not None:
+                            checkpoint_id = await conn.fetchval(
+                                '''SELECT checkpoint_id FROM checkpoints
+                                   WHERE task_id = $1::uuid AND checkpoint_ns = ''
+                                   ORDER BY created_at DESC LIMIT 1''',
+                                task_id,
+                            )
+                            if checkpoint_id:
+                                embedding_cost = int(
+                                    pending_memory.get(
+                                        "embedding_cost_microdollars"
+                                    )
+                                    or 0
+                                )
+                                await conn.execute(
+                                    '''INSERT INTO agent_cost_ledger
+                                           (tenant_id, agent_id, task_id,
+                                            checkpoint_id, cost_microdollars)
+                                       VALUES ($1, $2, $3::uuid, $4, $5)''',
+                                    tenant_id,
+                                    agent_id,
+                                    task_id,
+                                    checkpoint_id,
+                                    embedding_cost,
+                                )
+
+                    # 2. Lease-validated task dead-letter update.
+                    updated = await conn.fetchval(
+                        '''UPDATE tasks
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
+                        reason,
+                        error_msg,
+                        effective_error_code,
+                        worker_id,
+                        task_id,
+                        worker_id,
+                    )
+                    if updated is None:
+                        # Raise an internal sentinel to roll back the entire
+                        # transaction (memory UPSERT + task UPDATE). Caught
+                        # at the outer scope so we preserve the pre-Task-8
+                        # "log-and-return" semantics that callers depend on.
+                        raise _DeadLetterLeaseLost(
+                            f"Lease revoked before dead-letter write for task {task_id}"
+                        )
+
                     # Track 3: Decrement running_task_count on dead-letter
                     await conn.execute(
                         '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
@@ -2463,11 +2812,91 @@ class GraphExecutor:
                         error_message=error_msg,
                         details={"dead_letter_reason": reason},
                     )
+        except _DeadLetterLeaseLost:
+            lease_lost = True
+            memory_written = False  # Rolled back with the tx.
+            memory_id = None
+            trim_evicted = 0
+            logger.warning(
+                "Task %s dead-letter skipped: lease no longer owned by this worker.",
+                task_id,
+            )
+            return
 
-        if updated is None:
-            logger.warning("Task %s dead-letter skipped: lease no longer owned by this worker.", task_id)
-        else:
-            logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+        # Emit the dead-letter memory structured log AFTER the commit so the
+        # "committed" claim is truthful.
+        if memory_written:
+            logger.info(
+                "memory.deadletter.template tenant_id=%s agent_id=%s "
+                "task_id=%s reason=%s observation_count=%d memory_id=%s "
+                "trim_evicted=%d content_vec_null=%s",
+                tenant_id, agent_id, task_id, reason,
+                len(pending_memory.get("observations_snapshot") or [])
+                if pending_memory else 0,
+                memory_id, trim_evicted,
+                pending_memory.get("content_vec") is None if pending_memory else True,
+            )
+        elif memory_write_attempted:
+            # This branch is unreachable today (we only set the flag when we
+            # also populate pending_memory), but we keep it so a future
+            # divergence is noticed in logs rather than silently drops.
+            logger.warning(
+                "memory.deadletter.skipped_after_attempt task_id=%s", task_id
+            )
+
+        logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+
+    async def _read_observations_from_checkpoint(
+        self,
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+    ) -> list[str]:
+        """Read ``observations`` out of the latest checkpoint's state.
+
+        Returns ``[]`` on any read failure so the dead-letter hook gracefully
+        treats a missing/corrupt checkpoint as "no observations, skip memory
+        write" rather than blocking the dead-letter transition.
+        """
+        try:
+            config: dict[str, Any] = {"configurable": {"thread_id": task_id}}
+            tup = await checkpointer.aget_tuple(config)
+            if tup is None:
+                return []
+            checkpoint = getattr(tup, "checkpoint", None) or {}
+            if not isinstance(checkpoint, dict):
+                return []
+            values = checkpoint.get("channel_values")
+            if not isinstance(values, dict):
+                return []
+            obs = values.get("observations") or []
+            if isinstance(obs, list):
+                return [str(x) for x in obs if x is not None]
+            return []
+        except Exception:
+            logger.warning(
+                "memory.deadletter.observations_read_failed task_id=%s",
+                task_id,
+                exc_info=True,
+            )
+            return []
+
+
+def _build_dead_letter_embedding_text(pending_memory: dict[str, Any]) -> str:
+    """Concatenate the text that seeds the dead-letter ``content_vec``.
+
+    Matches the generated ``content_tsv`` expression in migration 0011 so
+    search-time BM25 and embedding-time vector share a single content
+    surface. Mirrors :func:`executor.memory_graph._build_embedding_text`
+    but lives at module scope because the dead-letter hook uses a template
+    dict rather than running through the ``memory_write_node`` path.
+    """
+    parts = [
+        pending_memory.get("title") or "",
+        pending_memory.get("summary") or "",
+        " ".join(pending_memory.get("observations_snapshot") or []),
+        " ".join(pending_memory.get("tags") or []),
+    ]
+    return " ".join(p for p in parts if p).strip()
 
 
 async def _insert_task_event(
