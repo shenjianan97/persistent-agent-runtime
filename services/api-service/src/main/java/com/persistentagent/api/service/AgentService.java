@@ -8,6 +8,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.AgentCreateRequest;
 import com.persistentagent.api.model.request.AgentUpdateRequest;
+import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.model.response.AgentResponse;
 import com.persistentagent.api.model.response.AgentSummaryResponse;
@@ -199,6 +200,12 @@ public class AgentService {
             }
         }
 
+        // Memory sub-object round-trip: preserve verbatim when present, omit
+        // when absent. No platform defaults are written into the canonical
+        // config — defaults apply at read time (worker + validator) per
+        // Phase 2 Track 5 design.
+        MemoryConfigRequest canonicalizedMemory = config.memory();
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -210,7 +217,8 @@ public class AgentService {
                 config.toolServers() != null
                         ? config.toolServers()
                         : List.of(),
-                canonicalizedSandbox);
+                canonicalizedSandbox,
+                canonicalizedMemory);
     }
 
     private String serializeConfig(AgentConfigRequest config) {

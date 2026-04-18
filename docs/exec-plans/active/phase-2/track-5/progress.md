@@ -3,7 +3,7 @@
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
 | Task 1 | Infra + Migration | Done | Migration `0011_agent_memory.sql`; pgvector image pin across dev/CI/test DB |
-| Task 2 | Agent Config Extension | Not started | `agent_config.memory` sub-object: Jackson, validation, canonicalisation |
+| Task 2 | Agent Config Extension | Done | `agent_config.memory` sub-object: Jackson, validation, canonicalisation |
 | Task 3 | Memory REST API | Not started | List, hybrid RRF search, detail, delete, storage stats |
 | Task 4 | Task Submission Extension | Not started | `attached_memory_ids` + `skip_memory_write`, join table, event mirror |
 | Task 5 | Worker Embeddings | Not started | Provider abstraction + discovery validation + deferred path |

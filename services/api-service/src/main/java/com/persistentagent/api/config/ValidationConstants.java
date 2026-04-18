@@ -48,6 +48,14 @@ public final class ValidationConstants {
 
     public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";
 
+    // Memory config bounds (Phase 2 Track 5).
+    // Lower bound prevents starving Console UX; upper bound keeps HNSW
+    // rebuild within operational tolerances. Platform default is applied at
+    // read time (worker + validator), not written into canonical config.
+    public static final int MEMORY_MAX_ENTRIES_MIN = 100;
+    public static final int MEMORY_MAX_ENTRIES_MAX = 100_000;
+    public static final int MEMORY_MAX_ENTRIES_DEFAULT = 10_000;
+
     // Sandbox config defaults and limits
     public static final int SANDBOX_VCPU_MIN = 1;
     public static final int SANDBOX_VCPU_MAX = 8;
