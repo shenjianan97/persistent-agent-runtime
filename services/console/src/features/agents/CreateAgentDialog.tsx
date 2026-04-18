@@ -35,6 +35,16 @@ const createAgentSchema = z.object({
     sandbox_vcpu: z.number().int().min(1).max(8).default(2),
     sandbox_memory_mb: z.number().int().min(512).max(8192).default(2048),
     sandbox_timeout_seconds: z.number().int().min(60).max(86400).default(3600),
+    memory_enabled: z.boolean().default(false),
+    memory_summarizer_model: z.string().default(''),
+    memory_max_entries: z
+        .string()
+        .default('')
+        .refine((value) => {
+            if (value.trim() === '') return true;
+            const parsed = Number.parseInt(value, 10);
+            return Number.isInteger(parsed) && parsed >= 100 && parsed <= 100_000;
+        }, 'Max entries must be between 100 and 100,000'),
 });
 
 type CreateAgentFormValues = z.infer<typeof createAgentSchema>;
@@ -67,11 +77,15 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
             sandbox_vcpu: 2,
             sandbox_memory_mb: 2048,
             sandbox_timeout_seconds: 3600,
+            memory_enabled: false,
+            memory_summarizer_model: '',
+            memory_max_entries: '',
         },
     });
 
     const selectedToolServers = form.watch('tool_servers');
     const sandboxEnabled = form.watch('sandbox_enabled');
+    const memoryEnabled = form.watch('memory_enabled');
 
     function onSubmit(data: CreateAgentFormValues) {
         const sandboxConfig = data.sandbox_enabled
@@ -81,6 +95,18 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                 vcpu: data.sandbox_vcpu,
                 memory_mb: data.sandbox_memory_mb,
                 timeout_seconds: data.sandbox_timeout_seconds,
+            }
+            : undefined;
+        const parsedMaxEntries = data.memory_max_entries.trim() === ''
+            ? undefined
+            : Number.parseInt(data.memory_max_entries, 10);
+        const summarizerModel = data.memory_summarizer_model.trim();
+        const hasMemoryConfig = data.memory_enabled || !!summarizerModel || parsedMaxEntries !== undefined;
+        const memoryConfig = hasMemoryConfig
+            ? {
+                enabled: data.memory_enabled,
+                ...(summarizerModel ? { summarizer_model: summarizerModel } : {}),
+                ...(parsedMaxEntries !== undefined ? { max_entries: parsedMaxEntries } : {}),
             }
             : undefined;
 
@@ -94,6 +120,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                     temperature: data.temperature,
                     tool_servers: data.tool_servers,
                     ...(sandboxConfig ? { sandbox: sandboxConfig } : {}),
+                    ...(memoryConfig ? { memory: memoryConfig } : {}),
                 },
                 max_concurrent_tasks: data.max_concurrent_tasks,
                 budget_max_per_task: data.budget_max_per_task,
@@ -379,6 +406,93 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                                         The sandbox stays alive while the task is running. This timeout only applies after
                                                         a crash — if no one redrives within this window, the sandbox and its files are lost.
                                                         Default: 1 hour.
+                                                    </p>
+                                                    <FormMessage className="text-destructive font-bold text-xs" />
+                                                </FormItem>
+                                            )}
+                                        />
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="space-y-3">
+                            <span className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Memory</span>
+                            <div className="p-3 border border-border rounded-none bg-black/30 space-y-4">
+                                <FormField
+                                    control={form.control}
+                                    name="memory_enabled"
+                                    render={({ field }) => (
+                                        <FormItem className="flex flex-row items-center gap-3">
+                                            <FormControl>
+                                                <Checkbox
+                                                    className="rounded-none border-primary data-[state=checked]:bg-primary data-[state=checked]:text-black"
+                                                    checked={field.value}
+                                                    onCheckedChange={field.onChange}
+                                                />
+                                            </FormControl>
+                                            <div>
+                                                <FormLabel className="font-normal font-mono cursor-pointer text-sm">
+                                                    Enable Memory
+                                                </FormLabel>
+                                                <p className="text-xs text-muted-foreground mt-0.5">
+                                                    Persist cross-task memory entries for this agent and unlock memory tools in the Console.
+                                                </p>
+                                            </div>
+                                        </FormItem>
+                                    )}
+                                />
+
+                                {memoryEnabled && (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+                                        <FormField
+                                            control={form.control}
+                                            name="memory_summarizer_model"
+                                            render={({ field }) => (
+                                                <FormItem>
+                                                    <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Summarizer Model</FormLabel>
+                                                    <FormControl>
+                                                        <Input
+                                                            aria-label="Summarizer Model"
+                                                            className="rounded-none border-border bg-black/50 w-full"
+                                                            placeholder="e.g., claude-3-5-haiku-latest"
+                                                            {...field}
+                                                        />
+                                                    </FormControl>
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                        Leave blank to use the runtime-configured platform default summarizer. If the platform does not override it, the worker falls back to
+                                                        {' '}
+                                                        <code>claude-haiku-4-5</code>
+                                                        .
+                                                    </p>
+                                                    <FormMessage className="text-destructive font-bold text-xs" />
+                                                </FormItem>
+                                            )}
+                                        />
+                                        <FormField
+                                            control={form.control}
+                                            name="memory_max_entries"
+                                            render={({ field }) => (
+                                                <FormItem>
+                                                    <FormLabel className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">Max Entries</FormLabel>
+                                                    <FormControl>
+                                                        <Input
+                                                            type="number"
+                                                            min="100"
+                                                            max="100000"
+                                                            step="100"
+                                                            aria-label="Max Entries"
+                                                            className="rounded-none border-border bg-black/50 w-full"
+                                                            placeholder="10000"
+                                                            {...field}
+                                                        />
+                                                    </FormControl>
+                                                    <p className="text-xs text-muted-foreground mt-1">
+                                                        Optional retention cap. When omitted, the platform default of
+                                                        {' '}
+                                                        <code>10,000</code>
+                                                        {' '}
+                                                        entries is used.
                                                     </p>
                                                     <FormMessage className="text-destructive font-bold text-xs" />
                                                 </FormItem>

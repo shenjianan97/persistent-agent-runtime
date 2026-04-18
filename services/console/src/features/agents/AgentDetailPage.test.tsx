@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -100,6 +100,28 @@ const MOCK_AGENT_WITH_SANDBOX = {
     },
 };
 
+const MOCK_AGENT_WITH_MEMORY = {
+    ...MOCK_AGENT,
+    agent_config: {
+        ...MOCK_AGENT.agent_config,
+        memory: {
+            enabled: true,
+            summarizer_model: 'claude-3-5-sonnet-latest',
+            max_entries: 2500,
+        },
+    },
+};
+
+const MOCK_AGENT_WITH_MEMORY_DEFAULTS = {
+    ...MOCK_AGENT,
+    agent_config: {
+        ...MOCK_AGENT.agent_config,
+        memory: {
+            enabled: true,
+        },
+    },
+};
+
 describe('AgentDetailPage', () => {
     it('shows sandbox info in read-only mode when sandbox is enabled', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
@@ -165,6 +187,34 @@ describe('AgentDetailPage', () => {
         );
     });
 
+    it('preserves memory config in the submit payload when saving an existing memory-enabled agent', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_MEMORY, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+        fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+
+        await waitFor(() => expect(updateMock).toHaveBeenCalled());
+
+        expect(updateMock).toHaveBeenCalledWith(
+            expect.objectContaining({
+                request: expect.objectContaining({
+                    agent_config: expect.objectContaining({
+                        memory: {
+                            enabled: true,
+                            summarizer_model: 'claude-3-5-sonnet-latest',
+                            max_entries: 2500,
+                        },
+                    }),
+                }),
+            }),
+            expect.any(Object),
+        );
+    });
+
     it('omits sandbox from submit payload when sandbox is disabled', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
 
@@ -204,6 +254,37 @@ describe('AgentDetailPage', () => {
         expect(screen.getByText('$5.00')).toBeInTheDocument();
         expect(screen.getByRole('button', { name: /edit/i })).toBeInTheDocument();
         expect(screen.queryByRole('button', { name: /save changes/i })).not.toBeInTheDocument();
+    });
+
+    it('shows memory settings in overview and renders the memory tab without an icon', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_MEMORY, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        expect(screen.getByText('Enabled')).toBeInTheDocument();
+        expect(screen.getByText('claude-3-5-sonnet-latest')).toBeInTheDocument();
+        expect(screen.getByText('2500')).toBeInTheDocument();
+
+        const memoryTab = screen.getByTestId('agent-tab-memory');
+        expect(within(memoryTab).getByText('Memory')).toBeInTheDocument();
+        expect(memoryTab.querySelector('svg')).toBeNull();
+
+        expect(screen.getByTestId('agent-memory-status-label')).toHaveClass('whitespace-nowrap');
+    });
+
+    it('shows concrete memory defaults in overview when optional values are unset', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_MEMORY_DEFAULTS, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        expect(
+            screen.getByText('Platform default (runtime-configured; fallback: claude-haiku-4-5)')
+        ).toBeInTheDocument();
+        expect(screen.getByText('10,000')).toBeInTheDocument();
     });
 
     it('shows loading state', () => {
