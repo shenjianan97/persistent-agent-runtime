@@ -7,19 +7,23 @@ and .local / .internal suffixes) while keeping dev workflows working — loopbac
 and RFC1918 stay allowed so local Langfuse (127.0.0.1:3300) and VPN-reachable
 internal instances don't break.
 
+DNS resolution is offloaded to a thread so a slow resolver cannot pause the
+worker's event loop. Tests inject their own resolver and never hit real DNS.
+
 When the platform onboards external tenants, add a strict mode that additionally
 rejects loopback and RFC1918 and gate it on a config flag.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlparse
 
 
-Resolver = Callable[[str], list[str]]
+Resolver = Callable[[str], Awaitable[list[str]]]
 
 
 class UrlSafetyError(ValueError):
@@ -44,15 +48,19 @@ _BLOCKED_IPV6_NETWORKS = (
 )
 
 
-def _default_resolver(host: str) -> list[str]:
+async def _default_resolver(host: str) -> list[str]:
+    # Offload the blocking syscall so slow / unresponsive DNS cannot stall the
+    # worker's event loop — all other coroutines would pause with it otherwise.
     try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, host, None, type=socket.SOCK_STREAM
+        )
     except socket.gaierror as exc:
         raise UrlSafetyError(f"Hostname could not be resolved: {host}") from exc
     return sorted({info[4][0] for info in infos})
 
 
-def validate(url: str, *, resolver: Resolver = _default_resolver) -> None:
+async def validate(url: str, *, resolver: Resolver = _default_resolver) -> None:
     """Raise UrlSafetyError if the URL points anywhere unsafe; return None otherwise."""
     if url is None or not str(url).strip():
         raise UrlSafetyError("URL is required")
@@ -73,7 +81,7 @@ def validate(url: str, *, resolver: Resolver = _default_resolver) -> None:
     if normalized.endswith(".local") or normalized.endswith(".internal"):
         raise UrlSafetyError("Hostnames ending in .local or .internal are not allowed")
 
-    ips = resolver(host)
+    ips = await resolver(host)
     if not ips:
         raise UrlSafetyError(f"Hostname could not be resolved: {host}")
 

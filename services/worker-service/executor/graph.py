@@ -124,7 +124,7 @@ class GraphExecutor:
             # address before this worker ships traces + Basic Auth credentials to it.
             # Bail with None so the task still runs — tracing just degrades off.
             try:
-                url_safety.validate(host)
+                await url_safety.validate(host)
             except url_safety.UrlSafetyError as exc:
                 logger.warning(
                     "Langfuse endpoint %s host rejected by url safety check; disabling tracing: %s",
