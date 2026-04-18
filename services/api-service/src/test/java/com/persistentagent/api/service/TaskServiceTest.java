@@ -13,6 +13,7 @@ import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ArtifactRepository;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
+import com.persistentagent.api.repository.TaskAttachedMemoryRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.repository.TaskRepository.MutationResult;
 import com.persistentagent.api.repository.TaskRepository.CancelResult;
@@ -22,6 +23,7 @@ import com.persistentagent.api.service.observability.TaskObservabilityService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -64,6 +66,9 @@ class TaskServiceTest {
     @Mock
     private S3StorageService s3StorageService;
 
+    @Mock
+    private TaskAttachedMemoryRepository taskAttachedMemoryRepository;
+
     private TaskService taskService;
     private ObjectMapper objectMapper;
 
@@ -84,6 +89,7 @@ class TaskServiceTest {
                 new CheckpointEventParser(objectMapper),
                 configValidationHelper,
                 s3StorageService,
+                taskAttachedMemoryRepository,
                 false
         );
     }
@@ -93,7 +99,7 @@ class TaskServiceTest {
     @Test
     void submitTask_validRequest_returnsCreated() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "do something", 3, 100, 3600, null);
+                null, "agent1", "do something", 3, 100, 3600, null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
@@ -102,7 +108,7 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("do something"), eq(3), eq(100), eq(3600), isNull()))
+                eq("do something"), eq(3), eq(100), eq(3600), isNull(), anyBoolean()))
                 .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
@@ -119,7 +125,7 @@ class TaskServiceTest {
     void submitTask_withValidLangfuseEndpointId_succeeds() {
         UUID endpointId = UUID.randomUUID();
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "do something", 3, 100, 3600, endpointId);
+                null, "agent1", "do something", 3, 100, 3600, endpointId, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
@@ -132,7 +138,7 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("do something"), eq(3), eq(100), eq(3600), eq(endpointId)))
+                eq("do something"), eq(3), eq(100), eq(3600), eq(endpointId), anyBoolean()))
                 .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
@@ -145,7 +151,7 @@ class TaskServiceTest {
     void submitTask_withInvalidLangfuseEndpointId_throwsValidation() {
         UUID endpointId = UUID.randomUUID();
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "do something", 3, 100, 3600, endpointId);
+                null, "agent1", "do something", 3, 100, 3600, endpointId, null, null);
 
         when(langfuseEndpointRepository.findByIdAndTenant(endpointId, "default"))
                 .thenReturn(Optional.empty());
@@ -156,10 +162,10 @@ class TaskServiceTest {
     @Test
     void submitTask_agentNotFound_throwsAgentNotFoundException() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent-unknown", "input", null, null, null, null);
+                null, "agent-unknown", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-unknown"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
                 .thenReturn(Optional.empty());
         when(agentRepository.findByIdAndTenant("default", "agent-unknown"))
                 .thenReturn(Optional.empty());
@@ -170,10 +176,10 @@ class TaskServiceTest {
     @Test
     void submitTask_disabledAgent_throwsValidation() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent-disabled", "input", null, null, null, null);
+                null, "agent-disabled", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-disabled"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
                 .thenReturn(Optional.empty());
         Map<String, Object> agentRow = new LinkedHashMap<>();
         agentRow.put("agent_id", "agent-disabled");
@@ -188,10 +194,10 @@ class TaskServiceTest {
     @Test
     void submitTask_modelDeactivated_throwsValidation() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "input", null, null, null, null);
+                null, "agent1", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
                 .thenReturn(Optional.empty());
         Map<String, Object> agentRow = new LinkedHashMap<>();
         agentRow.put("agent_id", "agent1");
@@ -206,7 +212,7 @@ class TaskServiceTest {
     @Test
     void submitTask_shortTimeoutRejectedWhenDevTaskControlsDisabled() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "input", null, null, 30, null);
+                null, "agent1", "input", null, null, 30, null, null, null);
 
         assertThrows(ValidationException.class, () -> taskService.submitTask(request));
     }
@@ -214,7 +220,7 @@ class TaskServiceTest {
     @Test
     void submitTask_defaultValues_usedWhenNull() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "input", null, null, null, null);
+                null, "agent1", "input", null, null, null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());
@@ -223,13 +229,244 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600), isNull()))
+                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyBoolean()))
                 .thenReturn(Optional.of(inserted));
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600), isNull());
+                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyBoolean());
+    }
+
+    // --- submitTask: attached_memory_ids + skip_memory_write ---
+
+    @Test
+    void submitTask_withNullAttachedMemoryIds_insertsNoAttachmentRows() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsert(taskId, false);
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertNotNull(response.attachedMemoryIds());
+        assertTrue(response.attachedMemoryIds().isEmpty());
+        assertNotNull(response.attachedMemoriesPreview());
+        assertTrue(response.attachedMemoriesPreview().isEmpty());
+        // When nothing is attached, we must not issue the scope-resolution query.
+        verify(taskAttachedMemoryRepository, never()).resolveScopedMemoryIds(anyString(), anyString(), anyList());
+        // findAttachedMemoriesPreview should also not run for an empty attach list.
+        verify(taskAttachedMemoryRepository, never()).findAttachedMemoriesPreview(
+                any(UUID.class), anyString(), anyString());
+    }
+
+    @Test
+    void submitTask_withEmptyAttachedMemoryIds_treatedSameAsAbsent() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, List.of(), null);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsert(taskId, false);
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertTrue(response.attachedMemoryIds().isEmpty());
+        verify(taskAttachedMemoryRepository, never()).resolveScopedMemoryIds(anyString(), anyString(), anyList());
+    }
+
+    @Test
+    void submitTask_withThreeValidAttachedMemoryIds_insertsJoinRowsAndMirrorsEvent() {
+        UUID m1 = UUID.randomUUID();
+        UUID m2 = UUID.randomUUID();
+        UUID m3 = UUID.randomUUID();
+        List<UUID> inputIds = List.of(m1, m2, m3);
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, inputIds, null);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsert(taskId, false);
+        when(taskAttachedMemoryRepository.resolveScopedMemoryIds("default", "agent1", inputIds))
+                .thenReturn(List.of(m1, m2, m3));
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertEquals(inputIds, response.attachedMemoryIds());
+        verify(taskAttachedMemoryRepository).insertAttachments(taskId, inputIds);
+        ArgumentCaptor<String> detailsCaptor = ArgumentCaptor.forClass(String.class);
+        verify(taskEventService).recordEvent(
+                eq("default"), eq(taskId), eq("agent1"),
+                eq("task_submitted"), isNull(), eq("queued"),
+                isNull(), isNull(), isNull(), detailsCaptor.capture());
+        String details = detailsCaptor.getValue();
+        // Mirror the list in the event details JSONB
+        assertTrue(details.contains(m1.toString()));
+        assertTrue(details.contains(m2.toString()));
+        assertTrue(details.contains(m3.toString()));
+        assertTrue(details.contains("attached_memory_ids"));
+    }
+
+    @Test
+    void submitTask_withResolutionMiss_rejectsUniformlyAndDoesNotPersistAttachments() {
+        // Resolution runs AFTER the atomic agent-insert so unknown-agent errors win over
+        // scope-miss errors. A resolution miss on a valid agent still fails the request
+        // uniformly, and the @Transactional rollback (exercised by Spring at runtime)
+        // discards the task row. The mock here only verifies the @code{insertAttachments}
+        // side-effect is skipped and the task_submitted event is not emitted.
+        UUID ok = UUID.randomUUID();
+        UUID miss = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+        List<UUID> inputIds = List.of(ok, miss);
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, inputIds, null);
+
+        Map<String, Object> inserted = new HashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "agent1");
+        inserted.put("created_at", OffsetDateTime.now());
+        when(taskRepository.insertTaskFromAgent(anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean()))
+                .thenReturn(Optional.of(inserted));
+        when(taskAttachedMemoryRepository.resolveScopedMemoryIds("default", "agent1", inputIds))
+                .thenReturn(List.of(ok)); // count mismatch — one missed scope
+
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().toLowerCase().contains("attached_memory_ids"),
+                "Message should reference the field; got: " + ex.getMessage());
+        String lower = ex.getMessage().toLowerCase();
+        assertFalse(lower.contains("tenant") || lower.contains("agent_id")
+                        || lower.contains(miss.toString().toLowerCase()),
+                "Message must not leak scope-miss cause or the offending id: " + ex.getMessage());
+        verify(taskAttachedMemoryRepository, never()).insertAttachments(any(UUID.class), anyList());
+        verify(taskEventService, never()).recordEvent(anyString(), any(UUID.class), anyString(),
+                anyString(), any(), anyString(), any(), any(), any(), anyString());
+    }
+
+    @Test
+    void submitTask_withDuplicateAttachedMemoryIds_rejectsWith400() {
+        UUID dup = UUID.randomUUID();
+        List<UUID> ids = List.of(dup, dup);
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, ids, null);
+
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().toLowerCase().contains("duplicate"),
+                "Duplicate-id rejection should say 'duplicate'; got: " + ex.getMessage());
+        verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean());
+    }
+
+    @Test
+    void submitTask_withOver50AttachedMemoryIds_rejectsWith400() {
+        List<UUID> ids = new ArrayList<>();
+        for (int i = 0; i < 51; i++) {
+            ids.add(UUID.randomUUID());
+        }
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, ids, null);
+
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().contains("50"),
+                "Cap-exceeded rejection should mention 50; got: " + ex.getMessage());
+        verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean());
+    }
+
+    @Test
+    void submitTask_with50AttachedMemoryIds_accepted() {
+        List<UUID> ids = new ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            ids.add(UUID.randomUUID());
+        }
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, ids, null);
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsert(taskId, false);
+        when(taskAttachedMemoryRepository.resolveScopedMemoryIds(eq("default"), eq("agent1"), eq(ids)))
+                .thenReturn(ids);
+
+        assertDoesNotThrow(() -> taskService.submitTask(request));
+        verify(taskAttachedMemoryRepository).insertAttachments(taskId, ids);
+    }
+
+    @Test
+    void submitTask_withSkipMemoryWriteTrue_persistsOnTaskRow() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, true);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsertExpectingSkip(taskId, true);
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(
+                eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq(true));
+    }
+
+    @Test
+    void submitTask_withSkipMemoryWriteAbsent_defaultsToFalse() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsertExpectingSkip(taskId, false);
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(
+                eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq(false));
+    }
+
+    @Test
+    void submitTask_emptyAttachedMemoryIdsMirrorAsEmptyArrayInEventDetails() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsert(taskId, false);
+
+        taskService.submitTask(request);
+
+        ArgumentCaptor<String> detailsCaptor = ArgumentCaptor.forClass(String.class);
+        verify(taskEventService).recordEvent(
+                eq("default"), eq(taskId), eq("agent1"),
+                eq("task_submitted"), isNull(), eq("queued"),
+                isNull(), isNull(), isNull(), detailsCaptor.capture());
+        String details = detailsCaptor.getValue();
+        assertTrue(details.contains("attached_memory_ids"),
+                "Event details must include attached_memory_ids key even when empty; got: " + details);
+        assertTrue(details.contains("[]"),
+                "Empty list should render as []; got: " + details);
+    }
+
+    // Helper to stub a successful task insert without caring about skip_memory_write value.
+    private void stubSuccessfulInsert(UUID taskId, boolean skipMemoryWrite) {
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(
+                anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean()))
+                .thenReturn(Optional.of(inserted));
+    }
+
+    private void stubSuccessfulInsertExpectingSkip(UUID taskId, boolean expectedSkip) {
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(
+                anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), eq(expectedSkip)))
+                .thenReturn(Optional.of(inserted));
     }
 
     // --- getTaskStatus tests ---

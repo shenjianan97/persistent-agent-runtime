@@ -36,6 +36,29 @@ from sandbox.provisioner import (
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
+from executor.memory_graph import (
+    DEAD_LETTER_REASON_CANCELLED_BY_USER,
+    MemoryEnabledState,
+    MEMORY_WRITE_NODE_NAME,
+    PLATFORM_DEFAULT_SUMMARIZER_MODEL,
+    SummarizerResult,
+    build_attached_memories_preamble,
+    build_pending_memory_dead_letter_template,
+    checkpoint_tuple_has_prior_history,
+    effective_memory_enabled,
+    memory_write_node,
+)
+from executor.embeddings import compute_embedding as _default_compute_embedding
+from core.memory_repository import (
+    count_entries_for_agent,
+    max_entries_for_agent,
+    pending_memory_log_preview,
+    read_memory_observations_by_task_id,
+    read_pending_memory_from_state_values,
+    resolve_attached_memories_for_task,
+    trim_oldest,
+    upsert_memory_entry,
+)
 from storage.s3_client import S3Client
 from tools.definitions import (
     create_default_dependencies,
@@ -65,8 +88,14 @@ from tools.sandbox_tools import (
     create_sandbox_write_file_fn,
     create_export_sandbox_file_fn,
 )
+from tools.memory_tools import (
+    MemoryToolContext,
+    build_memory_tools,
+)
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +127,35 @@ class GraphExecutor:
                 bucket_name=s3_bucket_name,
             )
         self._sandbox_provisioner: SandboxProvisioner | None = None
+
+        # Phase 2 Track 5 Task 7: shared HTTP client for worker→Memory-API
+        # calls (memory_search). Lazily created on first use so tests and
+        # memory-disabled deployments never open a socket. Base URL comes
+        # from ``MEMORY_API_BASE_URL`` env; the worker is co-located with
+        # the API service in dev/compose so the default points at the
+        # standard API port.
+        self._memory_api_http_client: httpx.AsyncClient | None = None
+        self._memory_api_base_url: str = os.environ.get(
+            "MEMORY_API_BASE_URL", "http://localhost:8080"
+        )
+
+    def _get_memory_api_http_client(self) -> httpx.AsyncClient:
+        """Lazily instantiate the worker-to-Memory-API HTTP client.
+
+        One client per :class:`GraphExecutor` (connection-pool friendly);
+        memory-disabled deployments never reach this path and therefore
+        never open a socket. Exposed as a method so tests can swap the
+        client in via attribute assignment on the executor instance.
+        """
+        if self._memory_api_http_client is None:
+            # A short-ish timeout keeps a hung Memory API from wedging the
+            # tool call. The worker's ``_await_or_cancel`` helper also
+            # surfaces cancellations, but the httpx-level timeout is the
+            # belt on top of suspenders.
+            self._memory_api_http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+        return self._memory_api_http_client
 
     @property
     def sandbox_provisioner(self) -> SandboxProvisioner | None:
@@ -386,10 +444,14 @@ class GraphExecutor:
         cancel_event: asyncio.Event,
         task_id: str,
         tenant_id: str = "default",
+        agent_id: str = "unknown",
         custom_tools: list[StructuredTool] | None = None,
         sandbox=None,
         s3_client=None,
         injected_files: list[str] | None = None,
+        memory_enabled: bool = False,
+        task_input: str | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -416,6 +478,31 @@ class GraphExecutor:
             tenant_id=tenant_id,
             sandbox=sandbox,
             s3_client=s3_client,
+        )
+
+        # Phase 2 Track 5 Task 7 — memory tools are registered per-task with
+        # (tenant_id, agent_id) bound from the worker's task context. Scope
+        # is captured by closure; the LLM cannot override it via arguments.
+        #
+        # - ``memory_note`` and ``memory_search`` are gated on
+        #   ``effective_memory_enabled`` (agent.memory.enabled AND NOT
+        #   task.skip_memory_write).
+        # - ``task_history_get`` is always registered — diagnostic drill-down
+        #   that is still safe cross-scope because of the bound predicate.
+        memory_tool_ctx = MemoryToolContext(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            pool=self.pool,
+            memory_api_base_url=self._memory_api_base_url,
+            http_client=self._get_memory_api_http_client(),
+            cancel_event=cancel_event,
+            await_or_cancel_fn=self._await_or_cancel,
+            checkpointer=checkpointer,
+        )
+        tools = tools + build_memory_tools(
+            memory_tool_ctx,
+            effective_memory_enabled=memory_enabled,
         )
 
         # Merge custom tools from MCP servers
@@ -472,18 +559,71 @@ class GraphExecutor:
                         continue
                     raise
 
-        # Define the Graph layout
-        workflow = StateGraph(MessagesState)
+        # Define the Graph layout.
+        # When ``memory.enabled`` AND NOT ``skip_memory_write``, we register a
+        # custom state schema (MemoryEnabledState) which adds the
+        # ``observations`` + ``pending_memory`` fields and attaches the
+        # ``operator.add`` reducer on ``observations`` so the Task 7
+        # ``memory_note`` tool can append durably. Memory-disabled agents
+        # keep using the stock ``MessagesState`` — identical to pre-Track-5
+        # behaviour.
+        state_type = MemoryEnabledState if memory_enabled else MessagesState
+        workflow = StateGraph(state_type)
         workflow.add_node("agent", agent_node)
 
+        # Wire the ``memory_write`` node when memory is enabled. Placed on
+        # the "no pending tool calls" branch so the terminal path becomes
+        # ``agent → memory_write → END`` — HITL pauses, budget pauses, and
+        # dead-letters exit the graph via different paths and therefore
+        # never traverse this node.
+        if memory_enabled:
+            summarizer_model_id = (
+                (agent_config.get("memory") or {}).get("summarizer_model")
+                or PLATFORM_DEFAULT_SUMMARIZER_MODEL
+            )
+            summarizer_callable = self._build_summarizer_callable(
+                default_model_id=summarizer_model_id,
+            )
+            embedding_callable = self._build_embedding_callable()
+
+            async def memory_write_graph_node(state, config):
+                return await memory_write_node(
+                    state,
+                    task_input=task_input,
+                    summarizer_model_id=summarizer_model_id,
+                    summarizer_callable=summarizer_callable,
+                    embedding_callable=embedding_callable,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    config=config,
+                )
+
+            workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
+            workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
+
         if tools:
-            # LangGraph handles routing the LLM's ToolCall directly to our python functions
             tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
-            workflow.add_conditional_edges("agent", tools_condition)
+            if memory_enabled:
+                # ``tools_condition`` routes to ``tools`` when the agent
+                # message has pending tool calls, else to the node we pass
+                # as the third argument. Replace the "no pending calls"
+                # target with ``memory_write`` so the single terminal path
+                # out of ``agent`` runs the memory write.
+                workflow.add_conditional_edges(
+                    "agent",
+                    tools_condition,
+                    {"tools": "tools", END: MEMORY_WRITE_NODE_NAME},
+                )
+            else:
+                workflow.add_conditional_edges("agent", tools_condition)
         else:
-            workflow.add_edge("agent", END)
+            if memory_enabled:
+                workflow.add_edge("agent", MEMORY_WRITE_NODE_NAME)
+            else:
+                workflow.add_edge("agent", END)
 
         workflow.add_edge(START, "agent")
         return workflow
@@ -705,6 +845,336 @@ class GraphExecutor:
 
         return injected_files
 
+    # --------------------------------------------------------------------
+    # Phase 2 Track 5 — memory write path helpers
+    # --------------------------------------------------------------------
+
+    def _build_summarizer_callable(self, *, default_model_id: str):
+        """Factory: returns an async callable that runs the summarizer LLM.
+
+        The returned coroutine matches the :class:`SummarizerCallable`
+        protocol expected by :func:`executor.memory_graph.memory_write_node`.
+        It pulls credentials via :mod:`executor.providers` the same way the
+        agent node does and reports tokens + cost in microdollars using the
+        existing ``_calculate_step_cost`` path so cost accounting matches the
+        rest of the worker.
+
+        Summarizer retries ride on the provider SDK's own retry logic. If
+        every retry fails the node switches to the template fallback.
+        """
+        async def summarizer(
+            *, system: str, user: str, model_id: str
+        ) -> SummarizerResult:
+            effective_model = model_id or default_model_id
+            provider = self._resolve_provider_for_model(effective_model)
+            llm = await providers.create_llm(
+                self.pool, provider, effective_model, temperature=0.2
+            )
+            # LangChain chat models accept a ``(role, content)`` tuple list
+            # via ``ainvoke``. Two messages is enough: a system-shape hint
+            # and the user payload carrying observations + trimmed
+            # transcript.
+            response = await llm.ainvoke(
+                [SystemMessage(content=system), HumanMessage(content=user)]
+            )
+
+            # Parse the expected ``TITLE:`` / ``SUMMARY:`` shape out of the
+            # content; if the model deviates we fall back to a trimmed
+            # single-line title + full body summary so the write still
+            # succeeds cleanly.
+            content = response.content if isinstance(response.content, str) else self._stringify_chat_content(response.content)
+            title, summary = self._parse_summarizer_response(content)
+
+            resp_meta = dict(getattr(response, "response_metadata", {}) or {})
+            if getattr(response, "usage_metadata", None):
+                resp_meta.setdefault("usage_metadata", response.usage_metadata)
+            cost_microdollars, execution_metadata = await self._calculate_step_cost(
+                resp_meta, effective_model
+            )
+            return SummarizerResult(
+                title=title,
+                summary=summary,
+                model_id=effective_model,
+                tokens_in=int(execution_metadata.get("input_tokens") or 0),
+                tokens_out=int(execution_metadata.get("output_tokens") or 0),
+                cost_microdollars=int(cost_microdollars or 0),
+            )
+
+        return summarizer
+
+    def _build_embedding_callable(self):
+        """Factory: returns the :func:`compute_embedding` closure bound to
+        this worker's pool. Unit tests override this via monkey-patching; the
+        injected argument to ``memory_write_node`` is the public extension
+        point.
+        """
+        pool = self.pool
+
+        async def embedding(text: str):
+            return await _default_compute_embedding(text, pool=pool)
+
+        return embedding
+
+    @staticmethod
+    def _resolve_provider_for_model(model_id: str) -> str:
+        """Heuristic used by :func:`providers.create_llm` callers elsewhere
+        in the worker: Anthropic Claude models by name prefix; everything
+        else defaults to Bedrock (worker README § Model). The summarizer
+        honours the same routing so an operator can set
+        ``MEMORY_DEFAULT_SUMMARIZER_MODEL`` to a model configured under any
+        existing provider credential.
+        """
+        if "claude" in model_id.lower():
+            return "anthropic"
+        return "bedrock"
+
+    @staticmethod
+    def _stringify_chat_content(content: Any) -> str:
+        """Flatten the chat-model content list ``[{type: text, text: ...}]``
+        into a single string. Anthropic returns content blocks, OpenAI plain
+        strings; the summarizer parsing downstream works on a string.
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(parts)
+        return str(content)
+
+    @staticmethod
+    def _parse_summarizer_response(content: str) -> tuple[str, str]:
+        """Parse the ``TITLE:`` / ``SUMMARY:`` convention from the summary
+        prompt. Falls back to a first-line title + trimmed remainder if the
+        model deviated. Empty title or summary triggers the fallback branch
+        in the calling node via the "empty title/summary" guard.
+        """
+        lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+        title = ""
+        summary_lines: list[str] = []
+        mode: str | None = None
+        for line in lines:
+            lower = line.lstrip().lower()
+            if lower.startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+                mode = "after_title"
+                continue
+            if lower.startswith("summary:"):
+                summary_lines.append(line.split(":", 1)[1].strip())
+                mode = "summary"
+                continue
+            if mode == "summary":
+                summary_lines.append(line)
+            elif mode is None:
+                # Model ignored the prompt format — use the first non-empty
+                # line as title and everything after as summary.
+                title = line.strip()
+                mode = "summary"
+        summary = "\n".join(filter(None, summary_lines)).strip()
+        # Cap title at 200 chars (the DB CHECK constraint). Long titles
+        # usually mean the model concatenated the prompt — clip politely
+        # rather than crash the commit.
+        if len(title) > 200:
+            title = title[:197] + "..."
+        return title, summary
+
+    async def _commit_memory_and_complete_task(
+        self,
+        *,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        pending_memory: dict[str, Any] | None,
+        agent_config: dict[str, Any],
+        output: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any]:
+        """Co-commit the memory UPSERT and the lease-validated task UPDATE.
+
+        Runs as ONE transaction:
+
+        1. ``UPDATE tasks SET status='completed' ...`` guarded by
+           ``lease_owner = :me`` — raises :class:`LeaseRevokedException` if
+           the predicate fails, rolling back any memory write inside the
+           same tx.
+        2. UPSERT into ``agent_memory_entries`` keyed on ``task_id`` when
+           ``pending_memory`` is non-``None``. The UPSERT returns
+           ``(memory_id, inserted)`` — ``inserted`` distinguishes the INSERT
+           from UPDATE branch.
+        3. FIFO trim when the row count exceeds ``max_entries`` AND the
+           UPSERT took the INSERT branch. UPDATE branch never trims.
+        4. Summarizer / embedding cost ledger rows attributed to the
+           task's most recent checkpoint (attribution parity with the
+           chat-model per-step ledger writes).
+
+        Returns a dict with observability keys the caller logs:
+        ``{committed, memory_written, inserted, trim_evicted, memory_id}``.
+        """
+        log_extra = {
+            "task_id": task_id,
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+        }
+        if pending_memory is None:
+            logger.warning(
+                "memory.write.missing_pending %s", log_extra
+            )
+        max_entries = max_entries_for_agent(agent_config)
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Lease-validated task completion (FOR UPDATE pin). We
+                # run the task UPDATE FIRST so the lease predicate fails
+                # fast on eviction and the memory row never gets written.
+                updated = await conn.fetchval(
+                    '''UPDATE tasks
+                       SET status='completed',
+                           output=$1,
+                           last_error_code=NULL,
+                           last_error_message=NULL,
+                           human_response=NULL,
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$2::uuid
+                         AND status='running'
+                         AND lease_owner=$3
+                       RETURNING task_id''',
+                    json.dumps(output),
+                    task_id,
+                    worker_id,
+                )
+                if updated is None:
+                    raise LeaseRevokedException(
+                        f"Lease revoked before memory commit for task {task_id}"
+                    )
+
+                inserted = False
+                memory_id: Any = None
+                trim_evicted = 0
+                memory_written = False
+
+                if pending_memory is not None:
+                    entry = {
+                        "tenant_id": tenant_id,
+                        "agent_id": agent_id,
+                        "task_id": task_id,
+                        "title": pending_memory["title"],
+                        "summary": pending_memory["summary"],
+                        "observations": list(pending_memory.get("observations_snapshot") or []),
+                        "outcome": pending_memory.get("outcome", "succeeded"),
+                        "tags": list(pending_memory.get("tags") or []),
+                        "content_vec": pending_memory.get("content_vec"),
+                        "summarizer_model_id": pending_memory.get("summarizer_model_id"),
+                    }
+                    upserted = await upsert_memory_entry(conn, entry)
+                    memory_id = upserted["memory_id"]
+                    inserted = upserted["inserted"]
+                    memory_written = True
+
+                    if inserted:
+                        post_insert_count = await count_entries_for_agent(
+                            conn, tenant_id, agent_id
+                        )
+                        if post_insert_count > max_entries:
+                            trim_evicted = await trim_oldest(
+                                conn,
+                                tenant_id=tenant_id,
+                                agent_id=agent_id,
+                                max_entries=max_entries,
+                                keep_memory_id=memory_id,
+                            )
+
+                    # Cost ledger rows for summarizer + embedding — attributed
+                    # to the task's most recent checkpoint. We resolve the
+                    # checkpoint inside the transaction for a consistent read.
+                    checkpoint_id = await conn.fetchval(
+                        '''SELECT checkpoint_id FROM checkpoints
+                           WHERE task_id = $1::uuid AND checkpoint_ns = ''
+                           ORDER BY created_at DESC LIMIT 1''',
+                        task_id,
+                    )
+                    summarizer_cost = int(
+                        pending_memory.get("summarizer_cost_microdollars") or 0
+                    )
+                    if checkpoint_id and summarizer_cost > 0:
+                        await conn.execute(
+                            '''INSERT INTO agent_cost_ledger
+                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                               VALUES ($1, $2, $3::uuid, $4, $5)''',
+                            tenant_id, agent_id, task_id, checkpoint_id, summarizer_cost,
+                        )
+                        # Hourly-spend accrues normally — memory cost is
+                        # exempt from the per-task pause check ONLY, not
+                        # from the rolling-window aggregation.
+                        await conn.execute(
+                            '''INSERT INTO agent_runtime_state
+                                   (tenant_id, agent_id, running_task_count,
+                                    hour_window_cost_microdollars,
+                                    scheduler_cursor, updated_at)
+                               VALUES ($1, $2, 0, $3, '1970-01-01T00:00:00Z', NOW())
+                               ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                               SET hour_window_cost_microdollars =
+                                       agent_runtime_state.hour_window_cost_microdollars + $3,
+                                   updated_at = NOW()''',
+                            tenant_id, agent_id, summarizer_cost,
+                        )
+                    embedding_cost = int(
+                        pending_memory.get("embedding_cost_microdollars") or 0
+                    )
+                    # Embedding is zero-rated in v1; still record the ledger
+                    # row when a real embedding was returned so the attribution
+                    # metadata is visible to the API / Console.
+                    if (
+                        checkpoint_id
+                        and pending_memory.get("content_vec") is not None
+                    ):
+                        await conn.execute(
+                            '''INSERT INTO agent_cost_ledger
+                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                               VALUES ($1, $2, $3::uuid, $4, $5)''',
+                            tenant_id, agent_id, task_id, checkpoint_id,
+                            embedding_cost,
+                        )
+
+                # Track 3: decrement running_task_count on completion.
+                await conn.execute(
+                    '''INSERT INTO agent_runtime_state
+                           (tenant_id, agent_id, running_task_count,
+                            hour_window_cost_microdollars, scheduler_cursor,
+                            updated_at)
+                       VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                       ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                       SET running_task_count = GREATEST(
+                               agent_runtime_state.running_task_count - 1, 0),
+                           updated_at = NOW()''',
+                    tenant_id, agent_id,
+                )
+                await _insert_task_event(
+                    conn, task_id, tenant_id, agent_id,
+                    "task_completed", "running", "completed",
+                    worker_id,
+                )
+
+        logger.info(
+            "memory.write.committed task_id=%s inserted=%s trim_evicted=%d "
+            "content_vec_null=%s preview=%s",
+            task_id, inserted, trim_evicted,
+            pending_memory.get("content_vec") is None if pending_memory else None,
+            pending_memory_log_preview(pending_memory) if pending_memory else "null",
+        )
+        return {
+            "committed": True,
+            "memory_written": memory_written,
+            "inserted": inserted,
+            "trim_evicted": trim_evicted,
+            "memory_id": memory_id,
+        }
+
     def _build_platform_system_message(
         self,
         allowed_tools: list[str],
@@ -777,6 +1247,16 @@ class GraphExecutor:
         worker_id = self.config.worker_id
         agent_id = task_data.get("agent_id") or "unknown"
 
+        # Phase 2 Track 5: single-source-of-truth memory gate — computed once
+        # and consulted by graph assembly, the commit path, and the budget
+        # carve-out. ``skip_memory_write`` lands as a typed column on the
+        # tasks row (see migration 0011); the router should forward it via
+        # ``task_data`` in Task 4's dispatch path.
+        memory_enabled_for_task = effective_memory_enabled(
+            agent_config=agent_config,
+            skip_memory_write=bool(task_data.get("skip_memory_write", False)),
+        )
+
         # Reset per-task cost rate cache
         self._cost_rate_cache = {}
 
@@ -817,6 +1297,11 @@ class GraphExecutor:
         custom_tools: list[StructuredTool] = []
         sandbox = None
         provisioner = None
+        # Initialized below in the try block; predeclared so the
+        # ``except`` handlers can pass it into ``_handle_dead_letter`` even
+        # when a pre-graph failure (tool servers, sandbox) triggers dead-
+        # letter before the checkpointer is wired up.
+        checkpointer: PostgresDurableCheckpointer | None = None
 
         try:
             # Look up and connect to MCP tool servers if configured
@@ -1013,10 +1498,14 @@ class GraphExecutor:
                 cancel_event=cancel_event,
                 task_id=task_id,
                 tenant_id=tenant_id,
+                agent_id=agent_id,
                 custom_tools=custom_tools if custom_tools else None,
                 sandbox=sandbox,
                 s3_client=self.s3_client,
                 injected_files=injected_files if sandbox_enabled else None,
+                memory_enabled=memory_enabled_for_task,
+                task_input=task_input,
+                checkpointer=checkpointer,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
@@ -1031,13 +1520,126 @@ class GraphExecutor:
 
             async def run_astream():
                 nonlocal session_manager, per_task_langfuse_client, sandbox
-                # For first run, inject HumanMessage based on initial input
+                # For first run, inject HumanMessage based on initial input.
+                # ``first_execution`` is the single predicate used to gate
+                # initial-state setup: True when there is no checkpoint tuple
+                # at all AND when a checkpoint tuple exists but has no prior
+                # messages. (LangGraph durability can persist an empty
+                # checkpoint before the first super-step in some modes; both
+                # scenarios want identical first-run handling.)
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
-                is_first_run = not checkpoint_tuple
-                initial_input = {"messages": [HumanMessage(content=task_input)]} if is_first_run else None
+                has_prior_history = checkpoint_tuple_has_prior_history(
+                    checkpoint_tuple
+                )
+                first_execution = not has_prior_history
+
+                # Phase 2 Track 5 Task 8 — resolve attached memories (first
+                # execution only) + seed observations from the existing memory
+                # row (first-execution-with-memory-row, i.e. redrive after a
+                # prior dead-letter template write). Attachments are
+                # immutable after task creation, so we only resolve on first
+                # execution; the injected preamble is captured in the first
+                # super-step checkpoint and implicit for subsequent resumes.
+                attached_preamble: str | None = None
+                seeded_observations: list[str] | None = None
+                if first_execution:
+                    async with self.pool.acquire() as _attach_conn:
+                        if memory_enabled_for_task:
+                            seeded_observations = (
+                                await read_memory_observations_by_task_id(
+                                    _attach_conn, tenant_id, agent_id, task_id,
+                                )
+                            )
+                        # Attach injection runs regardless of
+                        # ``effective_memory_enabled`` — see design doc §
+                        # "Read Path → Retrieval is always explicit". Console
+                        # gates this UI-side when the agent has memory
+                        # disabled; the worker does not additionally gate.
+                        resolved_entries = (
+                            await resolve_attached_memories_for_task(
+                                _attach_conn, tenant_id, agent_id, task_id,
+                            )
+                        )
+                    attached_preamble = build_attached_memories_preamble(
+                        resolved_entries
+                    )
+                    if attached_preamble is not None:
+                        approx_bytes = len(
+                            attached_preamble.encode("utf-8", errors="replace")
+                        )
+                        logger.info(
+                            "memory.attach.injected tenant_id=%s agent_id=%s "
+                            "task_id=%s count=%d approx_bytes=%d",
+                            tenant_id, agent_id, task_id,
+                            len(resolved_entries), approx_bytes,
+                        )
+                    if seeded_observations:
+                        logger.info(
+                            "memory.seeding.applied tenant_id=%s agent_id=%s "
+                            "task_id=%s observation_count=%d",
+                            tenant_id, agent_id, task_id,
+                            len(seeded_observations),
+                        )
+
+                # Build initial message list. Attachment preamble (when
+                # present) is prepended as a SystemMessage BEFORE the agent's
+                # own system prompt — the distinction between "agent rules"
+                # and "customer-attached memory" must be preserved. Because
+                # the ``agent_node`` only auto-synthesizes system prompts
+                # when NO SystemMessage is present in state, we explicitly
+                # include the agent's system prompt + platform system
+                # message here when we're also injecting the preamble, so
+                # those aren't silently dropped on the first super-step.
+                initial_messages: list[Any] = []
+                if attached_preamble is not None:
+                    initial_messages.append(
+                        SystemMessage(
+                            content=(
+                                "The following memory entries have been "
+                                "attached to this task by the customer. "
+                                "Use them as reference context:\n\n"
+                                f"{attached_preamble}"
+                            )
+                        )
+                    )
+                    # Reconstruct the agent's system prompts that
+                    # ``agent_node`` would normally synthesise on the first
+                    # super-step — see agent_node's "no SystemMessage"
+                    # branch in _build_graph.
+                    agent_system_prompt = agent_config.get("system_prompt", "")
+                    allowed_tools_for_sys = agent_config.get("allowed_tools", [])
+                    sandbox_template_for_sys = (
+                        agent_config.get("sandbox") or {}
+                    ).get("template")
+                    platform_system_msg = self._build_platform_system_message(
+                        allowed_tools_for_sys,
+                        injected_files=(
+                            injected_files if sandbox_enabled else None
+                        ),
+                        sandbox_template=sandbox_template_for_sys,
+                    )
+                    if agent_system_prompt:
+                        initial_messages.append(
+                            SystemMessage(content=agent_system_prompt)
+                        )
+                    if platform_system_msg:
+                        initial_messages.append(
+                            SystemMessage(content=platform_system_msg)
+                        )
+                if first_execution:
+                    initial_messages.append(HumanMessage(content=task_input))
+
+                initial_input: Any
+                if first_execution:
+                    _payload: dict[str, Any] = {"messages": initial_messages}
+                    if memory_enabled_for_task and seeded_observations:
+                        _payload["observations"] = list(seeded_observations)
+                    initial_input = _payload
+                else:
+                    initial_input = None
 
                 # Resume path: if this is a resumed task with a human response, use Command(resume=...)
-                if not is_first_run:
+                if not first_execution:
                     human_response = await self.pool.fetchval(
                         'SELECT human_response FROM tasks WHERE task_id = $1::uuid', task_id
                     )
@@ -1079,6 +1681,21 @@ class GraphExecutor:
                             await asyncio.to_thread(sandbox.set_timeout, sandbox_timeout)
                         except Exception:
                             logger.debug("sandbox_timeout_refresh_failed", extra={"task_id": task_id})
+
+                    # Phase 2 Track 5 budget carve-out: the ``memory_write``
+                    # super-step is a platform-directed closure step and MUST
+                    # NOT trip ``budget_max_per_task``. Its summarizer LLM
+                    # cost is written by ``_commit_memory_and_complete_task``
+                    # directly (outside this per-step loop), which is why
+                    # there's no ``event["agent"]`` payload to gate on here
+                    # — the node returns a ``Command`` updating
+                    # ``pending_memory``, not a new ``AIMessage``. Hourly
+                    # spend still accrues via the same commit path. This
+                    # explicit check provides defense in depth in case the
+                    # pause enforcement ever widens to fire on non-agent
+                    # nodes.
+                    if MEMORY_WRITE_NODE_NAME in event:
+                        continue
 
                     # Per-checkpoint incremental cost tracking
                     if "agent" in event:
@@ -1347,6 +1964,38 @@ class GraphExecutor:
                 output_data = {"result": output_content}
                 if langfuse_endpoint_id:
                     output_data["langfuse_status"] = langfuse_status
+
+                if memory_enabled_for_task:
+                    # Phase 2 Track 5: co-commit the memory UPSERT + FIFO
+                    # trim + lease-validated task completion in one
+                    # transaction. Read ``pending_memory`` from the final
+                    # state values — the ``memory_write`` node just set it
+                    # on the terminal branch.
+                    pending_memory = read_pending_memory_from_state_values(
+                        final_state.values
+                    )
+                    try:
+                        await self._commit_memory_and_complete_task(
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            pending_memory=pending_memory,
+                            agent_config=agent_config,
+                            output=output_data,
+                            worker_id=worker_id,
+                        )
+                        logger.info(
+                            "Task %s completed with memory (cost: %d microdollars, langfuse: %s).",
+                            task_id, cumulative_task_cost, langfuse_status,
+                        )
+                    except LeaseRevokedException:
+                        logger.warning(
+                            "Task %s memory commit skipped: lease no longer owned by this worker.",
+                            task_id,
+                        )
+                    return
+
+                # Memory-disabled branch — unchanged from pre-Track-5.
                 async with self.pool.acquire() as conn:
                     async with conn.transaction():
                         updated = await conn.fetchval(
@@ -1391,9 +2040,26 @@ class GraphExecutor:
             await asyncio.wait_for(run_astream(), timeout=task_timeout_seconds)
 
         except asyncio.TimeoutError:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "task_timeout", "Execution exceeded task logic timeout")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "task_timeout", "Execution exceeded task logic timeout",
+                memory_enabled=memory_enabled_for_task,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except GraphRecursionError:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "max_steps_exceeded", f"Execution exceeded max_steps ({max_steps})")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "max_steps_exceeded",
+                f"Execution exceeded max_steps ({max_steps})",
+                memory_enabled=memory_enabled_for_task,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except GraphInterrupt as gi:
             await self._handle_interrupt(task_data, gi, worker_id)
         except LeaseRevokedException:
@@ -1403,9 +2069,25 @@ class GraphExecutor:
         except Exception as e:
             # Step 4: Failure classification
             if self._is_retryable_error(e):
-                await self._handle_retryable_error(task_data, e)
+                await self._handle_retryable_error(
+                    task_data,
+                    e,
+                    memory_enabled=memory_enabled_for_task,
+                    agent_config=agent_config,
+                    task_input=task_input,
+                    checkpointer=checkpointer,
+                )
             else:
-                await self._handle_dead_letter(task_id, tenant_id, agent_id, "non_retryable_error", str(e), error_code="fatal_error")
+                await self._handle_dead_letter(
+                    task_id, tenant_id, agent_id,
+                    "non_retryable_error", str(e),
+                    error_code="fatal_error",
+                    memory_enabled=memory_enabled_for_task,
+                    agent_config=agent_config,
+                    task_input=task_input,
+                    retry_count=task_data.get("retry_count", 0),
+                    checkpointer=checkpointer,
+                )
         finally:
             if per_task_langfuse_client is not None:
                 try:
@@ -1829,7 +2511,16 @@ class GraphExecutor:
         else:
             logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
 
-    async def _handle_retryable_error(self, task_data: dict[str, Any], e: Exception):
+    async def _handle_retryable_error(
+        self,
+        task_data: dict[str, Any],
+        e: Exception,
+        *,
+        memory_enabled: bool = False,
+        agent_config: dict[str, Any] | None = None,
+        task_input: str | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
+    ):
         task_id = str(task_data["task_id"])
         tenant_id = task_data.get("tenant_id", "default")
         agent_id = task_data.get("agent_id") or "unknown"
@@ -1838,7 +2529,16 @@ class GraphExecutor:
         worker_pool_id = self.config.worker_pool_id
 
         if retry_count >= max_retries:
-            await self._handle_dead_letter(task_id, tenant_id, agent_id, "retries_exhausted", f"Max retries reached. Last error: {e}")
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                "retries_exhausted",
+                f"Max retries reached. Last error: {e}",
+                memory_enabled=memory_enabled,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=retry_count,
+                checkpointer=checkpointer,
+            )
             return
 
         new_retry_count = retry_count + 1
@@ -1894,37 +2594,208 @@ class GraphExecutor:
 
         logger.info("Task %s hit retryable error. Requeued (try %d).", task_id, new_retry_count)
 
-    async def _handle_dead_letter(self, task_id: str, tenant_id: str, agent_id: str,
-                                   reason: str, error_msg: str, error_code: str | None = None):
+    async def _handle_dead_letter(
+        self,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        reason: str,
+        error_msg: str,
+        error_code: str | None = None,
+        *,
+        memory_enabled: bool = False,
+        agent_config: dict[str, Any] | None = None,
+        task_input: str | None = None,
+        retry_count: int | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
+    ):
+        """Transition a task to ``dead_letter`` with lease validation.
+
+        Phase 2 Track 5 Task 8 adds an optional memory-write branch **inside
+        the same transaction** as the task UPDATE. Gating rules (all must
+        hold to write a row):
+
+        * ``memory_enabled`` is True (agent.memory.enabled AND NOT
+          tasks.skip_memory_write — caller's pre-computed decision).
+        * ``reason != 'cancelled_by_user'`` — cancellation writes nothing.
+        * At least one observation recorded in the most recent checkpoint.
+
+        The row is template-only (``summarizer_model_id='template:dead_letter'``,
+        ``outcome='failed'``) — no LLM call. Embedding is still attempted when
+        a ``pool`` / embedding client is available; on provider failure the
+        row is written with ``content_vec=NULL``.
+
+        On lease loss at step (5) below, the whole transaction rolls back —
+        no orphan memory row.
+        """
         worker_id = self.config.worker_id
         error_msg = str(error_msg)[:1024]
         effective_error_code = error_code or reason
 
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                updated = await conn.fetchval(
-                    '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
-                    reason,
-                    error_msg,
-                    effective_error_code,
-                    worker_id,
-                    task_id,
-                    worker_id,
+        # Phase 2 Track 5 Task 8 — memory hook pre-work (outside tx).
+        #
+        # We resolve the observations + template pending_memory BEFORE opening
+        # the transaction so the transaction body stays tight around the DB
+        # writes. The embedding call (if any) also happens here because it is
+        # a network call that we don't want wrapped inside a DB transaction.
+        pending_memory: dict[str, Any] | None = None
+        memory_write_attempted = False
+        if (
+            memory_enabled
+            and reason != DEAD_LETTER_REASON_CANCELLED_BY_USER
+            and checkpointer is not None
+        ):
+            observations = await self._read_observations_from_checkpoint(
+                checkpointer, task_id
+            )
+            if observations:
+                memory_write_attempted = True
+                pending_memory = build_pending_memory_dead_letter_template(
+                    task_input=task_input,
+                    observations=observations,
+                    retry_count=retry_count,
+                    last_error_code=effective_error_code,
+                    last_error_message=error_msg,
                 )
-                if updated is not None:
+                # Best-effort embedding. A failure here must NOT sink the
+                # memory row — invariant: observations-bearing genuine
+                # failures always produce a row.
+                try:
+                    embed_result = await _default_compute_embedding(
+                        _build_dead_letter_embedding_text(pending_memory),
+                        pool=self.pool,
+                    )
+                except Exception:
+                    logger.warning(
+                        "memory.deadletter.embedding_unexpected_exception "
+                        "task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
+                    embed_result = None
+                if embed_result is None:
+                    pending_memory["content_vec"] = None
+                    pending_memory["embedding_tokens"] = 0
+                    pending_memory["embedding_cost_microdollars"] = 0
+                else:
+                    pending_memory["content_vec"] = list(embed_result.vector)
+                    pending_memory["embedding_tokens"] = embed_result.tokens
+                    pending_memory["embedding_cost_microdollars"] = (
+                        embed_result.cost_microdollars
+                    )
+
+        memory_id: Any = None
+        trim_evicted = 0
+        memory_written = False
+        lease_lost = False
+
+        class _DeadLetterLeaseLost(Exception):
+            """Internal sentinel used to roll back the dead-letter tx
+            atomically when the lease-validated UPDATE returns no row."""
+
+        try:
+            async with self.pool.acquire() as conn:
+                async with conn.transaction():
+                    # 1. Memory UPSERT (if any) runs FIRST inside the tx so
+                    # a lease mismatch on the task UPDATE below rolls back
+                    # the memory row atomically — no orphan row survives.
+                    if pending_memory is not None:
+                        max_entries = max_entries_for_agent(agent_config)
+                        entry = {
+                            "tenant_id": tenant_id,
+                            "agent_id": agent_id,
+                            "task_id": task_id,
+                            "title": pending_memory["title"],
+                            "summary": pending_memory["summary"],
+                            "observations": list(
+                                pending_memory.get("observations_snapshot") or []
+                            ),
+                            "outcome": pending_memory.get("outcome", "failed"),
+                            "tags": list(pending_memory.get("tags") or []),
+                            "content_vec": pending_memory.get("content_vec"),
+                            "summarizer_model_id": pending_memory.get(
+                                "summarizer_model_id"
+                            ),
+                        }
+                        upserted = await upsert_memory_entry(conn, entry)
+                        memory_id = upserted["memory_id"]
+                        inserted_branch = upserted["inserted"]
+                        memory_written = True
+
+                        if inserted_branch:
+                            post_insert_count = await count_entries_for_agent(
+                                conn, tenant_id, agent_id
+                            )
+                            if post_insert_count > max_entries:
+                                trim_evicted = await trim_oldest(
+                                    conn,
+                                    tenant_id=tenant_id,
+                                    agent_id=agent_id,
+                                    max_entries=max_entries,
+                                    keep_memory_id=memory_id,
+                                )
+
+                        # Embedding cost ledger (template write has zero
+                        # summarizer cost — no LLM call). Only recorded when
+                        # an embedding was actually computed.
+                        if pending_memory.get("content_vec") is not None:
+                            checkpoint_id = await conn.fetchval(
+                                '''SELECT checkpoint_id FROM checkpoints
+                                   WHERE task_id = $1::uuid AND checkpoint_ns = ''
+                                   ORDER BY created_at DESC LIMIT 1''',
+                                task_id,
+                            )
+                            if checkpoint_id:
+                                embedding_cost = int(
+                                    pending_memory.get(
+                                        "embedding_cost_microdollars"
+                                    )
+                                    or 0
+                                )
+                                await conn.execute(
+                                    '''INSERT INTO agent_cost_ledger
+                                           (tenant_id, agent_id, task_id,
+                                            checkpoint_id, cost_microdollars)
+                                       VALUES ($1, $2, $3::uuid, $4, $5)''',
+                                    tenant_id,
+                                    agent_id,
+                                    task_id,
+                                    checkpoint_id,
+                                    embedding_cost,
+                                )
+
+                    # 2. Lease-validated task dead-letter update.
+                    updated = await conn.fetchval(
+                        '''UPDATE tasks
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
+                        reason,
+                        error_msg,
+                        effective_error_code,
+                        worker_id,
+                        task_id,
+                        worker_id,
+                    )
+                    if updated is None:
+                        # Raise an internal sentinel to roll back the entire
+                        # transaction (memory UPSERT + task UPDATE). Caught
+                        # at the outer scope so we preserve the pre-Task-8
+                        # "log-and-return" semantics that callers depend on.
+                        raise _DeadLetterLeaseLost(
+                            f"Lease revoked before dead-letter write for task {task_id}"
+                        )
+
                     # Track 3: Decrement running_task_count on dead-letter
                     await conn.execute(
                         '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
@@ -1941,11 +2812,91 @@ class GraphExecutor:
                         error_message=error_msg,
                         details={"dead_letter_reason": reason},
                     )
+        except _DeadLetterLeaseLost:
+            lease_lost = True
+            memory_written = False  # Rolled back with the tx.
+            memory_id = None
+            trim_evicted = 0
+            logger.warning(
+                "Task %s dead-letter skipped: lease no longer owned by this worker.",
+                task_id,
+            )
+            return
 
-        if updated is None:
-            logger.warning("Task %s dead-letter skipped: lease no longer owned by this worker.", task_id)
-        else:
-            logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+        # Emit the dead-letter memory structured log AFTER the commit so the
+        # "committed" claim is truthful.
+        if memory_written:
+            logger.info(
+                "memory.deadletter.template tenant_id=%s agent_id=%s "
+                "task_id=%s reason=%s observation_count=%d memory_id=%s "
+                "trim_evicted=%d content_vec_null=%s",
+                tenant_id, agent_id, task_id, reason,
+                len(pending_memory.get("observations_snapshot") or [])
+                if pending_memory else 0,
+                memory_id, trim_evicted,
+                pending_memory.get("content_vec") is None if pending_memory else True,
+            )
+        elif memory_write_attempted:
+            # This branch is unreachable today (we only set the flag when we
+            # also populate pending_memory), but we keep it so a future
+            # divergence is noticed in logs rather than silently drops.
+            logger.warning(
+                "memory.deadletter.skipped_after_attempt task_id=%s", task_id
+            )
+
+        logger.error("Task %s dead-lettered: %s (msg: %s)", task_id, reason, error_msg)
+
+    async def _read_observations_from_checkpoint(
+        self,
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+    ) -> list[str]:
+        """Read ``observations`` out of the latest checkpoint's state.
+
+        Returns ``[]`` on any read failure so the dead-letter hook gracefully
+        treats a missing/corrupt checkpoint as "no observations, skip memory
+        write" rather than blocking the dead-letter transition.
+        """
+        try:
+            config: dict[str, Any] = {"configurable": {"thread_id": task_id}}
+            tup = await checkpointer.aget_tuple(config)
+            if tup is None:
+                return []
+            checkpoint = getattr(tup, "checkpoint", None) or {}
+            if not isinstance(checkpoint, dict):
+                return []
+            values = checkpoint.get("channel_values")
+            if not isinstance(values, dict):
+                return []
+            obs = values.get("observations") or []
+            if isinstance(obs, list):
+                return [str(x) for x in obs if x is not None]
+            return []
+        except Exception:
+            logger.warning(
+                "memory.deadletter.observations_read_failed task_id=%s",
+                task_id,
+                exc_info=True,
+            )
+            return []
+
+
+def _build_dead_letter_embedding_text(pending_memory: dict[str, Any]) -> str:
+    """Concatenate the text that seeds the dead-letter ``content_vec``.
+
+    Matches the generated ``content_tsv`` expression in migration 0011 so
+    search-time BM25 and embedding-time vector share a single content
+    surface. Mirrors :func:`executor.memory_graph._build_embedding_text`
+    but lives at module scope because the dead-letter hook uses a template
+    dict rather than running through the ``memory_write_node`` path.
+    """
+    parts = [
+        pending_memory.get("title") or "",
+        pending_memory.get("summary") or "",
+        " ".join(pending_memory.get("observations_snapshot") or []),
+        " ".join(pending_memory.get("tags") or []),
+    ]
+    return " ".join(p for p in parts if p).strip()
 
 
 async def _insert_task_event(

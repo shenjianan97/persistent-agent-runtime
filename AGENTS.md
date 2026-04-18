@@ -80,6 +80,13 @@ When orchestrating parallel subagents via the Agent tool, **always use `isolatio
 - After worktree agents complete, merge their branches into the main working tree.
 - Only skip worktrees when agents have truly zero file overlap (e.g., Python worker vs React console).
 
+### Browser verification is the orchestrator's job
+
+`make start` (and any live-stack workflow) binds global ports that aren't per-worktree. Parallel subagents racing it will collide. Split ownership for Console UI tasks:
+
+- **Subagent:** ship code + unit tests (`make console-test`) + a new scenario in `CONSOLE_BROWSER_TESTING.md`. Never call `make start`/`make stop` or Playwright MCP tools.
+- **Orchestrator:** after merge, run the Playwright scenarios once, serially. The §Browser Verification blocking gate lives here.
+
 ## External Pull Request References
 
 **Do not link to pull requests in other people's repositories** from commit messages or PR descriptions. GitHub creates a cross-reference timeline event on the target PR, which typically surfaces as a notification to its author — unsolicited noise once the upstream work has shipped.

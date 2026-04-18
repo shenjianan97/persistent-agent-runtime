@@ -34,6 +34,19 @@ public record TaskStatusResponse(
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_reason") String pauseReason,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("pause_details") Object pauseDetails,
         @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("resume_eligible_at") OffsetDateTime resumeEligibleAt,
-        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("artifacts") List<ArtifactMetadata> artifacts
+        @JsonInclude(JsonInclude.Include.NON_NULL) @JsonProperty("artifacts") List<ArtifactMetadata> artifacts,
+        /**
+         * Attached memory ids resolved from {@code task_attached_memories} in
+         * {@code position} order. Always present — empty list for legacy tasks
+         * created before Track 5, or for new tasks with no attachments.
+         */
+        @JsonProperty("attached_memory_ids") List<UUID> attachedMemoryIds,
+        /**
+         * Live preview rows (memory_id + title) for attachments whose memory entries
+         * still resolve within the task's {@code (tenant_id, agent_id)} scope.
+         * Always present — may be shorter than {@code attached_memory_ids} when
+         * entries have been deleted.
+         */
+        @JsonProperty("attached_memories_preview") List<AttachedMemoryPreview> attachedMemoriesPreview
 ) {
 }

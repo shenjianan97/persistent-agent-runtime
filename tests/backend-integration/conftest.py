@@ -25,6 +25,7 @@ if str(E2E_ROOT) not in sys.path:
 from helpers.api_client import ApiClient
 from helpers.db import DbHelper
 from helpers.e2e_context import E2EContext
+from helpers.embedding_mock import EmbeddingMockServer
 from helpers.mock_llm import DynamicChatProvider, simple_response
 from helpers.worker_launcher import create_worker, stop_worker
 
@@ -43,6 +44,13 @@ DB_DSN = os.getenv(
 API_PORT = int(os.getenv("E2E_API_PORT", "8081"))
 API_BASE = os.getenv("E2E_API_BASE", f"http://localhost:{API_PORT}/v1")
 
+# Memory embedding mock configuration. The api-service reads these values
+# at startup via APP_MEMORY_EMBEDDING_*, so the port is pinned (not 0) and
+# the Makefile's ``e2e-up`` target passes the same endpoint to the API.
+EMBEDDING_MOCK_HOST = "127.0.0.1"
+EMBEDDING_MOCK_PORT = int(os.getenv("E2E_EMBEDDING_MOCK_PORT", "18099"))
+EMBEDDING_MOCK_PROVIDER_ID = os.getenv("E2E_EMBEDDING_MOCK_PROVIDER_ID", "memory-mock")
+
 os.environ.setdefault("APP_DEV_TASK_CONTROLS_ENABLED", "true")
 os.environ.setdefault("S3_ENDPOINT_URL", "http://localhost:4566")
 os.environ.setdefault("S3_BUCKET_NAME", "platform-artifacts")
@@ -51,7 +59,7 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 os.environ.setdefault("AWS_REGION", "us-east-1")
 
 PG_CONTAINER = os.getenv("E2E_PG_CONTAINER", "par-e2e-postgres")
-PG_IMAGE = os.getenv("E2E_PG_IMAGE", "postgres:16")
+PG_IMAGE = os.getenv("E2E_PG_IMAGE", "pgvector/pgvector:pg16")
 
 
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -110,13 +118,38 @@ async def _schema_exists() -> bool:
         await conn.close()
 
 
+async def _ensure_embedding_provider_key() -> None:
+    """Upsert the stub provider_keys row used by the memory embedding mock.
+
+    DefaultMemoryEmbeddingClient refuses to call out unless the configured
+    provider_id has a matching row in ``provider_keys`` — seed it once per
+    session so ``mode=vector`` and hybrid reach the HTTP mock.
+    """
+    conn = await asyncpg.connect(DB_DSN)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO provider_keys (provider_id, api_key)
+            VALUES ($1, $2)
+            ON CONFLICT (provider_id) DO NOTHING
+            """,
+            EMBEDDING_MOCK_PROVIDER_ID,
+            "sk-embedding-mock",
+        )
+    finally:
+        await conn.close()
+
+
 def _apply_migrations() -> None:
     for sql_file in sorted(MIGRATIONS_DIR.glob("*.sql")):
         _run(["psql", DB_DSN, "-f", str(sql_file)], check=True)
 
 
-def _start_api_process() -> subprocess.Popen[str]:
+def _start_api_process(embedding_endpoint: str | None = None) -> subprocess.Popen[str]:
     env = os.environ.copy()
+    if embedding_endpoint:
+        env["APP_MEMORY_EMBEDDING_ENDPOINT"] = embedding_endpoint
+        env["APP_MEMORY_EMBEDDING_PROVIDER_ID"] = EMBEDDING_MOCK_PROVIDER_ID
     langfuse_enabled = os.getenv("E2E_LANGFUSE_ENABLED", os.getenv("LANGFUSE_ENABLED", "false"))
     env.update(
         {
@@ -177,6 +210,7 @@ class RuntimeHandles:
     started_api: bool = False
     postgres_was_running: bool = False
     api_process: subprocess.Popen[str] | None = None
+    embedding_mock: EmbeddingMockServer | None = None
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -223,9 +257,32 @@ def runtime_environment() -> RuntimeHandles:
     except Exception as exc:  # pragma: no cover - startup failure path
         pytest.skip(f"Failed to verify/apply schema: {exc}")
 
+    # Memory embedding mock runs for the life of the session. The api-service
+    # reads ``app.memory.embedding.endpoint`` at startup, so the mock must be
+    # listening on a stable URL. The Makefile's ``e2e-up`` target bakes the
+    # same port into APP_MEMORY_EMBEDDING_ENDPOINT for the pre-started API,
+    # so we bind the mock to that pinned port here.
+    try:
+        handles.embedding_mock = EmbeddingMockServer(
+            host=EMBEDDING_MOCK_HOST, port=EMBEDDING_MOCK_PORT,
+        )
+        handles.embedding_mock.start()
+        asyncio_run(_ensure_embedding_provider_key())
+    except OSError as exc:
+        # Port already in use — likely a stale mock from a previous run.
+        _cleanup_runtime(handles)
+        pytest.skip(
+            f"Failed to bind embedding mock on port {EMBEDDING_MOCK_PORT}: {exc}"
+        )
+    except Exception as exc:  # pragma: no cover - startup failure path
+        _cleanup_runtime(handles)
+        pytest.skip(f"Failed to start embedding mock: {exc}")
+
     if not _is_api_healthy(API_BASE):
         try:
-            handles.api_process = _start_api_process()
+            handles.api_process = _start_api_process(
+                embedding_endpoint=handles.embedding_mock.url,
+            )
             handles.started_api = True
             _wait_for_api(API_BASE)
         except Exception as exc:  # pragma: no cover - startup failure path
@@ -248,6 +305,12 @@ def _cleanup_runtime(handles: RuntimeHandles) -> None:
         log_handle = getattr(process, "_codex_log_handle", None)
         if log_handle:
             log_handle.close()
+
+    if handles.embedding_mock is not None:
+        try:
+            handles.embedding_mock.stop()
+        except Exception:
+            pass
 
     if handles.started_postgres and not handles.postgres_was_running:
         _run(["docker", "stop", PG_CONTAINER], check=False)
@@ -358,6 +421,11 @@ async def _do_clean(conn: asyncpg.Connection) -> None:
     await conn.execute("DELETE FROM checkpoint_writes")
     await conn.execute("DELETE FROM checkpoints")
     await conn.execute("DELETE FROM task_artifacts")
+    # Track 5 (Phase 2): memory attachments cascade from tasks; drop memory
+    # entries before agents so the fk_agent_memory_entries_agent FK does not
+    # block the agents truncate.
+    await conn.execute("DELETE FROM task_attached_memories")
+    await conn.execute("DELETE FROM agent_memory_entries")
     await conn.execute("DELETE FROM tasks")
     await conn.execute("DELETE FROM agent_runtime_state")
     await conn.execute("DELETE FROM agents")
@@ -384,6 +452,35 @@ async def db_pool(runtime_environment: RuntimeHandles) -> asyncpg.Pool:
 def api_client(runtime_environment: RuntimeHandles) -> ApiClient:
     del runtime_environment
     return ApiClient(API_BASE)
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_mock_between_tests(runtime_environment: RuntimeHandles):
+    """Autouse-guard that clears stray programmed responses between tests.
+
+    Tests that do not request the ``embedding_mock`` fixture would
+    otherwise inherit whatever was left in the queue by the previous test
+    — in particular, a programmed 200-with-vector could cause
+    ``test_search_hybrid_degrades_to_text_when_embedding_unreachable`` to
+    take the hybrid path instead of degrading.
+    """
+    mock = runtime_environment.embedding_mock
+    if mock is not None:
+        mock.reset()
+    yield
+
+
+@pytest.fixture
+def embedding_mock(runtime_environment: RuntimeHandles) -> EmbeddingMockServer:
+    """Per-test handle to the session-scoped embedding mock.
+
+    Reset is handled by the autouse fixture above; this just exposes the
+    handle to tests that need to program a response.
+    """
+    mock = runtime_environment.embedding_mock
+    if mock is None:  # pragma: no cover - only when E2E_SKIP_AUTO_INFRA=1
+        pytest.skip("Embedding mock not available (auto-infra disabled)")
+    return mock
 
 
 @pytest_asyncio.fixture

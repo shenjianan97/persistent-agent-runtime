@@ -1,4 +1,4 @@
-import { useParams, useNavigate } from 'react-router';
+import { useParams, useLocation, Link } from 'react-router';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -10,6 +10,7 @@ import { toast } from 'sonner';
 import { useEffect, useState } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
+import { MemoryTab } from './memory/MemoryTab';
 
 import {
     Form, FormControl, FormField, FormItem, FormLabel, FormMessage,
@@ -20,7 +21,7 @@ import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Bot, Pencil, X } from 'lucide-react';
+import { Bot, Pencil, X, Brain } from 'lucide-react';
 
 const agentDetailSchema = z.object({
     display_name: z.string().min(1, 'Agent name is required').max(200),
@@ -44,13 +45,21 @@ type AgentDetailFormValues = z.infer<typeof agentDetailSchema>;
 
 export function AgentDetailPage() {
     const { agentId } = useParams<{ agentId: string }>();
-    const navigate = useNavigate();
+    const location = useLocation();
     const { data: agent, isLoading, error } = useAgent(agentId!);
     const mutation = useUpdateAgent();
     const { data: models = [], isLoading: isLoadingModels } = useModels();
     const modelGroups = groupModelsByProvider(models);
     const [isEditing, setIsEditing] = useState(false);
     const { data: toolServers = [] } = useToolServers('active');
+
+    // The memory tab mounts when the current route is `/agents/:id/memory[/:memoryId]`.
+    const basePath = agentId ? `/agents/${encodeURIComponent(agentId)}` : '';
+    const onMemoryRoute = !!agentId && location.pathname.startsWith(`${basePath}/memory`);
+    const memoryEnabled = agent?.agent_config?.memory?.enabled === true;
+    // The tab strip is visible whenever memory is enabled OR the user is
+    // already on the memory route (historical entries when memory is disabled).
+    const showMemoryTab = memoryEnabled || onMemoryRoute;
 
     const form = useForm<AgentDetailFormValues>({
         resolver: zodResolver(agentDetailSchema),
@@ -190,9 +199,13 @@ export function AgentDetailPage() {
         </div>
     );
 
+    const tabBaseClass = 'px-4 py-2 text-xs font-bold uppercase tracking-widest transition-all border-b-2 -mb-px';
+    const tabActiveClass = 'border-primary text-primary';
+    const tabInactiveClass = 'border-transparent text-muted-foreground hover:text-foreground';
+
     return (
         <div className="space-y-6 animate-in fade-in duration-500">
-            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 mb-8 flex flex-col md:flex-row md:items-end justify-between gap-4">
+            <div className="console-surface-strong rounded-[28px] p-6 md:p-7 flex flex-col md:flex-row md:items-end justify-between gap-4">
                 <div>
                     <h2 className="text-3xl font-display font-semibold tracking-tight mb-1 flex items-center gap-2">
                         <Bot className="w-6 h-6 text-primary drop-shadow-[0_0_12px_var(--color-primary)]" />
@@ -212,7 +225,7 @@ export function AgentDetailPage() {
                         </Badge>
                     </div>
                 </div>
-                {!isEditing && (
+                {!onMemoryRoute && !isEditing && (
                     <Button
                         onClick={() => setIsEditing(true)}
                         variant="outline"
@@ -224,7 +237,38 @@ export function AgentDetailPage() {
                 )}
             </div>
 
-            {!isEditing ? (
+            <nav
+                className="flex gap-1 border-b border-white/8 px-2"
+                role="tablist"
+                aria-label="Agent detail sections"
+                data-testid="agent-detail-tabs"
+            >
+                <Link
+                    to={basePath}
+                    role="tab"
+                    aria-selected={!onMemoryRoute}
+                    className={`${tabBaseClass} ${!onMemoryRoute ? tabActiveClass : tabInactiveClass}`}
+                    data-testid="agent-tab-overview"
+                >
+                    Overview
+                </Link>
+                {showMemoryTab && (
+                    <Link
+                        to={`${basePath}/memory`}
+                        role="tab"
+                        aria-selected={onMemoryRoute}
+                        className={`${tabBaseClass} ${onMemoryRoute ? tabActiveClass : tabInactiveClass} inline-flex items-center gap-1.5`}
+                        data-testid="agent-tab-memory"
+                    >
+                        <Brain className="w-3.5 h-3.5" />
+                        Memory
+                    </Link>
+                )}
+            </nav>
+
+            {onMemoryRoute ? (
+                <MemoryTab />
+            ) : !isEditing ? (
                 <div className="space-y-6">
                     <Card className="console-surface border-white/10">
                         <CardHeader className="border-b border-white/8 pb-4">

@@ -34,6 +34,8 @@ function App() {
                         <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
                         <Route path="/agents" element={<AgentsListPage />} />
                         <Route path="/agents/:agentId" element={<AgentDetailPage />} />
+                        <Route path="/agents/:agentId/memory" element={<AgentDetailPage />} />
+                        <Route path="/agents/:agentId/memory/:memoryId" element={<AgentDetailPage />} />
                         <Route path="/tool-servers" element={<ToolServersListPage />} />
                         <Route path="/tool-servers/:serverId" element={<ToolServerDetailPage />} />
                         <Route path="/dead-letter" element={<DeadLetterPage />} />

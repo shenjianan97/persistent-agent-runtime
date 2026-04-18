@@ -6,6 +6,7 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
+import java.util.List;
 import java.util.UUID;
 
 public record TaskSubmissionRequest(
@@ -37,6 +38,27 @@ public record TaskSubmissionRequest(
         Integer taskTimeoutSeconds,
 
         @JsonProperty("langfuse_endpoint_id")
-        UUID langfuseEndpointId
+        UUID langfuseEndpointId,
+
+        /**
+         * Optional list of memory entry ids to attach to this task. Each id must
+         * belong to the caller's (tenant_id, agent_id). Order is preserved in
+         * {@code task_attached_memories.position}.
+         *
+         * <p>Capped at 50 entries. This cap is a plan-level guard against blowing
+         * the initial prompt context; it is not codified in the design doc, which
+         * specifies only a Console-side token-footprint indicator.
+         */
+        @JsonProperty("attached_memory_ids")
+        List<UUID> attachedMemoryIds,
+
+        /**
+         * Per-task privacy override. When {@code true}, the worker treats the task
+         * as if the agent's memory were disabled (no memory tools, no write node,
+         * no dead-letter memory hook) — even if {@code agent.memory.enabled} is true.
+         * Defaults to {@code false} when absent.
+         */
+        @JsonProperty("skip_memory_write")
+        Boolean skipMemoryWrite
 ) {
 }

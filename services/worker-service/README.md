@@ -46,11 +46,20 @@ Create a `.env` file in `services/worker-service/` or export directly:
 |----------|-------------|---------|
 | `DB_DSN` | Worker | **Required** (no default) |
 | `ANTHROPIC_API_KEY` | Claude models | — |
+| `OPENAI_API_KEY` | OpenAI chat models + **memory embeddings** (Track 5) | — |
 | `AWS_ACCESS_KEY_ID` | Bedrock models | — |
 | `AWS_SECRET_ACCESS_KEY` | Bedrock models | — |
 | `AWS_REGION` | Bedrock models | — |
 | `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
+| `MEMORY_DEFAULT_SUMMARIZER_MODEL` | Platform-default summarizer model for memory-enabled agents that don't set `agent_config.memory.summarizer_model` | `claude-haiku-4-5` |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | Dev-only task controls and `dev_sleep` tool | `false` |
+
+> **Memory-enabled agents (Phase 2 Track 5).** Memory writes compute embeddings via
+> OpenAI's `text-embedding-3-small`. The worker reads the API key from the same
+> `provider_keys` table that stores chat-model credentials, so setting
+> `OPENAI_API_KEY` (or seeding the `openai` row via model-discovery) is what
+> unlocks memory-enabled agents locally. Model-discovery will fail startup fast
+> if a memory-enabled agent exists but the embedding key is missing or invalid.
 
 The model is selected per-agent via `agent_config.model`. Names containing `claude` use Anthropic; others use Bedrock.
 Checkpoint cost estimation uses the local pricing file, not a runtime provider lookup. Update `config/model_pricing.json` or point `MODEL_PRICING_FILE` at another JSON file to add or override model rates.

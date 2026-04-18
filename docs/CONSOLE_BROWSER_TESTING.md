@@ -146,6 +146,32 @@ What to verify:
 - After creating an endpoint, it appears in the list
 - Deleting an endpoint removes it from the list
 
+### Scenario 11: Agent Memory Tab
+
+Covers design-doc acceptance criteria AC-9 (Console browse / search / read / delete / storage stats), AC-10 (memory-disabled agent still renders historical entries), and AC-13 (80%-of-cap warning banner).
+
+What it validates: Memory tab on the Agent detail page renders, filters, searches, opens detail, and deletes entries. Covers the memory-disabled and 80%-of-cap variants.
+
+Preconditions:
+
+- At least one agent with `agent_config.memory.enabled = true` exists. Use the API (`POST /v1/agents`) or the Settings / Agent dialog once memory toggling surfaces.
+- (For the "list with entries" checks) at least one completed memory-enabled task has executed so the list is non-empty. If the worker write path (Task 6) has not shipped yet, use a temporary `INSERT INTO agent_memory_entries (...)` via `psql` against the dev DB to seed at least one row per scope.
+
+What to verify:
+
+- Navigating to `/agents/:agentId` shows two tabs — `Overview` (active) and `Memory` — when the agent has memory enabled. Only `Overview` shows when memory is disabled.
+- Clicking the `Memory` tab navigates to `/agents/:agentId/memory` and renders the Memory tab content.
+- The storage-stats strip at the top shows an entry count (`N of 10,000 entries`) and approximate bytes (e.g., `~12.3 MB`). With `entry_count = 0`, the strip still renders; no warning banner appears.
+- With `entry_count >= 0.8 * max_entries`, the strip becomes an amber warning banner with a `Delete old entries` button. With `entry_count >= max_entries`, the banner is red and references FIFO trim.
+- The filter bar exposes: outcome dropdown (All / Succeeded / Failed), `From` date input, `To` date input, search input, `Search` button, and a `Clear` button (visible when any filter is set).
+- Selecting `outcome = Failed` updates the list to show only failed entries (or the "No results match your filters" empty state).
+- Typing a query and pressing `Search` switches the view to search mode with a `Top 20 matches` label plus a `ranking: hybrid | text | vector` badge. Clearing the search restores the list view.
+- Clicking a row navigates to `/agents/:agentId/memory/:memoryId` and renders: title, outcome badge, created/updated timestamps, summary, observations list (in order), linked task link (deep-linked to `/tasks/:taskId`), summarizer model id, tags, an `Attach to new task` button, and a `Delete` button.
+- Clicking `Attach to new task` navigates to `/tasks/new?agentId=<id>&attachMemoryId=<memory_id>` (Task 10 picks up the query param).
+- Clicking `Delete` on the detail view (or the per-row delete button in the list) opens a confirmation dialog with the entry title and a "cannot be undone" notice. Confirming deletes the entry, shows a `Memory entry deleted` toast, and removes the row from the list.
+- Navigating to a memory-disabled agent's Memory tab still renders the tab (when visited directly via URL) with a dismissible notice: `Memory is disabled for this agent. Existing entries are preserved; no new entries will be written.` Historical entries remain browsable and deletable.
+- `browser_console_messages` shows no uncaught exceptions during any of the above flows.
+
 ### Scenario 10: Task File Attachments
 
 What it validates: File attachment affordances on task submission work in a real browser.
@@ -159,6 +185,49 @@ What to verify:
 - Disabled state does not open the browser file picker
 - No console errors appear during click-to-browse or drag-and-drop interactions
 
+### Scenario 12: Submit-Page Memory Attach
+
+Covers design-doc acceptance criteria AC-8 (customer attach at submission with validated scope + persisted `attached_memory_ids`) and AC-11 (`skip_memory_write` per-task override propagates on the wire).
+
+What it validates: The Submit-page memory-attach widget, token-footprint indicator, `skip_memory_write` toggle, and deep-link pre-selection are wired end-to-end.
+
+What to verify:
+
+- `/tasks/new` does NOT render the `Memory` card when the selected agent has `agent_config.memory.enabled = false` or the field is absent
+- Selecting an agent with `agent_config.memory.enabled = true` reveals a `Memory` card containing the `Attach Past Memories` picker (initially closed) and the `Skip writing a memory entry for this task` checkbox
+- Clicking `Browse` expands the picker and triggers a `GET /v1/agents/:agent_id/memory` call (confirm via `browser_network_requests`). The initial expand is lazy — no memory API hits before that
+- Typing in the search input switches the endpoint from `/memory` to `/memory/search?q=...`; clearing the input falls back to `/memory`
+- Clicking an entry in the picker adds it to the `Selected` panel below, in position order; clicking the `X` removes it
+- The `Attached context:` indicator renders with a byte approximation and entry count. Selecting a large entry (≥10 KB combined summary + observations) turns the indicator amber and surfaces a tooltip on hover
+- The `(N/50)` counter on the picker reflects the current selection size; selecting a 51st entry no-ops and surfaces a capped-selection warning
+- Submitting the form with attached memories POSTs a JSON body that contains `attached_memory_ids: [...]` in selection order and (when the checkbox is ticked) `skip_memory_write: true`. Verify via `browser_network_requests` on the `/v1/tasks` POST
+- After a successful submit, navigate to `/tasks/:taskId` and confirm the `TaskStatusResponse` exposes `attached_memory_ids` and `attached_memories_preview` with the attached entries — inspect with `browser_evaluate` against the task detail endpoint
+- Deep link: navigating to `/tasks/new?agent_id=<memory-enabled-agent>&attachMemoryId=<valid-memory-id>` auto-selects that entry in the Selected panel
+- Deep link mismatch: navigating with `attachMemoryId` pointing at a memory-DISABLED agent surfaces a toast along the lines of `Attachment ignored — memory is disabled for this agent` and does NOT render the Memory card
+- Clicking `Attach to new task` from the Memory tab (Task 9) opens `/tasks/new?agent_id=...&attachMemoryId=...` with the entry pre-selected
+- Switching the selected agent after a selection clears the Selected list (no cross-agent leak)
+- No console errors during any of the flows above
+
+### Scenario 13: Memory End-to-End Cross-Feature Flow
+
+Covers Task 11's "Memory Tab E2E" and "Submit Attach E2E" requirements in a single cross-feature session that exercises every Console-visible stop on the memory journey. Primarily validates design-doc acceptance criteria AC-2 (one entry per completed memory-enabled task), AC-8 (attachment persisted on the submitted task), AC-9 (customer-visible browse / search / read / delete), and AC-11 (`skip_memory_write` honoured end-to-end).
+
+Preconditions:
+
+- `make start` stack running with the API at `:8080` and the Console at `:5173`.
+- Two agents created via `POST /v1/agents` — one with `agent_config.memory.enabled = true` (the "memory-enabled agent") and one with memory disabled (or absent).
+- At least one past completed task on the memory-enabled agent so the Memory tab is non-empty. Seed via running a real task (preferred) or, as a fallback, a temporary `INSERT INTO agent_memory_entries ...`.
+
+What to verify, in order (a single browser session):
+
+1. **Memory Tab E2E**: navigate to `/agents/:memory_enabled_agent_id/memory`. Confirm the list renders with at least one entry, the storage-stats strip shows entry count + bytes, and filters / search behave per Scenario 11. Open a row (detail view), assert title, summary, observations, linked task, tags, summarizer model id render. Delete a row via the detail page's `Delete` button, confirm the toast and the entry disappearing from the list.
+2. **Submit Attach E2E**: from the detail page of a different (still-present) memory entry, click `Attach to new task`. Confirm routing to `/tasks/new?agent_id=<memory_enabled_agent_id>&attachMemoryId=<memory_id>` with that entry pre-selected. Open the picker, add a second entry, leave `skip_memory_write` unchecked, submit. Confirm the POST body carries `attached_memory_ids` in the correct order (via `browser_network_requests`).
+3. **Task detail surfaces attachments**: navigate to `/tasks/:taskId`, confirm the Attachments / Memory section lists the two attached memory entries (preview titles). Use `browser_evaluate` against `/v1/tasks/:taskId` to assert the response has `attached_memory_ids: [...]` and `attached_memories_preview: [...]` with the same two ids.
+4. **Wait for completion**: poll until the task reaches `completed` (may take several seconds against a live worker). Once completed, re-open the Memory tab for the same agent — confirm a NEW entry appears for this task, with title / summary populated, and that it survives a page reload.
+5. **`skip_memory_write` variant**: submit a second task with `skip_memory_write` checked. After completion, re-open the Memory tab and assert **no** new entry was written for the task (AC-11).
+6. **Memory-disabled agent negative path**: navigate to the disabled agent's `/tasks/new`, confirm the Memory card does NOT render. Submitting a task there produces no memory row. Navigate to that agent's Memory tab and confirm the disabled notice + any historical entries render as read-only.
+7. `browser_console_messages` shows zero uncaught exceptions across the full walkthrough.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -167,12 +236,15 @@ What to verify:
 | Agent management feature | 1, 2, 3 |
 | Task submission feature | 1, 3 |
 | Task submission file attachment feature | 1, 3, 10 |
+| Task submission memory attach feature | 1, 3, 12 |
 | Task detail / timeline feature | 1, 4 |
 | Task list feature | 1, 5 |
 | Budget / pause feature | 1, 4, 6 |
 | Dead letter feature | 1, 7 |
 | HITL / approval / input feature | 1, 4, 8 |
 | Settings / Langfuse feature | 1, 9 |
+| Agent Memory tab feature | 1, 11 |
+| Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |

@@ -43,7 +43,7 @@ class TaskMultipartTest {
         UUID taskId = UUID.randomUUID();
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         when(taskService.submitTaskWithFiles(any(), any()))
-                .thenReturn(new TaskSubmissionResponse(taskId, "agent-1", "Agent One", "queued", now));
+                .thenReturn(new TaskSubmissionResponse(taskId, "agent-1", "Agent One", "queued", now, java.util.List.of(), java.util.List.of()));
 
         String taskJson = """
                 {"agent_id": "agent-1", "input": "Process this file"}
@@ -67,7 +67,7 @@ class TaskMultipartTest {
         UUID taskId = UUID.randomUUID();
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         when(taskService.submitTaskWithFiles(any(), any()))
-                .thenReturn(new TaskSubmissionResponse(taskId, "agent-1", "Agent One", "queued", now));
+                .thenReturn(new TaskSubmissionResponse(taskId, "agent-1", "Agent One", "queued", now, java.util.List.of(), java.util.List.of()));
 
         String taskJson = """
                 {"agent_id": "agent-1", "input": "No files here"}
