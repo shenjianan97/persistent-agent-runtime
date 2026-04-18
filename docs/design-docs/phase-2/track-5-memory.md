@@ -44,7 +44,7 @@ Track 5 does not include:
 - Memory is **opt-in per agent** via `agent_config.memory.enabled` (default `false`).
 - Storage is a single PostgreSQL table `agent_memory_entries`, scoped by `(tenant_id, agent_id)`.
 - Search uses **hybrid BM25 + vector** against the same table (Postgres-native `tsvector` + `pgvector` extension). No SQLite, no S3, no external index.
-- Every completed task produces **exactly one memory entry**, written atomically at task termination.
+- Every completed task produces **exactly one memory entry per `task_id`**, written atomically at task termination. Follow-up runs and redrives (which reuse the same `task_id`) **overwrite** the prior entry so it always reflects the latest execution state — not additional rows.
 - The agent may call `memory_note(text)` any number of times during execution to append observations. The final write merges those observations with a retrospective summary; the summary does **not** overwrite observations.
 - Memory write runs as the **final LangGraph node** for `completed` tasks. For `dead_letter` tasks, a worker-side terminal hook writes a minimal entry **only if** the agent wrote at least one observation. For `cancelled` tasks, nothing is written.
 - Memory is never auto-injected into a task's prompt. Retrieval is explicit only:
@@ -72,8 +72,9 @@ Track 5 does not include:
 | `tags` | `TEXT[]` | NOT NULL, default `'{}'`, optional entity/keyword hints for search precision |
 | `content_tsv` | `tsvector` | Generated column over `title \|\| summary \|\| array_to_string(observations, ' ') \|\| array_to_string(tags, ' ')`, GIN-indexed |
 | `content_vec` | `vector(1536)` | Embedding of the same concatenated text, HNSW-indexed. Dimension matches platform default embedding model. |
-| `summarizer_model_id` | `TEXT` | Nullable, records which model generated the summary (for debuggability / future re-generation) |
-| `created_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()` |
+| `summarizer_model_id` | `TEXT` | Nullable, records which model generated the summary. Sentinel values: `'template:fallback'` when the LLM was unavailable and a template summary was used, `'template:dead_letter'` for the dead-letter path. |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()`, immutable once set |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()`, rewritten on each upsert (follow-up / redrive / regeneration) |
 
 **Primary key:** `memory_id`.
 
@@ -116,6 +117,20 @@ When `memory.enabled` is `false` or the `memory` section is absent:
 - No memory entries are ever written for the agent
 - The agent's memory store remains browsable and deletable via API (historical entries from when it was enabled are preserved)
 
+### Tasks table extension
+
+Track 5 adds one column to the existing `tasks` table so the attachment set is a first-class, queryable task field rather than something reconstructed from event payloads.
+
+| Column | Type | Constraints / Meaning |
+|--------|------|------------------------|
+| `attached_memory_ids` | `UUID[]` | NOT NULL, default `'{}'`, set at task submission from the `attached_memory_ids` request field. Each id must belong to the submitting `(tenant_id, agent_id)` at submission time — validated by the API. Immutable after task creation (not updated on follow-up). |
+
+This column is not a FK to `agent_memory_entries.memory_id` — customer delete of a memory entry leaves a dangling id in the task row, which is acceptable because the entry was already injected into the task's initial context at submission time and the audit trail is the source of truth, not the live entry.
+
+The `task_submitted` event's `details` JSONB also includes the id list so a pure event-timeline consumer can reconstruct attachment history without joining the `tasks` row. Storing in both places is a deliberate small duplication: the `tasks` column is cheap to query; the event record is immutable.
+
+Task detail API responses include `attached_memory_ids` and, for human-friendly rendering, a derived `attached_memories_preview: [{memory_id, title}]` resolved from the current `agent_memory_entries` rows (ids that no longer resolve are omitted from the preview but remain in the raw array).
+
 ### pgvector extension
 
 The `pgvector` extension must be enabled on the Postgres database. Embedding dimension is fixed at **1536** in v1, matching the default embedding model (`text-embedding-3-small` or equivalent; see [§ Embeddings](#embeddings)).
@@ -140,10 +155,22 @@ A dedicated terminal LangGraph node runs as the last step before graph terminati
 2. Call the `summarizer_model` with a prompt that:
    - Instructs it to produce a `title` (≤10 words, action-oriented) and a `summary` (≤400 words, retrospective)
    - Passes the observations so the summary complements, not duplicates, them
-3. Insert a row into `agent_memory_entries` with `outcome = 'succeeded'`, observations preserved verbatim, and summary/title from the LLM.
+3. **Upsert** a row into `agent_memory_entries` (see [§ Concurrency and idempotency](#concurrency-and-idempotency)) with `outcome = 'succeeded'`, observations preserved verbatim, and summary/title from the LLM.
 4. Compute and store the embedding (`content_vec`) in the same transaction. `content_tsv` is a generated column so no separate write is needed.
 
-LLM cost for this call is recorded against the task via the existing Track 3 cost-ledger mechanism. The cost is attributed to the task that produced the entry. If the summarizer LLM call fails after internal retries, the task still completes successfully — memory write is best-effort and does not block task completion. A log line records the failure; no retry queue is added in v1.
+LLM cost for this call is recorded against the task via the existing Track 3 cost-ledger mechanism. The cost is attributed to the task that produced the entry.
+
+**Summarizer-unavailable fallback.** If the `summarizer_model` call fails after its internal retries — provider outage, rate limit, credential rotation lag — the node does **not** skip the write. Instead it falls back to a template-generated entry and still upserts a row:
+
+- `title`: `"Completed: <first 80 chars of task input, sanitized>"`
+- `summary`: `"<final_output truncated to ~1KB> [summary generation unavailable; review observations and linked task trace for detail.]"`
+- `observations`: preserved verbatim
+- `outcome`: `'succeeded'` (the task did succeed — only the summary is degraded)
+- `summarizer_model_id`: `'template:fallback'`
+
+The failure is recorded in a structured log line so operators can detect sustained summarizer outages. The embedding step still runs on the template text; if the embedding provider is also down, the row is written with `content_vec = NULL` as described in [§ Embeddings](#embeddings). The task itself still transitions to `completed` regardless. The invariant every completed memory-enabled task produces exactly one memory entry is preserved across both normal and degraded paths.
+
+Customers can later regenerate a proper summary for `'template:fallback'` entries once the provider recovers. A regeneration endpoint is **out of scope for v1** — the template entry remains until manually deleted or overwritten by a follow-up run.
 
 ### Dead-letter hook (failed tasks with observations)
 
@@ -154,7 +181,7 @@ As part of the worker's dead-letter finalization path — after max retries are 
 3. If `observations` is non-empty:
    - Auto-generate a minimal summary: `"Task dead-lettered after <N> retries: <last_error_code> — <last_error_message>"` (no LLM call; template-generated from task fields).
    - Generate a short title template: `"[Failed] <first_50_chars_of_task_input>"`.
-   - Insert a row with `outcome = 'failed'`, observations preserved, summary and title from the template.
+   - Upsert a row with `outcome = 'failed'`, observations preserved, summary and title from the template, `summarizer_model_id = 'template:dead_letter'`.
    - Compute embedding over the same concatenated text.
 
 The rationale: if the agent flagged something mid-execution, the task got far enough to learn something worth remembering. If nothing was flagged, the failure is likely trivial and memory noise outweighs signal.
@@ -167,8 +194,24 @@ No LLM is called on the dead-letter path. Cost is effectively zero beyond the em
 
 ### Concurrency and idempotency
 
-- `UNIQUE (task_id)` on `agent_memory_entries` ensures at most one entry per task.
-- Memory-write is idempotent: retrying the final node inserts with `ON CONFLICT (task_id) DO NOTHING`. A task that successfully wrote its memory and is later re-executed (e.g., via redrive) does not double-write.
+- `UNIQUE (task_id)` on `agent_memory_entries` ensures at most one entry per task at any time.
+- Memory writes use **upsert**, not insert-or-skip:
+  ```
+  INSERT INTO agent_memory_entries (...) VALUES (...)
+  ON CONFLICT (task_id) DO UPDATE SET
+    title = EXCLUDED.title,
+    summary = EXCLUDED.summary,
+    observations = EXCLUDED.observations,
+    outcome = EXCLUDED.outcome,
+    tags = EXCLUDED.tags,
+    content_vec = EXCLUDED.content_vec,
+    summarizer_model_id = EXCLUDED.summarizer_model_id,
+    updated_at = now();
+  ```
+- **Why upsert, not insert-once:** Track 4's follow-up endpoint (`POST /v1/tasks/{task_id}/follow-up`) resumes a completed task under the same `task_id`. A dead-letter-then-redrive sequence also reuses the same `task_id`. In both cases the memory entry must reflect the latest execution, not be permanently frozen to the first attempt's outcome. An insert-once model would leave stale or failed entries in place forever after follow-up or successful redrive.
+- **Duplicate-write within a single execution** (e.g., the final node is re-entered after a transient crash before it committed): upsert is still safe. The second call overwrites the first with the same data; `created_at` is preserved, `updated_at` advances.
+- **Ordering guarantee:** the final memory-write node (or the dead-letter hook) runs once per execution attempt, so there is no intra-attempt race. Cross-execution upserts are inherently serialized by the task's own lifecycle — only one worker holds a lease at a time.
+- **`created_at` vs `updated_at`:** `created_at` is the first time a memory row was written for this `task_id`. `updated_at` is the most recent execution's write time. The Console renders both.
 
 ## Read Path
 
@@ -176,7 +219,7 @@ No LLM is called on the dead-letter path. Cost is effectively zero beyond the em
 
 Memory entries are never auto-loaded into a task's prompt. There are exactly three ways an entry is surfaced:
 
-1. **Customer attach at submission** — `POST /v1/tasks` accepts `attached_memory_ids: [uuid]`. The API resolves each id against the submitting tenant+agent, fails fast on unknown/wrong-agent ids, and copies the resolved `title + observations + summary` blocks into the task's initial prompt context (system-prompt-prefix). The ids themselves are recorded on the task for auditability.
+1. **Customer attach at submission** — `POST /v1/tasks` accepts `attached_memory_ids: [uuid]`. The API resolves each id against the submitting tenant+agent, fails fast on unknown/wrong-agent ids, and copies the resolved `title + observations + summary` blocks into the task's initial prompt context (system-prompt-prefix). The ids are persisted on the task row (see [§ Tasks table extension](#tasks-table-extension)) so the Console, API, and audit consumers can always reconstruct which memories were injected into a given run.
 2. **Agent `memory_search` tool call during execution** — see [§ Agent Tools](#agent-tools).
 3. **Console browse / attach** — a human user reads entries in the Console, selecting ids to attach at submission time. Same underlying API as (1).
 
@@ -352,7 +395,8 @@ Returns the full entry:
   "outcome": "succeeded",
   "tags": ["..."],
   "summarizer_model_id": "...",
-  "created_at": "..."
+  "created_at": "...",
+  "updated_at": "..."
 }
 ```
 
@@ -431,14 +475,15 @@ Track 5 introduces a new Postgres extension (`pgvector`) and a new table. Schema
 Track 5 is complete from a design perspective when all of the following are true:
 
 1. A customer can enable memory for an agent and choose a summarizer model (or accept the platform default).
-2. Every completed task with memory enabled writes exactly one entry containing a title, summary, and the agent's observations.
-3. `dead_letter` tasks with observations write a minimal entry; `dead_letter` tasks without observations, and all `cancelled` tasks, write nothing.
-4. The agent can call `memory_note` during execution to append observations that appear verbatim in the final entry alongside the retrospective summary.
-5. The agent can call `memory_search` and receive ranked hybrid results scoped to its own agent.
-6. The agent can call `task_history_get(task_id)` and receive a bounded structured view of any past task on the same agent.
-7. A customer can attach specific memory entries to a new task at submission; the resolved entries are injected into the task's initial context.
-8. A customer can browse, search, read, and delete memory entries for each of their agents via the Console and the API.
-9. Cross-tenant and cross-agent access is rejected at the API layer and invisible to the caller (404, not 403).
-10. If `memory.enabled` is `false`, no memory tools are registered, no final node runs, no entries are written, and no cost is incurred.
-11. The memory write does not block task completion — if the summarizer LLM fails, the task still completes; the memory entry is skipped with a structured log entry.
-12. All acceptance scenarios are covered by unit and E2E tests, including: memory disabled, memory enabled / successful write, dead-letter with and without observations, cancellation, concurrent task completion, cross-tenant attachment rejection, and search degradation when pgvector is unavailable.
+2. Every completed task with memory enabled writes exactly one entry containing a title, summary, and the agent's observations. Summarizer outage does not break this invariant — a template fallback entry is written instead, flagged via `summarizer_model_id = 'template:fallback'`.
+3. `dead_letter` tasks with observations write a minimal entry (`outcome = 'failed'`, `summarizer_model_id = 'template:dead_letter'`); `dead_letter` tasks without observations, and all `cancelled` tasks, write nothing.
+4. Follow-up runs and redrives reusing the same `task_id` **overwrite** the prior memory entry. The entry always reflects the latest execution; `created_at` is preserved, `updated_at` advances.
+5. The agent can call `memory_note` during execution to append observations that appear verbatim in the final entry alongside the retrospective summary.
+6. The agent can call `memory_search` and receive ranked hybrid results (RRF, k=60, 4× candidate multiplier) scoped to its own agent.
+7. The agent can call `task_history_get(task_id)` and receive a bounded structured view of any past task on the same agent.
+8. A customer can attach specific memory entries to a new task at submission; the resolved entries are injected into the task's initial context. The submitted id set is persisted on the task row (`attached_memory_ids`) and in the `task_submitted` event details, so the audit trail of which memories were injected into a given run is queryable after the fact.
+9. A customer can browse, search, read, and delete memory entries for each of their agents via the Console and the API.
+10. Cross-tenant and cross-agent access is rejected at the API layer and invisible to the caller (404, not 403).
+11. If `memory.enabled` is `false`, no memory tools are registered, no final node runs, no entries are written, and no cost is incurred.
+12. The memory write does not block task completion — on summarizer failure, the template fallback writes the entry and the task still transitions to `completed`.
+13. All acceptance scenarios are covered by unit and E2E tests, including: memory disabled, memory enabled / successful write, summarizer-outage template fallback, dead-letter with and without observations, cancellation, follow-up overwrite, redrive overwrite, concurrent task completion, cross-tenant attachment rejection, and search degradation when pgvector is unavailable.
