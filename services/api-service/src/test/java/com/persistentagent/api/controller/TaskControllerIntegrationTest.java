@@ -46,6 +46,19 @@ class TaskControllerIntegrationTest {
                 jdbcTemplate.execute("DELETE FROM task_events");
                 jdbcTemplate.execute("DELETE FROM checkpoint_writes");
                 jdbcTemplate.execute("DELETE FROM checkpoints");
+                // task_attached_memories cascades with tasks (ON DELETE CASCADE),
+                // but clear explicitly to make test state obvious. Only drop if
+                // the migration has run; otherwise these rows don't exist yet.
+                try {
+                        jdbcTemplate.execute("DELETE FROM task_attached_memories");
+                } catch (Exception ignored) {
+                        // Table absent on older schemas — Track 5 Task 1 adds it.
+                }
+                try {
+                        jdbcTemplate.execute("DELETE FROM agent_memory_entries");
+                } catch (Exception ignored) {
+                        // Table absent on older schemas — Track 5 Task 1 adds it.
+                }
                 jdbcTemplate.execute("DELETE FROM tasks");
                 jdbcTemplate.execute("DELETE FROM agents");
                 // Create agent for task submission
@@ -225,5 +238,223 @@ class TaskControllerIntegrationTest {
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.status").value("healthy"))
                                 .andExpect(jsonPath("$.database").value("connected"));
+        }
+
+        // --- Track 5: attached_memory_ids + skip_memory_write ---
+
+        @Test
+        void submitTask_withValidAttachedMemoryIds_persistsJoinRowsInOrder() throws Exception {
+                // Seed three memory entries owned by the test agent
+                java.util.UUID m1 = seedMemoryEntry(TEST_AGENT_ID, "Solved login bug");
+                java.util.UUID m2 = seedMemoryEntry(TEST_AGENT_ID, "Optimized query path");
+                java.util.UUID m3 = seedMemoryEntry(TEST_AGENT_ID, "Fixed flaky test");
+
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "do more work",
+                                  "attached_memory_ids": ["%s", "%s", "%s"]
+                                }
+                                """, TEST_AGENT_ID, m1, m2, m3);
+
+                MvcResult submitResult = mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andExpect(jsonPath("$.attached_memory_ids.length()").value(3))
+                                .andReturn();
+
+                String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
+                                .get("task_id").asText();
+
+                // Three rows in task_attached_memories, position preserved
+                java.util.List<java.util.Map<String, Object>> rows = jdbcTemplate.queryForList(
+                                "SELECT memory_id, position FROM task_attached_memories"
+                                                + " WHERE task_id = ?::uuid ORDER BY position ASC",
+                                taskId);
+                org.junit.jupiter.api.Assertions.assertEquals(3, rows.size());
+                org.junit.jupiter.api.Assertions.assertEquals(m1, rows.get(0).get("memory_id"));
+                org.junit.jupiter.api.Assertions.assertEquals(0, rows.get(0).get("position"));
+                org.junit.jupiter.api.Assertions.assertEquals(m2, rows.get(1).get("memory_id"));
+                org.junit.jupiter.api.Assertions.assertEquals(1, rows.get(1).get("position"));
+                org.junit.jupiter.api.Assertions.assertEquals(m3, rows.get(2).get("memory_id"));
+                org.junit.jupiter.api.Assertions.assertEquals(2, rows.get(2).get("position"));
+
+                // Event details JSONB mirrors the list
+                String details = (String) jdbcTemplate.queryForObject(
+                                "SELECT details::text FROM task_events"
+                                                + " WHERE task_id = ?::uuid AND event_type = 'task_submitted'",
+                                String.class, taskId);
+                org.junit.jupiter.api.Assertions.assertTrue(details.contains("attached_memory_ids"));
+                org.junit.jupiter.api.Assertions.assertTrue(details.contains(m1.toString()));
+                org.junit.jupiter.api.Assertions.assertTrue(details.contains(m2.toString()));
+                org.junit.jupiter.api.Assertions.assertTrue(details.contains(m3.toString()));
+
+                // Detail GET exposes the full id list + preview
+                mockMvc.perform(get("/v1/tasks/" + taskId))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.attached_memory_ids.length()").value(3))
+                                .andExpect(jsonPath("$.attached_memory_ids[0]").value(m1.toString()))
+                                .andExpect(jsonPath("$.attached_memories_preview.length()").value(3))
+                                .andExpect(jsonPath("$.attached_memories_preview[0].memory_id").value(m1.toString()));
+        }
+
+        @Test
+        void submitTask_withAttachedMemoryFromOtherAgent_returnsUniform400() throws Exception {
+                // Create a second agent and seed a memory entry against it
+                jdbcTemplate.execute("""
+                        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+                        VALUES ('default', 'other-agent', 'Other Agent',
+                                '{"system_prompt":"p","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":[]}'::jsonb,
+                                'active')
+                        ON CONFLICT (tenant_id, agent_id) DO NOTHING
+                        """);
+                java.util.UUID otherAgentMemory = seedMemoryEntry("other-agent", "Belongs elsewhere");
+
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "do work",
+                                  "attached_memory_ids": ["%s"]
+                                }
+                                """, TEST_AGENT_ID, otherAgentMemory);
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest())
+                                .andExpect(jsonPath("$.message").value(
+                                                "one or more attached_memory_ids could not be resolved"));
+
+                // No task, no attached-memory rows, no task_submitted event
+                Integer taskCount = jdbcTemplate.queryForObject(
+                                "SELECT COUNT(*) FROM tasks WHERE agent_id = ?", Integer.class, TEST_AGENT_ID);
+                org.junit.jupiter.api.Assertions.assertEquals(0, taskCount.intValue());
+                Integer attachmentCount = jdbcTemplate.queryForObject(
+                                "SELECT COUNT(*) FROM task_attached_memories", Integer.class);
+                org.junit.jupiter.api.Assertions.assertEquals(0, attachmentCount.intValue());
+        }
+
+        @Test
+        void submitTask_withUnknownAttachedMemoryId_returnsUniform400() throws Exception {
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "do work",
+                                  "attached_memory_ids": ["%s"]
+                                }
+                                """, TEST_AGENT_ID, java.util.UUID.randomUUID());
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest())
+                                .andExpect(jsonPath("$.message").value(
+                                                "one or more attached_memory_ids could not be resolved"));
+        }
+
+        @Test
+        void submitTask_withSkipMemoryWriteTrue_persistsOnTaskRow() throws Exception {
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "sensitive work",
+                                  "skip_memory_write": true
+                                }
+                                """, TEST_AGENT_ID);
+
+                MvcResult submitResult = mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andReturn();
+                String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
+                                .get("task_id").asText();
+
+                Boolean skip = jdbcTemplate.queryForObject(
+                                "SELECT skip_memory_write FROM tasks WHERE task_id = ?::uuid",
+                                Boolean.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals(Boolean.TRUE, skip);
+        }
+
+        @Test
+        void submitTask_skipMemoryWriteAbsent_defaultsFalse() throws Exception {
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "plain work"
+                                }
+                                """, TEST_AGENT_ID);
+
+                MvcResult submitResult = mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andReturn();
+                String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
+                                .get("task_id").asText();
+
+                Boolean skip = jdbcTemplate.queryForObject(
+                                "SELECT skip_memory_write FROM tasks WHERE task_id = ?::uuid",
+                                Boolean.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals(Boolean.FALSE, skip);
+        }
+
+        @Test
+        void submitTask_deletedMemoryEntryDropsFromPreviewButKeepsIdList() throws Exception {
+                java.util.UUID keep = seedMemoryEntry(TEST_AGENT_ID, "Keep me");
+                java.util.UUID doomed = seedMemoryEntry(TEST_AGENT_ID, "Will be deleted");
+
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "work",
+                                  "attached_memory_ids": ["%s", "%s"]
+                                }
+                                """, TEST_AGENT_ID, keep, doomed);
+
+                MvcResult submitResult = mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andReturn();
+                String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
+                                .get("task_id").asText();
+
+                // Simulate Task 3's DELETE — remove the memory entry
+                jdbcTemplate.update("DELETE FROM agent_memory_entries WHERE memory_id = ?", doomed);
+
+                // Attachment rows remain intact (soft reference, no cascade)
+                Integer attachmentCount = jdbcTemplate.queryForObject(
+                                "SELECT COUNT(*) FROM task_attached_memories WHERE task_id = ?::uuid",
+                                Integer.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals(2, attachmentCount.intValue());
+
+                // Full id list still includes both; preview drops the deleted entry
+                mockMvc.perform(get("/v1/tasks/" + taskId))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.attached_memory_ids.length()").value(2))
+                                .andExpect(jsonPath("$.attached_memories_preview.length()").value(1))
+                                .andExpect(jsonPath("$.attached_memories_preview[0].memory_id").value(keep.toString()));
+        }
+
+        /**
+         * Inserts a minimal memory row and returns its generated {@code memory_id}.
+         * {@code content_vec} is left null — the deferred-embedding path.
+         */
+        private java.util.UUID seedMemoryEntry(String agentId, String title) {
+                return jdbcTemplate.queryForObject("""
+                        INSERT INTO agent_memory_entries (
+                            tenant_id, agent_id, task_id, title, summary,
+                            observations, outcome, tags,
+                            summarizer_model_id, version
+                        )
+                        VALUES (
+                            'default', ?, gen_random_uuid(), ?, 'test summary',
+                            '{}', 'succeeded', '{}',
+                            'template:fallback', 1
+                        )
+                        RETURNING memory_id
+                        """, java.util.UUID.class, agentId, title);
         }
 }

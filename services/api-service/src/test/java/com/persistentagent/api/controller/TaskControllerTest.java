@@ -4,6 +4,7 @@ import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.InvalidStateTransitionException;
 import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
+import com.persistentagent.api.model.response.AttachedMemoryPreview;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
@@ -42,7 +43,7 @@ class TaskControllerTest {
         void submitTask_validRequest_returns201() throws Exception {
                 UUID taskId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now, List.of(), List.of());
                 when(taskService.submitTask(any())).thenReturn(response);
 
                 String body = """
@@ -67,7 +68,7 @@ class TaskControllerTest {
                 UUID taskId = UUID.randomUUID();
                 UUID endpointId = UUID.randomUUID();
                 OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
-                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(taskId, "agent1", "Agent One", "queued", now, List.of(), List.of());
                 when(taskService.submitTask(any())).thenReturn(response);
 
                 String body = """
@@ -204,6 +205,79 @@ class TaskControllerTest {
         }
 
         @Test
+        void submitTask_withAttachedMemoryIdsAndSkipMemoryWrite_returns201() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                UUID m1 = UUID.randomUUID();
+                UUID m2 = UUID.randomUUID();
+                OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(
+                                taskId, "agent1", "Agent One", "queued", now,
+                                List.of(m1, m2),
+                                List.of(
+                                                new AttachedMemoryPreview(m1, "Resolved bug A"),
+                                                new AttachedMemoryPreview(m2, "Resolved bug B")));
+                when(taskService.submitTask(any())).thenReturn(response);
+
+                String body = String.format("""
+                                {
+                                  "agent_id": "agent1",
+                                  "input": "test",
+                                  "attached_memory_ids": ["%s", "%s"],
+                                  "skip_memory_write": true
+                                }
+                                """, m1, m2);
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andExpect(jsonPath("$.attached_memory_ids").isArray())
+                                .andExpect(jsonPath("$.attached_memory_ids[0]").value(m1.toString()))
+                                .andExpect(jsonPath("$.attached_memory_ids[1]").value(m2.toString()))
+                                .andExpect(jsonPath("$.attached_memories_preview").isArray())
+                                .andExpect(jsonPath("$.attached_memories_preview[0].memory_id").value(m1.toString()))
+                                .andExpect(jsonPath("$.attached_memories_preview[0].title").value("Resolved bug A"));
+        }
+
+        @Test
+        void submitTask_withMalformedAttachedMemoryUuid_returns400() throws Exception {
+                String body = """
+                                {
+                                  "agent_id": "agent1",
+                                  "input": "test",
+                                  "attached_memory_ids": ["not-a-uuid"]
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest());
+        }
+
+        @Test
+        void submitTask_withAttachedMemoryResolutionFailure_returnsUniform400() throws Exception {
+                when(taskService.submitTask(any()))
+                                .thenThrow(new ValidationException(
+                                                "one or more attached_memory_ids could not be resolved"));
+
+                String body = String.format("""
+                                {
+                                  "agent_id": "agent1",
+                                  "input": "test",
+                                  "attached_memory_ids": ["%s"]
+                                }
+                                """, UUID.randomUUID());
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest())
+                                .andExpect(jsonPath("$.message").value(
+                                                "one or more attached_memory_ids could not be resolved"));
+        }
+
+        @Test
         void submitTask_taskTimeoutOutOfRange_returns400() throws Exception {
                 String body = """
                                 {
@@ -230,7 +304,7 @@ class TaskControllerTest {
                                 0, List.of(), 5, 12500L, "worker-abc-123",
                                 null, null, null, null, null, now, now, null,
                                 null, null, null,
-                                null, null, null, null);
+                                null, null, null, null, List.of(), List.of());
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId))
