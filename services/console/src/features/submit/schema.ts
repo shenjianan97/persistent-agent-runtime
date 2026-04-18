@@ -9,6 +9,10 @@ export const submitTaskSchema = z.object({
     max_retries: z.number().int().min(0).max(10).optional().default(3),
     task_timeout_seconds: z.number().int().min(devTaskControlsEnabled ? 1 : 60).max(86400).optional().default(3600),
     langfuse_endpoint_id: z.string().optional(),
+    /** Attached memory ids in selection order. Capped at 50 (server enforces the same). */
+    attached_memory_ids: z.array(z.string()).max(50).optional().default([]),
+    /** Per-task privacy opt-out — skip writing a memory entry for this task. */
+    skip_memory_write: z.boolean().optional().default(false),
 });
 
 export type SubmitTaskFormValues = z.infer<typeof submitTaskSchema>;

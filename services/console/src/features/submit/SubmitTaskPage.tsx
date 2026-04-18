@@ -6,9 +6,16 @@ import { useAgents, useAgent } from '@/features/agents/useAgents';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { submitTaskSchema, SubmitTaskFormValues, ALL_TOOL_LABELS } from './schema';
 import { FileAttachment } from './FileAttachment';
+import { AttachMemoryPicker } from './AttachMemoryPicker';
+import { TokenFootprintIndicator, type TokenFootprintEntry } from './TokenFootprintIndicator';
+import {
+    useAgentMemoryDetail,
+    useAgentMemoryList,
+} from '@/features/agents/memory/hooks';
 import { toast } from 'sonner';
 import { formatUsd } from '@/lib/utils';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
+import type { MemoryEntrySummary } from '@/types';
 
 
 import {
@@ -18,12 +25,14 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { PlaySquare, AlertCircle, Bot } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
+import { PlaySquare, AlertCircle, Bot, Brain } from 'lucide-react';
 
 export function SubmitTaskPage() {
     const navigate = useNavigate();
     const [searchParams] = useSearchParams();
     const queryAgentId = searchParams.get('agent_id') || '';
+    const deepLinkMemoryId = searchParams.get('attachMemoryId') || '';
 
     const mutation = useSubmitTask();
     const { data: agents = [], isLoading: isLoadingAgents } = useAgents('active');
@@ -40,14 +49,161 @@ export function SubmitTaskPage() {
             max_steps: 100,
             max_retries: 3,
             task_timeout_seconds: import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? 60 : 3600,
+            attached_memory_ids: [],
+            skip_memory_write: false,
         },
     });
 
     const selectedAgentId = form.watch('agent_id');
+    const attachedMemoryIds = form.watch('attached_memory_ids') ?? [];
 
     const { data: selectedAgent, isLoading: isLoadingAgent } = useAgent(selectedAgentId);
 
     const sandboxEnabled = selectedAgent?.agent_config?.sandbox?.enabled === true;
+    const memoryEnabled = selectedAgent?.agent_config?.memory?.enabled === true;
+
+    // Cache of resolved memory entries keyed by id, used to render the "Selected"
+    // panel and to feed the token-footprint indicator. Entries arrive lazily as
+    // `useAgentMemoryDetail` resolves each selected id; they stay in the cache
+    // across renders so removing and re-adding does not re-fetch.
+    const [memoryCache, setMemoryCache] = useState<
+        Record<string, MemoryEntrySummary & { summary?: string; observations?: string[] }>
+    >({});
+
+    // Remember the last agent for which we seeded from a deep link so we only
+    // react to the deep link once per agent change.
+    const deepLinkAppliedForAgentRef = useRef<string>('');
+
+    // Fetch the deep-linked entry's detail only when agent has memory enabled.
+    const deepLinkDetailQuery = useAgentMemoryDetail(
+        selectedAgentId,
+        memoryEnabled ? deepLinkMemoryId : '',
+        { enabled: !!deepLinkMemoryId && !!selectedAgentId && memoryEnabled }
+    );
+
+    // Fetch detail for every currently-selected id that we haven't cached yet.
+    // We don't batch-fetch because the memory REST API exposes only per-id
+    // detail today; this is acceptable at the 50-entry cap.
+    const nextUncachedId = attachedMemoryIds.find((id) => !memoryCache[id]);
+    const detailQuery = useAgentMemoryDetail(selectedAgentId, nextUncachedId, {
+        enabled: !!nextUncachedId && memoryEnabled,
+    });
+
+    useEffect(() => {
+        if (detailQuery.data) {
+            const entry = detailQuery.data;
+            setMemoryCache((prev) => {
+                if (prev[entry.memory_id]) return prev;
+                return {
+                    ...prev,
+                    [entry.memory_id]: {
+                        memory_id: entry.memory_id,
+                        title: entry.title,
+                        outcome: entry.outcome,
+                        task_id: entry.task_id,
+                        created_at: entry.created_at,
+                        summary_preview: (entry.summary ?? '').slice(0, 100),
+                        summary: entry.summary,
+                        observations: entry.observations,
+                    },
+                };
+            });
+        }
+    }, [detailQuery.data]);
+
+    // List data enriches the cache with summary_preview so newly-selected rows
+    // render their badge + date before their detail call lands.
+    const listQuery = useAgentMemoryList(selectedAgentId, {
+        enabled: memoryEnabled,
+        limit: 50,
+    });
+    useEffect(() => {
+        const items = listQuery.data?.items;
+        if (!items || items.length === 0) return;
+        setMemoryCache((prev) => {
+            let changed = false;
+            const next = { ...prev };
+            for (const item of items) {
+                if (!next[item.memory_id]) {
+                    next[item.memory_id] = { ...item };
+                    changed = true;
+                }
+            }
+            return changed ? next : prev;
+        });
+    }, [listQuery.data]);
+
+    // Deep-link pre-selection: once per agent change, if ?attachMemoryId= is
+    // present and the agent has memory enabled, pre-select that entry. If memory
+    // is disabled on the target agent, drop the selection and toast the user.
+    useEffect(() => {
+        if (!deepLinkMemoryId || !selectedAgentId) return;
+        if (deepLinkAppliedForAgentRef.current === selectedAgentId) return;
+        if (isLoadingAgent) return; // wait for agent_config to resolve
+        if (!selectedAgent) return;
+
+        if (!memoryEnabled) {
+            toast.info('Attachment ignored — memory is disabled for this agent');
+            deepLinkAppliedForAgentRef.current = selectedAgentId;
+            return;
+        }
+
+        if (deepLinkDetailQuery.isError) {
+            toast.error('Memory entry not found for this agent');
+            deepLinkAppliedForAgentRef.current = selectedAgentId;
+            return;
+        }
+
+        if (deepLinkDetailQuery.data && !attachedMemoryIds.includes(deepLinkMemoryId)) {
+            form.setValue('attached_memory_ids', [deepLinkMemoryId]);
+            deepLinkAppliedForAgentRef.current = selectedAgentId;
+        }
+        // deep-link is resolved on first success/error; further re-renders no-op
+    }, [
+        deepLinkMemoryId,
+        selectedAgentId,
+        memoryEnabled,
+        selectedAgent,
+        isLoadingAgent,
+        deepLinkDetailQuery.data,
+        deepLinkDetailQuery.isError,
+        attachedMemoryIds,
+        form,
+    ]);
+
+    // On agent change, clear attachments + skip toggle to avoid leaking memory
+    // ids across agents. Also reset the memory cache (scope-bound data).
+    const prevAgentIdRef = useRef<string>(selectedAgentId);
+    useEffect(() => {
+        if (prevAgentIdRef.current === selectedAgentId) return;
+        // Only clear on a *change* from a non-empty id; the initial mount with
+        // a deep link + query-param agent should flow to the deep-link effect
+        // above without being wiped.
+        if (prevAgentIdRef.current !== '') {
+            form.setValue('attached_memory_ids', []);
+            form.setValue('skip_memory_write', false);
+            setMemoryCache({});
+            deepLinkAppliedForAgentRef.current = '';
+        }
+        prevAgentIdRef.current = selectedAgentId;
+    }, [selectedAgentId, form]);
+
+    // Footprint entries: only include items whose detail has loaded (i.e., we
+    // have a real summary/observations length). Entries still loading are
+    // counted by id in `selectionCount` but contribute 0 bytes until resolved.
+    const footprintEntries: TokenFootprintEntry[] = useMemo(
+        () =>
+            attachedMemoryIds
+                .map((id) => memoryCache[id])
+                .filter(Boolean)
+                .map((entry) => ({
+                    memory_id: entry!.memory_id,
+                    title: entry!.title,
+                    summary: entry!.summary,
+                    observations: entry!.observations,
+                })),
+        [attachedMemoryIds, memoryCache]
+    );
 
     // Validate query param agent_id against loaded agents
     useEffect(() => {
@@ -65,24 +221,53 @@ export function SubmitTaskPage() {
     }, [queryAgentId, agents, isLoadingAgents, form]);
 
     function onSubmit(data: SubmitTaskFormValues) {
+        // Only include attachment fields in the payload when they have a
+        // non-default value. Keeps the wire shape backward-compatible with
+        // legacy consumers and matches the api client's omit-on-empty logic.
+        const payload = {
+            ...data,
+            attached_memory_ids:
+                memoryEnabled && data.attached_memory_ids && data.attached_memory_ids.length > 0
+                    ? data.attached_memory_ids
+                    : undefined,
+            skip_memory_write:
+                memoryEnabled && data.skip_memory_write ? true : undefined,
+        };
+
         mutation.mutate(
             {
-                request: data,
+                request: payload,
                 files: attachedFiles.length > 0 ? attachedFiles : undefined,
             },
             {
                 onSuccess: (response) => {
+                    const fileCopy =
+                        attachedFiles.length > 0
+                            ? `${attachedFiles.length} file(s)`
+                            : null;
+                    const memoryCopy =
+                        payload.attached_memory_ids && payload.attached_memory_ids.length > 0
+                            ? `${payload.attached_memory_ids.length} memory entr${
+                                  payload.attached_memory_ids.length === 1 ? 'y' : 'ies'
+                              }`
+                            : null;
+                    const description =
+                        fileCopy && memoryCopy
+                            ? `Execution initialized with ${fileCopy} and ${memoryCopy} attached.`
+                            : fileCopy
+                            ? `Execution initialized with ${fileCopy}.`
+                            : memoryCopy
+                            ? `Execution initialized with ${memoryCopy} attached.`
+                            : 'Execution initialized.';
                     toast.success(`Task ${response.task_id} submitted`, {
-                        description: attachedFiles.length > 0
-                            ? `Execution initialized with ${attachedFiles.length} file(s).`
-                            : "Execution initialized.",
+                        description,
                     });
                     setAttachedFiles([]);
                     navigate(`/tasks/${response.task_id}`);
                 },
                 onError: (error: Error) => {
-                    toast.error("Submission failed", {
-                        description: error.message || "Unknown error occurred.",
+                    toast.error('Submission failed', {
+                        description: error.message || 'Unknown error occurred.',
                     });
                 },
             }
@@ -273,6 +458,73 @@ export function SubmitTaskPage() {
                                 />
                             </CardContent>
                         </Card>
+
+                        {/* Memory Attachments — visible only when agent has memory enabled */}
+                        {selectedAgentId && memoryEnabled && (
+                            <Card className="console-surface border-white/10" data-testid="memory-attach-card">
+                                <CardHeader className="border-b border-white/8 pb-3">
+                                    <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2">
+                                        <Brain className="w-4 h-4 text-primary" />
+                                        Memory
+                                    </CardTitle>
+                                </CardHeader>
+                                <CardContent className="pt-4 space-y-4">
+                                    <FormField
+                                        control={form.control}
+                                        name="attached_memory_ids"
+                                        render={({ field }) => (
+                                            <FormItem>
+                                                <FormControl>
+                                                    <AttachMemoryPicker
+                                                        agentId={selectedAgentId}
+                                                        value={field.value ?? []}
+                                                        onChange={(ids) => field.onChange(ids)}
+                                                        selectedSummaries={memoryCache}
+                                                        footer={
+                                                            <TokenFootprintIndicator
+                                                                entries={footprintEntries}
+                                                                selectionCount={(field.value ?? []).length}
+                                                            />
+                                                        }
+                                                    />
+                                                </FormControl>
+                                                <FormDescription className="text-xs text-muted-foreground">
+                                                    Attached entries are injected into the initial prompt. The indicator above is informational; submission is never blocked by attachment size.
+                                                </FormDescription>
+                                                <FormMessage className="text-destructive font-bold text-xs" />
+                                            </FormItem>
+                                        )}
+                                    />
+
+                                    <FormField
+                                        control={form.control}
+                                        name="skip_memory_write"
+                                        render={({ field }) => (
+                                            <FormItem>
+                                                <label className="flex items-start gap-3 cursor-pointer">
+                                                    <FormControl>
+                                                        <Checkbox
+                                                            checked={!!field.value}
+                                                            onCheckedChange={(checked) => field.onChange(checked === true)}
+                                                            data-testid="skip-memory-write-checkbox"
+                                                        />
+                                                    </FormControl>
+                                                    <div className="space-y-1 leading-tight">
+                                                        <span className="text-xs font-display uppercase tracking-widest">
+                                                            Skip writing a memory entry for this task
+                                                        </span>
+                                                        <FormDescription className="text-xs text-muted-foreground">
+                                                            Per-task privacy opt-out. When checked, this task will not produce a memory entry even though the agent has memory enabled.
+                                                        </FormDescription>
+                                                    </div>
+                                                </label>
+                                                <FormMessage className="text-destructive font-bold text-xs" />
+                                            </FormItem>
+                                        )}
+                                    />
+                                </CardContent>
+                            </Card>
+                        )}
 
                         {/* Execution Parameters */}
                         <Card className="console-surface border-white/10">

@@ -56,6 +56,15 @@ export interface TaskStatusResponse {
     resume_eligible_at?: string | null;
     created_at: string;
     updated_at: string;
+    /** Attached memory ids in position order. Empty for tasks without attachments. */
+    attached_memory_ids?: string[];
+    /** Live preview (memory_id + title) for attachments that still resolve within scope. */
+    attached_memories_preview?: AttachedMemoryPreview[];
+}
+
+export interface AttachedMemoryPreview {
+    memory_id: string;
+    title: string;
 }
 
 export interface TaskSubmissionRequest {
@@ -65,6 +74,10 @@ export interface TaskSubmissionRequest {
     max_retries?: number;
     task_timeout_seconds?: number;
     langfuse_endpoint_id?: string;
+    /** Optional list of memory entry ids to attach (ordered). Omitted when empty. */
+    attached_memory_ids?: string[];
+    /** Per-task privacy override — when true, no memory entry is written for this task. */
+    skip_memory_write?: boolean;
 }
 
 export interface TaskSubmissionResponse {

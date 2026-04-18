@@ -70,30 +70,40 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
     return text ? JSON.parse(text) as T : {} as T;
 }
 
+/**
+ * Serialize the submit-task body to JSON. Extracted so the JSON and multipart
+ * code paths share the same shape, including the Track-5 `attached_memory_ids`
+ * and `skip_memory_write` fields. Empty attachment list and `false` skip flag
+ * are omitted from the payload so the wire shape stays backward-compatible.
+ */
+function buildSubmitTaskBody(request: TaskSubmissionRequest): string {
+    const body: Record<string, unknown> = {
+        agent_id: request.agent_id,
+        input: request.input,
+        max_steps: request.max_steps,
+        max_retries: request.max_retries,
+        task_timeout_seconds: request.task_timeout_seconds,
+        langfuse_endpoint_id: request.langfuse_endpoint_id,
+    };
+    if (request.attached_memory_ids && request.attached_memory_ids.length > 0) {
+        body.attached_memory_ids = request.attached_memory_ids;
+    }
+    if (request.skip_memory_write) {
+        body.skip_memory_write = true;
+    }
+    return JSON.stringify(body);
+}
+
 export const api = {
     submitTask: (request: TaskSubmissionRequest) =>
         fetchApi<TaskSubmissionResponse>('/v1/tasks', {
             method: 'POST',
-            body: JSON.stringify({
-                agent_id: request.agent_id,
-                input: request.input,
-                max_steps: request.max_steps,
-                max_retries: request.max_retries,
-                task_timeout_seconds: request.task_timeout_seconds,
-                langfuse_endpoint_id: request.langfuse_endpoint_id,
-            }),
+            body: buildSubmitTaskBody(request),
         }),
 
     submitTaskMultipart: (request: TaskSubmissionRequest, files: File[]) => {
         const formData = new FormData();
-        formData.append('task_request', JSON.stringify({
-            agent_id: request.agent_id,
-            input: request.input,
-            max_steps: request.max_steps,
-            max_retries: request.max_retries,
-            task_timeout_seconds: request.task_timeout_seconds,
-            langfuse_endpoint_id: request.langfuse_endpoint_id,
-        }));
+        formData.append('task_request', buildSubmitTaskBody(request));
         for (const file of files) {
             formData.append('files', file);
         }
