@@ -18,6 +18,9 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 5 | Memory | Design drafted ([track-5-memory.md](docs/design-docs/phase-2/track-5-memory.md)); plan not started | — | — |
 | Track 6 | GitHub Integration | Not started | — | — |
 | Track 7 | Context Window Management | Stub ([track-7-context-window-management.md](docs/design-docs/phase-2/track-7-context-window-management.md)); brainstorm pending | — | — |
+| Track 8 | Coding-Agent Primitives | Design proposed ([track-8-coding-primitives.md](docs/design-docs/phase-2/track-8-coding-primitives.md)); relocated from AC Track 3; plan not started | — | — |
+| Track 9 | Planning Primitive | Stub ([track-9-planning-primitive.md](docs/design-docs/phase-2/track-9-planning-primitive.md)); brainstorm pending | — | — |
+| Track 10 | Deep Research Mode | Not started (brainstorm after Track 9) | — | — |
 
 
 ### Cross-Cutting
@@ -33,4 +36,4 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 |-------|------|--------|------|----------|
 | Track 1 | Output Artifact Storage | Complete | [plan](docs/exec-plans/completed/agent-capabilities/track-1/plan.md) | [progress](docs/exec-plans/completed/agent-capabilities/track-1/progress.md) |
 | Track 2 | E2B Sandbox & File Input | Complete | [plan](docs/exec-plans/completed/agent-capabilities/track-2/plan.md) | [progress](docs/exec-plans/completed/agent-capabilities/track-2/progress.md) |
-| Track 3 | Coding-Agent Primitives | Proposed (design only) | — | — |
+| Track 3 | Coding-Agent Primitives | Relocated to [Phase 2 Track 8](docs/design-docs/phase-2/track-8-coding-primitives.md) on 2026-04-18 | — | — |

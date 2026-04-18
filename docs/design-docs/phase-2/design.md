@@ -114,6 +114,48 @@ Enable code agents to access customer repositories and deliver results as pull r
 Primary design coverage:
 - Detailed design TBD (will be developed as a dedicated design doc when this track is planned)
 
+### Track 8 — Coding-Agent Primitives
+
+Extend the sandbox tool surface so agents doing real iterative coding (edit → run test → read stack trace → edit again) can work without blowing through the context window on every turn. The Agent Capabilities Track 2 tools are sufficient to "run a script"; Track 8 is what makes "iterate on a codebase" practical.
+
+- `sandbox_edit` (surgical string-replace, not full-file rewrite)
+- `sandbox_read_file` with `offset` + `limit` (partial reads)
+- `sandbox_grep` + `sandbox_glob` (first-class ripgrep/glob surfaces, not shell-wrapped)
+- `sandbox_exec` output truncation + background mode with `sandbox_process_read` / `sandbox_process_kill`
+
+**Depends on:** Agent Capabilities Track 2 (E2B Sandbox & File Input) — already complete.
+
+**Relocated from Agent Capabilities Track 3** on 2026-04-18 — coding primitives are platform surface area, not a cross-cutting capability add-on.
+
+**Status:** Design proposed — see [track-8-coding-primitives.md](./track-8-coding-primitives.md). Implementation plan TBD.
+
+### Track 9 — Planning Primitive
+
+Add a durable, first-class plan/todo surface that survives compaction, checkpoint restart, and follow-up — the managed-runtime equivalent of Claude Code's `TodoWrite`, but as typed state rather than a message-history convention.
+
+- Typed `plan: list[PlanItem]` field on graph state; checkpointed by LangGraph
+- `plan_write` tool (full-list replace semantics) the agent calls when it decides to plan or replan
+- Auto-injection of current plan state into every LLM call, post-compaction
+- Opt-in per agent via `agent_config.planning.enabled` (default `false`), matching Track 5's shape
+- ReAct topology unchanged — the primitive is data, not graph control flow
+
+**Depends on:** Nothing hard-blocking. Composes with Track 7 (injection runs post-compaction) and Track 10 (deep-research mode may use this as its plan data surface).
+
+**Status:** Stub — see [track-9-planning-primitive.md](./track-9-planning-primitive.md). Direction sketched during 2026-04-17 brainstorm; full design and open questions pending.
+
+### Track 10 — Deep Research Mode (proposed)
+
+Add a first-class "deep research" agent mode selected at agent creation (`agent_config.mode = 'deep_research'`), with a distinct graph topology (orchestrator + parallel subagents + synthesiser) rather than a bolt-on tool. Inspired by Anthropic and OpenAI deep-research products.
+
+- New graph topology, separate from the default ReAct mode
+- Parallel subagent fan-out; subagent costs roll up into the parent task's budget (single budget envelope)
+- Builds on Track 9's planning primitive for its plan/tree representation
+- Coding capabilities (Track 8) remain orthogonal — any mode can be configured with coding tools
+
+**Depends on:** Track 9 (planning primitive) for the plan data surface.
+
+**Status:** Not started — brainstorm pending. Registered here to block accidental coupling with Track 9.
+
 ### Track 7 — Context Window Management
 
 Keep long-running tasks viable by bounding the in-task message-history growth that otherwise pushes tasks into context-limit or cost-limit failure.
@@ -140,16 +182,16 @@ For implementation planning, the safest order is:
 5. **Agent Capabilities (cross-cutting)** — see [agent-capabilities/design.md](../agent-capabilities/design.md):
    - AC Track 1 — Output Artifact Storage ✅
    - AC Track 2 — E2B Sandbox & File Input ✅
-   - **AC Track 3 — Coding-Agent Primitives (proposed; must land before Phase 3)**
-6. Track 7 — Context Window Management (recommended ahead of Track 5: long tasks must be able to finish before cross-task memory is useful)
-7. Track 5 — Memory
-8. Track 6 — GitHub Integration
+6. **Track 8 — Coding-Agent Primitives (proposed; must land before Phase 3)** — relocated from AC Track 3
+7. Track 7 — Context Window Management (recommended ahead of Track 5: long tasks must be able to finish before cross-task memory is useful)
+8. Track 5 — Memory
+9. Track 6 — GitHub Integration
 
 Phase 2 Tracks 1–4 and Agent Capabilities Tracks 1 & 2 are complete — the platform can now run coding and document-processing workloads end-to-end with sandbox execution and artifact storage.
 
-**AC Track 3 is gating for Phase 3.** The Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [agent-capabilities/design.md#track-3-coding-agent-primitives-proposed](../agent-capabilities/design.md) for the detailed proposal.
+**Track 8 is gating for Phase 3.** The Agent Capabilities Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [track-8-coding-primitives.md](./track-8-coding-primitives.md) for the detailed proposal.
 
-Tracks 5 (Memory), 6 (GitHub Integration), and 7 (Context Window Management) can be sequenced alongside AC Track 3 as independent initiatives — they have no blocking dependency in either direction. Track 7 is recommended ahead of Track 5 on the grounds that cross-task memory is less useful if long-running tasks cannot complete.
+Tracks 5 (Memory), 6 (GitHub Integration), 7 (Context Window Management), and 8 (Coding-Agent Primitives) can be sequenced as independent initiatives — they have no blocking dependency in either direction. Track 7 is recommended ahead of Track 5 on the grounds that cross-task memory is less useful if long-running tasks cannot complete.
 
 ---
 
