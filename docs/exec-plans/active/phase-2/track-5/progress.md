@@ -7,7 +7,7 @@
 | Task 3 | Memory REST API | Done | List, hybrid RRF search, detail, delete, storage stats |
 | Task 4 | Task Submission Extension | Done | `attached_memory_ids` + `skip_memory_write`, join table, event mirror |
 | Task 5 | Worker Embeddings | Done | Provider abstraction + discovery validation + deferred path |
-| Task 6 | Worker Memory Write Path | Not started | `memory_write` node + commit + trim + template fallback + budget carve-out |
+| Task 6 | Worker Memory Write Path | Done | `memory_write` node + commit + trim + template fallback + budget carve-out |
 | Task 7 | Worker Memory Tools | Not started | `memory_note`, `memory_search`, `task_history_get` with scope binding |
 | Task 8 | DL + Follow-up + Attach | Not started | Template DL hook, observation seeding, prompt injection |
 | Task 9 | Console — Memory Tab | Not started | List, search, detail, delete, storage stats, 80% warning |

@@ -36,6 +36,23 @@ from sandbox.provisioner import (
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
+from executor.memory_graph import (
+    MemoryEnabledState,
+    MEMORY_WRITE_NODE_NAME,
+    PLATFORM_DEFAULT_SUMMARIZER_MODEL,
+    SummarizerResult,
+    effective_memory_enabled,
+    memory_write_node,
+)
+from executor.embeddings import compute_embedding as _default_compute_embedding
+from core.memory_repository import (
+    count_entries_for_agent,
+    max_entries_for_agent,
+    pending_memory_log_preview,
+    read_pending_memory_from_state_values,
+    trim_oldest,
+    upsert_memory_entry,
+)
 from storage.s3_client import S3Client
 from tools.definitions import (
     create_default_dependencies,
@@ -386,10 +403,13 @@ class GraphExecutor:
         cancel_event: asyncio.Event,
         task_id: str,
         tenant_id: str = "default",
+        agent_id: str = "unknown",
         custom_tools: list[StructuredTool] | None = None,
         sandbox=None,
         s3_client=None,
         injected_files: list[str] | None = None,
+        memory_enabled: bool = False,
+        task_input: str | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -472,18 +492,71 @@ class GraphExecutor:
                         continue
                     raise
 
-        # Define the Graph layout
-        workflow = StateGraph(MessagesState)
+        # Define the Graph layout.
+        # When ``memory.enabled`` AND NOT ``skip_memory_write``, we register a
+        # custom state schema (MemoryEnabledState) which adds the
+        # ``observations`` + ``pending_memory`` fields and attaches the
+        # ``operator.add`` reducer on ``observations`` so the Task 7
+        # ``memory_note`` tool can append durably. Memory-disabled agents
+        # keep using the stock ``MessagesState`` — identical to pre-Track-5
+        # behaviour.
+        state_type = MemoryEnabledState if memory_enabled else MessagesState
+        workflow = StateGraph(state_type)
         workflow.add_node("agent", agent_node)
 
+        # Wire the ``memory_write`` node when memory is enabled. Placed on
+        # the "no pending tool calls" branch so the terminal path becomes
+        # ``agent → memory_write → END`` — HITL pauses, budget pauses, and
+        # dead-letters exit the graph via different paths and therefore
+        # never traverse this node.
+        if memory_enabled:
+            summarizer_model_id = (
+                (agent_config.get("memory") or {}).get("summarizer_model")
+                or PLATFORM_DEFAULT_SUMMARIZER_MODEL
+            )
+            summarizer_callable = self._build_summarizer_callable(
+                default_model_id=summarizer_model_id,
+            )
+            embedding_callable = self._build_embedding_callable()
+
+            async def memory_write_graph_node(state, config):
+                return await memory_write_node(
+                    state,
+                    task_input=task_input,
+                    summarizer_model_id=summarizer_model_id,
+                    summarizer_callable=summarizer_callable,
+                    embedding_callable=embedding_callable,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    config=config,
+                )
+
+            workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
+            workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
+
         if tools:
-            # LangGraph handles routing the LLM's ToolCall directly to our python functions
             tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
-            workflow.add_conditional_edges("agent", tools_condition)
+            if memory_enabled:
+                # ``tools_condition`` routes to ``tools`` when the agent
+                # message has pending tool calls, else to the node we pass
+                # as the third argument. Replace the "no pending calls"
+                # target with ``memory_write`` so the single terminal path
+                # out of ``agent`` runs the memory write.
+                workflow.add_conditional_edges(
+                    "agent",
+                    tools_condition,
+                    {"tools": "tools", END: MEMORY_WRITE_NODE_NAME},
+                )
+            else:
+                workflow.add_conditional_edges("agent", tools_condition)
         else:
-            workflow.add_edge("agent", END)
+            if memory_enabled:
+                workflow.add_edge("agent", MEMORY_WRITE_NODE_NAME)
+            else:
+                workflow.add_edge("agent", END)
 
         workflow.add_edge(START, "agent")
         return workflow
@@ -705,6 +778,336 @@ class GraphExecutor:
 
         return injected_files
 
+    # --------------------------------------------------------------------
+    # Phase 2 Track 5 — memory write path helpers
+    # --------------------------------------------------------------------
+
+    def _build_summarizer_callable(self, *, default_model_id: str):
+        """Factory: returns an async callable that runs the summarizer LLM.
+
+        The returned coroutine matches the :class:`SummarizerCallable`
+        protocol expected by :func:`executor.memory_graph.memory_write_node`.
+        It pulls credentials via :mod:`executor.providers` the same way the
+        agent node does and reports tokens + cost in microdollars using the
+        existing ``_calculate_step_cost`` path so cost accounting matches the
+        rest of the worker.
+
+        Summarizer retries ride on the provider SDK's own retry logic. If
+        every retry fails the node switches to the template fallback.
+        """
+        async def summarizer(
+            *, system: str, user: str, model_id: str
+        ) -> SummarizerResult:
+            effective_model = model_id or default_model_id
+            provider = self._resolve_provider_for_model(effective_model)
+            llm = await providers.create_llm(
+                self.pool, provider, effective_model, temperature=0.2
+            )
+            # LangChain chat models accept a ``(role, content)`` tuple list
+            # via ``ainvoke``. Two messages is enough: a system-shape hint
+            # and the user payload carrying observations + trimmed
+            # transcript.
+            response = await llm.ainvoke(
+                [SystemMessage(content=system), HumanMessage(content=user)]
+            )
+
+            # Parse the expected ``TITLE:`` / ``SUMMARY:`` shape out of the
+            # content; if the model deviates we fall back to a trimmed
+            # single-line title + full body summary so the write still
+            # succeeds cleanly.
+            content = response.content if isinstance(response.content, str) else self._stringify_chat_content(response.content)
+            title, summary = self._parse_summarizer_response(content)
+
+            resp_meta = dict(getattr(response, "response_metadata", {}) or {})
+            if getattr(response, "usage_metadata", None):
+                resp_meta.setdefault("usage_metadata", response.usage_metadata)
+            cost_microdollars, execution_metadata = await self._calculate_step_cost(
+                resp_meta, effective_model
+            )
+            return SummarizerResult(
+                title=title,
+                summary=summary,
+                model_id=effective_model,
+                tokens_in=int(execution_metadata.get("input_tokens") or 0),
+                tokens_out=int(execution_metadata.get("output_tokens") or 0),
+                cost_microdollars=int(cost_microdollars or 0),
+            )
+
+        return summarizer
+
+    def _build_embedding_callable(self):
+        """Factory: returns the :func:`compute_embedding` closure bound to
+        this worker's pool. Unit tests override this via monkey-patching; the
+        injected argument to ``memory_write_node`` is the public extension
+        point.
+        """
+        pool = self.pool
+
+        async def embedding(text: str):
+            return await _default_compute_embedding(text, pool=pool)
+
+        return embedding
+
+    @staticmethod
+    def _resolve_provider_for_model(model_id: str) -> str:
+        """Heuristic used by :func:`providers.create_llm` callers elsewhere
+        in the worker: Anthropic Claude models by name prefix; everything
+        else defaults to Bedrock (worker README § Model). The summarizer
+        honours the same routing so an operator can set
+        ``MEMORY_DEFAULT_SUMMARIZER_MODEL`` to a model configured under any
+        existing provider credential.
+        """
+        if "claude" in model_id.lower():
+            return "anthropic"
+        return "bedrock"
+
+    @staticmethod
+    def _stringify_chat_content(content: Any) -> str:
+        """Flatten the chat-model content list ``[{type: text, text: ...}]``
+        into a single string. Anthropic returns content blocks, OpenAI plain
+        strings; the summarizer parsing downstream works on a string.
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return "\n".join(parts)
+        return str(content)
+
+    @staticmethod
+    def _parse_summarizer_response(content: str) -> tuple[str, str]:
+        """Parse the ``TITLE:`` / ``SUMMARY:`` convention from the summary
+        prompt. Falls back to a first-line title + trimmed remainder if the
+        model deviated. Empty title or summary triggers the fallback branch
+        in the calling node via the "empty title/summary" guard.
+        """
+        lines = [line.rstrip() for line in content.splitlines() if line.strip()]
+        title = ""
+        summary_lines: list[str] = []
+        mode: str | None = None
+        for line in lines:
+            lower = line.lstrip().lower()
+            if lower.startswith("title:"):
+                title = line.split(":", 1)[1].strip()
+                mode = "after_title"
+                continue
+            if lower.startswith("summary:"):
+                summary_lines.append(line.split(":", 1)[1].strip())
+                mode = "summary"
+                continue
+            if mode == "summary":
+                summary_lines.append(line)
+            elif mode is None:
+                # Model ignored the prompt format — use the first non-empty
+                # line as title and everything after as summary.
+                title = line.strip()
+                mode = "summary"
+        summary = "\n".join(filter(None, summary_lines)).strip()
+        # Cap title at 200 chars (the DB CHECK constraint). Long titles
+        # usually mean the model concatenated the prompt — clip politely
+        # rather than crash the commit.
+        if len(title) > 200:
+            title = title[:197] + "..."
+        return title, summary
+
+    async def _commit_memory_and_complete_task(
+        self,
+        *,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        pending_memory: dict[str, Any] | None,
+        agent_config: dict[str, Any],
+        output: dict[str, Any],
+        worker_id: str,
+    ) -> dict[str, Any]:
+        """Co-commit the memory UPSERT and the lease-validated task UPDATE.
+
+        Runs as ONE transaction:
+
+        1. ``UPDATE tasks SET status='completed' ...`` guarded by
+           ``lease_owner = :me`` — raises :class:`LeaseRevokedException` if
+           the predicate fails, rolling back any memory write inside the
+           same tx.
+        2. UPSERT into ``agent_memory_entries`` keyed on ``task_id`` when
+           ``pending_memory`` is non-``None``. The UPSERT returns
+           ``(memory_id, inserted)`` — ``inserted`` distinguishes the INSERT
+           from UPDATE branch.
+        3. FIFO trim when the row count exceeds ``max_entries`` AND the
+           UPSERT took the INSERT branch. UPDATE branch never trims.
+        4. Summarizer / embedding cost ledger rows attributed to the
+           task's most recent checkpoint (attribution parity with the
+           chat-model per-step ledger writes).
+
+        Returns a dict with observability keys the caller logs:
+        ``{committed, memory_written, inserted, trim_evicted, memory_id}``.
+        """
+        log_extra = {
+            "task_id": task_id,
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+        }
+        if pending_memory is None:
+            logger.warning(
+                "memory.write.missing_pending %s", log_extra
+            )
+        max_entries = max_entries_for_agent(agent_config)
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Lease-validated task completion (FOR UPDATE pin). We
+                # run the task UPDATE FIRST so the lease predicate fails
+                # fast on eviction and the memory row never gets written.
+                updated = await conn.fetchval(
+                    '''UPDATE tasks
+                       SET status='completed',
+                           output=$1,
+                           last_error_code=NULL,
+                           last_error_message=NULL,
+                           human_response=NULL,
+                           version=version+1,
+                           lease_owner=NULL,
+                           lease_expiry=NULL
+                       WHERE task_id=$2::uuid
+                         AND status='running'
+                         AND lease_owner=$3
+                       RETURNING task_id''',
+                    json.dumps(output),
+                    task_id,
+                    worker_id,
+                )
+                if updated is None:
+                    raise LeaseRevokedException(
+                        f"Lease revoked before memory commit for task {task_id}"
+                    )
+
+                inserted = False
+                memory_id: Any = None
+                trim_evicted = 0
+                memory_written = False
+
+                if pending_memory is not None:
+                    entry = {
+                        "tenant_id": tenant_id,
+                        "agent_id": agent_id,
+                        "task_id": task_id,
+                        "title": pending_memory["title"],
+                        "summary": pending_memory["summary"],
+                        "observations": list(pending_memory.get("observations_snapshot") or []),
+                        "outcome": pending_memory.get("outcome", "succeeded"),
+                        "tags": list(pending_memory.get("tags") or []),
+                        "content_vec": pending_memory.get("content_vec"),
+                        "summarizer_model_id": pending_memory.get("summarizer_model_id"),
+                    }
+                    upserted = await upsert_memory_entry(conn, entry)
+                    memory_id = upserted["memory_id"]
+                    inserted = upserted["inserted"]
+                    memory_written = True
+
+                    if inserted:
+                        post_insert_count = await count_entries_for_agent(
+                            conn, tenant_id, agent_id
+                        )
+                        if post_insert_count > max_entries:
+                            trim_evicted = await trim_oldest(
+                                conn,
+                                tenant_id=tenant_id,
+                                agent_id=agent_id,
+                                max_entries=max_entries,
+                                keep_memory_id=memory_id,
+                            )
+
+                    # Cost ledger rows for summarizer + embedding — attributed
+                    # to the task's most recent checkpoint. We resolve the
+                    # checkpoint inside the transaction for a consistent read.
+                    checkpoint_id = await conn.fetchval(
+                        '''SELECT checkpoint_id FROM checkpoints
+                           WHERE task_id = $1::uuid AND checkpoint_ns = ''
+                           ORDER BY created_at DESC LIMIT 1''',
+                        task_id,
+                    )
+                    summarizer_cost = int(
+                        pending_memory.get("summarizer_cost_microdollars") or 0
+                    )
+                    if checkpoint_id and summarizer_cost > 0:
+                        await conn.execute(
+                            '''INSERT INTO agent_cost_ledger
+                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                               VALUES ($1, $2, $3::uuid, $4, $5)''',
+                            tenant_id, agent_id, task_id, checkpoint_id, summarizer_cost,
+                        )
+                        # Hourly-spend accrues normally — memory cost is
+                        # exempt from the per-task pause check ONLY, not
+                        # from the rolling-window aggregation.
+                        await conn.execute(
+                            '''INSERT INTO agent_runtime_state
+                                   (tenant_id, agent_id, running_task_count,
+                                    hour_window_cost_microdollars,
+                                    scheduler_cursor, updated_at)
+                               VALUES ($1, $2, 0, $3, '1970-01-01T00:00:00Z', NOW())
+                               ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                               SET hour_window_cost_microdollars =
+                                       agent_runtime_state.hour_window_cost_microdollars + $3,
+                                   updated_at = NOW()''',
+                            tenant_id, agent_id, summarizer_cost,
+                        )
+                    embedding_cost = int(
+                        pending_memory.get("embedding_cost_microdollars") or 0
+                    )
+                    # Embedding is zero-rated in v1; still record the ledger
+                    # row when a real embedding was returned so the attribution
+                    # metadata is visible to the API / Console.
+                    if (
+                        checkpoint_id
+                        and pending_memory.get("content_vec") is not None
+                    ):
+                        await conn.execute(
+                            '''INSERT INTO agent_cost_ledger
+                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
+                               VALUES ($1, $2, $3::uuid, $4, $5)''',
+                            tenant_id, agent_id, task_id, checkpoint_id,
+                            embedding_cost,
+                        )
+
+                # Track 3: decrement running_task_count on completion.
+                await conn.execute(
+                    '''INSERT INTO agent_runtime_state
+                           (tenant_id, agent_id, running_task_count,
+                            hour_window_cost_microdollars, scheduler_cursor,
+                            updated_at)
+                       VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
+                       ON CONFLICT (tenant_id, agent_id) DO UPDATE
+                       SET running_task_count = GREATEST(
+                               agent_runtime_state.running_task_count - 1, 0),
+                           updated_at = NOW()''',
+                    tenant_id, agent_id,
+                )
+                await _insert_task_event(
+                    conn, task_id, tenant_id, agent_id,
+                    "task_completed", "running", "completed",
+                    worker_id,
+                )
+
+        logger.info(
+            "memory.write.committed task_id=%s inserted=%s trim_evicted=%d "
+            "content_vec_null=%s preview=%s",
+            task_id, inserted, trim_evicted,
+            pending_memory.get("content_vec") is None if pending_memory else None,
+            pending_memory_log_preview(pending_memory) if pending_memory else "null",
+        )
+        return {
+            "committed": True,
+            "memory_written": memory_written,
+            "inserted": inserted,
+            "trim_evicted": trim_evicted,
+            "memory_id": memory_id,
+        }
+
     def _build_platform_system_message(
         self,
         allowed_tools: list[str],
@@ -776,6 +1179,16 @@ class GraphExecutor:
         task_timeout_seconds = task_data.get("task_timeout_seconds", 3600)
         worker_id = self.config.worker_id
         agent_id = task_data.get("agent_id") or "unknown"
+
+        # Phase 2 Track 5: single-source-of-truth memory gate — computed once
+        # and consulted by graph assembly, the commit path, and the budget
+        # carve-out. ``skip_memory_write`` lands as a typed column on the
+        # tasks row (see migration 0011); the router should forward it via
+        # ``task_data`` in Task 4's dispatch path.
+        memory_enabled_for_task = effective_memory_enabled(
+            agent_config=agent_config,
+            skip_memory_write=bool(task_data.get("skip_memory_write", False)),
+        )
 
         # Reset per-task cost rate cache
         self._cost_rate_cache = {}
@@ -1013,10 +1426,13 @@ class GraphExecutor:
                 cancel_event=cancel_event,
                 task_id=task_id,
                 tenant_id=tenant_id,
+                agent_id=agent_id,
                 custom_tools=custom_tools if custom_tools else None,
                 sandbox=sandbox,
                 s3_client=self.s3_client,
                 injected_files=injected_files if sandbox_enabled else None,
+                memory_enabled=memory_enabled_for_task,
+                task_input=task_input,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
@@ -1079,6 +1495,21 @@ class GraphExecutor:
                             await asyncio.to_thread(sandbox.set_timeout, sandbox_timeout)
                         except Exception:
                             logger.debug("sandbox_timeout_refresh_failed", extra={"task_id": task_id})
+
+                    # Phase 2 Track 5 budget carve-out: the ``memory_write``
+                    # super-step is a platform-directed closure step and MUST
+                    # NOT trip ``budget_max_per_task``. Its summarizer LLM
+                    # cost is written by ``_commit_memory_and_complete_task``
+                    # directly (outside this per-step loop), which is why
+                    # there's no ``event["agent"]`` payload to gate on here
+                    # — the node returns a ``Command`` updating
+                    # ``pending_memory``, not a new ``AIMessage``. Hourly
+                    # spend still accrues via the same commit path. This
+                    # explicit check provides defense in depth in case the
+                    # pause enforcement ever widens to fire on non-agent
+                    # nodes.
+                    if MEMORY_WRITE_NODE_NAME in event:
+                        continue
 
                     # Per-checkpoint incremental cost tracking
                     if "agent" in event:
@@ -1347,6 +1778,38 @@ class GraphExecutor:
                 output_data = {"result": output_content}
                 if langfuse_endpoint_id:
                     output_data["langfuse_status"] = langfuse_status
+
+                if memory_enabled_for_task:
+                    # Phase 2 Track 5: co-commit the memory UPSERT + FIFO
+                    # trim + lease-validated task completion in one
+                    # transaction. Read ``pending_memory`` from the final
+                    # state values — the ``memory_write`` node just set it
+                    # on the terminal branch.
+                    pending_memory = read_pending_memory_from_state_values(
+                        final_state.values
+                    )
+                    try:
+                        await self._commit_memory_and_complete_task(
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            pending_memory=pending_memory,
+                            agent_config=agent_config,
+                            output=output_data,
+                            worker_id=worker_id,
+                        )
+                        logger.info(
+                            "Task %s completed with memory (cost: %d microdollars, langfuse: %s).",
+                            task_id, cumulative_task_cost, langfuse_status,
+                        )
+                    except LeaseRevokedException:
+                        logger.warning(
+                            "Task %s memory commit skipped: lease no longer owned by this worker.",
+                            task_id,
+                        )
+                    return
+
+                # Memory-disabled branch — unchanged from pre-Track-5.
                 async with self.pool.acquire() as conn:
                     async with conn.transaction():
                         updated = await conn.fetchval(
