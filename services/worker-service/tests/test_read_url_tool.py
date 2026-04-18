@@ -42,6 +42,39 @@ def _build_client(handler) -> httpx.AsyncClient:
 
 class TestReadUrlFetcher:
     @pytest.mark.asyncio
+    async def test_uses_browser_like_headers_for_public_pages(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.headers.get("user-agent", "").startswith("Mozilla/5.0") and request.headers.get(
+                "accept-language"
+            ) == "en-US,en;q=0.9":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    content="""
+                        <html>
+                            <head><title>Readable Article</title></head>
+                            <body><main><p>Accessible content.</p></main></body>
+                        </html>
+                    """,
+                )
+
+            return httpx.Response(
+                403,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content="<html><body>Please enable JS and disable any ad blocker</body></html>",
+            )
+
+        fetcher = ReadUrlFetcher(
+            client=_build_client(handler),
+            resolver=_public_resolver,
+        )
+
+        result = await fetcher.fetch("https://example.com/protected", 5000)
+
+        assert result.title == "Readable Article"
+        assert "Accessible content." in result.content
+
+    @pytest.mark.asyncio
     async def test_fetches_and_truncates_html_content(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
             del request
@@ -86,6 +119,39 @@ class TestReadUrlFetcher:
         assert result["title"] == "Example Page"
         assert result["content"].startswith("# Example Page")
         assert "[truncated]" in result["content"]
+
+    @pytest.mark.asyncio
+    async def test_accepts_large_html_pages_within_updated_body_limit(self) -> None:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            del request
+            repeated_paragraph = "Live updates from a major news event. "
+            html = """
+                <html>
+                    <head><title>Large Page</title></head>
+                    <body>
+                        <main>
+                            <h1>Large Page</h1>
+                            <p>{paragraph}</p>
+                        </main>
+                    </body>
+                </html>
+            """.format(paragraph=repeated_paragraph * 35_000)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/html; charset=utf-8"},
+                content=html,
+            )
+
+        fetcher = ReadUrlFetcher(
+            client=_build_client(handler),
+            resolver=_public_resolver,
+        )
+
+        result = await fetcher.fetch("https://example.com/live", 800)
+
+        assert result.title == "Large Page"
+        assert result.content.startswith("# Large Page")
+        assert "[truncated]" in result.content
 
     @pytest.mark.asyncio
     async def test_rejects_private_targets(self) -> None:
