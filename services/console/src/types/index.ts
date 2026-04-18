@@ -236,6 +236,12 @@ export interface SandboxConfig {
     timeout_seconds?: number;
 }
 
+export interface MemoryConfig {
+    enabled?: boolean;
+    summarizer_model?: string;
+    max_entries?: number;
+}
+
 export interface AgentConfig {
     system_prompt: string;
     provider: string;
@@ -244,6 +250,7 @@ export interface AgentConfig {
     allowed_tools: string[];
     tool_servers?: string[];
     sandbox?: SandboxConfig;
+    memory?: MemoryConfig;
 }
 
 export interface AgentResponse {
@@ -336,6 +343,50 @@ export interface ToolDiscoverResponse {
     status: 'reachable' | 'unreachable';
     error: string | null;
     tools: DiscoveredToolInfo[];
+}
+
+// Memory types (Phase 2 Track 5)
+export type MemoryOutcome = 'succeeded' | 'failed';
+
+export interface MemoryStorageStats {
+    entry_count: number;
+    approx_bytes: number;
+}
+
+export interface MemoryEntrySummary {
+    memory_id: string;
+    title: string;
+    outcome: MemoryOutcome;
+    task_id: string;
+    created_at: string;
+    summary_preview?: string;
+    score?: number;
+}
+
+export interface MemoryListResponse {
+    items: MemoryEntrySummary[];
+    next_cursor?: string;
+    agent_storage_stats?: MemoryStorageStats;
+}
+
+export interface MemorySearchResponse {
+    results: MemoryEntrySummary[];
+    ranking_used: 'hybrid' | 'text' | 'vector';
+}
+
+export interface MemoryEntryResponse {
+    memory_id: string;
+    agent_id: string;
+    task_id: string;
+    title: string;
+    summary: string;
+    observations: string[];
+    outcome: MemoryOutcome;
+    tags: string[];
+    summarizer_model_id?: string;
+    version: number;
+    created_at: string;
+    updated_at: string;
 }
 
 // Artifact types

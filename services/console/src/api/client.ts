@@ -23,6 +23,9 @@ import {
     ToolServerCreateRequest,
     ToolServerUpdateRequest,
     ToolDiscoverResponse,
+    MemoryListResponse,
+    MemorySearchResponse,
+    MemoryEntryResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -260,6 +263,63 @@ export const api = {
         fetchApi<ToolDiscoverResponse>(`/v1/tool-servers/${encodeURIComponent(serverId)}/discover`, {
             method: 'POST',
         }),
+
+    // Memory (Phase 2 Track 5)
+    listAgentMemory: (
+        agentId: string,
+        opts?: {
+            outcome?: string;
+            from?: string;
+            to?: string;
+            limit?: number;
+            cursor?: string;
+        }
+    ) => {
+        const params = new URLSearchParams();
+        if (opts?.outcome) params.set('outcome', opts.outcome);
+        if (opts?.from) params.set('from', opts.from);
+        if (opts?.to) params.set('to', opts.to);
+        if (opts?.limit) params.set('limit', opts.limit.toString());
+        if (opts?.cursor) params.set('cursor', opts.cursor);
+        const query = params.toString();
+        return fetchApi<MemoryListResponse>(
+            `/v1/agents/${encodeURIComponent(agentId)}/memory${query ? `?${query}` : ''}`
+        );
+    },
+
+    searchAgentMemory: (
+        agentId: string,
+        query: string,
+        opts?: {
+            mode?: 'hybrid' | 'text' | 'vector';
+            limit?: number;
+            outcome?: string;
+            from?: string;
+            to?: string;
+        }
+    ) => {
+        const params = new URLSearchParams();
+        params.set('q', query);
+        if (opts?.mode) params.set('mode', opts.mode);
+        if (opts?.limit) params.set('limit', opts.limit.toString());
+        if (opts?.outcome) params.set('outcome', opts.outcome);
+        if (opts?.from) params.set('from', opts.from);
+        if (opts?.to) params.set('to', opts.to);
+        return fetchApi<MemorySearchResponse>(
+            `/v1/agents/${encodeURIComponent(agentId)}/memory/search?${params.toString()}`
+        );
+    },
+
+    getAgentMemoryEntry: (agentId: string, memoryId: string) =>
+        fetchApi<MemoryEntryResponse>(
+            `/v1/agents/${encodeURIComponent(agentId)}/memory/${encodeURIComponent(memoryId)}`
+        ),
+
+    deleteAgentMemoryEntry: (agentId: string, memoryId: string) =>
+        fetchApi<void>(
+            `/v1/agents/${encodeURIComponent(agentId)}/memory/${encodeURIComponent(memoryId)}`,
+            { method: 'DELETE' }
+        ),
 
     // Artifacts
     listArtifacts: (taskId: string, direction?: string) => {

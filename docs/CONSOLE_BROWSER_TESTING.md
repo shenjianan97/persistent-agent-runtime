@@ -146,6 +146,30 @@ What to verify:
 - After creating an endpoint, it appears in the list
 - Deleting an endpoint removes it from the list
 
+### Scenario 11: Agent Memory Tab
+
+What it validates: Memory tab on the Agent detail page renders, filters, searches, opens detail, and deletes entries. Covers the memory-disabled and 80%-of-cap variants.
+
+Preconditions:
+
+- At least one agent with `agent_config.memory.enabled = true` exists. Use the API (`POST /v1/agents`) or the Settings / Agent dialog once memory toggling surfaces.
+- (For the "list with entries" checks) at least one completed memory-enabled task has executed so the list is non-empty. If the worker write path (Task 6) has not shipped yet, use a temporary `INSERT INTO agent_memory_entries (...)` via `psql` against the dev DB to seed at least one row per scope.
+
+What to verify:
+
+- Navigating to `/agents/:agentId` shows two tabs — `Overview` (active) and `Memory` — when the agent has memory enabled. Only `Overview` shows when memory is disabled.
+- Clicking the `Memory` tab navigates to `/agents/:agentId/memory` and renders the Memory tab content.
+- The storage-stats strip at the top shows an entry count (`N of 10,000 entries`) and approximate bytes (e.g., `~12.3 MB`). With `entry_count = 0`, the strip still renders; no warning banner appears.
+- With `entry_count >= 0.8 * max_entries`, the strip becomes an amber warning banner with a `Delete old entries` button. With `entry_count >= max_entries`, the banner is red and references FIFO trim.
+- The filter bar exposes: outcome dropdown (All / Succeeded / Failed), `From` date input, `To` date input, search input, `Search` button, and a `Clear` button (visible when any filter is set).
+- Selecting `outcome = Failed` updates the list to show only failed entries (or the "No results match your filters" empty state).
+- Typing a query and pressing `Search` switches the view to search mode with a `Top 20 matches` label plus a `ranking: hybrid | text | vector` badge. Clearing the search restores the list view.
+- Clicking a row navigates to `/agents/:agentId/memory/:memoryId` and renders: title, outcome badge, created/updated timestamps, summary, observations list (in order), linked task link (deep-linked to `/tasks/:taskId`), summarizer model id, tags, an `Attach to new task` button, and a `Delete` button.
+- Clicking `Attach to new task` navigates to `/tasks/new?agentId=<id>&attachMemoryId=<memory_id>` (Task 10 picks up the query param).
+- Clicking `Delete` on the detail view (or the per-row delete button in the list) opens a confirmation dialog with the entry title and a "cannot be undone" notice. Confirming deletes the entry, shows a `Memory entry deleted` toast, and removes the row from the list.
+- Navigating to a memory-disabled agent's Memory tab still renders the tab (when visited directly via URL) with a dismissible notice: `Memory is disabled for this agent. Existing entries are preserved; no new entries will be written.` Historical entries remain browsable and deletable.
+- `browser_console_messages` shows no uncaught exceptions during any of the above flows.
+
 ### Scenario 10: Task File Attachments
 
 What it validates: File attachment affordances on task submission work in a real browser.
@@ -173,6 +197,7 @@ What to verify:
 | Dead letter feature | 1, 7 |
 | HITL / approval / input feature | 1, 4, 8 |
 | Settings / Langfuse feature | 1, 9 |
+| Agent Memory tab feature | 1, 11 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |

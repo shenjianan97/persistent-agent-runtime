@@ -10,7 +10,7 @@
 | Task 6 | Worker Memory Write Path | Not started | `memory_write` node + commit + trim + template fallback + budget carve-out |
 | Task 7 | Worker Memory Tools | Not started | `memory_note`, `memory_search`, `task_history_get` with scope binding |
 | Task 8 | DL + Follow-up + Attach | Not started | Template DL hook, observation seeding, prompt injection |
-| Task 9 | Console — Memory Tab | Not started | List, search, detail, delete, storage stats, 80% warning |
+| Task 9 | Console — Memory Tab | Done | List, search, detail, delete, storage stats, 80% warning |
 | Task 10 | Console — Submit Attach | Not started | Multi-select picker, token-footprint indicator |
 | Task 11 | Integration + Browser | Not started | 15-criterion E2E coverage + Playwright scenarios |
 
