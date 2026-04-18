@@ -3,6 +3,7 @@ package com.persistentagent.api.service;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
+import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
@@ -154,10 +155,55 @@ public class ConfigValidationHelper {
         // not per-agent. At agent config time we can only validate the range.
     }
 
+    /**
+     * Validates the optional {@code memory} sub-object on
+     * {@link AgentConfigRequest}. Absence is always valid; platform defaults
+     * for {@code summarizer_model} and {@code max_entries} apply at read time
+     * in the worker and the validator, not at write time.
+     *
+     * <ul>
+     *   <li>{@code summarizerModel}, when non-blank, must resolve against the
+     *       {@code models} table for the agent's provider (same lookup as
+     *       {@link #validateModel(String, String)}).</li>
+     *   <li>{@code maxEntries}, when non-null, must fall within the platform
+     *       bounds {@code [MEMORY_MAX_ENTRIES_MIN, MEMORY_MAX_ENTRIES_MAX]}.</li>
+     *   <li>{@code enabled} is a pure toggle — no further validation.</li>
+     * </ul>
+     */
+    public void validateMemoryConfig(MemoryConfigRequest memory, String provider) {
+        if (memory == null) {
+            return; // Absent memory sub-object is valid — Phase 1/2 behaviour.
+        }
+
+        // summarizer_model: optional; when present, must be active for the
+        // agent's provider. Reject blank strings — ambiguous with absence.
+        if (memory.summarizerModel() != null && !memory.summarizerModel().isBlank()) {
+            if (!modelRepository.isModelActive(provider, memory.summarizerModel())) {
+                throw new ValidationException(
+                        "Unsupported summarizer model or provider: "
+                                + provider + "/" + memory.summarizerModel()
+                                + ". Check GET /v1/models for supported ones.");
+            }
+        }
+
+        // max_entries: optional; when present, must be in the platform range.
+        if (memory.maxEntries() != null) {
+            int value = memory.maxEntries();
+            if (value < ValidationConstants.MEMORY_MAX_ENTRIES_MIN
+                    || value > ValidationConstants.MEMORY_MAX_ENTRIES_MAX) {
+                throw new ValidationException(
+                        "memory.max_entries must be between "
+                                + ValidationConstants.MEMORY_MAX_ENTRIES_MIN + " and "
+                                + ValidationConstants.MEMORY_MAX_ENTRIES_MAX);
+            }
+        }
+    }
+
     public void validateAgentConfig(AgentConfigRequest config) {
         validateModel(config.provider(), config.model());
         validateAllowedTools(config.allowedTools());
         validateToolServers(config.toolServers());
         validateSandboxConfig(config.sandbox());
+        validateMemoryConfig(config.memory(), config.provider());
     }
 }

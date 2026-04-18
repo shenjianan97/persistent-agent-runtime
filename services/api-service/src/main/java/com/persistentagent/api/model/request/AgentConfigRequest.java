@@ -1,5 +1,6 @@
 package com.persistentagent.api.model.request;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
@@ -21,5 +22,10 @@ public record AgentConfigRequest(
 
                 @Size(max = 50, message = "tool_servers must not exceed 50 entries") @JsonProperty("tool_servers") List<String> toolServers,
 
-                SandboxConfigRequest sandbox) {
+                SandboxConfigRequest sandbox,
+
+                // When absent on the request, the persisted canonical JSON
+                // omits the key entirely (per Track 5 design: no silent
+                // defaults written to the row).
+                @JsonInclude(JsonInclude.Include.NON_NULL) MemoryConfigRequest memory) {
 }
