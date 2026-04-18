@@ -100,33 +100,21 @@ public class TaskService {
                             "langfuse_endpoint_id not found: " + request.langfuseEndpointId()));
         }
 
-        // 2. Validate attached_memory_ids payload (cardinality + duplicates) before any DB work.
-        //    The 404-not-403 disclosure rule in the track design doc forbids differentiating
-        //    unknown id / wrong tenant / wrong agent at the resolver step; those cases share
-        //    the same uniform error surfaced below after scope-resolution.
+        // 2. Validate attached_memory_ids shape (cardinality + duplicates) before any DB work.
+        //    Scope resolution happens AFTER the atomic agent-insert step so an unknown
+        //    agent surfaces AgentNotFoundException rather than the generic attachment
+        //    resolver error. The 404-not-403 rule still applies to the resolver step
+        //    once we get there.
         List<UUID> attachedMemoryIds = validateAttachedMemoryIdShape(request.attachedMemoryIds());
         boolean skipMemoryWrite = Boolean.TRUE.equals(request.skipMemoryWrite());
 
-        // 3. Scope-validated resolution of attached memory ids in one SQL query.
-        //    Any count mismatch — unknown id, wrong tenant, or wrong agent — produces
-        //    a uniform 4xx. Do NOT leak the offending id or the specific cause.
-        if (!attachedMemoryIds.isEmpty()) {
-            List<UUID> resolved = taskAttachedMemoryRepository.resolveScopedMemoryIds(
-                    tenantId, request.agentId(), attachedMemoryIds);
-            if (resolved.size() != attachedMemoryIds.size()) {
-                // Uniform, generic message — matches the design doc's validation section.
-                throw new ValidationException(
-                        "one or more attached_memory_ids could not be resolved");
-            }
-        }
-
-        // 4. Apply task-level defaults
+        // 3. Apply task-level defaults
         int maxRetries = request.maxRetries() != null ? request.maxRetries() : ValidationConstants.DEFAULT_MAX_RETRIES;
         int maxSteps = request.maxSteps() != null ? request.maxSteps() : ValidationConstants.DEFAULT_MAX_STEPS;
         int taskTimeoutSeconds = request.taskTimeoutSeconds() != null
                 ? request.taskTimeoutSeconds() : ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS;
 
-        // 5. Atomic agent resolution + model validation + task insertion (single SQL statement)
+        // 4. Atomic agent resolution + model validation + task insertion (single SQL statement)
         //    The INSERT...SELECT joins agents with models to atomically enforce:
         //    - Agent exists and status = 'active'
         //    - Agent's model is active in the models registry
@@ -157,6 +145,20 @@ public class TaskService {
         UUID taskId = (UUID) row.get("task_id");
         String displayName = (String) row.get("agent_display_name_snapshot");
         OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(row.get("created_at"));
+
+        // 5. Scope-validated resolution of attached memory ids in one SQL query.
+        //    Runs after agent validation so unknown-agent errors win. Any count
+        //    mismatch — unknown id, wrong tenant, or wrong agent — produces a
+        //    uniform 4xx. Do NOT leak the offending id or the specific cause.
+        //    Failure here rolls back the task insert via the @Transactional boundary.
+        if (!attachedMemoryIds.isEmpty()) {
+            List<UUID> resolved = taskAttachedMemoryRepository.resolveScopedMemoryIds(
+                    tenantId, request.agentId(), attachedMemoryIds);
+            if (resolved.size() != attachedMemoryIds.size()) {
+                throw new ValidationException(
+                        "one or more attached_memory_ids could not be resolved");
+            }
+        }
 
         // 6. Insert join-table rows preserving input order as `position`.
         //    Same transaction as the task insert — any failure rolls back the task.
@@ -264,7 +266,7 @@ public class TaskService {
         // task with no attachments gets empty lists rather than nulls — the design
         // doc specifies both fields are always present, even for legacy tasks.
         String agentId = (String) task.get("agent_id");
-        List<UUID> attachedMemoryIds = taskAttachedMemoryRepository.findAttachedMemoryIds(taskId);
+        List<UUID> attachedMemoryIds = taskAttachedMemoryRepository.findAttachedMemoryIds(taskId, tenantId, agentId);
         List<AttachedMemoryPreview> attachedMemoriesPreview = attachedMemoryIds.isEmpty()
                 ? List.of()
                 : taskAttachedMemoryRepository.findAttachedMemoriesPreview(taskId, tenantId, agentId);

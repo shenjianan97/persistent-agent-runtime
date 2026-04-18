@@ -224,10 +224,14 @@ EXPORT_SANDBOX_FILE_TOOL = ToolDefinition(
 
 
 class MemoryNoteResult(BaseModel):
-    """Result schema for the ``memory_note`` tool catalog entry."""
+    """Placeholder schema for the ``memory_note`` catalog entry.
 
-    ok: bool
-    count: int
+    ``memory_note`` is a state-mutating tool: its runtime return is a LangGraph
+    ``Command(update={"observations": [text]})`` consumed by the graph's
+    ``operator.add`` reducer, not a JSON payload. This model exists only to
+    satisfy :class:`ToolDefinition.output_model`'s non-optional contract and
+    give catalog consumers a stable (empty) shape.
+    """
 
 
 class MemorySearchResultSummary(BaseModel):

@@ -307,27 +307,37 @@ class TaskServiceTest {
     }
 
     @Test
-    void submitTask_withResolutionMiss_rejectsUniformlyAndSkipsTaskInsert() {
+    void submitTask_withResolutionMiss_rejectsUniformlyAndDoesNotPersistAttachments() {
+        // Resolution runs AFTER the atomic agent-insert so unknown-agent errors win over
+        // scope-miss errors. A resolution miss on a valid agent still fails the request
+        // uniformly, and the @Transactional rollback (exercised by Spring at runtime)
+        // discards the task row. The mock here only verifies the @code{insertAttachments}
+        // side-effect is skipped and the task_submitted event is not emitted.
         UUID ok = UUID.randomUUID();
         UUID miss = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
         List<UUID> inputIds = List.of(ok, miss);
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", "input", null, null, null, null, inputIds, null);
 
+        Map<String, Object> inserted = new HashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "agent1");
+        inserted.put("created_at", OffsetDateTime.now());
+        when(taskRepository.insertTaskFromAgent(anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean()))
+                .thenReturn(Optional.of(inserted));
         when(taskAttachedMemoryRepository.resolveScopedMemoryIds("default", "agent1", inputIds))
                 .thenReturn(List.of(ok)); // count mismatch — one missed scope
 
         ValidationException ex = assertThrows(ValidationException.class,
                 () -> taskService.submitTask(request));
-        // Uniform, generic message — do not name which id failed, do not explain cause.
         assertTrue(ex.getMessage().toLowerCase().contains("attached_memory_ids"),
                 "Message should reference the field; got: " + ex.getMessage());
         String lower = ex.getMessage().toLowerCase();
         assertFalse(lower.contains("tenant") || lower.contains("agent_id")
                         || lower.contains(miss.toString().toLowerCase()),
                 "Message must not leak scope-miss cause or the offending id: " + ex.getMessage());
-        verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean());
         verify(taskAttachedMemoryRepository, never()).insertAttachments(any(UUID.class), anyList());
         verify(taskEventService, never()).recordEvent(anyString(), any(UUID.class), anyString(),
                 anyString(), any(), anyString(), any(), any(), any(), anyString());

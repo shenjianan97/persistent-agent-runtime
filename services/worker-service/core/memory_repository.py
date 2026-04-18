@@ -131,6 +131,16 @@ SELECT COUNT(*) FROM agent_memory_entries
 WHERE tenant_id = $1 AND agent_id = $2
 """
 
+# Serializes INSERT+count+trim across concurrent workers writing memory for the
+# same (tenant, agent). Without it, two commits can both see ``count == cap``
+# (each inside its own READ COMMITTED snapshot) and both skip trim, leaving
+# ``cap + 1`` rows. Transaction-scoped — auto-released at commit/rollback.
+_AGENT_SCOPE_ADVISORY_LOCK_SQL = """
+SELECT pg_advisory_xact_lock(
+    hashtextextended($1 || '/' || $2, 0)
+)
+"""
+
 
 def _vec_to_sql_literal(vec: list[float] | None) -> str | None:
     """Render a vector as the pgvector-accepted text literal ``"[a, b, c]"``.
@@ -166,7 +176,18 @@ async def upsert_memory_entry(
     ``{"memory_id": UUID, "inserted": bool}`` — ``inserted`` is ``True`` on
     the INSERT branch and ``False`` on the UPDATE branch (per the ``xmax=0``
     idiom). Callers use this to gate FIFO trim.
+
+    Takes a transaction-scoped advisory lock keyed by ``(tenant_id, agent_id)``
+    before the UPSERT so concurrent workers committing memory for the same
+    agent serialize on insert + trim, preventing the ``cap + 1`` drift that
+    would otherwise happen when two transactions each see ``count == cap``
+    under READ COMMITTED.
     """
+    await conn.execute(
+        _AGENT_SCOPE_ADVISORY_LOCK_SQL,
+        entry["tenant_id"],
+        entry["agent_id"],
+    )
     row = await conn.fetchrow(
         _UPSERT_SQL,
         entry["tenant_id"],

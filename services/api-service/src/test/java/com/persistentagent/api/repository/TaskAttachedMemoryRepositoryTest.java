@@ -10,8 +10,6 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 
-import java.sql.Array;
-import java.sql.Connection;
 import java.util.List;
 import java.util.UUID;
 
@@ -45,31 +43,33 @@ class TaskAttachedMemoryRepositoryTest {
     }
 
     @Test
-    void resolveScopedMemoryIds_queriesWithTenantAndAgentScope() throws Exception {
+    void resolveScopedMemoryIds_queriesWithTenantAndAgentScope() {
         UUID id1 = UUID.randomUUID();
         UUID id2 = UUID.randomUUID();
-        Array sqlArray = org.mockito.Mockito.mock(Array.class);
-        Connection connection = org.mockito.Mockito.mock(Connection.class);
-        javax.sql.DataSource dataSource = org.mockito.Mockito.mock(javax.sql.DataSource.class);
-        org.mockito.Mockito.doReturn(sqlArray).when(connection).createArrayOf(anyString(), any(UUID[].class));
-        org.mockito.Mockito.doReturn(connection).when(dataSource).getConnection();
-        org.mockito.Mockito.doReturn(dataSource).when(jdbcTemplate).getDataSource();
         org.mockito.Mockito.doReturn(List.of(id1, id2))
                 .when(jdbcTemplate)
-                .queryForList(anyString(), eq(UUID.class), any(Array.class), eq("default"), eq("agent1"));
+                .queryForList(anyString(), eq(UUID.class), any(Object[].class));
 
         List<UUID> resolved = repository.resolveScopedMemoryIds(
                 "default", "agent1", List.of(id1, id2));
 
         assertEquals(List.of(id1, id2), resolved);
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Object[]> argsCaptor = ArgumentCaptor.forClass(Object[].class);
         verify(jdbcTemplate).queryForList(
-                sqlCaptor.capture(), eq(UUID.class), any(Array.class), eq("default"), eq("agent1"));
+                sqlCaptor.capture(), eq(UUID.class), argsCaptor.capture());
         String sql = sqlCaptor.getValue();
         assertTrue(sql.contains("agent_memory_entries"));
-        assertTrue(sql.contains("memory_id = ANY"));
+        assertTrue(sql.contains("memory_id IN"));
         assertTrue(sql.contains("tenant_id"));
         assertTrue(sql.contains("agent_id"));
+        Object[] args = argsCaptor.getValue();
+        // 2 memory ids (as strings) + tenant + agent
+        assertEquals(4, args.length);
+        assertEquals(id1.toString(), args[0]);
+        assertEquals(id2.toString(), args[1]);
+        assertEquals("default", args[2]);
+        assertEquals("agent1", args[3]);
     }
 
     @Test
@@ -117,17 +117,21 @@ class TaskAttachedMemoryRepositoryTest {
         UUID taskId = UUID.randomUUID();
         UUID m1 = UUID.randomUUID();
         UUID m2 = UUID.randomUUID();
-        when(jdbcTemplate.queryForList(anyString(), eq(UUID.class), eq(taskId)))
+        when(jdbcTemplate.queryForList(anyString(), eq(UUID.class),
+                eq("default"), eq("agent1"), eq(taskId)))
                 .thenReturn(List.of(m1, m2));
 
-        List<UUID> result = repository.findAttachedMemoryIds(taskId);
+        List<UUID> result = repository.findAttachedMemoryIds(taskId, "default", "agent1");
 
         assertEquals(List.of(m1, m2), result);
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
-        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(UUID.class), eq(taskId));
+        verify(jdbcTemplate).queryForList(sqlCaptor.capture(), eq(UUID.class),
+                eq("default"), eq("agent1"), eq(taskId));
         String sql = sqlCaptor.getValue();
         assertTrue(sql.contains("task_attached_memories"));
-        assertTrue(sql.contains("ORDER BY position"));
+        assertTrue(sql.contains("ORDER BY tam.position"));
+        assertTrue(sql.contains("t.tenant_id"));
+        assertTrue(sql.contains("t.agent_id"));
     }
 
     @Test

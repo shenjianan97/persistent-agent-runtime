@@ -5,14 +5,11 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
 
-import java.sql.Array;
-import java.sql.Connection;
-import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-
-import javax.sql.DataSource;
 
 /**
  * Repository for the {@code task_attached_memories} join table.
@@ -47,20 +44,20 @@ public class TaskAttachedMemoryRepository {
             return List.of();
         }
 
-        String sql = """
-                SELECT memory_id
-                FROM agent_memory_entries
-                WHERE memory_id = ANY(?)
-                  AND tenant_id = ?
-                  AND agent_id = ?
-                """;
+        String placeholders = memoryIds.stream()
+                .map(id -> "?::uuid")
+                .collect(Collectors.joining(", "));
+        String sql = "SELECT memory_id FROM agent_memory_entries"
+                + " WHERE memory_id IN (" + placeholders + ")"
+                + " AND tenant_id = ? AND agent_id = ?";
 
-        Array uuidArray = toUuidArray(memoryIds);
-        try {
-            return jdbcTemplate.queryForList(sql, UUID.class, uuidArray, tenantId, agentId);
-        } finally {
-            freeQuietly(uuidArray);
+        List<Object> args = new ArrayList<>(memoryIds.size() + 2);
+        for (UUID id : memoryIds) {
+            args.add(id.toString());
         }
+        args.add(tenantId);
+        args.add(agentId);
+        return jdbcTemplate.queryForList(sql, UUID.class, args.toArray());
     }
 
     /**
@@ -88,18 +85,22 @@ public class TaskAttachedMemoryRepository {
 
     /**
      * Returns all attached memory_ids for a task, ordered by {@code position}
-     * (the order they were supplied at submission). Unscoped by (tenant, agent) because
-     * task ownership already gates access; the caller has verified the task belongs to
-     * its tenant before calling this method.
+     * (the order they were supplied at submission). Scoped by (tenant, agent) via
+     * an inner join on {@code tasks} so the memory-query invariant holds even if
+     * a future caller forgets to pre-verify task ownership.
      */
-    public List<UUID> findAttachedMemoryIds(UUID taskId) {
+    public List<UUID> findAttachedMemoryIds(UUID taskId, String tenantId, String agentId) {
         String sql = """
-                SELECT memory_id
-                FROM task_attached_memories
-                WHERE task_id = ?
-                ORDER BY position ASC
+                SELECT tam.memory_id
+                FROM task_attached_memories tam
+                JOIN tasks t
+                  ON t.task_id = tam.task_id
+                 AND t.tenant_id = ?
+                 AND t.agent_id = ?
+                WHERE tam.task_id = ?
+                ORDER BY tam.position ASC
                 """;
-        return jdbcTemplate.queryForList(sql, UUID.class, taskId);
+        return jdbcTemplate.queryForList(sql, UUID.class, tenantId, agentId, taskId);
     }
 
     /**
@@ -128,29 +129,5 @@ public class TaskAttachedMemoryRepository {
                 rs.getString("title"));
 
         return jdbcTemplate.query(sql, mapper, tenantId, agentId, taskId);
-    }
-
-    private Array toUuidArray(List<UUID> uuids) {
-        DataSource ds = jdbcTemplate.getDataSource();
-        if (ds == null) {
-            throw new IllegalStateException("JdbcTemplate has no DataSource configured");
-        }
-        try (Connection conn = ds.getConnection()) {
-            return conn.createArrayOf("uuid", uuids.toArray(UUID[]::new));
-        } catch (SQLException e) {
-            throw new RuntimeException("Failed to build UUID array for memory_id resolution", e);
-        }
-    }
-
-    private static void freeQuietly(Array array) {
-        if (array == null) {
-            return;
-        }
-        try {
-            array.free();
-        } catch (SQLException ignored) {
-            // Best-effort: the array is owned by a transient connection that may
-            // already be closed; the driver will reclaim the resource.
-        }
     }
 }

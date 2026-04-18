@@ -182,7 +182,7 @@ Same single-deployment pattern as Tracks 1–4. Key sequencing:
 ## A9. Orchestrator Guidance
 
 - Use `docs/design-docs/phase-2/track-5-memory.md` as the canonical design contract. Phase 2 `design.md §3` is historical and **must not** be followed.
-- Memory-disabled agents (`memory.enabled=false` or absent) and tasks submitted with `skip_memory_write=true` MUST behave identically to pre-Track-5 behaviour. No new tools registered, no new graph node, no new cost, no new rows written.
+- Memory-disabled agents (`memory.enabled=false` or absent) and tasks submitted with `skip_memory_write=true` MUST behave identically to pre-Track-5 behaviour with two exceptions: (a) `task_history_get` is registered regardless of memory state (it's a diagnostic, not a write path), and (b) if a task submits `attached_memory_ids`, the resolved entries are still injected into the initial prompt — `skip_memory_write` only suppresses the write side. Beyond those, no new graph node, no new cost, no new rows written.
 - Always include both `tenant_id` and `agent_id` predicates in every query touching `agent_memory_entries` or `task_attached_memories`. Enforce at the repository layer; reviewers must reject PRs that violate this.
 - Follow the 404-not-403 disclosure rule across every memory-related surface (list, single-entry lookup, search, delete, tool errors). Uniform response shape regardless of whether the id is unknown, from another tenant, or from another agent.
 - Attachments are **immutable after task creation**. Follow-up and redrive do not rewrite the join table.
