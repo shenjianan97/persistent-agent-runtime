@@ -56,44 +56,20 @@ Dead-letter, follow-up seeding, and attached-memory injection are Task 8. Memory
   5. **No DB writes from the node itself** — only state mutation. LangGraph persists via the normal super-step checkpoint.
 - **Summarizer outage handling:** retry per the summarizer-model LangChain client's default. On exhaustion, build `pending_memory` from a template — `title = "Completed: <first 80 chars of task input>"`, `summary = "<final_output truncated to ~1KB> [summary generation unavailable; review observations and linked task trace for detail.]"`, `summarizer_model_id = "template:fallback"`, `outcome = "succeeded"`. The node returns the same shape — no separate "fallback" branch in the caller.
 - **Embedding outage handling:** if `compute_embedding` returns `None`, populate `pending_memory.content_vec = None`. The caller writes the row with `content_vec = NULL`. Log `memory.write.embedding_deferred` once.
-- **Commit transaction (in `worker.py` or the post-astream helper):**
-  ```
-  BEGIN;
-    -- 1) Read pending_memory from final state (via aget_tuple on thread_id).
-    -- 2) UPSERT with RETURNING: capture both the new row's memory_id and
-    --    whether this was an INSERT (xmax = 0) or an UPDATE (xmax != 0).
-    --    Pattern:
-    --      INSERT INTO agent_memory_entries (…) VALUES (…)
-    --      ON CONFLICT (task_id) DO UPDATE SET
-    --        title=EXCLUDED.title, summary=EXCLUDED.summary, … ,
-    --        updated_at=now(), version = agent_memory_entries.version + 1
-    --      RETURNING memory_id, (xmax = 0) AS inserted;
-    -- 3) If inserted = TRUE AND current_count > max_entries:
-    --      DELETE FROM agent_memory_entries
-    --      WHERE memory_id IN (
-    --        SELECT memory_id FROM agent_memory_entries
-    --        WHERE tenant_id=$1 AND agent_id=$2 AND memory_id != :just_inserted
-    --        ORDER BY created_at ASC, memory_id ASC
-    --        LIMIT (current_count - max_entries)
-    --      );
-    --    The `memory_id != :just_inserted` predicate guarantees the row just
-    --    written by step 2 cannot itself be evicted. The ORDER BY tiebreak
-    --    on memory_id makes the eviction deterministic when multiple rows
-    --    share a created_at timestamp.
-    --    current_count is read AFTER the UPSERT, inside the same transaction,
-    --    via a scoped SELECT COUNT(*). Per-task serialisation is guaranteed
-    --    because only one worker holds the task lease at a time — concurrent
-    --    writes from OTHER tasks are possible but land in independent
-    --    transactions and race-resolve via MVCC; at worst the trim evicts
-    --    one too few rows in a given transaction, and the next task's
-    --    commit catches up.
-    -- 4) UPDATE tasks SET status='completed', … WHERE task_id=$t AND lease_owner=:me;
-    -- 5) COMMIT.
-  ```
-  - All four (UPSERT, optional TRIM, task UPDATE, COMMIT) are in one transaction. Lease validation on step 4 rolls back the whole thing if the worker lost the lease.
-  - `created_at` must NOT be in the UPSERT's `DO UPDATE SET` clause. `updated_at = now()`; `version = agent_memory_entries.version + 1`.
-  - Trim fires ONLY when `inserted = TRUE`. The ON CONFLICT → UPDATE branch leaves the row count unchanged and MUST NOT trigger trim.
-  - Emit `memory.write.trim_evicted` with the evicted count when trim fires.
+- **Commit transaction behaviour (in `worker.py` or the post-astream helper).** The commit runs as ONE Postgres transaction containing three ordered operations, all guarded by a final lease-validation predicate. Contract, not prescriptive script — the implementing agent chooses the SQL shape that best matches existing repository style:
+
+  1. **Read `pending_memory`** from the final graph state (via `aget_tuple(thread_id)` on the checkpointer).
+  2. **UPSERT the memory row** keyed on `task_id`. The statement must distinguish the INSERT branch from the UPDATE branch so step 3 can fire correctly — any functionally-equivalent signal works (`RETURNING xmax = 0`, a returning sentinel, or a MERGE-style differentiation). On the UPDATE branch: `created_at` MUST NOT be mutated; `updated_at = now()`; `version` MUST increment by 1.
+  3. **FIFO trim (INSERT branch only).** When the INSERT branch fired AND the agent's post-insert row count exceeds `max_entries`, delete the oldest excess rows, ordered by `created_at ASC` with `memory_id ASC` as the tiebreak. The trim query MUST exclude the row just inserted (by `memory_id`) so the fresh write cannot be evicted inside its own transaction. The ON CONFLICT → UPDATE branch MUST NOT trigger trim — row count is unchanged in that case.
+  4. **`UPDATE tasks SET status='completed' …`** scoped by `task_id` AND the lease predicate (`lease_owner = :me`). Transaction commits.
+
+  Failure modes:
+  - Lost lease → lease predicate fails on step 4 → transaction rolls back → reaper re-claims → worker retries.
+  - Any exception before commit → transaction rolls back → no partial state.
+
+  Concurrency: per-task serialisation is guaranteed by the task lease — only one worker holds a given task at a time. Different tasks for the same agent commit in independent transactions; FIFO trim runs per-transaction and can, in a boundary case, leave the agent briefly at `max_entries + 1` rows before the next task's commit catches up. This is acceptable — the cap is a soft cap per the design doc.
+
+  Observability: emit `memory.write.trim_evicted` with the evicted count when trim fires.
 - **Budget carve-out (Track 3 interaction):** The Track 3 per-step budget enforcement the worker runs after each super-step must **skip** the per-task pause check if and only if the super-step that just completed is the `memory_write` node. Identify the node by name (do not use heuristics on cost magnitude). `budget_max_per_hour` accounting still receives the cost at the normal point.
   - **Where the carve-out lives:** Track 3's per-step enforcement was implemented in the worker post-super-step hook in `services/worker-service/executor/graph.py` (look for the per-step cost check that raises / triggers the pause transition). Read that path end-to-end before adding the carve-out; do NOT invent a new enforcement file. If the Track 3 path has since moved (check git history), follow the rename.
 - **Cost ledger:** write one row per LLM call (summarizer) and one row per embedding call (`compute_embedding` succeeded). Attribute to the task's current checkpoint id. Both go into the existing `agent_cost_ledger` — schema unchanged. Cost values come from the `models` table (summarizer) and the helper / pricing constant (embedding — see Task 5). A failed `compute_embedding` call (returned `None`) produces no ledger row.
