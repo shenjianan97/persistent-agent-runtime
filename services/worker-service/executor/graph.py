@@ -1146,10 +1146,18 @@ class GraphExecutor:
                     # checkpoints.cost_microdollars (not agent_cost_ledger), so
                     # without this UPDATE the memory step shows $0 and the
                     # cumulative total doesn't advance between the agent's
-                    # final response and the memory-saved step. We also
-                    # populate execution_metadata with the summarizer's model
-                    # + tokens so the Console's usage panel renders on this
-                    # step the same way it does for chat-model steps.
+                    # final response and the memory-saved step.
+                    #
+                    # This must be ADDITIVE, not a replacement. The sandbox
+                    # cleanup path at the end of execute_task (see the
+                    # "sandbox_cost_recording_failed" block) has already
+                    # accumulated sandbox runtime spend onto this same
+                    # checkpoint via `cost_microdollars = cost_microdollars
+                    # + $1`; replacing would silently drop that spend from
+                    # the timeline totals. Same goes for any future
+                    # post-astream cost attribution path that lands on the
+                    # terminal checkpoint. execution_metadata uses COALESCE
+                    # so if an earlier writer populated it we don't clobber.
                     if checkpoint_id:
                         step_total_cost = summarizer_cost + embedding_cost
                         summarizer_tokens_in = int(
@@ -1165,8 +1173,8 @@ class GraphExecutor:
                         }
                         await conn.execute(
                             '''UPDATE checkpoints
-                               SET cost_microdollars = $1,
-                                   execution_metadata = $2::jsonb
+                               SET cost_microdollars = cost_microdollars + $1,
+                                   execution_metadata = COALESCE(execution_metadata, $2::jsonb)
                                WHERE checkpoint_id = $3
                                  AND task_id = $4::uuid''',
                             step_total_cost,

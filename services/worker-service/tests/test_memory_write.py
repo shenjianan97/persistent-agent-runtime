@@ -609,6 +609,8 @@ class TestCommitCheckpointAttribution:
         task_id: str,
         checkpoint_id: str,
         worker_id: str = WORKER_A,
+        initial_cost: int = 0,
+        initial_execution_metadata: str | None = None,
     ) -> None:
         async with pool.acquire() as conn:
             await conn.execute(
@@ -616,12 +618,13 @@ class TestCommitCheckpointAttribution:
                 INSERT INTO checkpoints (
                     task_id, checkpoint_ns, checkpoint_id, worker_id,
                     thread_ts, checkpoint_payload, metadata_payload,
-                    cost_microdollars
+                    cost_microdollars, execution_metadata
                 )
                 VALUES ($1::uuid, '', $2, $3, $2, '{}'::jsonb,
-                        '{"source":"loop","step":6}'::jsonb, 0)
+                        '{"source":"loop","step":6}'::jsonb, $4, $5::jsonb)
                 """,
                 task_id, checkpoint_id, worker_id,
+                initial_cost, initial_execution_metadata,
             )
 
     @pytest.mark.asyncio
@@ -660,6 +663,53 @@ class TestCommitCheckpointAttribution:
         assert exec_metadata["model"] == "claude-haiku-4-5"
         assert exec_metadata["input_tokens"] == 50
         assert exec_metadata["output_tokens"] == 20
+
+    @pytest.mark.asyncio
+    async def test_memory_cost_is_additive_preserving_prior_checkpoint_spend(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        """The mirror MUST add summarizer+embedding onto the checkpoint's
+        existing cost_microdollars, not replace it. Tasks that use the sandbox
+        have already rolled sandbox runtime spend onto the latest checkpoint
+        (`cost_microdollars = cost_microdollars + <sandbox>`) before the
+        commit path runs; replacing would silently drop that spend from the
+        API's timeline and status totals.
+        """
+        task_id = str(uuid.uuid4())
+        checkpoint_id = f"cp-{uuid.uuid4()}"
+        await _seed_running_task(integration_pool, task_id=task_id)
+        # Seed the checkpoint as if sandbox already rolled 500µ$ onto it.
+        # Also seed pre-existing execution_metadata to confirm COALESCE
+        # behaviour preserves whatever an earlier writer set.
+        await self._seed_checkpoint(
+            integration_pool, task_id=task_id, checkpoint_id=checkpoint_id,
+            initial_cost=500,
+            initial_execution_metadata='{"source":"sandbox_cost_rollup"}',
+        )
+        executor = _make_executor(integration_pool)
+        agent_config = {"memory": {"enabled": True, "max_entries": 10_000}}
+
+        pm = _pending_memory(
+            title="With prior spend", content_vec=[0.1] * 1536,
+        )
+        await executor._commit_memory_and_complete_task(
+            task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID,
+            pending_memory=pm, agent_config=agent_config,
+            output={"result": "done"}, worker_id=WORKER_A,
+        )
+
+        async with integration_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT cost_microdollars, execution_metadata "
+                "FROM checkpoints WHERE checkpoint_id = $1",
+                checkpoint_id,
+            )
+
+        # 500 pre-existing + 100 summarizer + 2 embedding = 602.
+        assert row["cost_microdollars"] == 602
+        # Pre-existing execution_metadata is preserved via COALESCE.
+        preserved = json.loads(row["execution_metadata"])
+        assert preserved == {"source": "sandbox_cost_rollup"}
 
 
 class TestCommitMissingPendingMemorySafetyNet:
