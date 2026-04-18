@@ -6,7 +6,7 @@
 | Task 2 | Agent Config Extension | Not started | `agent_config.memory` sub-object: Jackson, validation, canonicalisation |
 | Task 3 | Memory REST API | Not started | List, hybrid RRF search, detail, delete, storage stats |
 | Task 4 | Task Submission Extension | Not started | `attached_memory_ids` + `skip_memory_write`, join table, event mirror |
-| Task 5 | Worker Embeddings | Not started | Provider abstraction + discovery validation + deferred path |
+| Task 5 | Worker Embeddings | Done | Provider abstraction + discovery validation + deferred path |
 | Task 6 | Worker Memory Write Path | Not started | `memory_write` node + commit + trim + template fallback + budget carve-out |
 | Task 7 | Worker Memory Tools | Not started | `memory_note`, `memory_search`, `task_history_get` with scope binding |
 | Task 8 | DL + Follow-up + Attach | Not started | Template DL hook, observation seeding, prompt injection |

@@ -64,6 +64,32 @@ PROVIDER_SOURCES = (
 AWS_BEDROCK_REGION_ENV = "AWS_BEDROCK_REGION"
 AWS_BEDROCK_DEFAULT_REGION = "us-east-1"
 
+# Phase 2 Track 5 — embedding provider.
+#
+# The platform uses a single embedding provider (OpenAI text-embedding-3-small,
+# 1536 dimensions). The API key lives in the same ``provider_keys`` table as
+# the chat provider — OpenAI's embedding endpoint shares credentials with its
+# chat endpoint, so the existing ``openai`` row is reused. The validation
+# behaviour below runs at discovery/startup time so a broken embedding key
+# surfaces here, not at the first memory-enabled task.
+EMBEDDING_PROVIDER_ID = "openai"
+EMBEDDING_MODEL_ID = "text-embedding-3-small"
+EMBEDDING_MODEL_DISPLAY_NAME = "OpenAI text-embedding-3-small"
+EMBEDDING_MODEL_INPUT_MICRODOLLARS_PER_MTOK = 20_000  # OpenAI: $0.02 / 1M tokens
+EMBEDDING_PROBE_URL = "https://api.openai.com/v1/embeddings"
+EMBEDDING_PROBE_INPUT = "healthcheck"
+
+# Query used to decide how loudly to fail when the embedding key is missing
+# or invalid. Any row with ``agent_config -> 'memory' ->> 'enabled' = 'true'``
+# counts. The table is part of Phase 2 Track 1 (agents table, migration 0005);
+# if it is absent (e.g. fresh CI schema without migrations) the count comes
+# back zero and we treat the situation as "no memory-enabled agents".
+MEMORY_ENABLED_AGENT_COUNT_SQL = """
+    SELECT COUNT(*)
+      FROM agents
+     WHERE (agent_config -> 'memory' ->> 'enabled') = 'true'
+"""
+
 
 def resolve_model_pricing(provider_id, model_id):
     pricing = PRICING_DEFAULTS.get(model_id)
@@ -367,11 +393,142 @@ def upsert_models(conn, provider_keys):
             conn.commit()
 
 
+def _probe_openai_embedding(api_key: str) -> bool:
+    """Make a minimal real embedding call to confirm the key works.
+
+    Uses a ~1-token input so the cost is negligible. Returns True on any
+    2xx response, False on any HTTP / transport error. Logs the failure
+    reason at WARNING level so operators can tell "bad key" from "provider
+    outage" without reading stack traces.
+    """
+    try:
+        req = urllib.request.Request(
+            EMBEDDING_PROBE_URL,
+            data=json.dumps(
+                {"model": EMBEDDING_MODEL_ID, "input": EMBEDDING_PROBE_INPUT}
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return 200 <= getattr(response, "status", response.getcode()) < 300
+    except HTTPError as exc:
+        print(f"[Discovery] Embedding provider probe failed: HTTP {exc.code}")
+        return False
+    except Exception as exc:
+        print(f"[Discovery] Embedding provider probe failed: {exc}")
+        return False
+
+
+def _count_memory_enabled_agents(conn) -> int:
+    """Return the number of agents with ``memory.enabled = true``. If the
+    ``agents`` table doesn't exist (early-stage CI / bootstrap), returns
+    zero. We explicitly do not want the embedding check to fail startup
+    just because Phase 2 Track 1's migration hasn't been applied yet.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(MEMORY_ENABLED_AGENT_COUNT_SQL)
+            row = cur.fetchone()
+            if row is None:
+                return 0
+            return int(row[0] or 0)
+    except Exception as exc:  # table missing, schema drift, etc.
+        print(f"[Discovery] Unable to count memory-enabled agents: {exc}")
+        return 0
+
+
+def validate_embedding_provider(
+    conn,
+    *,
+    api_key: str | None,
+    probe=None,
+):
+    """Validate the embedding provider's credentials at discovery time.
+
+    Behaviour follows Track 5 Task 5:
+
+    * Key present AND probe succeeds → upsert a row into ``models`` for
+      ``EMBEDDING_MODEL_ID`` with the published input price so downstream
+      cost accounting can find it.
+    * Key absent or probe fails AND any ``memory.enabled = true`` agent
+      exists → raise ``RuntimeError`` so the caller fails startup fast
+      with a diagnostic message. Memory-enabled agents cannot function
+      without this credential; silent continuation would turn every
+      memory-write into a deferred-embedding ``content_vec = NULL``.
+    * Key absent or probe fails AND no memory-enabled agents exist →
+      log a warning and continue. Memory-disabled agents are unaffected.
+
+    The ``probe`` hook exists for tests; production callers rely on the
+    default probe which actually hits the embedding endpoint.
+    """
+    probe_fn = probe if probe is not None else _probe_openai_embedding
+
+    key_valid = bool(api_key) and probe_fn(api_key)
+    if key_valid:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO models (
+                    model_id,
+                    provider_id,
+                    display_name,
+                    input_microdollars_per_million,
+                    output_microdollars_per_million,
+                    is_active,
+                    created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, true, NOW())
+                ON CONFLICT (provider_id, model_id) DO UPDATE SET
+                    is_active = true,
+                    display_name = EXCLUDED.display_name,
+                    input_microdollars_per_million = EXCLUDED.input_microdollars_per_million
+                """,
+                (
+                    EMBEDDING_MODEL_ID,
+                    EMBEDDING_PROVIDER_ID,
+                    EMBEDDING_MODEL_DISPLAY_NAME,
+                    EMBEDDING_MODEL_INPUT_MICRODOLLARS_PER_MTOK,
+                    0,  # embedding models have no output token billing
+                ),
+            )
+        print(
+            f"[Discovery] Embedding provider validated (provider={EMBEDDING_PROVIDER_ID}, "
+            f"model={EMBEDDING_MODEL_ID})."
+        )
+        return
+
+    memory_enabled_agents = _count_memory_enabled_agents(conn)
+    reason = "missing" if not api_key else "invalid or unreachable"
+    if memory_enabled_agents > 0:
+        raise RuntimeError(
+            "Embedding provider key "
+            f"{reason} — required because {memory_enabled_agents} memory-enabled "
+            f"agent(s) exist. Set the embedding provider ({EMBEDDING_PROVIDER_ID}) "
+            "API key or disable memory on those agents."
+        )
+
+    print(
+        f"[Discovery] WARNING: Embedding provider key {reason} and no memory-enabled "
+        "agents exist. Memory-disabled agents continue to work; enabling memory on "
+        "any agent will require a valid embedding provider key."
+    )
+
+
 def run_discovery() -> dict[str, Any]:
     provider_keys = _load_provider_api_keys()
     conn = get_db_connection()
     try:
-        return upsert_models(conn, provider_keys)
+        result = upsert_models(conn, provider_keys)
+        validate_embedding_provider(
+            conn,
+            api_key=provider_keys.get(EMBEDDING_PROVIDER_ID),
+        )
+        conn.commit()
+        return result
     finally:
         conn.close()
 
