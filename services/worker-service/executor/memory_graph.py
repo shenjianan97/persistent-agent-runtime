@@ -74,6 +74,21 @@ PLATFORM_DEFAULT_SUMMARIZER_MODEL: str = os.environ.get(
 # ``models``).
 SUMMARIZER_TEMPLATE_FALLBACK = "template:fallback"
 
+# Dead-letter sentinel (Task 8). Template-only write on genuine-failure
+# dead-letter with observations.
+SUMMARIZER_TEMPLATE_DEAD_LETTER = "template:dead_letter"
+
+# Dead-letter reason constant reused across worker code. Keeps the string
+# from drifting across hook sites.
+DEAD_LETTER_REASON_CANCELLED_BY_USER = "cancelled_by_user"
+
+# Attached-memory prompt-prefix caps (Task 8). Observations and summary
+# are injected into the initial prompt; we cap per-block byte sizes so a
+# pathological customer attach does not blow the context window.
+_ATTACH_INJECTION_TITLE_CAP = 200
+_ATTACH_INJECTION_SUMMARY_CAP = 4000
+_ATTACH_INJECTION_OBSERVATION_CAP = 2000
+
 # Caps documented in the design doc § "Successful-task memory write".
 _TITLE_INPUT_SLICE_CHARS = 80
 _SUMMARY_FINAL_OUTPUT_SLICE_CHARS = 1024
@@ -469,3 +484,147 @@ def _short(message: str, limit: int = 200) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit] + "..."
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Track 5 Task 8 — dead-letter template, attached-memory preamble,
+# and first-execution predicate.
+# ---------------------------------------------------------------------------
+
+
+# Dead-letter template title caps the first slice of task_input at 50 chars
+# (design doc § "Dead-letter hook (failed tasks with observations)").
+_DEAD_LETTER_TITLE_INPUT_SLICE_CHARS = 50
+
+
+def build_pending_memory_dead_letter_template(
+    *,
+    task_input: str | None,
+    observations: list[str],
+    retry_count: int | None,
+    last_error_code: str | None,
+    last_error_message: str | None,
+) -> dict[str, Any]:
+    """Build a ``pending_memory``-shaped dict for the dead-letter write path.
+
+    The caller feeds this into :func:`core.memory_repository.upsert_memory_entry`
+    the same way the successful-path template fallback does. The two templates
+    differ in three places: ``outcome='failed'``, ``summarizer_model_id=
+    'template:dead_letter'``, and the summary is an error-oriented one-liner.
+
+    No LLM is invoked on this path — template only. Observations are preserved
+    verbatim; the caller also still owns the embedding call if it wants one.
+    """
+    safe_input = task_input or ""
+    input_slice = _sanitize_one_line(safe_input)[
+        :_DEAD_LETTER_TITLE_INPUT_SLICE_CHARS
+    ]
+    title = f"[Failed] {input_slice}" if input_slice else "[Failed]"
+
+    retries = int(retry_count or 0)
+    code = last_error_code or "unknown_error"
+    msg = _short(last_error_message or "", limit=500)
+    if msg:
+        summary = (
+            f"Task dead-lettered after {retries} retries: {code} — {msg}"
+        )
+    else:
+        summary = f"Task dead-lettered after {retries} retries: {code}"
+
+    return {
+        "title": title,
+        "summary": summary,
+        "outcome": "failed",
+        "content_vec": None,  # Caller overwrites with embedding or leaves NULL.
+        "summarizer_model_id": SUMMARIZER_TEMPLATE_DEAD_LETTER,
+        "observations_snapshot": list(observations),
+        "tags": list(_EMPTY_TAGS),
+        # No LLM call on this path — billable summarizer cost is zero.
+        "summarizer_tokens_in": 0,
+        "summarizer_tokens_out": 0,
+        "summarizer_cost_microdollars": 0,
+    }
+
+
+def build_attached_memories_preamble(
+    resolved_entries: list[dict[str, Any]],
+) -> str | None:
+    """Render a list of resolved attached-memory entries as a preamble block.
+
+    Each entry is formatted per the design doc § "Attached-memory injection":
+
+        [Attached memory: <title>]
+        Observations:
+        - <obs 1>
+        - <obs 2>
+        Summary: <summary>
+
+    Blocks are concatenated in the caller-provided list order (which must
+    already be sorted by ``position``). Returns ``None`` when the list is
+    empty so the caller can skip prepending a ``SystemMessage`` entirely —
+    Tasks with no attachments leave the initial message list unchanged.
+
+    Per-block byte caps keep a pathological attach from blowing out the
+    context window:
+    * title capped at 200 chars
+    * summary capped at ~4 KB
+    * each observation capped at ~2 KB
+    """
+    if not resolved_entries:
+        return None
+
+    blocks: list[str] = []
+    for entry in resolved_entries:
+        title = (entry.get("title") or "")[:_ATTACH_INJECTION_TITLE_CAP]
+        summary_text = (entry.get("summary") or "")[
+            :_ATTACH_INJECTION_SUMMARY_CAP
+        ]
+        observations = entry.get("observations") or []
+
+        lines: list[str] = [f"[Attached memory: {title}]"]
+        if observations:
+            lines.append("Observations:")
+            for obs in observations:
+                capped = (obs or "")[:_ATTACH_INJECTION_OBSERVATION_CAP]
+                lines.append(f"- {capped}")
+        else:
+            lines.append("Observations: (none)")
+        lines.append(f"Summary: {summary_text}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
+
+
+def checkpoint_tuple_has_prior_history(checkpoint_tuple: Any) -> bool:
+    """Return ``True`` when the checkpoint already holds executed history.
+
+    Shared predicate for the two Task 8 branches that must differ between a
+    first execution and a follow-up / redrive / resume:
+
+    * **Attached-memory injection** — only on first execution; the follow-up
+      checkpoint already contains the previously-injected preamble.
+    * **Follow-up seeding source** — always queries the memory row, but only
+      first-execution paths are expected to find it empty.
+
+    Predicate is deliberately loose: a tuple that returns ``None``, has no
+    ``messages`` key in ``channel_values``, or whose messages list is empty
+    is treated as "no history yet". Anything else is "has history".
+    """
+    if checkpoint_tuple is None:
+        return False
+    checkpoint = getattr(checkpoint_tuple, "checkpoint", None)
+    if not isinstance(checkpoint, dict):
+        return False
+    values = checkpoint.get("channel_values")
+    if not isinstance(values, dict):
+        return False
+    messages = values.get("messages")
+    if not messages:
+        return False
+    # ``messages`` may legitimately be a non-empty list, tuple, or any other
+    # truthy sequence — LangGraph serializers normalise to list, but we stay
+    # tolerant of the channel-values shape.
+    try:
+        return len(messages) > 0
+    except TypeError:
+        return bool(messages)

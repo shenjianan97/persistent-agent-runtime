@@ -373,19 +373,19 @@ async def test_timeout_dead_letter(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
                 "task_timeout",
                 "Execution exceeded task logic timeout",
                 "task_timeout",
@@ -447,19 +447,19 @@ async def test_non_retryable_error(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
                 "non_retryable_error",
                 "pydantic validation error: invalid property",
                 "fatal_error",
@@ -493,19 +493,19 @@ async def test_graph_recursion_error(mock_worker, task_data):
             # Verify dead letter logic — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
                 "max_steps_exceeded",
                 "Execution exceeded max_steps (5)",
                 "max_steps_exceeded",
@@ -541,19 +541,19 @@ async def test_retries_exhausted(mock_worker, task_data):
             # Verify dead letter logic with retries_exhausted — now uses conn.fetchval with lease guard
             mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_called_with(
                 '''UPDATE tasks
-                       SET status='dead_letter',
-                           dead_letter_reason=$1,
-                           last_error_message=$2,
-                           last_error_code=$3,
-                           last_worker_id=$4,
-                           dead_lettered_at=NOW(),
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$5::uuid
-                         AND status='running'
-                         AND lease_owner=$6
-                       RETURNING task_id''',
+                           SET status='dead_letter',
+                               dead_letter_reason=$1,
+                               last_error_message=$2,
+                               last_error_code=$3,
+                               last_worker_id=$4,
+                               dead_lettered_at=NOW(),
+                               version=version+1,
+                               lease_owner=NULL,
+                               lease_expiry=NULL
+                           WHERE task_id=$5::uuid
+                             AND status='running'
+                             AND lease_owner=$6
+                           RETURNING task_id''',
                 "retries_exhausted",
                 "Max retries reached. Last error: 503 Service Unavailable",
                 "retries_exhausted",

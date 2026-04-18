@@ -302,3 +302,101 @@ def pending_memory_log_preview(pending_memory: dict[str, Any]) -> str:
         "content_vec_null": pending_memory.get("content_vec") is None,
     }
     return json.dumps(preview, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Track 5 Task 8 — follow-up seeding + attached-memory resolution
+# ---------------------------------------------------------------------------
+
+
+_READ_OBSERVATIONS_SQL = """
+SELECT observations
+FROM agent_memory_entries
+WHERE tenant_id = $1 AND agent_id = $2 AND task_id = $3::uuid
+"""
+
+
+async def read_memory_observations_by_task_id(
+    conn: asyncpg.Connection,
+    tenant_id: str,
+    agent_id: str,
+    task_id: str,
+) -> list[str] | None:
+    """Return the ``observations`` array for the memory row keyed on ``task_id``.
+
+    Used by the follow-up / redrive seeding hook so a fresh graph execution can
+    recover the observations captured in a prior run — follow-up and redrive
+    reuse the same ``task_id`` and the UPSERT would otherwise clobber earlier
+    observations when the new run starts from an empty list.
+
+    Returns
+    -------
+    * ``None`` — no memory row for this task (first-run task, never written).
+    * ``[]`` — row exists but the prior run produced no observations.
+    * ``list[str]`` — verbatim observations in original order.
+
+    Scope binding is MANDATORY (``tenant_id`` + ``agent_id`` predicates) per
+    design doc § "Memory-query invariant". A cross-scope ``task_id`` will
+    simply return ``None``.
+    """
+    row = await conn.fetchrow(
+        _READ_OBSERVATIONS_SQL, tenant_id, agent_id, str(task_id)
+    )
+    if row is None:
+        return None
+    obs = row["observations"]
+    if obs is None:
+        return []
+    return list(obs)
+
+
+_RESOLVE_ATTACHED_SQL = """
+SELECT tam.position,
+       am.memory_id,
+       am.title,
+       am.summary,
+       am.observations
+FROM task_attached_memories tam
+LEFT JOIN agent_memory_entries am
+       ON am.memory_id = tam.memory_id
+      AND am.tenant_id = $1
+      AND am.agent_id = $2
+WHERE tam.task_id = $3::uuid
+ORDER BY tam.position
+"""
+
+
+async def resolve_attached_memories_for_task(
+    conn: asyncpg.Connection,
+    tenant_id: str,
+    agent_id: str,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Resolve ``task_attached_memories`` rows into injection-ready entries.
+
+    Performs a LEFT JOIN with the same ``(tenant_id, agent_id)`` predicate
+    that every other memory surface uses. Rows where the memory id no longer
+    resolves (deleted since submission, or cross-scope planted maliciously)
+    are silently dropped — the attachment record is preserved elsewhere for
+    audit, but injection can only ship content that still exists.
+
+    The returned list preserves ``position`` order. Each element is
+    ``{"position": int, "memory_id": UUID, "title": str, "summary": str,
+    "observations": list[str]}``.
+    """
+    rows = await conn.fetch(
+        _RESOLVE_ATTACHED_SQL, tenant_id, agent_id, str(task_id)
+    )
+    resolved: list[dict[str, Any]] = []
+    for row in rows:
+        # LEFT JOIN misses land with am.title IS NULL — drop silently.
+        if row["title"] is None:
+            continue
+        resolved.append({
+            "position": int(row["position"]),
+            "memory_id": row["memory_id"],
+            "title": row["title"],
+            "summary": row["summary"] or "",
+            "observations": list(row["observations"] or []),
+        })
+    return resolved
