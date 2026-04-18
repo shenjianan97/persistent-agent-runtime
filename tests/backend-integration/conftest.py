@@ -358,6 +358,11 @@ async def _do_clean(conn: asyncpg.Connection) -> None:
     await conn.execute("DELETE FROM checkpoint_writes")
     await conn.execute("DELETE FROM checkpoints")
     await conn.execute("DELETE FROM task_artifacts")
+    # Track 5 (Phase 2): memory attachments cascade from tasks; drop memory
+    # entries before agents so the fk_agent_memory_entries_agent FK does not
+    # block the agents truncate.
+    await conn.execute("DELETE FROM task_attached_memories")
+    await conn.execute("DELETE FROM agent_memory_entries")
     await conn.execute("DELETE FROM tasks")
     await conn.execute("DELETE FROM agent_runtime_state")
     await conn.execute("DELETE FROM agents")
