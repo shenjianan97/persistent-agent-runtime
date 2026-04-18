@@ -72,6 +72,15 @@ E2E_API_PORT ?= 8081
 E2E_API_BASE ?= http://localhost:$(E2E_API_PORT)/v1
 E2E_API_LOG ?= $(TMP_DIR)/e2e-api-service.log
 
+# Port the session-scoped memory embedding mock listens on (started by
+# tests/backend-integration/conftest.py). Baked into the API service's
+# APP_MEMORY_EMBEDDING_ENDPOINT at e2e-up time so the api-service reaches
+# the mock — not the real OpenAI endpoint — when tests exercise the
+# memory/search vector or hybrid paths.
+E2E_EMBEDDING_MOCK_PORT ?= 18099
+E2E_EMBEDDING_MOCK_PROVIDER_ID ?= memory-mock
+E2E_EMBEDDING_MOCK_ENDPOINT ?= http://127.0.0.1:$(E2E_EMBEDDING_MOCK_PORT)/v1/embeddings
+
 # Color Output
 GREEN := $(shell printf '\033[0;32m')
 YELLOW := $(shell printf '\033[0;33m')
@@ -782,6 +791,8 @@ e2e-test: e2e-up
 	 E2E_PG_IMAGE=$(E2E_PG_IMAGE) \
 	 E2E_API_PORT=$(E2E_API_PORT) \
 	 E2E_API_BASE=$(E2E_API_BASE) \
+	 E2E_EMBEDDING_MOCK_PORT=$(E2E_EMBEDDING_MOCK_PORT) \
+	 E2E_EMBEDDING_MOCK_PROVIDER_ID=$(E2E_EMBEDDING_MOCK_PROVIDER_ID) \
 	 APP_DEV_TASK_CONTROLS_ENABLED=true \
 	 $(WORKER_VENV_PYTHON) -m pytest tests/backend-integration -v --tb=short -ra 2>&1 | tee $(TMP_DIR)/e2e-test.log; \
 	 e2e_exit=$${PIPESTATUS[0]}; \
@@ -862,6 +873,8 @@ e2e-up: test-db-up
 		DB_HOST=$(E2E_DB_HOST) DB_PORT=$(E2E_DB_PORT) DB_NAME=$(E2E_DB_NAME) \
 		DB_USER=$(E2E_DB_USER) DB_PASSWORD=$(E2E_DB_PASSWORD) \
 		SERVER_PORT=$(E2E_API_PORT) APP_DEV_TASK_CONTROLS_ENABLED=true \
+		APP_MEMORY_EMBEDDING_ENDPOINT=$(E2E_EMBEDDING_MOCK_ENDPOINT) \
+		APP_MEMORY_EMBEDDING_PROVIDER_ID=$(E2E_EMBEDDING_MOCK_PROVIDER_ID) \
 		nohup $(API_DIR)/gradlew bootRun -p $(API_DIR) > $(E2E_API_LOG) 2>&1 & \
 		echo $$! > $(TMP_DIR)/e2e-api.pid; \
 		echo "  $(YELLOW)⏳ Waiting for E2E API health...$(NC)"; \
