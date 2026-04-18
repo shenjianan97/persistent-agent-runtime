@@ -22,6 +22,23 @@ MAX_BODY_BYTES: Final[int] = 1_000_000
 MAX_REDIRECTS: Final[int] = 3
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 10.0
 DISALLOWED_HOST_SUFFIXES: Final[tuple[str, ...]] = (".localhost", ".local", ".internal")
+DEFAULT_REQUEST_HEADERS: Final[dict[str, str]] = {
+    # Some news sites and CDNs block obvious bot headers but allow the same public
+    # pages to be fetched with standard browser request metadata.
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/135.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
 STRIP_TAGS: Final[tuple[str, ...]] = (
     "script",
     "style",
@@ -51,6 +68,7 @@ class _FetchedResponse:
     status_code: int
     headers: dict[str, str]
     body: bytes
+    body_truncated: bool = False
 
 
 class ReadUrlFetcher:
@@ -109,6 +127,9 @@ class ReadUrlFetcher:
             if not truncated:
                 raise ToolExecutionError(f"No readable content was extracted from {current_url}.")
 
+            if response.body_truncated and len(content) <= max_chars:
+                truncated = _append_fetch_truncation_notice(truncated, max_chars)
+
             return ReadUrlResultData(
                 final_url=response.url,
                 title=title,
@@ -145,16 +166,11 @@ class ReadUrlFetcher:
             _assert_public_ip(ipaddress.ip_address(ip_text))
 
     async def _request_once(self, url: str) -> _FetchedResponse:
-        headers = {
-            "User-Agent": "persistent-agent-runtime/phase1-read-url",
-            "Accept": "text/html,text/plain,application/xhtml+xml",
-        }
-
         if self._client is not None:
             return await _stream_response(
                 self._client,
                 url,
-                headers,
+                DEFAULT_REQUEST_HEADERS,
                 self._timeout_seconds,
                 self._max_body_bytes,
             )
@@ -163,7 +179,7 @@ class ReadUrlFetcher:
             return await _stream_response(
                 client,
                 url,
-                headers,
+                DEFAULT_REQUEST_HEADERS,
                 self._timeout_seconds,
                 self._max_body_bytes,
             )
@@ -185,17 +201,23 @@ async def _stream_response(
             timeout=timeout_seconds,
         ) as response:
             body = bytearray()
+            body_truncated = False
             async for chunk in response.aiter_bytes():
+                remaining = max_body_bytes - len(body)
+                if remaining <= 0:
+                    body_truncated = True
+                    break
+                if len(chunk) > remaining:
+                    body.extend(chunk[:remaining])
+                    body_truncated = True
+                    break
                 body.extend(chunk)
-                if len(body) > max_body_bytes:
-                    raise ToolExecutionError(
-                        f"Response body exceeded the {max_body_bytes} byte limit."
-                    )
             return _FetchedResponse(
                 url=str(response.url),
                 status_code=response.status_code,
                 headers={key.lower(): value for key, value in response.headers.items()},
                 body=bytes(body),
+                body_truncated=body_truncated,
             )
     except httpx.TimeoutException as exc:
         raise ToolTransportError(f"URL fetch timed out for {url}.") from exc
@@ -291,3 +313,10 @@ def _truncate_text(text: str, max_chars: int) -> str:
     if max_chars <= len(marker):
         return text[:max_chars]
     return text[: max_chars - len(marker)].rstrip() + marker
+
+
+def _append_fetch_truncation_notice(text: str, max_chars: int) -> str:
+    marker = "\n\n[source HTML truncated during fetch]"
+    if len(text) + len(marker) <= max_chars:
+        return text + marker
+    return _truncate_text(text + marker, max_chars)
