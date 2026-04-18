@@ -13,6 +13,7 @@ import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.LangfuseEndpointRepository;
 import com.persistentagent.api.repository.ModelRepository;
+import com.persistentagent.api.repository.TaskAttachedMemoryRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
@@ -33,6 +34,16 @@ public class TaskService {
 
     private static final Set<String> VALID_PAUSE_REASONS = Set.of("budget_per_task", "budget_per_hour");
 
+    /**
+     * Maximum attached memory ids per task submission.
+     *
+     * <p>Provenance: NOT from the design doc — the design doc specifies only a
+     * Console-side token-footprint indicator. This 50-id cap is a plan-level guard
+     * (exec-plan Task 4) against blowing the initial prompt context regardless of
+     * indicator state. Keep this limit in sync with the Console picker (Task 10).
+     */
+    static final int MAX_ATTACHED_MEMORY_IDS = 50;
+
     private final ArtifactRepository artifactRepository;
     private final TaskRepository taskRepository;
     private final AgentRepository agentRepository;
@@ -44,6 +55,7 @@ public class TaskService {
     private final CheckpointEventParser checkpointEventParser;
     private final ConfigValidationHelper configValidationHelper;
     private final S3StorageService s3StorageService;
+    private final TaskAttachedMemoryRepository taskAttachedMemoryRepository;
     private final boolean devTaskControlsEnabled;
 
     public TaskService(
@@ -58,6 +70,7 @@ public class TaskService {
             CheckpointEventParser checkpointEventParser,
             ConfigValidationHelper configValidationHelper,
             S3StorageService s3StorageService,
+            TaskAttachedMemoryRepository taskAttachedMemoryRepository,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.artifactRepository = artifactRepository;
         this.taskRepository = taskRepository;
@@ -70,6 +83,7 @@ public class TaskService {
         this.checkpointEventParser = checkpointEventParser;
         this.configValidationHelper = configValidationHelper;
         this.s3StorageService = s3StorageService;
+        this.taskAttachedMemoryRepository = taskAttachedMemoryRepository;
         this.devTaskControlsEnabled = devTaskControlsEnabled;
     }
 
@@ -86,13 +100,33 @@ public class TaskService {
                             "langfuse_endpoint_id not found: " + request.langfuseEndpointId()));
         }
 
-        // 2. Apply task-level defaults
+        // 2. Validate attached_memory_ids payload (cardinality + duplicates) before any DB work.
+        //    The 404-not-403 disclosure rule in the track design doc forbids differentiating
+        //    unknown id / wrong tenant / wrong agent at the resolver step; those cases share
+        //    the same uniform error surfaced below after scope-resolution.
+        List<UUID> attachedMemoryIds = validateAttachedMemoryIdShape(request.attachedMemoryIds());
+        boolean skipMemoryWrite = Boolean.TRUE.equals(request.skipMemoryWrite());
+
+        // 3. Scope-validated resolution of attached memory ids in one SQL query.
+        //    Any count mismatch — unknown id, wrong tenant, or wrong agent — produces
+        //    a uniform 4xx. Do NOT leak the offending id or the specific cause.
+        if (!attachedMemoryIds.isEmpty()) {
+            List<UUID> resolved = taskAttachedMemoryRepository.resolveScopedMemoryIds(
+                    tenantId, request.agentId(), attachedMemoryIds);
+            if (resolved.size() != attachedMemoryIds.size()) {
+                // Uniform, generic message — matches the design doc's validation section.
+                throw new ValidationException(
+                        "one or more attached_memory_ids could not be resolved");
+            }
+        }
+
+        // 4. Apply task-level defaults
         int maxRetries = request.maxRetries() != null ? request.maxRetries() : ValidationConstants.DEFAULT_MAX_RETRIES;
         int maxSteps = request.maxSteps() != null ? request.maxSteps() : ValidationConstants.DEFAULT_MAX_STEPS;
         int taskTimeoutSeconds = request.taskTimeoutSeconds() != null
                 ? request.taskTimeoutSeconds() : ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS;
 
-        // 3. Atomic agent resolution + model validation + task insertion (single SQL statement)
+        // 5. Atomic agent resolution + model validation + task insertion (single SQL statement)
         //    The INSERT...SELECT joins agents with models to atomically enforce:
         //    - Agent exists and status = 'active'
         //    - Agent's model is active in the models registry
@@ -101,7 +135,7 @@ public class TaskService {
         Optional<Map<String, Object>> result = taskRepository.insertTaskFromAgent(
                 tenantId, request.agentId(), workerPoolId,
                 request.input(), maxRetries, maxSteps, taskTimeoutSeconds,
-                request.langfuseEndpointId());
+                request.langfuseEndpointId(), skipMemoryWrite);
 
         if (result.isEmpty()) {
             // Atomic INSERT returned empty — determine why for the error response.
@@ -124,10 +158,79 @@ public class TaskService {
         String displayName = (String) row.get("agent_display_name_snapshot");
         OffsetDateTime createdAt = DateTimeUtil.toOffsetDateTime(row.get("created_at"));
 
-        taskEventService.recordEvent(tenantId, taskId, request.agentId(),
-                "task_submitted", null, "queued", null, null, null, "{}");
+        // 6. Insert join-table rows preserving input order as `position`.
+        //    Same transaction as the task insert — any failure rolls back the task.
+        taskAttachedMemoryRepository.insertAttachments(taskId, attachedMemoryIds);
 
-        return new TaskSubmissionResponse(taskId, request.agentId(), displayName, "queued", createdAt);
+        // 7. Mirror attached_memory_ids into the task_submitted event's details JSONB.
+        //    The join table is authoritative on divergence; the event mirror is a
+        //    convenience so event consumers don't need to join. Always include the
+        //    key — empty list renders as [], not an absent key.
+        String eventDetails = buildTaskSubmittedEventDetails(attachedMemoryIds);
+        taskEventService.recordEvent(tenantId, taskId, request.agentId(),
+                "task_submitted", null, "queued", null, null, null, eventDetails);
+
+        // Preview is empty for fresh submissions — memory rows referenced for the
+        // first time by a just-inserted task are trivially all live, but we return
+        // preview rows only on GET. The submission response mirrors the shape.
+        List<AttachedMemoryPreview> preview = attachedMemoryIds.isEmpty()
+                ? List.of()
+                : taskAttachedMemoryRepository.findAttachedMemoriesPreview(
+                        taskId, tenantId, request.agentId());
+
+        return new TaskSubmissionResponse(
+                taskId, request.agentId(), displayName, "queued", createdAt,
+                List.copyOf(attachedMemoryIds), preview);
+    }
+
+    /**
+     * Validates the shape of the {@code attached_memory_ids} payload:
+     * cardinality cap, duplicate rejection. Syntactic UUID validity is enforced
+     * upstream by Jackson; a non-UUID string fails deserialization with a 400.
+     *
+     * <p>Returns an immutable defensive copy of the list (never {@code null}).
+     * Callers treat {@code null} and {@code []} identically.
+     */
+    private List<UUID> validateAttachedMemoryIdShape(List<UUID> attached) {
+        if (attached == null || attached.isEmpty()) {
+            return List.of();
+        }
+        if (attached.size() > MAX_ATTACHED_MEMORY_IDS) {
+            throw new ValidationException(
+                    "attached_memory_ids must not exceed " + MAX_ATTACHED_MEMORY_IDS + " entries");
+        }
+        // Reject duplicates — they would produce duplicate (task_id, memory_id) rows
+        // which the PK rejects, but surface the error at the 400 layer with a clear message.
+        Set<UUID> seen = new HashSet<>();
+        for (UUID id : attached) {
+            if (id == null) {
+                throw new ValidationException("attached_memory_ids must not contain null");
+            }
+            if (!seen.add(id)) {
+                throw new ValidationException(
+                        "attached_memory_ids must not contain duplicate entries");
+            }
+        }
+        return List.copyOf(attached);
+    }
+
+    /**
+     * Builds the {@code task_submitted} event's {@code details} JSONB. Always
+     * includes the {@code attached_memory_ids} key — empty list renders as {@code []},
+     * not an absent key. Divergence from the join table is resolved in the join table's
+     * favor per the design doc.
+     */
+    private String buildTaskSubmittedEventDetails(List<UUID> attachedMemoryIds) {
+        try {
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("attached_memory_ids",
+                    attachedMemoryIds.stream().map(UUID::toString).toList());
+            return objectMapper.writeValueAsString(details);
+        } catch (Exception e) {
+            // Serialization of a UUID list cannot fail in practice; fall back to a
+            // minimal safe envelope so the event is still recorded.
+            return "{\"attached_memory_ids\":[]}";
+        }
     }
 
     public TaskStatusResponse getTaskStatus(UUID taskId) {
@@ -156,6 +259,16 @@ public class TaskService {
 
         List<ArtifactMetadata> artifacts = artifactRepository.findByTaskId(taskId, tenantId, "output");
 
+        // Attached memories: the full id list (in position order), plus a preview
+        // restricted to entries still resolvable within the task's scope. A fresh
+        // task with no attachments gets empty lists rather than nulls — the design
+        // doc specifies both fields are always present, even for legacy tasks.
+        String agentId = (String) task.get("agent_id");
+        List<UUID> attachedMemoryIds = taskAttachedMemoryRepository.findAttachedMemoryIds(taskId);
+        List<AttachedMemoryPreview> attachedMemoriesPreview = attachedMemoryIds.isEmpty()
+                ? List.of()
+                : taskAttachedMemoryRepository.findAttachedMemoriesPreview(taskId, tenantId, agentId);
+
         return new TaskStatusResponse(
                 (UUID) task.get("task_id"),
                 (String) task.get("agent_id"),
@@ -182,7 +295,9 @@ public class TaskService {
                 (String) task.get("pause_reason"),
                 pauseDetails,
                 DateTimeUtil.toOffsetDateTime(task.get("resume_eligible_at")),
-                artifacts);
+                artifacts,
+                attachedMemoryIds,
+                attachedMemoriesPreview);
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {
