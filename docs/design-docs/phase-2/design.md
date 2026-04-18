@@ -1,6 +1,6 @@
 # Phase 2 Design — Multi-Agent, Memory, and Cost-Aware Scheduling
 
-**Status:** In progress (Tracks 1, 2, 3, 4 complete; Tracks 5, 6 upcoming).
+**Status:** In progress (Tracks 1, 2, 3, 4 complete; Tracks 5, 6, 7 upcoming).
 
 **Goal:** Promote Agent to a first-class entity and extend the Phase 1 durable execution runtime with multi-agent scheduling, long-term memory, richer operational history, and customer-provided tools.
 
@@ -16,6 +16,7 @@
 - Custom Tool Runtime (BYOT): customer-provided MCP servers running in platform-managed isolated containers
 - `waiting_for_approval` and `waiting_for_input` task statuses for human-in-the-loop workflows
 - GitHub integration for code agents: GitHub App for repo access, clone/push/PR workflow
+- Context window management for long-running tasks: tiered in-task compaction so tool-call bloat does not push tasks into context-limit or cost-limit failure
 - ~~Non-idempotent tool guards~~ (deferred to Phase 3+)
 - Redrive checkpoint rollback: `rollback_last_checkpoint` option on `POST /redrive`
 - Mid-node task cancellation during in-flight LLM/tool calls
@@ -28,7 +29,7 @@
 
 ## Planning Tracks
 
-Phase 2 spans several loosely coupled subsystems. To keep implementation planning manageable, treat the work as six planning tracks with clear dependencies.
+Phase 2 spans several loosely coupled subsystems. To keep implementation planning manageable, treat the work as seven planning tracks with clear dependencies.
 
 ### Track 1 — Agent Control Plane
 
@@ -84,15 +85,20 @@ Primary design coverage:
 
 ### Track 5 — Memory
 
-Add long-term memory capabilities that build on the control-plane and runtime-state foundations.
+Add per-agent cross-task memory so completed tasks produce distilled, searchable entries that can be attached to future tasks on demand.
 
-- Long-term memory extraction and append-only storage
-- Memory compaction flows
+- Opt-in per-agent memory store (`agent_memory_entries`) in Postgres with hybrid BM25 + vector search via `pgvector`
+- Final LangGraph node distills each completed task into one memory entry
+- Agent `memory_note`, `memory_search`, and `task_history_get` tools
+- Customer attach-at-submission flow + Console browse and delete
+
+**Design scope change:** The original design (Section 3 below) described auto-loaded long-term memory with S3 append-only storage and periodic compaction — a personal-assistant-shaped model that does not fit the managed-runtime use case. The track-level design rescopes memory to a single Postgres-backed store with explicit-only retrieval, no auto-injection, and no promotion/compaction. In-task context compaction (the other reason memory mattered in the old sketch) has been split out as Track 7. See [track-5-memory.md](./track-5-memory.md) for the current design.
 
 **Note:** Human approval and freeform input workflows were originally scoped here but were delivered as part of Track 2 (Runtime State Model) alongside the `waiting_for_approval` / `waiting_for_input` pause states. Non-idempotent tool safeguards were deferred to Phase 3+.
 
 Primary design coverage:
-- [Section 3. Agent Memory Model](#3-agent-memory-model)
+- [track-5-memory.md](./track-5-memory.md) — current design
+- [Section 3. Agent Memory Model](#3-agent-memory-model) — original sketch, retained for historical context
 
 ### Track 6 — GitHub Integration
 
@@ -108,6 +114,21 @@ Enable code agents to access customer repositories and deliver results as pull r
 Primary design coverage:
 - Detailed design TBD (will be developed as a dedicated design doc when this track is planned)
 
+### Track 7 — Context Window Management
+
+Keep long-running tasks viable by bounding the in-task message-history growth that otherwise pushes tasks into context-limit or cost-limit failure.
+
+- Tiered in-task compaction (tool-result clearing, tool-call arg truncation, and retrospective LLM summarization)
+- Pre-LLM-call transforms inside the LangGraph executor loop — no new service, no new schema
+- Platform-level and per-agent thresholds; agent-opt-out path for workloads that need raw history
+
+**Why this is a separate track, not part of Track 5:** Memory (Track 5) is a cross-task store. Context management is a within-task transform. They share zero schema, zero API, zero UI. Bundling them would bloat both and couple independent rollout schedules. This track is specifically the work described in [GitHub issue #50](https://github.com/shenjianan97/persistent-agent-runtime/issues/50).
+
+**Status:** Proposed, design TBD — see [track-7-context-window-management.md](./track-7-context-window-management.md) for the stub and the brainstorm gate.
+
+Primary design coverage:
+- Detailed design pending its own brainstorming and design pass
+
 ### Recommended Planning Order
 
 For implementation planning, the safest order is:
@@ -120,14 +141,15 @@ For implementation planning, the safest order is:
    - AC Track 1 — Output Artifact Storage ✅
    - AC Track 2 — E2B Sandbox & File Input ✅
    - **AC Track 3 — Coding-Agent Primitives (proposed; must land before Phase 3)**
-6. Track 5 — Memory
-7. Track 6 — GitHub Integration
+6. Track 7 — Context Window Management (recommended ahead of Track 5: long tasks must be able to finish before cross-task memory is useful)
+7. Track 5 — Memory
+8. Track 6 — GitHub Integration
 
 Phase 2 Tracks 1–4 and Agent Capabilities Tracks 1 & 2 are complete — the platform can now run coding and document-processing workloads end-to-end with sandbox execution and artifact storage.
 
 **AC Track 3 is gating for Phase 3.** The Track 2 sandbox tool surface is sufficient to run a script but not to iterate on a codebase — every edit re-sends the full file, every search goes through `sandbox_exec` with no output cap, long-running processes block the tool slot. Phase 3 work (batch APIs, webhooks, structured output, scaling) should be built on top of a mature coding-agent tool surface rather than ship on top of token-burning primitives that would then need to be rolled back later. See [agent-capabilities/design.md#track-3-coding-agent-primitives-proposed](../agent-capabilities/design.md) for the detailed proposal.
 
-Tracks 5 (Memory) and 6 (GitHub Integration) can be sequenced alongside AC Track 3 as independent initiatives — they have no blocking dependency in either direction.
+Tracks 5 (Memory), 6 (GitHub Integration), and 7 (Context Window Management) can be sequenced alongside AC Track 3 as independent initiatives — they have no blocking dependency in either direction. Track 7 is recommended ahead of Track 5 on the grounds that cross-task memory is less useful if long-running tasks cannot complete.
 
 ---
 

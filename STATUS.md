@@ -15,8 +15,9 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 2 | HITL & Unified Timeline | Complete | [plan](docs/exec-plans/completed/phase-2/track-2/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-2/progress.md) |
 | Track 3 | Scheduler & Budgets | Complete | [plan](docs/exec-plans/completed/phase-2/track-3/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-3/progress.md) |
 | Track 4 | Custom Tool Runtime (BYOT) | Complete | [plan](docs/exec-plans/completed/phase-2/track-4/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-4/progress.md) |
-| Track 5 | Memory | Not started | — | — |
+| Track 5 | Memory | Design drafted ([track-5-memory.md](docs/design-docs/phase-2/track-5-memory.md)); plan not started | — | — |
 | Track 6 | GitHub Integration | Not started | — | — |
+| Track 7 | Context Window Management | Stub ([track-7-context-window-management.md](docs/design-docs/phase-2/track-7-context-window-management.md)); brainstorm pending | — | — |
 
 
 ### Cross-Cutting
