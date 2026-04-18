@@ -354,11 +354,19 @@ def _build_memory_search_tool(ctx: MemoryToolContext) -> StructuredTool:
                 "to let the server silently degrade when embeddings return."
             )
         if response.status_code == 404:
-            # Agent scope miss or unknown — 404-not-403: return empty results
-            # shape, not a crash. The agent will learn nothing was found.
-            logger.info(
-                "memory.search.not_found tenant_id=%s agent_id=%s task_id=%s",
-                bound_tenant, bound_agent, bound_task,
+            # 404 here means the API could not resolve the agent in the
+            # caller's tenant scope. Since ``bound_agent`` is the worker's
+            # OWN agent (the task is running under it), this should never
+            # happen in steady state — it usually points at a configuration
+            # drift (tenant-id header vs DEFAULT_TENANT_ID, agent soft-
+            # deleted mid-task, etc.). Log at WARNING so it's greppable in
+            # ops, but still return the uniform empty-result shape so the
+            # agent loop stays in-flight and doesn't leak the specific cause.
+            logger.warning(
+                "memory.search.scope_unresolved tenant_id=%s agent_id=%s "
+                "task_id=%s mode=%s — worker-bound agent returned 404 from "
+                "the memory API; check tenant/agent config",
+                bound_tenant, bound_agent, bound_task, mode,
             )
             return {"results": [], "ranking_used": mode}
         if response.status_code >= 400:

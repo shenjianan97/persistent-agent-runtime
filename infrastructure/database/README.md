@@ -18,6 +18,21 @@ This directory contains the canonical PostgreSQL bootstrap artifacts for Phase 1
 - `updated_at` uses `DEFAULT NOW()` for inserts only. Application update queries must set `updated_at = NOW()` explicitly. There are no triggers or database functions that maintain `updated_at`.
 - Both `checkpoints` and `checkpoint_writes` reference `tasks(task_id)` with `ON DELETE CASCADE`. Deleting a task automatically removes all associated checkpoint data.
 
+## Deployment pre-flight: pgvector (Phase 2 Track 5)
+
+Migration `0011_agent_memory.sql` runs `CREATE EXTENSION IF NOT EXISTS vector`. Before rolling this migration to any non-dev Postgres, verify two things on the target:
+
+1. **pgvector is installed.** Managed offerings differ:
+   - AWS RDS PG ≥ 15 default param group: pgvector is pre-installed and requires `rds_superuser`.
+   - Aurora Postgres: same.
+   - Self-hosted: the `postgresql-16-pgvector` (or equivalent) package must be present.
+   Confirm with `SELECT extname FROM pg_extension WHERE extname = 'vector';` or, if not yet created, `SELECT * FROM pg_available_extensions WHERE name = 'vector';`.
+2. **The deploy role can create extensions.** `CREATE EXTENSION vector` requires the role that runs migrations to have the relevant privilege (`rds_superuser` on RDS, `CREATE` on the database for self-hosted).
+
+Dev and CI pin `pgvector/pgvector:pg16` across `docker-compose.yml`, `Makefile`'s `E2E_PG_IMAGE`, and `.github/workflows/ci.yml` service containers — so the image is already correct for those paths. The pre-flight above is only for shared environments the repo doesn't pin.
+
+If pgvector isn't available on the target, migration `0011` fails loud on `CREATE EXTENSION vector` — which is the intended behavior. Don't silently skip it; install pgvector or hold the rollout.
+
 ## LISTEN/NOTIFY
 
 `LISTEN/NOTIFY` is application-level behavior, not schema-level behavior. This schema does not create any trigger or function for notifications.

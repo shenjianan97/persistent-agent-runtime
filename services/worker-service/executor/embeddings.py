@@ -289,8 +289,18 @@ async def compute_embedding(
             return None
 
         if response.status_code >= 400:
+            # Don't echo the provider's response body at WARNING — it can
+            # carry the rate-limit-echoed request payload or provider-
+            # specific error text that we don't want to forward to ops
+            # log sinks. Log a fixed message at WARNING; demote the body
+            # to DEBUG for deliberate diagnostics.
             _log_failure(
                 f"HTTP{response.status_code}",
+                "embedding provider rejected request",
+            )
+            logger.debug(
+                "memory.embedding.failed_body status=%d body=%s",
+                response.status_code,
                 _short(response.text),
             )
             return None
