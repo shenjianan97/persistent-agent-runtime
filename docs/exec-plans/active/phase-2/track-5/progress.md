@@ -13,6 +13,7 @@
 | Task 9 | Console — Memory Tab | Done | List, search, detail, delete, storage stats, 80% warning |
 | Task 10 | Console — Submit Attach | Done | Multi-select picker, token-footprint indicator |
 | Task 11 | Integration + Browser | Done (subagent half) | 15-criterion E2E coverage manifest (`services/worker-service/tests/test_track5_ac_mapping.py`) + new REST E2E tests (`tests/backend-integration/test_memory_task_submission.py`) + Playwright Scenarios 11/12/13. Orchestrator still owns live Playwright execution per AGENTS.md §Browser Verification. |
+| Task 12 | Task Memory Mode | Not started | Replace `skip_memory_write` boolean with three-value `memory_mode` enum (`always` / `agent_decides` / `skip`); new `save_memory(reason)` tool; conditional routing in `agent_decides` mode; Console dropdown. See `agent_tasks/task-12-task-memory-mode.md`. |
 
 ## Notes
 
