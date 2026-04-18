@@ -46,14 +46,24 @@ Track 5 does not include:
 - Search uses **hybrid BM25 + vector** against the same table (Postgres-native `tsvector` + `pgvector` extension). No SQLite, no S3, no external index.
 - Every completed task produces **exactly one memory entry per `task_id`**, written atomically at task termination. Follow-up runs and redrives (which reuse the same `task_id`) **overwrite** the prior entry so it always reflects the latest execution state — not additional rows.
 - The agent may call `memory_note(text)` any number of times during execution to append observations. The final write merges those observations with a retrospective summary; the summary does **not** overwrite observations.
-- Memory write runs as the **final LangGraph node** for `completed` tasks. For `dead_letter` tasks, a worker-side terminal hook writes a minimal entry **only if** the agent wrote at least one observation. For `cancelled` tasks, nothing is written.
+- Memory write for **successful** tasks is a **hybrid**: the summarizer LLM call lives inside a dedicated LangGraph node (`memory_write`) so LangGraph's checkpointer provides crash-recovery durability for the expensive step; the database commit is owned by the worker's post-astream path, which co-commits the `UPSERT` into `agent_memory_entries` together with `UPDATE tasks SET status='completed'` in a single transaction with lease validation. The graph node populates a `pending_memory` field on state; the worker reads it from the final state and does the DB writes.
+- Memory write for **dead-lettered** tasks is a worker-side hook (no LLM call, template-only; observation-less failures and cancellations write nothing). Branching by `(status, dead_letter_reason)`:
+  - `status = 'completed'` → graph-node path above.
+  - `status = 'dead_letter'` AND `dead_letter_reason = 'cancelled_by_user'` → nothing written. (Cancellation is modeled as dead-letter with this reason — see Phase 2 Track 2.)
+  - `status = 'dead_letter'` (all other reasons) AND agent wrote at least one observation → worker-side hook writes a template entry.
+  - `status = 'dead_letter'` (all other reasons) AND no observations → nothing written. Trivial failures don't pollute memory.
+- HITL pauses and budget pauses are not task completions; the graph never traverses `memory_write → END` while paused. The node only fires on the path the agent itself chose as terminal (no pending tool calls, graph is exiting).
 - Memory is never auto-injected into a task's prompt. Retrieval is explicit only:
   - **Customer attaches** specific entries at task submission
   - **Agent calls** `memory_search` tool during execution
 - **`memory_search` is the only cross-task retrieval tool.** Raw-trace access is drill-down-only via `task_history_get(task_id)`, which returns a bounded structured view of one task.
-- Summarization LLM cost counts against the agent's Track 3 budget, using a configurable `summarizer_model` (falls back to a platform default).
+- Summarization LLM cost is recorded in `agent_cost_ledger` for visibility but is **exempt from Track 3 per-task budget enforcement**. Rationale: the memory write is a platform-directed closure step, not agent-directed reasoning — allowing it to trip a per-task budget pause would leave tasks in `paused` state with an `outcome='succeeded'` memory entry, which is incoherent. The call still uses a configurable `summarizer_model` (falls back to a platform default). `budget_max_per_hour` accounting still receives the cost — only the synchronous per-task pause check is skipped.
 - Access is scoped to the customer that owns the agent. Cross-tenant access is forbidden at the API layer.
-- Retention in v1 is **unbounded**. Deletion is explicit only — customers delete individual entries via API. Auto-retention policies are deferred.
+- Retention in v1 is **effectively unbounded for everyday use**, with a platform-level soft cap of **10,000 entries per agent**. When an agent reaches the cap:
+  - New memory writes succeed, but the oldest entry by `created_at` is hard-deleted in the same transaction (FIFO trim).
+  - The Console surfaces a warning on the Memory tab when the agent crosses 80% of the cap.
+  - Customers can raise or lower the cap per agent via `agent_config.memory.max_entries` (bounded to a platform-max, e.g., 100,000).
+  - This is explicitly a *soft cap to keep migration manageable*, not a retention policy. Customers who need aggressive deletion still do so via the explicit `DELETE` endpoint.
 
 ## Data Model
 
@@ -70,11 +80,28 @@ Track 5 does not include:
 | `observations` | `TEXT[]` | NOT NULL, default `'{}'`, agent-written mid-task notes in order |
 | `outcome` | `TEXT` | NOT NULL, `'succeeded'` or `'failed'` |
 | `tags` | `TEXT[]` | NOT NULL, default `'{}'`, optional entity/keyword hints for search precision |
-| `content_tsv` | `tsvector` | Generated column over `title \|\| summary \|\| array_to_string(observations, ' ') \|\| array_to_string(tags, ' ')`, GIN-indexed |
-| `content_vec` | `vector(1536)` | Embedding of the same concatenated text, HNSW-indexed. Dimension matches platform default embedding model. |
-| `summarizer_model_id` | `TEXT` | Nullable, records which model generated the summary. Sentinel values: `'template:fallback'` when the LLM was unavailable and a template summary was used, `'template:dead_letter'` for the dead-letter path. |
+| `content_tsv` | `tsvector` | Generated column (see DDL below), GIN-indexed |
+| `content_vec` | `vector(1536)` | Embedding of the same concatenated text, HNSW-indexed. Dimension matches platform default embedding model. Nullable — see [§ Embeddings](#embeddings) for the deferred-embedding fallback. |
+| `summarizer_model_id` | `TEXT` | Nullable. Records which model generated the summary. **Not a foreign key** to `models` — the column also stores sentinels `'template:fallback'` (summarizer-outage fallback) and `'template:dead_letter'` (dead-letter path), which would violate an FK. |
+| `version` | `INT` | NOT NULL, default `1`. Incremented on each upsert (follow-up, redrive, summary regeneration). Matches the optimistic-concurrency pattern on `tasks.version`. |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()`, immutable once set |
 | `updated_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()`, rewritten on each upsert (follow-up / redrive / regeneration) |
+
+**Generated column DDL** (the expression must be IMMUTABLE for `STORED GENERATED`; the `regconfig` two-arg form of `to_tsvector` is required):
+
+```sql
+content_tsv tsvector GENERATED ALWAYS AS (
+  to_tsvector(
+    'english'::regconfig,
+    coalesce(title, '') || ' ' ||
+    coalesce(summary, '') || ' ' ||
+    array_to_string(observations, ' ') || ' ' ||
+    array_to_string(tags, ' ')
+  )
+) STORED
+```
+
+Using `to_tsvector('english'::regconfig, …)` (not the single-argument form) is required because the single-argument variant is only `STABLE` since Postgres 12, not `IMMUTABLE`, and cannot back a stored generated column.
 
 **Primary key:** `memory_id`.
 
@@ -117,19 +144,34 @@ When `memory.enabled` is `false` or the `memory` section is absent:
 - No memory entries are ever written for the agent
 - The agent's memory store remains browsable and deletable via API (historical entries from when it was enabled are preserved)
 
-### Tasks table extension
+### New table: `task_attached_memories`
 
-Track 5 adds one column to the existing `tasks` table so the attachment set is a first-class, queryable task field rather than something reconstructed from event payloads.
+Track 5 adds a dedicated join table for task-to-memory attachments rather than an array column on `tasks`. This mirrors the existing `task_artifacts` / `task_events` relational pattern in the codebase and leaves room for per-attachment metadata later (attach time, reason, injection mode) without requiring a schema migration.
 
 | Column | Type | Constraints / Meaning |
 |--------|------|------------------------|
-| `attached_memory_ids` | `UUID[]` | NOT NULL, default `'{}'`, set at task submission from the `attached_memory_ids` request field. Each id must belong to the submitting `(tenant_id, agent_id)` at submission time — validated by the API. Immutable after task creation (not updated on follow-up). |
+| `task_id` | `UUID` | NOT NULL, FK to `tasks(task_id)` with `ON DELETE CASCADE` |
+| `memory_id` | `UUID` | NOT NULL, soft reference to `agent_memory_entries(memory_id)` — no database FK so a later delete of a memory entry does not cascade-delete the attachment audit row |
+| `position` | `INT` | NOT NULL, preserves attach order for injection into the prompt context |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL, defaults to `now()` — records when the attachment was captured (equals task submit time in v1) |
 
-This column is not a FK to `agent_memory_entries.memory_id` — customer delete of a memory entry leaves a dangling id in the task row, which is acceptable because the entry was already injected into the task's initial context at submission time and the audit trail is the source of truth, not the live entry.
+**Primary key:** `(task_id, memory_id)`.
 
-The `task_submitted` event's `details` JSONB also includes the id list so a pure event-timeline consumer can reconstruct attachment history without joining the `tasks` row. Storing in both places is a deliberate small duplication: the `tasks` column is cheap to query; the event record is immutable.
+**Indexes:**
+- Primary key already covers `(task_id, memory_id)` for forward lookup and uniqueness.
+- `(memory_id)` — for reverse lookup ("which tasks used this memory entry?") to support operator analytics and future reference-count rendering.
 
-Task detail API responses include `attached_memory_ids` and, for human-friendly rendering, a derived `attached_memories_preview: [{memory_id, title}]` resolved from the current `agent_memory_entries` rows (ids that no longer resolve are omitted from the preview but remain in the raw array).
+**Semantics:**
+- Rows are inserted at task submission time. Each row is validated at insertion to belong to the submitting `(tenant_id, agent_id)`.
+- Attachments are **immutable after task creation** — not rewritten on follow-up or redrive. The follow-up continues the conversation already seeded with the attached memories.
+- When a memory entry is hard-deleted via `DELETE /v1/agents/{agent_id}/memory/{memory_id}`, matching `task_attached_memories` rows **remain** (no FK cascade). They represent the historical fact that the attachment happened, even if the entry itself no longer exists.
+- When a task is deleted (unusual — Phase 2 keeps tasks indefinitely), `ON DELETE CASCADE` drops the attachment rows with it.
+
+**Event-trail duplication.** The `task_submitted` event's `details` JSONB also includes the `memory_id` list. This is a deliberate small duplication: event consumers can reconstruct attachment history without joining the join table, and the join table gives constant-time forward and reverse lookup. Both sources should agree; if they diverge, the join table is authoritative (events are append-only and may lag).
+
+**API rendering.** Task detail API responses include:
+- `attached_memory_ids: [uuid]` — resolved by querying `task_attached_memories` for this task, ordered by `position`.
+- `attached_memories_preview: [{memory_id, title}]` — a join against the current `agent_memory_entries` for human-friendly rendering. The preview applies the same `(tenant_id, agent_id)` scope filter as any single-entry lookup; memory_ids that no longer resolve (deleted entries) are omitted from `attached_memories_preview` but remain present in `attached_memory_ids`.
 
 ### pgvector extension
 
@@ -137,76 +179,144 @@ The `pgvector` extension must be enabled on the Postgres database. Embedding dim
 
 ## Write Path
 
+### Graph state extension
+
+The `memory_note` tool and the `memory_write` node share two state fields. `MessagesState` does not have these keys natively, so the worker registers a custom state schema for memory-enabled tasks:
+
+```python
+class MemoryEnabledState(MessagesState):
+    observations: Annotated[list[str], operator.add]
+    pending_memory: dict | None
+```
+
+- `observations` — append-only list of agent-written notes. The `operator.add` reducer makes appends associative and compatible with LangGraph's super-step merge semantics. `memory_note` returns a state update (either via `Command(update={"observations": [note]})` or the tool-returns-state pattern — pick whichever the implementation prefers); a plain string return is insufficient because LangGraph cannot infer state mutations from scalar returns.
+- `pending_memory` — populated once by the `memory_write` node at task completion; read once by the worker's post-astream commit path. Not written by the agent, not reducer-merged. Stays `None` for the entire execution until the final node sets it.
+
+When `memory.enabled = false` the worker uses the default `MessagesState` (no custom schema, no `memory_note` tool, no `memory_write` node in the graph).
+
 ### Mid-task writes (optional)
 
-The agent can call `memory_note(text: string)` during task execution. Each call appends one string to an in-memory `observations` list held in the LangGraph graph state. The tool:
+The agent can call `memory_note(text: string)` during task execution. Each call appends one string to the `observations` list in graph state. The tool:
 
 - returns immediately (no LLM call, no I/O beyond graph-state mutation)
-- rejects empty strings and strings longer than a per-note cap (e.g., 2 KB)
+- rejects empty strings and strings longer than a per-note cap (2 KB)
 - is registered only when `memory.enabled` is `true` for the task's agent
 
-Observations live in graph state throughout execution. They are not persisted as their own rows. Observations that were present at the time of the most recent LangGraph super-step checkpoint survive worker crashes and are available when the task next runs — including during the dead-letter hook below. Observations appended mid-step and not yet checkpointed are lost on crash, but the raw trace for recently-attempted steps remains available via `task_history_get`.
+Observations are persisted as part of LangGraph super-step checkpoints (the worker runs with `durability="sync"`). Observations present at the time of the most recent checkpoint survive worker crashes and are available when the task next runs. Observations appended mid-step and not yet checkpointed are lost on crash along with any other in-flight tool results from that super-step; the raw trace for recently-attempted steps remains available via `task_history_get`.
 
-### Final memory-write node (completed tasks)
+**Follow-up seeding.** When Track 4's follow-up endpoint resumes a previously-completed task, the worker seeds the fresh graph state's `observations` list from the existing memory row's `observations` column (via `agent_memory_entries.observations` lookup by `task_id`) before the graph begins executing. This preserves first-execution observations through follow-up and matches the "entry reflects the combined execution" invariant. Redrive behaves the same way.
 
-A dedicated terminal LangGraph node runs as the last step before graph termination for every task where `memory.enabled` is `true`:
+### Successful-task memory write — hybrid graph-node + worker commit
 
-1. Read the full conversation state and the accumulated `observations` list.
-2. Call the `summarizer_model` with a prompt that:
-   - Instructs it to produce a `title` (≤10 words, action-oriented) and a `summary` (≤400 words, retrospective)
-   - Passes the observations so the summary complements, not duplicates, them
-3. **Upsert** a row into `agent_memory_entries` (see [§ Concurrency and idempotency](#concurrency-and-idempotency)) with `outcome = 'succeeded'`, observations preserved verbatim, and summary/title from the LLM.
-4. Compute and store the embedding (`content_vec`) in the same transaction. `content_tsv` is a generated column so no separate write is needed.
+Memory write for successful tasks is split between a LangGraph node (for the expensive, durability-sensitive LLM call) and the worker (for the co-commit with task status).
 
-LLM cost for this call is recorded against the task via the existing Track 3 cost-ledger mechanism. The cost is attributed to the task that produced the entry.
+**Graph topology change** (for agents with `memory.enabled = true`):
 
-**Summarizer-unavailable fallback.** If the `summarizer_model` call fails after its internal retries — provider outage, rate limit, credential rotation lag — the node does **not** skip the write. Instead it falls back to a template-generated entry and still upserts a row:
+```
+agent ──[pending tool calls?]──┬──► tools ──► agent
+                               │
+                               └──► memory_write ──► END
+```
+
+The existing `tools_condition` edge (`agent → tools | END`) is redirected so the "no pending tool calls" branch goes to `memory_write` instead of `END`. Agents with memory disabled keep the original edge (`agent → END`).
+
+**`memory_write` node responsibilities:**
+
+1. Read `messages` and `observations` from state.
+2. Call the `summarizer_model` to produce a `title` (≤10 words, action-oriented) and a `summary` (≤400 words, retrospective), passing observations so the summary complements rather than duplicates them.
+3. Compute the embedding over `title + summary + observations + tags`.
+4. Return a state update populating a `pending_memory` field:
+   ```python
+   Command(update={
+       "pending_memory": {
+           "title": ..., "summary": ..., "outcome": "succeeded",
+           "content_vec": ..., "summarizer_model_id": "<model>",
+           "observations_snapshot": [...],
+       }
+   })
+   ```
+5. **No DB writes from the node itself.** LangGraph's checkpointer persists the state update (including `pending_memory`) via the normal super-step commit.
+
+Running the summarizer call inside a graph node means a mid-call crash is recoverable: the checkpoint does not advance, the reaper re-claims the task, and LangGraph resumes from the prior checkpoint — which re-enters `memory_write` and retries the LLM call. Upsert downstream (step below) absorbs any duplicate-write race.
+
+**Worker post-astream commit:**
+
+1. Graph returns from `astream` normally with `pending_memory` in the final state (confirmable by inspecting the final checkpoint via `aget_tuple`).
+2. Worker opens a single Postgres transaction:
+   - `UPSERT` into `agent_memory_entries` using fields from `pending_memory` plus `observations_snapshot`.
+   - `UPDATE tasks SET status='completed'` — the same UPDATE that already concludes successful tasks today.
+   - Both guarded by lease validation (`WHERE lease_owner = :me`).
+3. Commit. The task is `completed` and the memory row is visible atomically.
+
+**Failure handling along this path:**
+
+| Crash point | Recovery |
+|---|---|
+| Mid-summarizer LLM call | Last checkpoint lacks `pending_memory`; reaper re-claim resumes graph, `memory_write` retries. |
+| After `memory_write` state update but before worker commit | Checkpoint has `pending_memory`; reaper re-claim; worker reads final state, re-runs the tx. Upsert absorbs any double-write. |
+| Lease lost during worker commit | Transaction rolls back (lease predicate fails); reaper eventually re-claims; worker retries from final state. |
+| Summarizer unavailable after internal retries | See fallback below. |
+
+**Summarizer-unavailable fallback.** If the `summarizer_model` call fails after its internal retries — provider outage, rate limit, credential rotation lag — the `memory_write` node does **not** skip the write. Instead it populates `pending_memory` from a template:
 
 - `title`: `"Completed: <first 80 chars of task input, sanitized>"`
 - `summary`: `"<final_output truncated to ~1KB> [summary generation unavailable; review observations and linked task trace for detail.]"`
-- `observations`: preserved verbatim
+- `observations_snapshot`: preserved verbatim
 - `outcome`: `'succeeded'` (the task did succeed — only the summary is degraded)
 - `summarizer_model_id`: `'template:fallback'`
 
-The failure is recorded in a structured log line so operators can detect sustained summarizer outages. The embedding step still runs on the template text; if the embedding provider is also down, the row is written with `content_vec = NULL` as described in [§ Embeddings](#embeddings). The task itself still transitions to `completed` regardless. The invariant every completed memory-enabled task produces exactly one memory entry is preserved across both normal and degraded paths.
+The failure is recorded in a structured log line. The embedding step still runs on the template text; if the embedding provider is also down, the row is written with `content_vec = NULL` as described in [§ Embeddings](#embeddings). The invariant "every completed memory-enabled task produces exactly one memory entry" is preserved across both normal and degraded paths.
 
-Customers can later regenerate a proper summary for `'template:fallback'` entries once the provider recovers. A regeneration endpoint is **out of scope for v1** — the template entry remains until manually deleted or overwritten by a follow-up run.
+Customers can later regenerate a proper summary for `'template:fallback'` entries once the provider recovers. A regeneration endpoint is **out of scope for v1**.
+
+**Budget interaction.** The summarizer LLM cost is recorded in `agent_cost_ledger` for visibility but is exempt from `budget_max_per_task` enforcement (see [§ Core Decisions](#core-decisions)). Hourly spend (`budget_max_per_hour`) accounting still applies, evaluated on the next task claim. The budget-enforcement path the worker runs between super-steps must skip the pause check when the super-step that just finished was `memory_write`; otherwise a memory-write cost that crosses the per-task cap would leave the task in `paused` with a `pending_memory` populated but no row written. This carve-out is narrow and named by graph-node identity.
 
 ### Dead-letter hook (failed tasks with observations)
 
-As part of the worker's dead-letter finalization path — after max retries are exhausted and before the task's status is updated to `dead_letter` — a hook runs:
+Cancellation is modeled in Phase 2 Track 2 as `status = 'dead_letter'` with `dead_letter_reason = 'cancelled_by_user'` — there is no distinct `cancelled` status. The dead-letter hook branches accordingly:
 
-1. Read the task's last LangGraph checkpoint to recover the `observations` list.
-2. If `observations` is empty → skip, no memory entry is written.
-3. If `observations` is non-empty:
-   - Auto-generate a minimal summary: `"Task dead-lettered after <N> retries: <last_error_code> — <last_error_message>"` (no LLM call; template-generated from task fields).
-   - Generate a short title template: `"[Failed] <first_50_chars_of_task_input>"`.
-   - Upsert a row with `outcome = 'failed'`, observations preserved, summary and title from the template, `summarizer_model_id = 'template:dead_letter'`.
-   - Compute embedding over the same concatenated text.
+1. Worker reaches the dead-letter finalization path (max retries exhausted, or cancel signal observed).
+2. If `dead_letter_reason = 'cancelled_by_user'` → **skip entirely**, no memory entry is written. Rationale: the customer explicitly aborted — residue in future contexts would be unwelcome. Observations remain in the checkpoint state for forensic access via `task_history_get`, but are never exfiltrated into the memory table.
+3. Otherwise (genuine failure path):
+   - Read the task's last checkpoint via `aget_tuple(thread_id)` to recover the `observations` list.
+   - If `observations` is empty → skip, no memory entry is written. Trivial failures don't pollute memory.
+   - If `observations` is non-empty:
+     - Auto-generate a minimal summary: `"Task dead-lettered after <N> retries: <last_error_code> — <last_error_message>"` (template; no LLM call).
+     - Generate a short title: `"[Failed] <first_50_chars_of_task_input>"`.
+     - Upsert a row with `outcome = 'failed'`, observations preserved, `summarizer_model_id = 'template:dead_letter'`.
+     - Compute embedding over the concatenated text.
 
-The rationale: if the agent flagged something mid-execution, the task got far enough to learn something worth remembering. If nothing was flagged, the failure is likely trivial and memory noise outweighs signal.
+**Ordering (critical).** The hook must execute in this sequence inside a single transaction with lease validation:
+
+```
+BEGIN;
+  -- 1. Read last checkpoint (via checkpointer cursor)
+  -- 2. Upsert agent_memory_entries row (if observations non-empty + not cancelled)
+  -- 3. UPDATE tasks SET status = 'dead_letter', dead_letter_reason = ... WHERE task_id = :id AND lease_owner = :me;
+COMMIT;
+```
+
+If step 3 fails lease validation, the whole transaction rolls back — no orphan memory row. If the worker crashes between steps 2 and 3, the reaper re-claims the task, the retry path returns through dead-letter, and upsert `ON CONFLICT DO UPDATE` re-writes the same row idempotently.
 
 No LLM is called on the dead-letter path. Cost is effectively zero beyond the embedding call.
-
-### Cancelled tasks
-
-`cancelled` tasks never write a memory entry. Observations in graph state are discarded. Rationale: the customer explicitly aborted the task — any residue in future contexts would be unwelcome.
 
 ### Concurrency and idempotency
 
 - `UNIQUE (task_id)` on `agent_memory_entries` ensures at most one entry per task at any time.
-- Memory writes use **upsert**, not insert-or-skip:
-  ```
+- Memory writes use **upsert**, not insert-or-skip. `created_at` is intentionally absent from the `UPDATE SET` clause so it stays immutable across follow-up / redrive:
+  ```sql
   INSERT INTO agent_memory_entries (...) VALUES (...)
   ON CONFLICT (task_id) DO UPDATE SET
-    title = EXCLUDED.title,
-    summary = EXCLUDED.summary,
-    observations = EXCLUDED.observations,
-    outcome = EXCLUDED.outcome,
-    tags = EXCLUDED.tags,
-    content_vec = EXCLUDED.content_vec,
+    title               = EXCLUDED.title,
+    summary             = EXCLUDED.summary,
+    observations        = EXCLUDED.observations,
+    outcome             = EXCLUDED.outcome,
+    tags                = EXCLUDED.tags,
+    content_vec         = EXCLUDED.content_vec,
     summarizer_model_id = EXCLUDED.summarizer_model_id,
-    updated_at = now();
+    version             = agent_memory_entries.version + 1,
+    updated_at          = now();
+    -- created_at intentionally not updated
   ```
 - **Why upsert, not insert-once:** Track 4's follow-up endpoint (`POST /v1/tasks/{task_id}/follow-up`) resumes a completed task under the same `task_id`. A dead-letter-then-redrive sequence also reuses the same `task_id`. In both cases the memory entry must reflect the latest execution, not be permanently frozen to the first attempt's outcome. An insert-once model would leave stale or failed entries in place forever after follow-up or successful redrive.
 - **Duplicate-write within a single execution** (e.g., the final node is re-entered after a transient crash before it committed): upsert is still safe. The second call overwrites the first with the same data; `created_at` is preserved, `updated_at` advances.
@@ -219,7 +329,7 @@ No LLM is called on the dead-letter path. Cost is effectively zero beyond the em
 
 Memory entries are never auto-loaded into a task's prompt. There are exactly three ways an entry is surfaced:
 
-1. **Customer attach at submission** — `POST /v1/tasks` accepts `attached_memory_ids: [uuid]`. The API resolves each id against the submitting tenant+agent, fails fast on unknown/wrong-agent ids, and copies the resolved `title + observations + summary` blocks into the task's initial prompt context (system-prompt-prefix). The ids are persisted on the task row (see [§ Tasks table extension](#tasks-table-extension)) so the Console, API, and audit consumers can always reconstruct which memories were injected into a given run.
+1. **Customer attach at submission** — `POST /v1/tasks` accepts `attached_memory_ids: [uuid]`. The API resolves each id against the submitting tenant+agent in a single `WHERE memory_id = ANY(:ids) AND tenant_id = :caller AND agent_id = :path_agent` query, fails fast on any id that fails to resolve, and copies the resolved `title + observations + summary` blocks into the task's initial prompt context (system-prompt-prefix). Validated ids are then persisted to `task_attached_memories` (see [§ New table: `task_attached_memories`](#new-table-task_attached_memories)) and echoed into the `task_submitted` event's `details` JSONB. Error responses for resolution failures do not distinguish "not found" / "wrong tenant" / "wrong agent" — all three return the same 4xx shape, matching the 404-not-403 rule used elsewhere in the API.
 2. **Agent `memory_search` tool call during execution** — see [§ Agent Tools](#agent-tools).
 3. **Console browse / attach** — a human user reads entries in the Console, selecting ids to attach at submission time. Same underlying API as (1).
 
@@ -235,8 +345,8 @@ Memory entries are never auto-loaded into a task's prompt. There are exactly thr
 
 Hybrid ranking in v1 uses **Reciprocal Rank Fusion (RRF)** — the widely-adopted standard (Elasticsearch, Weaviate, Azure AI Search) for combining heterogeneous rankers without score normalization. The algorithm:
 
-1. Pull top `N = candidate_multiplier × limit` candidates from BM25 (`ts_rank_cd` over `content_tsv`).
-2. Pull top `N` candidates from vector search (cosine similarity over `content_vec`).
+1. Pull top `N = candidate_multiplier × limit` candidates from BM25. The query text is converted with `websearch_to_tsquery('english', :q)` — never `to_tsquery(user_input)` — so arbitrary user/LLM strings cannot raise parse errors or smuggle operator syntax. Ranking uses `ts_rank_cd(content_tsv, websearch_to_tsquery(...))`.
+2. Pull top `N` candidates from vector search. The query text is embedded, then ranked by cosine similarity over `content_vec`. The query includes `WHERE content_vec IS NOT NULL` so rows that landed with deferred embeddings (see [§ Embeddings](#embeddings)) are excluded from this branch — they remain findable via BM25.
 3. For each document `d` in the union:
    ```
    rrf_score(d) = 1 / (k + bm25_rank(d)) + 1 / (k + vector_rank(d))
@@ -291,6 +401,8 @@ The tool-surface equivalent of the 503 case returns a recoverable tool error (no
 ## Agent Tools
 
 Two new built-in tools are registered for agents with `memory.enabled = true`. Plus one drill-down tool available regardless of `memory.enabled`.
+
+**Tool-scope binding (applies to every tool below).** All three tools filter queries by `(tenant_id, agent_id)`, and this binding comes from the **worker's task context at tool-registration time** — never from LLM-supplied arguments. The SQL executed under the tool always includes `WHERE tenant_id = :bound AND agent_id = :bound` appended server-side by the tool implementation; the bound values come from the immutable task identity, not from anything the model can set. A confused or compromised agent cannot broaden its own scope by passing arguments. `task_history_get` is included in this rule even though it is available regardless of `memory.enabled` — a `task_id` guessed or leaked from logs cannot read another tenant's or another agent's task.
 
 ### `memory_note(text: string)`
 
@@ -349,13 +461,17 @@ All endpoints are scoped by `(tenant_id, agent_id)` and require the same tenant 
 | `GET` | `/v1/agents/{agent_id}/memory/{memory_id}` | Full entry (title, summary, observations, tags, outcome, task_id, created_at). |
 | `DELETE` | `/v1/agents/{agent_id}/memory/{memory_id}` | Delete one entry. Hard delete. |
 
-Task submission (`POST /v1/tasks`) gains one optional field:
+Task submission (`POST /v1/tasks`) gains two optional fields:
 
 ```
 attached_memory_ids: [uuid]    // optional; must belong to the submitting tenant + agent
+skip_memory_write:   bool      // optional, default false; when true, no memory entry is written
+                               //   for this specific task even if agent.memory.enabled = true
 ```
 
-Unknown ids, ids from another tenant, or ids from another agent reject the submission with a 4xx error. Resolved entries are injected into the task's initial prompt context at worker start.
+**`attached_memory_ids`:** Unknown ids, ids from another tenant, or ids from another agent all reject the submission with the same 4xx error shape (no distinction surfaced to caller). Resolved entries are injected into the task's initial prompt context at worker start.
+
+**`skip_memory_write`:** When `true`, the worker registers neither the `memory_write` node nor the dead-letter memory hook for this task. `memory_note` is still available (agent can self-note for in-task use), but observations are discarded at task end rather than persisted. Intended for per-call privacy opt-out — e.g., a task that will handle sensitive PII the customer does not want accumulating in the memory store — without needing to disable memory on the agent itself.
 
 ### List response shape (lightweight)
 
@@ -442,17 +558,49 @@ If the selected agent has `memory.enabled = false`, the attachment UI is hidden.
 
 - `agent_config.memory.enabled` is a boolean. If unset, treated as `false`.
 - `agent_config.memory.summarizer_model`, when set, must reference an `active` row in the `models` table with the correct provider credentials resolvable. Validation runs at agent create/update time.
-- `attached_memory_ids` at submission must all resolve to entries within the submitting `(tenant_id, agent_id)`. Any mismatch rejects the submission.
-- `memory_note` inputs are bounded at 2 KB per call. Longer text is rejected by the tool with a usable error the agent can recover from.
+- `agent_config.memory.max_entries`, when set, must be an integer in `[100, 100_000]`. If unset, uses the platform default of `10_000`. Lower bound exists so customers cannot accidentally set it to a value that starves the Console UX; upper bound exists so HNSW rebuild stays within operational tolerances (see [§ Scale and Operational Plan](#scale-and-operational-plan)).
+- `agent_config.memory` is a JSON sub-object on the existing `agents.agent_config` JSONB column. **API-layer implication:** the Java `AgentConfigRequest` record must be extended with an explicit `MemoryConfigRequest memory` field; Spring Boot's default Jackson configuration will otherwise fail on unknown properties (`FAIL_ON_UNKNOWN_PROPERTIES = true`), and the `AgentService.canonicalizeConfig` rebuilder will drop the field on round-trip. Track 5 updates `AgentConfigRequest`, `ConfigValidationHelper.validateAgentConfig`, and the canonicalization path to recognize the new sub-object, matching the pattern already used by `SandboxConfigRequest`.
+- `attached_memory_ids` at submission must all resolve via a single SQL check `WHERE memory_id = ANY($1) AND tenant_id = :caller AND agent_id = :path_agent`. Any mismatch (unknown id, wrong tenant, wrong agent) rejects the submission with a uniform 4xx error that does **not** distinguish the cause. UUID non-enumerability is relied upon but is not a substitute for the scope predicate.
+- `skip_memory_write` at submission is a per-task override; it never changes the agent's persisted configuration.
+- `memory_note` inputs are bounded at 2 KB per call. Longer text is rejected by the tool with a usable error the agent can recover from. `memory_note` is only registered when the task-level effective setting is memory-enabled — i.e., `agent.memory.enabled = true AND NOT skip_memory_write`.
 - `memory_search.limit` is capped at 10 when invoked as a tool, 20 via the REST API.
-- Entry lookups by `memory_id` include an implicit `tenant_id = :caller_tenant AND agent_id = :path_agent` filter. A mismatched id returns 404, not 403, to avoid leaking existence.
+- `memory_search.q` is always converted via `websearch_to_tsquery('english', :q)` before use. Raw `to_tsquery` over user/LLM-controlled input is forbidden — it surfaces parse errors as a DoS/error-oracle.
+- **404-not-403 disclosure rule applies globally.** Every path that could reveal existence of an entry or attachment across tenants or agents returns a uniform "not found" response: single-entry lookup (`GET /v1/agents/{agent_id}/memory/{memory_id}`), `DELETE`, list endpoints with filters that miss scope, search endpoints where the path `agent_id` does not exist, and tool errors from `memory_search` / `task_history_get`. Callers never learn whether an id exists, was deleted, or simply belongs to a scope they cannot see.
+- **Memory-query invariant.** Every SQL query reading `agent_memory_entries` must include both `tenant_id = :bound` and `agent_id = :bound` predicates. The repository layer rejects queries missing either; a static-analysis / code-review rule enforces this at review time. Indexes are not partitioned by tenant, so these predicates are what pre-filters the vector/BM25 search — without them, HNSW may return cross-agent neighbors even at low `ef_search`.
 
 ## Embeddings
 
 - The platform uses a single embedding provider for memory. Default: `text-embedding-3-small` (1536 dimensions).
+- **Postgres version:** pgvector requires PG ≥ 12; HNSW requires pgvector ≥ 0.5.0 on PG ≥ 13. v1 pins pgvector ≥ 0.7 so that `halfvec` is available as a future-compatible option (not used in v1).
 - The embedding provider key is stored alongside the existing LLM provider keys (Phase 2 retains the Phase 1 `provider_keys` model; Secrets-Manager-backed resolution is deferred to Phase 3+). No new credential mechanism is introduced by this track — the Model Discovery startup path is extended to validate the embedding key alongside chat-model keys.
-- Embedding calls happen at memory-write time (one per entry) and at `memory_search` time when `mode` includes vector (one per search). Both costs are platform-internal in v1 and not charged back to customers — they are small relative to the summarizer LLM call.
-- If the embedding provider is unavailable at write time, the entry is written with `content_vec = NULL` and a structured log line indicates the missing embedding. Search degrades to text-only for that entry. A background reconciliation to backfill missing embeddings is **out of scope** for v1 — deferred embeddings remain `NULL` until explicitly reindexed.
+- **Data-flow trust boundary.** Every memory write (normal, template-fallback, and dead-letter paths) ships the concatenated `title + summary + observations + tags` text to the embedding provider. This is the same trust boundary as the chat LLM provider and inherits the same provider-key hygiene from Phase 1. Template-fallback and dead-letter entries are subject to the same secret-scanning / redaction policy as chat LLM traffic — notably, a stray echoed API key in `final_output` will flow into both the stored `summary` and the embedding request.
+- **Cost accounting.** Embedding calls happen at memory-write time (one per entry) and at `memory_search` time when `mode` includes vector (one per search). Each call records an entry in `agent_cost_ledger` with a distinct `cost_category` (e.g., `'memory_embedding'`) attributed to the task (write) or the initiating task / agent (search). Rates are **zero-rated in v1** — the ledger tracks usage so operators can detect runaway agents, but no charge hits customer budgets. A later track can flip the rate without changing schema.
+- If the embedding provider is unavailable at write time, the entry is written with `content_vec = NULL` and a structured log line indicates the missing embedding. Search degrades to text-only for that entry; vector-branch queries include `WHERE content_vec IS NOT NULL` and simply skip these rows. A background reconciliation to backfill missing embeddings is **out of scope** for v1 — deferred embeddings remain `NULL` until explicitly reindexed.
+
+## Scale and Operational Plan
+
+Track 5's v1 shape (single shared table, global HNSW, unbounded entries up to the per-agent soft cap) is deliberately simple. It works well up to a moderate corpus (order of 100k–1M rows) and degrades gracefully past that. This section names where it stops scaling and the path forward.
+
+**At what corpus size the v1 shape breaks:**
+
+- **Global HNSW index build & memory footprint.** HNSW is graph-structured; pgvector's HNSW keeps the graph in `shared_buffers` for hot queries. At ~1M rows × 1536 dims × float32, the raw vector footprint alone is ~6 GB, and the HNSW graph adds on top of that. Concurrent index builds (e.g., from `REINDEX CONCURRENTLY`) can peak at 2–3× that. Past ~10M rows, single-node pgvector becomes operationally painful.
+- **Global vs per-tenant recall.** Because indexes are not partitioned by `(tenant_id, agent_id)`, vector queries apply the tenant/agent filter as a post-HNSW predicate. At small corpora this is fine; at large corpora with heavily skewed tenant traffic, recall for smaller tenants can suffer because their entries may not reach the `ef_search` neighbor set.
+
+**Scale-out plan (forward-compatible with v1):**
+
+1. **Per-agent soft cap (10,000 entries, platform-max 100,000)** — already in Core Decisions. FIFO trim on insert keeps any single agent's corpus bounded. Most agents never cross the cap.
+2. **Partial indexes for large tenants** (post-v1). If a single tenant produces most of the corpus, add partial HNSW indexes filtered by `tenant_id` for that tenant. pgvector supports partial indexes; switching to them is a non-breaking migration.
+3. **Partitioning by `tenant_id` or `(tenant_id, agent_id)`** (later phase). Declarative `PARTITION BY HASH(tenant_id)` on `agent_memory_entries`, with per-partition HNSW indexes. This is the real scale-out answer but is a larger migration. The v1 schema does not preclude it.
+4. **`halfvec` downgrade** (later phase). pgvector ≥ 0.7 supports `halfvec(1536)` at 2 bytes per dimension instead of 4; the index memory footprint halves with minimal recall loss. Can be flipped later with a column swap migration.
+
+**Operational monitoring to add during implementation** (instrumentation enumerated now, dashboards deferred):
+
+- Per-agent entry count and approximate bytes, surfaced via `agent_storage_stats` in the list response and logged at task completion.
+- `memory_write` node end-to-end latency (summarizer + embedding + upsert commit).
+- Embedding-provider error rate.
+- `memory_search` p50 / p95 latency for each `mode`.
+- HNSW `ef_search` effective and max-rows-scanned per query (to detect recall starvation).
+- Count of rows with `content_vec IS NULL` per agent (deferred-embedding backlog).
 
 ## Cross-Track Coordination
 
@@ -461,29 +609,74 @@ If the selected agent has `memory.enabled = false`, the attachment UI is hidden.
 - **Track 3 (Scheduler & Budgets):** Summarizer LLM cost is recorded via the existing `agent_cost_ledger` mechanism, attributed to the task that produced the entry. Hourly and per-task budget enforcement applies to the final memory-write call like any other step.
 - **Track 4 (BYOT):** Memory is platform-owned and unrelated to the custom tool runtime. `memory_note`, `memory_search`, and `task_history_get` are built-in tools, not BYOT tools.
 - **Track 7 (Context Window Management, proposed):** Track 5 and Track 7 are independent for shipping purposes — neither blocks the other. There is, however, one deliberate design coupling worth naming:
-  - **Pre-compaction memory flush.** When Track 7's Tier 3 summarization fires mid-task, the agent would otherwise lose anything in the about-to-be-compacted messages that it had not yet captured via `memory_note`. To mitigate this, Track 7 is expected to introduce a short "pre-compaction flush" hook: a separate agentic turn immediately before Tier 3 runs, with a system instruction of the form *"Compaction is about to run. Use `memory_note` to save anything worth persisting that has not already been noted."* This reuses Track 5's existing `memory_note` tool and its graph-state-backed observations buffer — no new Track 5 primitive is required.
+  - **Pre-compaction memory flush.** When Track 7's Tier 3 summarization fires mid-task, the agent would otherwise lose anything in the about-to-be-compacted messages that it had not yet captured via `memory_note`. To mitigate this, Track 7 is expected to introduce a short "pre-compaction flush" hook: a full agentic turn (LLM call) immediately before Tier 3 runs, with a system instruction of the form *"Compaction is about to run. Use `memory_note` to save anything worth persisting that has not already been noted."* This is **not a synchronous platform-invoked tool call** — LangGraph tool invocation requires an `AIMessage.tool_calls`, so the flush literally is one extra LLM turn. It carries its own cost, latency, and context footprint, which Track 7's design is expected to budget and throttle.
   - **Implication for Track 5:** `memory_note` is designed to be callable from such system-triggered turns, not only from agent-initiated reasoning. The observations buffer is append-only and resilient to multiple calls throughout a task's life. The exact trigger design — when the flush fires, how it is throttled, whether it is opt-out — is deferred to Track 7's brainstorm.
-  - If Track 7 ships first, the final memory-write node runs on an already-compacted conversation, which is cheaper to summarize. If Track 7 ships after Track 5, memory write already works; Track 7 extends it with the flush hook.
+  - If Track 7 ships first, the `memory_write` node runs on an already-compacted conversation, which is cheaper to summarize. If Track 7 ships after Track 5, memory write already works; Track 7 extends it with the flush hook without any Track 5 schema or tool change.
 - **Agent Capabilities (sandbox/artifacts):** Orthogonal. Sandbox task inputs and artifact outputs are captured in the conversation like any other tool; the summarizer treats them the same.
 
 ## Development Environment Assumption
 
-Track 5 introduces a new Postgres extension (`pgvector`) and a new table. Schema changes may be folded into the existing SQL files. Existing dev data does not need to be preserved; local dev databases will be re-initialized. The CI workflow must enable `pgvector` on the E2E Postgres service container.
+Track 5 introduces the `pgvector` Postgres extension, two new tables (`agent_memory_entries`, `task_attached_memories`), a generated column using `to_tsvector('english'::regconfig, …)`, and HNSW indexes. The runtime currently uses the stock `postgres:16` Docker image, which does **not** ship pgvector — so enabling this track requires coordinated changes to local dev, CI, and production Postgres environments.
+
+**Image pin.** All Postgres environments switch from `postgres:16` to `pgvector/pgvector:pg16` (official pgvector distribution with matching PG major version). This applies to:
+
+- `docker-compose.yml` for local dev (both `par-dev-postgres` and `par-e2e-postgres`).
+- `.github/workflows/ci.yml` service container definitions (unit-test job, E2E job, worker-test job — any job that spins up Postgres).
+- Whatever container/RDS instance backs staging and production. RDS offers pgvector as a native extension on PG ≥ 15; if the production target is a managed Postgres that does not include pgvector, this is a deploy blocker that must be resolved before Track 5 ships.
+
+**Migration.** A new numbered migration file (next available slot, e.g. `0011_agent_memory.sql`) runs:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE agent_memory_entries ( ... );
+CREATE TABLE task_attached_memories ( ... );
+
+-- Generated column using the two-arg to_tsvector form
+-- (IMMUTABLE, required for STORED GENERATED)
+ALTER TABLE agent_memory_entries
+  ADD COLUMN content_tsv tsvector
+  GENERATED ALWAYS AS (
+    to_tsvector(
+      'english'::regconfig,
+      coalesce(title, '') || ' ' ||
+      coalesce(summary, '') || ' ' ||
+      array_to_string(observations, ' ') || ' ' ||
+      array_to_string(tags, ' ')
+    )
+  ) STORED;
+
+CREATE INDEX idx_memory_entries_tenant_agent_created
+  ON agent_memory_entries (tenant_id, agent_id, created_at DESC);
+
+CREATE INDEX idx_memory_entries_tsv
+  ON agent_memory_entries USING GIN (content_tsv);
+
+-- HNSW with pgvector default params (m=16, ef_construction=64)
+CREATE INDEX idx_memory_entries_vec
+  ON agent_memory_entries USING HNSW (content_vec vector_cosine_ops);
+```
+
+`CREATE EXTENSION vector` requires superuser privileges on most managed Postgres offerings; confirm the deploy role before shipping. Existing dev data does not need to be preserved — local dev databases will be re-initialized.
+
+**Java API surface.** The `AgentConfigRequest` record and `ConfigValidationHelper.validateAgentConfig` are extended with an explicit `MemoryConfigRequest memory` nested object (see [§ Validation and Consistency Rules](#validation-and-consistency-rules)). Without this change, memory configuration posted via `POST /v1/agents` is rejected by Jackson before reaching the service layer.
 
 ## Acceptance Criteria
 
 Track 5 is complete from a design perspective when all of the following are true:
 
-1. A customer can enable memory for an agent and choose a summarizer model (or accept the platform default).
-2. Every completed task with memory enabled writes exactly one entry containing a title, summary, and the agent's observations. Summarizer outage does not break this invariant — a template fallback entry is written instead, flagged via `summarizer_model_id = 'template:fallback'`.
-3. `dead_letter` tasks with observations write a minimal entry (`outcome = 'failed'`, `summarizer_model_id = 'template:dead_letter'`); `dead_letter` tasks without observations, and all `cancelled` tasks, write nothing.
-4. Follow-up runs and redrives reusing the same `task_id` **overwrite** the prior memory entry. The entry always reflects the latest execution; `created_at` is preserved, `updated_at` advances.
-5. The agent can call `memory_note` during execution to append observations that appear verbatim in the final entry alongside the retrospective summary.
-6. The agent can call `memory_search` and receive ranked hybrid results (RRF, k=60, 4× candidate multiplier) scoped to its own agent.
-7. The agent can call `task_history_get(task_id)` and receive a bounded structured view of any past task on the same agent.
-8. A customer can attach specific memory entries to a new task at submission; the resolved entries are injected into the task's initial context. The submitted id set is persisted on the task row (`attached_memory_ids`) and in the `task_submitted` event details, so the audit trail of which memories were injected into a given run is queryable after the fact.
-9. A customer can browse, search, read, and delete memory entries for each of their agents via the Console and the API.
-10. Cross-tenant and cross-agent access is rejected at the API layer and invisible to the caller (404, not 403).
-11. If `memory.enabled` is `false`, no memory tools are registered, no final node runs, no entries are written, and no cost is incurred.
-12. The memory write does not block task completion — on summarizer failure, the template fallback writes the entry and the task still transitions to `completed`.
-13. All acceptance scenarios are covered by unit and E2E tests, including: memory disabled, memory enabled / successful write, summarizer-outage template fallback, dead-letter with and without observations, cancellation, follow-up overwrite, redrive overwrite, concurrent task completion, cross-tenant attachment rejection, and search degradation when pgvector is unavailable.
+1. A customer can enable memory for an agent and choose a summarizer model (or accept the platform default). The agent-level toggle is persisted at `agent_config.memory.enabled` with `max_entries` honoring the platform-default soft cap.
+2. Every completed task with `memory.enabled = true` AND `skip_memory_write = false` writes exactly one entry containing a title, summary, and the agent's observations. Summarizer outage does not break this invariant — a template fallback entry is written instead, flagged via `summarizer_model_id = 'template:fallback'`.
+3. `dead_letter` tasks with observations write a minimal template entry (`outcome = 'failed'`, `summarizer_model_id = 'template:dead_letter'`). `dead_letter` tasks with `dead_letter_reason = 'cancelled_by_user'`, and `dead_letter` tasks with no observations, write nothing.
+4. Follow-up runs and redrives reusing the same `task_id` **overwrite** the prior memory entry. The entry always reflects the latest execution; `created_at` is preserved, `updated_at` and `version` advance. On follow-up, the graph state's `observations` is seeded from the existing row's `observations` column so earlier observations are not lost.
+5. The agent can call `memory_note` during execution to append observations. Observations are durable at super-step checkpoint granularity and appear verbatim in the final entry alongside the retrospective summary.
+6. The agent can call `memory_search` and receive ranked hybrid results (RRF, k=60, 4× candidate multiplier) scoped to its own `(tenant_id, agent_id)`. Tool scope is bound from the worker's task context, not from LLM arguments.
+7. The agent can call `task_history_get(task_id)` and receive a bounded structured view of any past task in the same `(tenant_id, agent_id)`. Cross-agent or cross-tenant task ids return a tool-shaped "not found" error.
+8. A customer can attach specific memory entries to a new task at submission. Attachment is validated via a single scoped SQL query; on any resolution miss the submission rejects with a uniform 4xx shape. Resolved attachments are persisted in `task_attached_memories` (with preserved `position`) and mirrored into the `task_submitted` event's `details` JSONB.
+9. A customer can browse, search, read, and delete memory entries for each of their agents via the Console and the API. `agent_storage_stats` surfaces entry count and approximate bytes.
+10. Cross-tenant and cross-agent access is rejected at the API layer with a uniform 404-shape response across list, single-entry lookup, search, delete, and tool-surface errors.
+11. If `memory.enabled` is `false` OR task-level `skip_memory_write = true`, no memory tools are registered, the `memory_write` node is absent from the graph, no entries are written, and no cost is incurred.
+12. Memory write does not block task completion: on summarizer LLM failure, the template fallback writes the entry and the task still transitions to `completed`. On `pgvector` / embedding outage, the row is written with `content_vec = NULL` and search degrades to text-only.
+13. When an agent reaches `max_entries`, FIFO trim removes the oldest entry in the same transaction as the new write; Console surfaces a warning at 80% of cap.
+14. Summarizer LLM and embedding calls are recorded in `agent_cost_ledger`. Summarizer cost is exempt from `budget_max_per_task` pause enforcement (to avoid paused-with-pending-memory incoherence); embedding cost is zero-rated in v1.
+15. All acceptance scenarios are covered by unit and E2E tests, including: memory disabled, memory enabled with successful write, summarizer-outage template fallback, embedding-outage deferred-vector path, dead-letter with and without observations, cancellation (`cancelled_by_user`), follow-up overwrite and observation seeding, redrive overwrite, cross-tenant attachment rejection, `memory_search` with all three modes, `task_history_get` scope enforcement, `max_entries` FIFO trim, and `skip_memory_write` at submission.
