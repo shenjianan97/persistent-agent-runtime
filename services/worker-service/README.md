@@ -51,6 +51,7 @@ Create a `.env` file in `services/worker-service/` or export directly:
 | `AWS_SECRET_ACCESS_KEY` | Bedrock models | — |
 | `AWS_REGION` | Bedrock models | — |
 | `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
+| `MEMORY_DEFAULT_SUMMARIZER_MODEL` | Platform-default summarizer model for memory-enabled agents that don't set `agent_config.memory.summarizer_model` | `claude-haiku-4-5` |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | Dev-only task controls and `dev_sleep` tool | `false` |
 
 > **Memory-enabled agents (Phase 2 Track 5).** Memory writes compute embeddings via

@@ -1,0 +1,471 @@
+"""Phase 2 Track 5 — ``memory_write`` LangGraph node + state schema.
+
+The state schema :class:`MemoryEnabledState` extends LangGraph's stock
+``MessagesState`` with two memory-specific fields:
+
+* ``observations`` — a list of strings the agent appends via the Task 7
+  ``memory_note`` tool. Declared as ``Annotated[list[str], operator.add]`` so
+  LangGraph treats it as an **associative, append-only** channel; every tool
+  return that sets ``observations=[note]`` is merged via list concatenation and
+  the reducer becomes durable at super-step checkpoint granularity. The
+  ``operator.add`` reducer on a list-typed channel is the pattern documented in
+  the LangGraph state-management docs (see
+  https://langchain-ai.github.io/langgraph/how-tos/graph-api/#use-reducers-to-update-state) —
+  Phase 2 Track 5 is the first place in this worker that uses a custom state
+  schema, so the pattern was imported from that documentation rather than
+  copied from a sibling module.
+* ``pending_memory`` — written by the ``memory_write`` node on the agent's
+  terminal branch, then read once by the worker's post-``astream`` commit
+  path. Absent while execution is in-flight; a dictionary after the node
+  fires. Never merged — each run either writes it once or leaves it unset.
+
+The node itself is intentionally factored so that the heavy external calls
+(summarizer LLM and embedding provider) are injected as plain async callables.
+That makes the node unit-testable without a live provider or DB, and keeps the
+contract small enough that the wiring in :mod:`executor.graph` stays readable.
+
+Terminal-only guarantee
+-----------------------
+This module provides the node function. The graph assembly in
+:mod:`executor.graph` wires it only into the "no pending tool calls" branch —
+the **single** terminal path out of the ``agent`` node. HITL pauses, budget
+pauses, cancellations, and dead-letters all exit via different paths and
+therefore never traverse ``memory_write``. That invariant is enforced by the
+edge wiring, not by anything inside this node. See
+``docs/design-docs/phase-2/track-5-memory.md`` § "Successful-task memory
+write — hybrid graph-node + worker commit".
+"""
+
+from __future__ import annotations
+
+import logging
+import operator
+import os
+import time
+from dataclasses import dataclass
+from typing import Annotated, Any, Awaitable, Callable, Protocol
+
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import MessagesState
+from langgraph.types import Command
+
+from executor.embeddings import EmbeddingResult, compute_embedding
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constants (documented in services/worker-service/README.md)
+# ---------------------------------------------------------------------------
+
+# The env variable is consulted once at import time. Operators override the
+# platform default via ``MEMORY_DEFAULT_SUMMARIZER_MODEL`` — the compiled-in
+# fallback is a cheap Haiku-class model per the design doc. We read env at
+# import time (not per call) so test monkeypatching needs to reload the
+# module; the production worker is long-lived so re-reading would be waste.
+PLATFORM_DEFAULT_SUMMARIZER_MODEL: str = os.environ.get(
+    "MEMORY_DEFAULT_SUMMARIZER_MODEL", "claude-haiku-4-5"
+)
+
+# Sentinel values written into ``agent_memory_entries.summarizer_model_id``
+# when the summarizer is unavailable. Both sentinels fall outside the normal
+# ``<provider>/<model>`` shape, so the column lives free-form (no FK to
+# ``models``).
+SUMMARIZER_TEMPLATE_FALLBACK = "template:fallback"
+
+# Caps documented in the design doc § "Successful-task memory write".
+_TITLE_INPUT_SLICE_CHARS = 80
+_SUMMARY_FINAL_OUTPUT_SLICE_CHARS = 1024
+
+# The node name used by the budget carve-out lookup in ``graph.py``. Anything
+# that imports this should NOT hard-code the string.
+MEMORY_WRITE_NODE_NAME = "memory_write"
+
+# ``tags`` is reserved in the schema for forward-compatibility (v1 has no tag
+# tool or tag input). The node always writes an empty list. Callers MUST NOT
+# invent tags at write time — that is deferred to a future iteration.
+_EMPTY_TAGS: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# State schema
+# ---------------------------------------------------------------------------
+
+
+class MemoryEnabledState(MessagesState):
+    """LangGraph state type for memory-enabled tasks.
+
+    Adds two fields to ``MessagesState``:
+
+    * ``observations`` — append-only list. Reducer is ``operator.add`` so any
+      node that returns ``{"observations": [note]}`` is merged associatively.
+    * ``pending_memory`` — populated once by the terminal ``memory_write``
+      node; read once by the worker's post-astream commit.
+
+    Memory-disabled tasks keep using plain ``MessagesState`` (see graph
+    assembly in :mod:`executor.graph`). The effective-memory gate is
+    :func:`effective_memory_enabled`.
+    """
+
+    observations: Annotated[list[str], operator.add]
+    pending_memory: dict[str, Any] | None
+
+
+# ---------------------------------------------------------------------------
+# Effective-memory gate
+# ---------------------------------------------------------------------------
+
+
+def effective_memory_enabled(
+    *,
+    agent_config: dict[str, Any],
+    skip_memory_write: bool,
+) -> bool:
+    """Single predicate used by every downstream memory branch.
+
+    ``effective_memory_enabled = agent.memory.enabled AND NOT
+    tasks.skip_memory_write``. Designed to be computed once per task at the
+    top of ``execute_task`` so every code site that branches on memory state
+    reads the same decision.
+    """
+
+    memory = agent_config.get("memory") if isinstance(agent_config, dict) else None
+    if not isinstance(memory, dict):
+        return False
+    enabled = memory.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return False
+    return enabled and not bool(skip_memory_write)
+
+
+# ---------------------------------------------------------------------------
+# Summarizer contract (callable signature documented below)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SummarizerResult:
+    """What the summarizer callable returns to the node.
+
+    The node does not own the LLM client — :mod:`executor.graph` builds a
+    closure that calls the configured chat model and returns this dataclass.
+    Keeping the shape here decouples the node's unit tests from the chat
+    client and makes the cost-attribution contract explicit.
+    """
+
+    title: str
+    summary: str
+    model_id: str
+    tokens_in: int
+    tokens_out: int
+    cost_microdollars: int
+
+
+class SummarizerCallable(Protocol):
+    """Injected callable signature. Implemented by :mod:`executor.graph`."""
+
+    async def __call__(
+        self, *, system: str, user: str, model_id: str
+    ) -> SummarizerResult | Any:
+        ...
+
+
+EmbeddingCallable = Callable[[str], Awaitable[EmbeddingResult | None]]
+
+
+# ---------------------------------------------------------------------------
+# Template fallback helper
+# ---------------------------------------------------------------------------
+
+
+def build_pending_memory_template_fallback(
+    *,
+    task_input: str | None,
+    final_output: str | None,
+    observations: list[str],
+) -> dict[str, Any]:
+    """Build a ``pending_memory`` dict when the summarizer is unavailable.
+
+    Invariant preserved across all paths: every completed memory-enabled task
+    emits exactly one ``agent_memory_entries`` row. The caller turns this
+    dict into the row verbatim; ``summarizer_model_id`` is the sentinel
+    ``'template:fallback'`` so operators can later regenerate.
+    """
+
+    safe_input = task_input or ""
+    input_slice = _sanitize_one_line(safe_input)[:_TITLE_INPUT_SLICE_CHARS]
+    title = f"Completed: {input_slice}"
+
+    safe_output = final_output if isinstance(final_output, str) else ""
+    output_slice = safe_output[:_SUMMARY_FINAL_OUTPUT_SLICE_CHARS]
+    summary = (
+        f"{output_slice} "
+        "[summary generation unavailable; review observations and linked "
+        "task trace for detail.]"
+    ).strip()
+
+    return {
+        "title": title,
+        "summary": summary,
+        "outcome": "succeeded",
+        "content_vec": None,  # Caller may overwrite with the embedding result.
+        "summarizer_model_id": SUMMARIZER_TEMPLATE_FALLBACK,
+        "observations_snapshot": list(observations),
+        "tags": list(_EMPTY_TAGS),
+        # Ledger-attribution metadata. The fallback never produced a
+        # billable summarizer call, so all three are zero.
+        "summarizer_tokens_in": 0,
+        "summarizer_tokens_out": 0,
+        "summarizer_cost_microdollars": 0,
+    }
+
+
+def _sanitize_one_line(text: str) -> str:
+    """Collapse whitespace so the title renders cleanly in Console lists."""
+    return " ".join(text.split())
+
+
+# ---------------------------------------------------------------------------
+# memory_write node
+# ---------------------------------------------------------------------------
+
+
+def _extract_final_output(messages: list[BaseMessage]) -> str | None:
+    """Best-effort recovery of the agent's final answer for the template
+    fallback. Used only when the summarizer failed — the happy path never
+    reads this text.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            content = msg.content
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                parts = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                joined = "\n".join(p for p in parts if p)
+                if joined.strip():
+                    return joined
+    return None
+
+
+def _build_summarizer_prompt(
+    *,
+    messages: list[BaseMessage],
+    observations: list[str],
+) -> tuple[str, str]:
+    """Assemble system + user messages for the summarizer call.
+
+    * ``system`` — describes the exact output shape. Keeping this out of the
+      user message lets template-fallback stay layout-agnostic.
+    * ``user`` — the per-task payload: observations + truncated transcript.
+    """
+    system = (
+        "You are the post-task memory summarizer. Produce a concise, "
+        "retrospective memory entry for the task that just completed. "
+        "Output exactly two sections, separated by a single blank line:\n"
+        "TITLE: <one line, action-oriented, max 10 words>\n"
+        "SUMMARY: <one paragraph, ≤400 words, describing what happened and "
+        "why — complement, do not duplicate, the agent observations below>"
+    )
+    obs_block = (
+        "AGENT OBSERVATIONS:\n"
+        + "\n".join(f"- {o}" for o in observations)
+        if observations
+        else "AGENT OBSERVATIONS: (none)"
+    )
+    # Keep the transcript summary bounded — very long runs can otherwise
+    # blow the summarizer's context. We hand the assistant a compact
+    # representation; the checkpointer still has the full trace.
+    transcript_lines: list[str] = []
+    for msg in messages[-40:]:  # last ~40 messages is plenty for a summary.
+        role = getattr(msg, "type", msg.__class__.__name__).upper()
+        content = msg.content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            content_str = "\n".join(parts)
+        else:
+            content_str = str(content)
+        transcript_lines.append(f"{role}: {content_str[:2000]}")
+    user = obs_block + "\n\nTRANSCRIPT:\n" + "\n".join(transcript_lines)
+    return system, user
+
+
+def _coerce_summarizer_result(raw: Any, model_id: str) -> SummarizerResult:
+    """Accept either a :class:`SummarizerResult` or a duck-typed namespace
+    with the same attributes. Callers in production return the dataclass;
+    tests occasionally use :class:`types.SimpleNamespace` for brevity.
+    """
+    if isinstance(raw, SummarizerResult):
+        return raw
+    return SummarizerResult(
+        title=getattr(raw, "title", ""),
+        summary=getattr(raw, "summary", ""),
+        model_id=getattr(raw, "model_id", model_id),
+        tokens_in=int(getattr(raw, "tokens_in", 0) or 0),
+        tokens_out=int(getattr(raw, "tokens_out", 0) or 0),
+        cost_microdollars=int(getattr(raw, "cost_microdollars", 0) or 0),
+    )
+
+
+async def memory_write_node(
+    state: dict[str, Any],
+    *,
+    task_input: str | None,
+    summarizer_model_id: str | None,
+    summarizer_callable: SummarizerCallable,
+    embedding_callable: EmbeddingCallable | None = None,
+    tenant_id: str | None = None,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    config: RunnableConfig | None = None,
+) -> Command:
+    """LangGraph node. Reads ``messages`` + ``observations`` off ``state``,
+    calls the summarizer LLM and the embedding provider, and returns a
+    :class:`Command` updating ``pending_memory``.
+
+    The node itself does no DB writes — the worker's post-``astream`` commit
+    path owns the transaction. That split is deliberate: keeping the LLM call
+    inside a LangGraph node means the checkpointer absorbs mid-call crashes
+    and a re-entered node sees a fresh retry path.
+
+    Parameters mirror the design-doc contract:
+
+    - ``summarizer_model_id`` — from ``agent_config.memory.summarizer_model``;
+      falls back to :data:`PLATFORM_DEFAULT_SUMMARIZER_MODEL` when ``None``.
+    - ``summarizer_callable`` / ``embedding_callable`` — injected by
+      :mod:`executor.graph`. ``embedding_callable`` defaults to
+      :func:`executor.embeddings.compute_embedding` in tests where the caller
+      is willing to make a real network call; unit tests override it.
+    """
+    del config  # Unused for now; kept in the signature for forward compat.
+
+    started_ns = time.monotonic_ns()
+    messages = state.get("messages") or []
+    observations = list(state.get("observations") or [])
+    resolved_model_id = summarizer_model_id or PLATFORM_DEFAULT_SUMMARIZER_MODEL
+    summarizer_cost_microdollars = 0
+    summarizer_tokens_in = 0
+    summarizer_tokens_out = 0
+
+    logger.info(
+        "memory.write.started tenant_id=%s agent_id=%s task_id=%s "
+        "observations=%d messages=%d",
+        tenant_id, agent_id, task_id, len(observations), len(messages),
+    )
+
+    # 1. Summarizer call — template fallback on any unexpected exception.
+    try:
+        system, user = _build_summarizer_prompt(
+            messages=messages, observations=observations
+        )
+        raw = await summarizer_callable(
+            system=system, user=user, model_id=resolved_model_id
+        )
+        summarizer = _coerce_summarizer_result(raw, resolved_model_id)
+        if not summarizer.title or not summarizer.summary:
+            raise RuntimeError(
+                "summarizer returned empty title/summary; treating as outage"
+            )
+        pending_memory: dict[str, Any] = {
+            "title": summarizer.title,
+            "summary": summarizer.summary,
+            "outcome": "succeeded",
+            "content_vec": None,  # filled in step 2.
+            "summarizer_model_id": summarizer.model_id or resolved_model_id,
+            "observations_snapshot": observations,
+            "tags": list(_EMPTY_TAGS),
+            "summarizer_tokens_in": summarizer.tokens_in,
+            "summarizer_tokens_out": summarizer.tokens_out,
+            "summarizer_cost_microdollars": summarizer.cost_microdollars,
+        }
+        summarizer_cost_microdollars = summarizer.cost_microdollars
+        summarizer_tokens_in = summarizer.tokens_in
+        summarizer_tokens_out = summarizer.tokens_out
+    except Exception as exc:
+        logger.warning(
+            "memory.write.summarizer_failed tenant_id=%s agent_id=%s "
+            "task_id=%s error_class=%s error_message=%s",
+            tenant_id, agent_id, task_id,
+            type(exc).__name__, _short(str(exc)),
+        )
+        final_output = _extract_final_output(messages)
+        pending_memory = build_pending_memory_template_fallback(
+            task_input=task_input,
+            final_output=final_output,
+            observations=observations,
+        )
+
+    # 2. Embedding — compute over the concatenated title + summary + obs + tags.
+    embed_text = _build_embedding_text(pending_memory)
+    embed_callable = embedding_callable or compute_embedding
+    try:
+        embed_result = await embed_callable(embed_text)
+    except Exception as exc:
+        # compute_embedding itself never raises, but injected test doubles
+        # might. Keep the node bulletproof.
+        logger.warning(
+            "memory.write.embedding_unexpected_exception tenant_id=%s "
+            "agent_id=%s task_id=%s error=%s",
+            tenant_id, agent_id, task_id, _short(str(exc)),
+        )
+        embed_result = None
+
+    if embed_result is None:
+        pending_memory["content_vec"] = None
+        pending_memory["embedding_tokens"] = 0
+        pending_memory["embedding_cost_microdollars"] = 0
+        logger.info(
+            "memory.write.embedding_deferred tenant_id=%s agent_id=%s task_id=%s",
+            tenant_id, agent_id, task_id,
+        )
+    else:
+        pending_memory["content_vec"] = list(embed_result.vector)
+        pending_memory["embedding_tokens"] = embed_result.tokens
+        pending_memory["embedding_cost_microdollars"] = (
+            embed_result.cost_microdollars
+        )
+
+    latency_ms = (time.monotonic_ns() - started_ns) // 1_000_000
+    logger.info(
+        "memory.write.node_completed tenant_id=%s agent_id=%s task_id=%s "
+        "latency_ms=%d summarizer_model_id=%s content_vec_null=%s "
+        "summarizer_cost_microdollars=%d summarizer_tokens_in=%d "
+        "summarizer_tokens_out=%d",
+        tenant_id, agent_id, task_id, latency_ms,
+        pending_memory["summarizer_model_id"],
+        pending_memory["content_vec"] is None,
+        summarizer_cost_microdollars,
+        summarizer_tokens_in,
+        summarizer_tokens_out,
+    )
+
+    return Command(update={"pending_memory": pending_memory})
+
+
+def _build_embedding_text(pending_memory: dict[str, Any]) -> str:
+    """Concatenate the text that seeds the content_vec — matches the
+    generated-column expression so search-time BM25 and embedding-time
+    vector share a single content surface.
+    """
+    parts = [
+        pending_memory.get("title") or "",
+        pending_memory.get("summary") or "",
+        " ".join(pending_memory.get("observations_snapshot") or []),
+        " ".join(pending_memory.get("tags") or []),
+    ]
+    return " ".join(p for p in parts if p).strip()
+
+
+def _short(message: str, limit: int = 200) -> str:
+    cleaned = " ".join(message.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit] + "..."
