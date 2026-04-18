@@ -129,6 +129,33 @@ Extend the sandbox tool surface so agents doing real iterative coding (edit → 
 
 **Status:** Design proposed — see [track-8-coding-primitives.md](./track-8-coding-primitives.md). Implementation plan TBD.
 
+### Track 9 — Planning Primitive
+
+Add a durable, first-class plan/todo surface that survives compaction, checkpoint restart, and follow-up — the managed-runtime equivalent of Claude Code's `TodoWrite`, but as typed state rather than a message-history convention.
+
+- Typed `plan: list[PlanItem]` field on graph state; checkpointed by LangGraph
+- `plan_write` tool (full-list replace semantics) the agent calls when it decides to plan or replan
+- Auto-injection of current plan state into every LLM call, post-compaction
+- Opt-in per agent via `agent_config.planning.enabled` (default `false`), matching Track 5's shape
+- ReAct topology unchanged — the primitive is data, not graph control flow
+
+**Depends on:** Nothing hard-blocking. Composes with Track 7 (injection runs post-compaction) and Track 10 (deep-research mode may use this as its plan data surface).
+
+**Status:** Stub — see [track-9-planning-primitive.md](./track-9-planning-primitive.md). Direction sketched during 2026-04-17 brainstorm; full design and open questions pending.
+
+### Track 10 — Deep Research Mode (proposed)
+
+Add a first-class "deep research" agent mode selected at agent creation (`agent_config.mode = 'deep_research'`), with a distinct graph topology (orchestrator + parallel subagents + synthesiser) rather than a bolt-on tool. Inspired by Anthropic and OpenAI deep-research products.
+
+- New graph topology, separate from the default ReAct mode
+- Parallel subagent fan-out; subagent costs roll up into the parent task's budget (single budget envelope)
+- Builds on Track 9's planning primitive for its plan/tree representation
+- Coding capabilities (Track 8) remain orthogonal — any mode can be configured with coding tools
+
+**Depends on:** Track 9 (planning primitive) for the plan data surface.
+
+**Status:** Not started — brainstorm pending. Registered here to block accidental coupling with Track 9.
+
 ### Track 7 — Context Window Management
 
 Keep long-running tasks viable by bounding the in-task message-history growth that otherwise pushes tasks into context-limit or cost-limit failure.

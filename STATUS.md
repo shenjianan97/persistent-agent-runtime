@@ -19,6 +19,8 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 6 | GitHub Integration | Not started | — | — |
 | Track 7 | Context Window Management | Stub ([track-7-context-window-management.md](docs/design-docs/phase-2/track-7-context-window-management.md)); brainstorm pending | — | — |
 | Track 8 | Coding-Agent Primitives | Design proposed ([track-8-coding-primitives.md](docs/design-docs/phase-2/track-8-coding-primitives.md)); relocated from AC Track 3; plan not started | — | — |
+| Track 9 | Planning Primitive | Stub ([track-9-planning-primitive.md](docs/design-docs/phase-2/track-9-planning-primitive.md)); brainstorm pending | — | — |
+| Track 10 | Deep Research Mode | Not started (brainstorm after Track 9) | — | — |
 
 
 ### Cross-Cutting
