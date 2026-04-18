@@ -308,17 +308,44 @@ public class TaskService {
         List<Map<String, Object>> rows = taskRepository.getCheckpoints(taskId, tenantId)
                 .orElseThrow(() -> new TaskNotFoundException(taskId));
 
+        // The memory_write node sets the pending_memory channel, which then
+        // carries forward in every subsequent checkpoint's channel_values
+        // (LangGraph state is cumulative). So "this checkpoint has
+        // pending_memory" is not a reliable signal — only checkpoints where
+        // the pending_memory VALUE changed from the previous one are actual
+        // memory_write steps. We compute this boolean once, up-front, then
+        // override the event on flagged checkpoints.
+        boolean[] isMemoryWrite = new boolean[rows.size()];
+        Map<?, ?> priorPendingMemory = null;
+        for (int i = 0; i < rows.size(); i++) {
+            Map<String, Object> row = rows.get(i);
+            String checkpointId = (String) row.get("checkpoint_id");
+            Map<?, ?> currentPendingMemory = checkpointEventParser.extractPendingMemory(
+                    row.get("checkpoint_payload"), checkpointId);
+            if (currentPendingMemory != null && !currentPendingMemory.equals(priorPendingMemory)) {
+                isMemoryWrite[i] = true;
+                priorPendingMemory = currentPendingMemory;
+            }
+        }
+
         List<CheckpointResponse> checkpoints = IntStream.range(0, rows.size())
                 .mapToObj(i -> {
                     Map<String, Object> row = rows.get(i);
                     String checkpointId = (String) row.get("checkpoint_id");
                     String nodeName = checkpointEventParser.extractNodeName(row.get("metadata_payload"), checkpointId);
                     Object executionMetadata = parseJson(row.get("execution_metadata"));
-                    CheckpointEventResponse event = checkpointEventParser.parseEvent(
-                            row.get("checkpoint_payload"),
-                            row.get("metadata_payload"),
-                            nodeName,
-                            checkpointId);
+                    CheckpointEventResponse event;
+                    if (isMemoryWrite[i]) {
+                        Map<?, ?> memoryMap = checkpointEventParser.extractPendingMemory(
+                                row.get("checkpoint_payload"), checkpointId);
+                        event = checkpointEventParser.buildMemoryEvent(memoryMap);
+                    } else {
+                        event = checkpointEventParser.parseEvent(
+                                row.get("checkpoint_payload"),
+                                row.get("metadata_payload"),
+                                nodeName,
+                                checkpointId);
+                    }
                     return new CheckpointResponse(
                             checkpointId,
                             i + 1, // step_number derived from insertion order
@@ -331,7 +358,46 @@ public class TaskService {
                 })
                 .toList();
 
-        return new CheckpointListResponse(checkpoints);
+        return new CheckpointListResponse(relabelSubsequentMemorySaves(checkpoints));
+    }
+
+    // The first memory_write terminal step is a fresh save; subsequent ones
+    // (from follow-ups or redrives) UPSERT the same agent_memory_entries row
+    // via ON CONFLICT (task_id), so rendering them all as "Memory Saved" reads
+    // like multiple memories exist when only one does. Relabel 2nd+ events so
+    // users see the write path is a refresh, not a new row.
+    private List<CheckpointResponse> relabelSubsequentMemorySaves(List<CheckpointResponse> checkpoints) {
+        int memorySaveCount = 0;
+        List<CheckpointResponse> rewritten = new java.util.ArrayList<>(checkpoints.size());
+        for (CheckpointResponse cp : checkpoints) {
+            CheckpointEventResponse event = cp.event();
+            if (event != null && "Memory Saved".equals(event.title())) {
+                memorySaveCount++;
+                if (memorySaveCount > 1) {
+                    CheckpointEventResponse relabeled = new CheckpointEventResponse(
+                            event.type(),
+                            "Memory Updated",
+                            event.summary(),
+                            event.content(),
+                            event.toolName(),
+                            event.toolArgs(),
+                            event.toolResult(),
+                            event.usage());
+                    rewritten.add(new CheckpointResponse(
+                            cp.checkpointId(),
+                            cp.stepNumber(),
+                            cp.nodeName(),
+                            cp.workerId(),
+                            cp.costMicrodollars(),
+                            cp.executionMetadata(),
+                            relabeled,
+                            cp.createdAt()));
+                    continue;
+                }
+            }
+            rewritten.add(cp);
+        }
+        return rewritten;
     }
 
     public TaskObservabilityResponse getTaskObservability(UUID taskId) {

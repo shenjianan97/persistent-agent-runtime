@@ -120,7 +120,7 @@ export function MemoryEntryDetail({
 
                     <div className="flex flex-wrap gap-2 shrink-0">
                         <Link
-                            to={`/tasks/new?agentId=${encodeURIComponent(agentId)}&attachMemoryId=${encodeURIComponent(entry.memory_id)}`}
+                            to={`/tasks/new?agent_id=${encodeURIComponent(agentId)}&attachMemoryId=${encodeURIComponent(entry.memory_id)}`}
                         >
                             <Button
                                 type="button"
