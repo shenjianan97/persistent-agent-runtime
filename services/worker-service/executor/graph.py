@@ -82,8 +82,14 @@ from tools.sandbox_tools import (
     create_sandbox_write_file_fn,
     create_export_sandbox_file_fn,
 )
+from tools.memory_tools import (
+    MemoryToolContext,
+    build_memory_tools,
+)
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +121,35 @@ class GraphExecutor:
                 bucket_name=s3_bucket_name,
             )
         self._sandbox_provisioner: SandboxProvisioner | None = None
+
+        # Phase 2 Track 5 Task 7: shared HTTP client for worker→Memory-API
+        # calls (memory_search). Lazily created on first use so tests and
+        # memory-disabled deployments never open a socket. Base URL comes
+        # from ``MEMORY_API_BASE_URL`` env; the worker is co-located with
+        # the API service in dev/compose so the default points at the
+        # standard API port.
+        self._memory_api_http_client: httpx.AsyncClient | None = None
+        self._memory_api_base_url: str = os.environ.get(
+            "MEMORY_API_BASE_URL", "http://localhost:8080"
+        )
+
+    def _get_memory_api_http_client(self) -> httpx.AsyncClient:
+        """Lazily instantiate the worker-to-Memory-API HTTP client.
+
+        One client per :class:`GraphExecutor` (connection-pool friendly);
+        memory-disabled deployments never reach this path and therefore
+        never open a socket. Exposed as a method so tests can swap the
+        client in via attribute assignment on the executor instance.
+        """
+        if self._memory_api_http_client is None:
+            # A short-ish timeout keeps a hung Memory API from wedging the
+            # tool call. The worker's ``_await_or_cancel`` helper also
+            # surfaces cancellations, but the httpx-level timeout is the
+            # belt on top of suspenders.
+            self._memory_api_http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+        return self._memory_api_http_client
 
     @property
     def sandbox_provisioner(self) -> SandboxProvisioner | None:
@@ -436,6 +471,30 @@ class GraphExecutor:
             tenant_id=tenant_id,
             sandbox=sandbox,
             s3_client=s3_client,
+        )
+
+        # Phase 2 Track 5 Task 7 — memory tools are registered per-task with
+        # (tenant_id, agent_id) bound from the worker's task context. Scope
+        # is captured by closure; the LLM cannot override it via arguments.
+        #
+        # - ``memory_note`` and ``memory_search`` are gated on
+        #   ``effective_memory_enabled`` (agent.memory.enabled AND NOT
+        #   task.skip_memory_write).
+        # - ``task_history_get`` is always registered — diagnostic drill-down
+        #   that is still safe cross-scope because of the bound predicate.
+        memory_tool_ctx = MemoryToolContext(
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            pool=self.pool,
+            memory_api_base_url=self._memory_api_base_url,
+            http_client=self._get_memory_api_http_client(),
+            cancel_event=cancel_event,
+            await_or_cancel_fn=self._await_or_cancel,
+        )
+        tools = tools + build_memory_tools(
+            memory_tool_ctx,
+            effective_memory_enabled=memory_enabled,
         )
 
         # Merge custom tools from MCP servers
