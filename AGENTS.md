@@ -80,6 +80,17 @@ When orchestrating parallel subagents via the Agent tool, **always use `isolatio
 - After worktree agents complete, merge their branches into the main working tree.
 - Only skip worktrees when agents have truly zero file overlap (e.g., Python worker vs React console).
 
+### Browser verification is the orchestrator's job, not the subagent's
+
+Parallel subagents **must not** run Playwright / `make start` browser verification themselves. `make start` binds global ports (`5173` Console, `8080` API, `55432`/`55433` Postgres) that are not namespaced per worktree, so two subagents racing `make start` will collide and both will observe flaky or false-negative behaviour — and even a single subagent can clobber a running dev stack the user or another agent started.
+
+Ownership split when a task changes Console UI:
+
+- **Subagent:** implement code, write/update unit tests (`make console-test`), update `CONSOLE_BROWSER_TESTING.md` with the new scenario, and commit. **Do not** call `make start`, `make stop`, or any Playwright MCP browser tool. Report the intended scenario text back to the orchestrator.
+- **Orchestrator:** after merging the subagent's branch, start the stack once, run the Playwright scenarios described in `CONSOLE_BROWSER_TESTING.md` sequentially, and only mark the task done when browser verification passes. This is the "blocking gate" from §Browser Verification above — the gate lives with the orchestrator.
+
+This applies to any long-lived port-binding workflow (`make start`, `make e2e-stack-up`, the dev-watch Vite server, etc.), not just Playwright. Subagents get unit tests and static checks; anything that needs the live stack runs once, serially, in the orchestrator.
+
 ## External Pull Request References
 
 **Do not link to pull requests in other people's repositories** from commit messages or PR descriptions. GitHub creates a cross-reference timeline event on the target PR, which typically surfaces as a notification to its author — unsolicited noise once the upstream work has shipped.
