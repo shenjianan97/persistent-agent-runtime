@@ -159,6 +159,27 @@ What to verify:
 - Disabled state does not open the browser file picker
 - No console errors appear during click-to-browse or drag-and-drop interactions
 
+### Scenario 11: Submit-Page Memory Attach
+
+What it validates: The Submit-page memory-attach widget, token-footprint indicator, `skip_memory_write` toggle, and deep-link pre-selection are wired end-to-end.
+
+What to verify:
+
+- `/tasks/new` does NOT render the `Memory` card when the selected agent has `agent_config.memory.enabled = false` or the field is absent
+- Selecting an agent with `agent_config.memory.enabled = true` reveals a `Memory` card containing the `Attach Past Memories` picker (initially closed) and the `Skip writing a memory entry for this task` checkbox
+- Clicking `Browse` expands the picker and triggers a `GET /v1/agents/:agent_id/memory` call (confirm via `browser_network_requests`). The initial expand is lazy — no memory API hits before that
+- Typing in the search input switches the endpoint from `/memory` to `/memory/search?q=...`; clearing the input falls back to `/memory`
+- Clicking an entry in the picker adds it to the `Selected` panel below, in position order; clicking the `X` removes it
+- The `Attached context:` indicator renders with a byte approximation and entry count. Selecting a large entry (≥10 KB combined summary + observations) turns the indicator amber and surfaces a tooltip on hover
+- The `(N/50)` counter on the picker reflects the current selection size; selecting a 51st entry no-ops and surfaces a capped-selection warning
+- Submitting the form with attached memories POSTs a JSON body that contains `attached_memory_ids: [...]` in selection order and (when the checkbox is ticked) `skip_memory_write: true`. Verify via `browser_network_requests` on the `/v1/tasks` POST
+- After a successful submit, navigate to `/tasks/:taskId` and confirm the `TaskStatusResponse` exposes `attached_memory_ids` and `attached_memories_preview` with the attached entries — inspect with `browser_evaluate` against the task detail endpoint
+- Deep link: navigating to `/tasks/new?agent_id=<memory-enabled-agent>&attachMemoryId=<valid-memory-id>` auto-selects that entry in the Selected panel
+- Deep link mismatch: navigating with `attachMemoryId` pointing at a memory-DISABLED agent surfaces a toast along the lines of `Attachment ignored — memory is disabled for this agent` and does NOT render the Memory card
+- Clicking `Attach to new task` from the Memory tab (Task 9) opens `/tasks/new?agent_id=...&attachMemoryId=...` with the entry pre-selected
+- Switching the selected agent after a selection clears the Selected list (no cross-agent leak)
+- No console errors during any of the flows above
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -167,6 +188,7 @@ What to verify:
 | Agent management feature | 1, 2, 3 |
 | Task submission feature | 1, 3 |
 | Task submission file attachment feature | 1, 3, 10 |
+| Task submission memory attach feature | 1, 3, 11 |
 | Task detail / timeline feature | 1, 4 |
 | Task list feature | 1, 5 |
 | Budget / pause feature | 1, 4, 6 |
