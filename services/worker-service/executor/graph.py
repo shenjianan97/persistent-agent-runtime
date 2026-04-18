@@ -49,6 +49,24 @@ from executor.memory_graph import (
     memory_write_node,
 )
 from executor.embeddings import compute_embedding as _default_compute_embedding
+from core.agent_runtime_state_repository import (
+    decrement_running_count,
+    increment_hour_window_cost,
+)
+from core.checkpoint_repository import (
+    add_cost_and_preserve_metadata,
+    add_cost_to_latest_terminal_checkpoint,
+    fetch_latest_checkpoint_id,
+    fetch_latest_terminal_checkpoint_id,
+    set_cost_and_metadata,
+    set_execution_metadata,
+)
+from core.cost_ledger_repository import (
+    insert_cost_row,
+    min_created_at_in_hour_window,
+    sum_hourly_cost_for_agent,
+    sum_task_cost,
+)
 from core.memory_repository import (
     count_entries_for_agent,
     max_entries_for_agent,
@@ -701,51 +719,31 @@ class GraphExecutor:
                 f"Lease revoked before cost write for task {task_id}"
             )
 
-        import json as _json
-        await conn.execute(
-            '''UPDATE checkpoints
-               SET cost_microdollars = $1,
-                   execution_metadata = $4::jsonb
-               WHERE checkpoint_id = $2
-                 AND task_id = $3::uuid''',
-            cost_microdollars,
-            checkpoint_id,
-            task_id,
-            _json.dumps(execution_metadata) if execution_metadata else None,
+        await set_cost_and_metadata(
+            conn,
+            checkpoint_id=checkpoint_id,
+            task_id=task_id,
+            cost_microdollars=cost_microdollars,
+            execution_metadata=execution_metadata if execution_metadata else None,
         )
 
         # 2. Insert into agent_cost_ledger
-        await conn.execute(
-            '''INSERT INTO agent_cost_ledger
-                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-               VALUES ($1, $2, $3::uuid, $4, $5)''',
-            tenant_id,
-            agent_id,
-            task_id,
-            checkpoint_id,
-            cost_microdollars,
+        await insert_cost_row(
+            conn,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            checkpoint_id=checkpoint_id,
+            cost_microdollars=cost_microdollars,
         )
 
         # 3. Upsert agent_runtime_state, incrementing hour_window_cost_microdollars
-        await conn.execute(
-            '''INSERT INTO agent_runtime_state
-                   (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-               VALUES ($1, $2, 0, $3, '1970-01-01T00:00:00Z', NOW())
-               ON CONFLICT (tenant_id, agent_id) DO UPDATE
-               SET hour_window_cost_microdollars = agent_runtime_state.hour_window_cost_microdollars + $3,
-                   updated_at = NOW()''',
-            tenant_id,
-            agent_id,
-            cost_microdollars,
+        await increment_hour_window_cost(
+            conn, tenant_id, agent_id, cost_microdollars
         )
 
         # 4. Return cumulative task cost and hourly window cost
-        cumulative_task_cost = await conn.fetchval(
-            '''SELECT COALESCE(SUM(cost_microdollars), 0)
-               FROM agent_cost_ledger
-               WHERE task_id = $1::uuid''',
-            task_id,
-        )
+        cumulative_task_cost = await sum_task_cost(conn, task_id)
 
         hourly_cost = await conn.fetchval(
             '''SELECT hour_window_cost_microdollars
@@ -1092,36 +1090,26 @@ class GraphExecutor:
                     # Cost ledger rows for summarizer + embedding — attributed
                     # to the task's most recent checkpoint. We resolve the
                     # checkpoint inside the transaction for a consistent read.
-                    checkpoint_id = await conn.fetchval(
-                        '''SELECT checkpoint_id FROM checkpoints
-                           WHERE task_id = $1::uuid AND checkpoint_ns = ''
-                           ORDER BY created_at DESC LIMIT 1''',
-                        task_id,
+                    checkpoint_id = await fetch_latest_terminal_checkpoint_id(
+                        conn, task_id
                     )
                     summarizer_cost = int(
                         pending_memory.get("summarizer_cost_microdollars") or 0
                     )
                     if checkpoint_id and summarizer_cost > 0:
-                        await conn.execute(
-                            '''INSERT INTO agent_cost_ledger
-                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                               VALUES ($1, $2, $3::uuid, $4, $5)''',
-                            tenant_id, agent_id, task_id, checkpoint_id, summarizer_cost,
+                        await insert_cost_row(
+                            conn,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            task_id=task_id,
+                            checkpoint_id=checkpoint_id,
+                            cost_microdollars=summarizer_cost,
                         )
                         # Hourly-spend accrues normally — memory cost is
                         # exempt from the per-task pause check ONLY, not
                         # from the rolling-window aggregation.
-                        await conn.execute(
-                            '''INSERT INTO agent_runtime_state
-                                   (tenant_id, agent_id, running_task_count,
-                                    hour_window_cost_microdollars,
-                                    scheduler_cursor, updated_at)
-                               VALUES ($1, $2, 0, $3, '1970-01-01T00:00:00Z', NOW())
-                               ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                               SET hour_window_cost_microdollars =
-                                       agent_runtime_state.hour_window_cost_microdollars + $3,
-                                   updated_at = NOW()''',
-                            tenant_id, agent_id, summarizer_cost,
+                        await increment_hour_window_cost(
+                            conn, tenant_id, agent_id, summarizer_cost
                         )
                     embedding_cost = int(
                         pending_memory.get("embedding_cost_microdollars") or 0
@@ -1133,12 +1121,13 @@ class GraphExecutor:
                         checkpoint_id
                         and pending_memory.get("content_vec") is not None
                     ):
-                        await conn.execute(
-                            '''INSERT INTO agent_cost_ledger
-                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                               VALUES ($1, $2, $3::uuid, $4, $5)''',
-                            tenant_id, agent_id, task_id, checkpoint_id,
-                            embedding_cost,
+                        await insert_cost_row(
+                            conn,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            task_id=task_id,
+                            checkpoint_id=checkpoint_id,
+                            cost_microdollars=embedding_cost,
                         )
 
                     # Mirror the memory-write cost onto the checkpoint row.
@@ -1171,31 +1160,16 @@ class GraphExecutor:
                             "input_tokens": summarizer_tokens_in,
                             "output_tokens": summarizer_tokens_out,
                         }
-                        await conn.execute(
-                            '''UPDATE checkpoints
-                               SET cost_microdollars = cost_microdollars + $1,
-                                   execution_metadata = COALESCE(execution_metadata, $2::jsonb)
-                               WHERE checkpoint_id = $3
-                                 AND task_id = $4::uuid''',
-                            step_total_cost,
-                            json.dumps(exec_metadata),
-                            checkpoint_id,
-                            task_id,
+                        await add_cost_and_preserve_metadata(
+                            conn,
+                            checkpoint_id=checkpoint_id,
+                            task_id=task_id,
+                            delta_microdollars=step_total_cost,
+                            execution_metadata=exec_metadata,
                         )
 
                 # Track 3: decrement running_task_count on completion.
-                await conn.execute(
-                    '''INSERT INTO agent_runtime_state
-                           (tenant_id, agent_id, running_task_count,
-                            hour_window_cost_microdollars, scheduler_cursor,
-                            updated_at)
-                       VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                       ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                       SET running_task_count = GREATEST(
-                               agent_runtime_state.running_task_count - 1, 0),
-                           updated_at = NOW()''',
-                    tenant_id, agent_id,
-                )
+                await decrement_running_count(conn, tenant_id, agent_id)
                 await _insert_task_event(
                     conn, task_id, tenant_id, agent_id,
                     "task_completed", "running", "completed",
@@ -1755,11 +1729,8 @@ class GraphExecutor:
                                         resp_meta, model_name
                                     )
                                     async with self.pool.acquire() as cost_conn:
-                                        checkpoint_id = await cost_conn.fetchval(
-                                            '''SELECT checkpoint_id FROM checkpoints
-                                               WHERE task_id = $1::uuid
-                                               ORDER BY created_at DESC LIMIT 1''',
-                                            task_id
+                                        checkpoint_id = await fetch_latest_checkpoint_id(
+                                            cost_conn, task_id
                                         )
                                         if checkpoint_id:
                                             if step_cost > 0:
@@ -1796,14 +1767,11 @@ class GraphExecutor:
                                                             raise LeaseRevokedException(
                                                                 f"Lease revoked before metadata write for task {task_id}"
                                                             )
-                                                        await cost_conn.execute(
-                                                            '''UPDATE checkpoints
-                                                               SET execution_metadata = $1::jsonb
-                                                               WHERE checkpoint_id = $2
-                                                                 AND task_id = $3::uuid''',
-                                                            json.dumps(execution_metadata),
-                                                            checkpoint_id,
-                                                            task_id,
+                                                        await set_execution_metadata(
+                                                            cost_conn,
+                                                            checkpoint_id=checkpoint_id,
+                                                            task_id=task_id,
+                                                            execution_metadata=execution_metadata,
                                                         )
                                                     logger.debug(
                                                         "Task %s step cost: 0 microdollars (metadata persisted)",
@@ -1833,11 +1801,13 @@ class GraphExecutor:
                                                         if pause_sandbox_cost > 0:
                                                             try:
                                                                 async with self.pool.acquire() as sc_conn:
-                                                                    await sc_conn.execute(
-                                                                        """INSERT INTO agent_cost_ledger
-                                                                           (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                                                                           VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
-                                                                        tenant_id, agent_id, task_id, pause_sandbox_cost,
+                                                                    await insert_cost_row(
+                                                                        sc_conn,
+                                                                        tenant_id=tenant_id,
+                                                                        agent_id=agent_id,
+                                                                        task_id=task_id,
+                                                                        checkpoint_id='sandbox',
+                                                                        cost_microdollars=pause_sandbox_cost,
                                                                     )
                                                             except Exception:
                                                                 logger.warning(
@@ -1900,11 +1870,13 @@ class GraphExecutor:
                                 if hitl_sandbox_cost > 0:
                                     try:
                                         async with self.pool.acquire() as sc_conn:
-                                            await sc_conn.execute(
-                                                """INSERT INTO agent_cost_ledger
-                                                   (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                                                   VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
-                                                tenant_id, agent_id, task_id, hitl_sandbox_cost,
+                                            await insert_cost_row(
+                                                sc_conn,
+                                                tenant_id=tenant_id,
+                                                agent_id=agent_id,
+                                                task_id=task_id,
+                                                checkpoint_id='sandbox',
+                                                cost_microdollars=hitl_sandbox_cost,
                                             )
                                     except Exception:
                                         logger.warning(
@@ -1949,27 +1921,20 @@ class GraphExecutor:
                     if sandbox_cost_microdollars > 0:
                         try:
                             async with self.pool.acquire() as cost_conn:
-                                await cost_conn.execute(
-                                    """INSERT INTO agent_cost_ledger
-                                       (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-                                       VALUES ($1, $2, $3::uuid, 'sandbox', $4)""",
-                                    tenant_id,
-                                    agent_id,
-                                    task_id,
-                                    sandbox_cost_microdollars,
+                                await insert_cost_row(
+                                    cost_conn,
+                                    tenant_id=tenant_id,
+                                    agent_id=agent_id,
+                                    task_id=task_id,
+                                    checkpoint_id='sandbox',
+                                    cost_microdollars=sandbox_cost_microdollars,
                                 )
                                 # Also roll sandbox cost into the last checkpoint so that
                                 # total_cost_microdollars (summed from checkpoints by the API) includes it.
-                                await cost_conn.execute(
-                                    """UPDATE checkpoints
-                                       SET cost_microdollars = cost_microdollars + $1
-                                       WHERE checkpoint_id = (
-                                           SELECT checkpoint_id FROM checkpoints
-                                           WHERE task_id = $2::uuid AND checkpoint_ns = ''
-                                           ORDER BY created_at DESC LIMIT 1
-                                       )""",
-                                    sandbox_cost_microdollars,
-                                    task_id,
+                                await add_cost_to_latest_terminal_checkpoint(
+                                    cost_conn,
+                                    task_id=task_id,
+                                    delta_microdollars=sandbox_cost_microdollars,
                                 )
                         except Exception:
                             logger.warning(
@@ -2060,14 +2025,7 @@ class GraphExecutor:
                         )
                         if updated is not None:
                             # Track 3: Decrement running_task_count on completion
-                            await conn.execute(
-                                '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-                                   VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                                   ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                                   SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-                                       updated_at = NOW()''',
-                                tenant_id, agent_id
-                            )
+                            await decrement_running_count(conn, tenant_id, agent_id)
                             await _insert_task_event(
                                 conn, task_id, tenant_id, agent_id,
                                 "task_completed", "running", "completed",
@@ -2345,13 +2303,7 @@ class GraphExecutor:
         per_task_exceeded = cumulative_task_cost > budget_max_per_task
 
         # Check hourly budget (rolling 60-minute window from canonical ledger)
-        hour_cost = await conn.fetchval(
-            '''SELECT COALESCE(SUM(cost_microdollars), 0)
-               FROM agent_cost_ledger
-               WHERE tenant_id = $1 AND agent_id = $2
-                 AND created_at > NOW() - INTERVAL '60 minutes' ''',
-            tenant_id, agent_id
-        )
+        hour_cost = await sum_hourly_cost_for_agent(conn, tenant_id, agent_id)
         hourly_exceeded = hour_cost > budget_max_per_hour
 
         if not per_task_exceeded and not hourly_exceeded:
@@ -2375,11 +2327,8 @@ class GraphExecutor:
             }
             # Estimate when enough spend ages out: find the oldest ledger entry
             # in the window and add 60 minutes
-            oldest_entry_time = await conn.fetchval(
-                '''SELECT MIN(created_at) FROM agent_cost_ledger
-                   WHERE tenant_id = $1 AND agent_id = $2
-                     AND created_at > NOW() - INTERVAL '60 minutes' ''',
-                tenant_id, agent_id
+            oldest_entry_time = await min_created_at_in_hour_window(
+                conn, tenant_id, agent_id
             )
             if oldest_entry_time:
                 resume_eligible_at = oldest_entry_time + timedelta(minutes=60)
@@ -2434,14 +2383,7 @@ class GraphExecutor:
                 return
 
             # 2. Decrement running_task_count (use upsert for robustness)
-            await conn.execute(
-                '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-                   VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                   ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                   SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-                       updated_at = NOW()''',
-                tenant_id, agent_id
-            )
+            await decrement_running_count(conn, tenant_id, agent_id)
 
             # 3. Record task_paused event
             # NOTE: _insert_task_event is a MODULE-LEVEL function, not a method
@@ -2527,14 +2469,7 @@ class GraphExecutor:
 
                 if updated is not None:
                     # Track 3: Decrement running_task_count on HITL pause
-                    await conn.execute(
-                        '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-                           VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                           ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                           SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-                               updated_at = NOW()''',
-                        tenant_id, agent_id
-                    )
+                    await decrement_running_count(conn, tenant_id, agent_id)
                     # Insert event in same transaction only if the UPDATE affected a row
                     event_details = None
                     if interrupt_type == "input":
@@ -2616,14 +2551,7 @@ class GraphExecutor:
                     logger.warning("Task %s retry-requeue skipped: lease no longer owned by this worker.", task_id)
                     return
                 # Track 3: Decrement running_task_count on retry requeue
-                await conn.execute(
-                    '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-                       VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                       ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                       SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-                           updated_at = NOW()''',
-                    tenant_id, agent_id
-                )
+                await decrement_running_count(conn, tenant_id, agent_id)
                 await _insert_task_event(
                     conn, task_id, tenant_id, agent_id,
                     "task_retry_scheduled", "running", "queued",
@@ -2781,11 +2709,8 @@ class GraphExecutor:
                         # summarizer cost — no LLM call). Only recorded when
                         # an embedding was actually computed.
                         if pending_memory.get("content_vec") is not None:
-                            checkpoint_id = await conn.fetchval(
-                                '''SELECT checkpoint_id FROM checkpoints
-                                   WHERE task_id = $1::uuid AND checkpoint_ns = ''
-                                   ORDER BY created_at DESC LIMIT 1''',
-                                task_id,
+                            checkpoint_id = await fetch_latest_terminal_checkpoint_id(
+                                conn, task_id
                             )
                             if checkpoint_id:
                                 embedding_cost = int(
@@ -2794,16 +2719,13 @@ class GraphExecutor:
                                     )
                                     or 0
                                 )
-                                await conn.execute(
-                                    '''INSERT INTO agent_cost_ledger
-                                           (tenant_id, agent_id, task_id,
-                                            checkpoint_id, cost_microdollars)
-                                       VALUES ($1, $2, $3::uuid, $4, $5)''',
-                                    tenant_id,
-                                    agent_id,
-                                    task_id,
-                                    checkpoint_id,
-                                    embedding_cost,
+                                await insert_cost_row(
+                                    conn,
+                                    tenant_id=tenant_id,
+                                    agent_id=agent_id,
+                                    task_id=task_id,
+                                    checkpoint_id=checkpoint_id,
+                                    cost_microdollars=embedding_cost,
                                 )
 
                     # 2. Lease-validated task dead-letter update.
@@ -2839,14 +2761,7 @@ class GraphExecutor:
                         )
 
                     # Track 3: Decrement running_task_count on dead-letter
-                    await conn.execute(
-                        '''INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-                           VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-                           ON CONFLICT (tenant_id, agent_id) DO UPDATE
-                           SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-                               updated_at = NOW()''',
-                        tenant_id, agent_id
-                    )
+                    await decrement_running_count(conn, tenant_id, agent_id)
                     await _insert_task_event(
                         conn, task_id, tenant_id, agent_id,
                         "task_dead_lettered", "running", "dead_letter",
