@@ -843,6 +843,110 @@ class TaskServiceTest {
     }
 
     @Test
+    void getCheckpoints_memoryWriteCheckpoint_returnsMemorySavedEvent() {
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        // The memory_write node writes pending_memory but does NOT append to
+        // messages. Without the dedicated branch in CheckpointEventParser, the
+        // parser would re-render the trailing "ai" message as a duplicate
+        // "Agent Response" step. source is always "loop" (LangGraph's standard
+        // superstep label), so detection must key off channel_values.
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow(
+                        "cp-memory-write",
+                        "worker-a",
+                        0,
+                        null,
+                        "{\"source\": \"loop\", \"step\": 6}",
+                        """
+                                {
+                                  "channel_values": {
+                                    "messages": [
+                                      {"kwargs": {"type":"ai","content":"final answer"}}
+                                    ],
+                                    "pending_memory": {
+                                      "title": "Completed: test task",
+                                      "summary": "Agent produced final answer.",
+                                      "outcome": "succeeded",
+                                      "content_vec": [0.1, 0.2, 0.3],
+                                      "summarizer_model_id": "claude-haiku-4-5",
+                                      "observations_snapshot": ["obs 1", "obs 2"],
+                                      "tags": [],
+                                      "summarizer_tokens_in": 500,
+                                      "summarizer_tokens_out": 80,
+                                      "summarizer_cost_microdollars": 1200,
+                                      "embedding_tokens": 42,
+                                      "embedding_cost_microdollars": 5
+                                    }
+                                  }
+                                }
+                                """,
+                        now));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
+
+        CheckpointEventResponse event = taskService.getCheckpoints(taskId).checkpoints().get(0).event();
+
+        assertEquals("system", event.type());
+        assertEquals("Memory Saved", event.title());
+        // The memory_write step is rendered as prose (title + summary). None
+        // of the internal fields — observations, embedding vector, or
+        // accounting — leak into the task timeline.
+        assertNull(event.content());
+        assertEquals(
+                "Completed: test task\n\nAgent produced final answer.",
+                event.summary());
+    }
+
+    @Test
+    void getCheckpoints_multipleMemoryWrites_relabelsSubsequentAsUpdate() {
+        // First memory_write creates the agent_memory_entries row; subsequent
+        // memory_write steps (from follow-ups or redrives) UPSERT the same row
+        // via ON CONFLICT(task_id), so rendering them all as "Memory Saved"
+        // would imply multiple memories exist when only one does.
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        String memoryPayload = """
+                {
+                  "channel_values": {
+                    "messages": [ {"kwargs": {"type":"ai","content":"done"}} ],
+                    "pending_memory": {
+                      "title": "First pass",
+                      "summary": "Initial memory write.",
+                      "outcome": "succeeded"
+                    }
+                  }
+                }
+                """;
+        String memoryPayload2 = """
+                {
+                  "channel_values": {
+                    "messages": [ {"kwargs": {"type":"ai","content":"done again"}} ],
+                    "pending_memory": {
+                      "title": "Refreshed",
+                      "summary": "Follow-up refreshed memory.",
+                      "outcome": "succeeded"
+                    }
+                  }
+                }
+                """;
+        List<Map<String, Object>> rows = List.of(
+                checkpointRow("cp-memory-1", "worker-a", 0, null,
+                        "{\"source\": \"loop\", \"step\": 6}", memoryPayload, now),
+                checkpointRow("cp-memory-2", "worker-a", 0, null,
+                        "{\"source\": \"loop\", \"step\": 12}", memoryPayload2,
+                        Timestamp.from(now.toInstant().plusSeconds(10))));
+        when(taskRepository.getCheckpoints(taskId, "default")).thenReturn(Optional.of(rows));
+
+        List<CheckpointResponse> result = taskService.getCheckpoints(taskId).checkpoints();
+
+        assertEquals(2, result.size());
+        assertEquals("Memory Saved", result.get(0).event().title());
+        assertEquals("Memory Updated", result.get(1).event().title());
+        // Summary on the updated event still reflects the fresh memory content.
+        assertTrue(result.get(1).event().summary().contains("Follow-up refreshed memory."));
+    }
+
+    @Test
     void getCheckpoints_malformedPayload_fallsBackToCheckpointEvent() {
         UUID taskId = UUID.randomUUID();
         Timestamp now = Timestamp.from(Instant.now());

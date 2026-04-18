@@ -240,6 +240,64 @@ public class CheckpointEventParser {
                 null);
     }
 
+    /**
+     * Extract the {@code pending_memory} channel from a checkpoint payload,
+     * or {@code null} if absent. Used by the caller to detect memory_write
+     * transitions across consecutive checkpoints — the channel value carries
+     * forward once written, so only a change in value identifies the actual
+     * memory_write step.
+     */
+    public Map<?, ?> extractPendingMemory(Object checkpointPayload, String checkpointId) {
+        Object parsedPayload = parseJson(checkpointPayload, "checkpoint_payload", checkpointId);
+        if (parsedPayload instanceof Map<?, ?> payloadMap) {
+            Object channelValues = payloadMap.get("channel_values");
+            if (channelValues instanceof Map<?, ?> channelMap) {
+                Object pendingMemory = channelMap.get("pending_memory");
+                if (pendingMemory instanceof Map<?, ?> memoryMap) {
+                    return memoryMap;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Build the user-facing event for a memory_write checkpoint. Only the
+     * title + summary are surfaced; observations, embeddings, and accounting
+     * are internal and belong on the memory detail page, not the timeline.
+     */
+    public CheckpointEventResponse buildMemoryEvent(Map<?, ?> memoryMap) {
+        return new CheckpointEventResponse(
+                "system",
+                "Memory Saved",
+                buildMemorySavedSummary(memoryMap),
+                null,
+                null,
+                null,
+                null,
+                null);
+    }
+
+    // Render the memory_write step as a short prose summary: the memory's
+    // one-line title followed by its paragraph. Everything else on the
+    // pending_memory dict — observations_snapshot, summarizer_model_id,
+    // content_vec, token/cost accounting — is implementation detail and
+    // belongs on the memory detail page, not the task timeline.
+    private String buildMemorySavedSummary(Map<?, ?> memoryMap) {
+        String title = asString(memoryMap.get("title"));
+        String summary = asString(memoryMap.get("summary"));
+        if ((title == null || title.isBlank()) && (summary == null || summary.isBlank())) {
+            return "Agent observations were saved to persistent memory.";
+        }
+        if (title == null || title.isBlank()) {
+            return summary;
+        }
+        if (summary == null || summary.isBlank()) {
+            return title;
+        }
+        return title + "\n\n" + summary;
+    }
+
     private List<Object> asList(Object value) {
         if (value instanceof List<?> list) {
             return new ArrayList<>(list);

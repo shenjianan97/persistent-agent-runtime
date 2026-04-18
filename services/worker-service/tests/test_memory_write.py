@@ -305,6 +305,126 @@ class TestCommitUpsertFollowUpBehaviour:
         assert row["version"] == 2
         assert row["updated_at"] > row["created_at"]
 
+    @pytest.mark.asyncio
+    async def test_followup_cycle_preserves_combined_observations_and_mirrors_cost(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        """End-to-end the full first-run + follow-up cycle at the commit boundary.
+
+        The design-doc invariant is "combined execution" — after a follow-up,
+        the persisted memory row must reflect both runs' observations (and the
+        follow-up's refreshed summary). The append-only observations reducer
+        delivers a merged list by the time memory_write fires, and the worker
+        passes that merged list into the UPSERT. We also verify the per-step
+        cost mirror lands on each run's terminal checkpoint — two distinct
+        checkpoints, two distinct cost attributions, one DB row.
+        """
+        task_id = str(uuid.uuid4())
+        await _seed_running_task(integration_pool, task_id=task_id)
+        executor = _make_executor(integration_pool)
+        agent_config = {"memory": {"enabled": True, "max_entries": 10_000}}
+
+        # Seed a terminal checkpoint for run 1 and commit with obs=["obs-run-1"].
+        checkpoint_id_1 = f"cp-{uuid.uuid4()}"
+        async with integration_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO checkpoints (
+                       task_id, checkpoint_ns, checkpoint_id, worker_id,
+                       thread_ts, checkpoint_payload, metadata_payload,
+                       cost_microdollars)
+                   VALUES ($1::uuid, '', $2, $3, $2, '{}'::jsonb,
+                           '{"source":"loop","step":6}'::jsonb, 0)""",
+                task_id, checkpoint_id_1, WORKER_A,
+            )
+
+        pm_run1 = _pending_memory(
+            title="Run 1 memory",
+            summary="Summary of the first run only.",
+            observations=["obs-run-1"],
+            content_vec=[0.1] * 1536,
+        )
+        await executor._commit_memory_and_complete_task(
+            task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID,
+            pending_memory=pm_run1, agent_config=agent_config,
+            output={"result": "first"}, worker_id=WORKER_A,
+        )
+
+        # Simulate the follow-up transition: completed → running, fresh lease.
+        async with integration_pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tasks SET status='running', lease_owner=$2,
+                          lease_expiry=NOW() + INTERVAL '60 seconds'
+                   WHERE task_id=$1::uuid""",
+                task_id, WORKER_A,
+            )
+
+        # The follow-up's terminal checkpoint is a NEW row. memory_write runs
+        # on this new checkpoint, so the cost attribution lands here, not on
+        # the prior run's terminal checkpoint. The observations channel's
+        # append-only reducer yields ["obs-run-1", "obs-run-2"] by the time
+        # memory_write fires — that's the snapshot we pass into the UPSERT.
+        checkpoint_id_2 = f"cp-{uuid.uuid4()}"
+        async with integration_pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO checkpoints (
+                       task_id, checkpoint_ns, checkpoint_id, worker_id,
+                       thread_ts, checkpoint_payload, metadata_payload,
+                       cost_microdollars)
+                   VALUES ($1::uuid, '', $2, $3, $2, '{}'::jsonb,
+                           '{"source":"loop","step":12}'::jsonb, 0)""",
+                task_id, checkpoint_id_2, WORKER_A,
+            )
+
+        pm_run2 = _pending_memory(
+            title="Refreshed after follow-up",
+            summary="Summary now covering both runs.",
+            observations=["obs-run-1", "obs-run-2"],
+            content_vec=[0.2] * 1536,
+        )
+        result = await executor._commit_memory_and_complete_task(
+            task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID,
+            pending_memory=pm_run2, agent_config=agent_config,
+            output={"result": "second"}, worker_id=WORKER_A,
+        )
+        assert result["inserted"] is False
+
+        async with integration_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT title, summary, version, observations, "
+                "       created_at, updated_at "
+                "FROM agent_memory_entries WHERE task_id = $1::uuid",
+                task_id,
+            )
+            mem_row_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM agent_memory_entries "
+                "WHERE task_id = $1::uuid", task_id,
+            )
+            cp1_cost = await conn.fetchval(
+                "SELECT cost_microdollars FROM checkpoints "
+                "WHERE checkpoint_id = $1", checkpoint_id_1,
+            )
+            cp2_cost = await conn.fetchval(
+                "SELECT cost_microdollars FROM checkpoints "
+                "WHERE checkpoint_id = $1", checkpoint_id_2,
+            )
+
+        # Invariant 1: exactly one row for the task, not a second entry.
+        assert mem_row_count == 1
+        # Invariant 2: version advanced on UPDATE branch.
+        assert row["version"] == 2
+        # Invariant 3: follow-up's title + summary replace run 1's content.
+        assert row["title"] == "Refreshed after follow-up"
+        assert row["summary"] == "Summary now covering both runs."
+        # Invariant 4: combined observations land in the DB row.
+        assert list(row["observations"]) == ["obs-run-1", "obs-run-2"]
+        # Invariant 5: each run's cost lands on its own terminal checkpoint,
+        # so the Console timeline shows a distinct per-step cost on each
+        # Memory Saved / Memory Updated step.
+        assert cp1_cost == 102  # summarizer 100 + embedding 2 on run 1
+        assert cp2_cost == 102  # summarizer 100 + embedding 2 on run 2
+        # Invariant 6: updated_at strictly advances across the follow-up.
+        assert row["updated_at"] > row["created_at"]
+
 
 class TestCommitTrim:
     @pytest.mark.asyncio
@@ -473,6 +593,73 @@ class TestCommitLeaseEnforcement:
         assert task_row["status"] == "running"
         assert task_row["lease_owner"] == WORKER_A
         assert mem_count == 0
+
+
+class TestCommitCheckpointAttribution:
+    """The commit path mirrors the memory step's cost onto the terminal
+    checkpoint row so the API's cost totals and the Console timeline
+    (which read checkpoints.cost_microdollars — not agent_cost_ledger)
+    reflect the summarizer + embedding spend on the memory-saved step.
+    """
+
+    async def _seed_checkpoint(
+        self,
+        pool: asyncpg.Pool,
+        *,
+        task_id: str,
+        checkpoint_id: str,
+        worker_id: str = WORKER_A,
+    ) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO checkpoints (
+                    task_id, checkpoint_ns, checkpoint_id, worker_id,
+                    thread_ts, checkpoint_payload, metadata_payload,
+                    cost_microdollars
+                )
+                VALUES ($1::uuid, '', $2, $3, $2, '{}'::jsonb,
+                        '{"source":"loop","step":6}'::jsonb, 0)
+                """,
+                task_id, checkpoint_id, worker_id,
+            )
+
+    @pytest.mark.asyncio
+    async def test_memory_cost_mirrored_onto_latest_checkpoint(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        task_id = str(uuid.uuid4())
+        checkpoint_id = f"cp-{uuid.uuid4()}"
+        await _seed_running_task(integration_pool, task_id=task_id)
+        await self._seed_checkpoint(
+            integration_pool, task_id=task_id, checkpoint_id=checkpoint_id
+        )
+        executor = _make_executor(integration_pool)
+        agent_config = {"memory": {"enabled": True, "max_entries": 10_000}}
+
+        # summarizer_cost=100, embedding_cost=2 → expected mirror = 102.
+        pm = _pending_memory(
+            title="Mirrored memory", content_vec=[0.1] * 1536,
+        )
+
+        await executor._commit_memory_and_complete_task(
+            task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID,
+            pending_memory=pm, agent_config=agent_config,
+            output={"result": "done"}, worker_id=WORKER_A,
+        )
+
+        async with integration_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT cost_microdollars, execution_metadata "
+                "FROM checkpoints WHERE checkpoint_id = $1",
+                checkpoint_id,
+            )
+
+        assert row["cost_microdollars"] == 102
+        exec_metadata = json.loads(row["execution_metadata"])
+        assert exec_metadata["model"] == "claude-haiku-4-5"
+        assert exec_metadata["input_tokens"] == 50
+        assert exec_metadata["output_tokens"] == 20
 
 
 class TestCommitMissingPendingMemorySafetyNet:

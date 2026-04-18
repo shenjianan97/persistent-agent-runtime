@@ -1141,6 +1141,40 @@ class GraphExecutor:
                             embedding_cost,
                         )
 
+                    # Mirror the memory-write cost onto the checkpoint row.
+                    # The API's cost totals and the per-step timeline read
+                    # checkpoints.cost_microdollars (not agent_cost_ledger), so
+                    # without this UPDATE the memory step shows $0 and the
+                    # cumulative total doesn't advance between the agent's
+                    # final response and the memory-saved step. We also
+                    # populate execution_metadata with the summarizer's model
+                    # + tokens so the Console's usage panel renders on this
+                    # step the same way it does for chat-model steps.
+                    if checkpoint_id:
+                        step_total_cost = summarizer_cost + embedding_cost
+                        summarizer_tokens_in = int(
+                            pending_memory.get("summarizer_tokens_in") or 0
+                        )
+                        summarizer_tokens_out = int(
+                            pending_memory.get("summarizer_tokens_out") or 0
+                        )
+                        exec_metadata = {
+                            "model": pending_memory.get("summarizer_model_id"),
+                            "input_tokens": summarizer_tokens_in,
+                            "output_tokens": summarizer_tokens_out,
+                        }
+                        await conn.execute(
+                            '''UPDATE checkpoints
+                               SET cost_microdollars = $1,
+                                   execution_metadata = $2::jsonb
+                               WHERE checkpoint_id = $3
+                                 AND task_id = $4::uuid''',
+                            step_total_cost,
+                            json.dumps(exec_metadata),
+                            checkpoint_id,
+                            task_id,
+                        )
+
                 # Track 3: decrement running_task_count on completion.
                 await conn.execute(
                     '''INSERT INTO agent_runtime_state
