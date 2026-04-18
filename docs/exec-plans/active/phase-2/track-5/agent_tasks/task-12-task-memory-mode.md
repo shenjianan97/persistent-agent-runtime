@@ -87,11 +87,12 @@ No data migration for existing `tasks.skip_memory_write` rows is required; the u
 ### Migration (`infrastructure/database/migrations/0012_task_memory_mode.sql`)
 
 One transaction that:
-1. `ALTER TABLE tasks DROP COLUMN skip_memory_write;`
-2. `ALTER TABLE tasks ADD COLUMN memory_mode TEXT NOT NULL DEFAULT 'always' CHECK (memory_mode IN ('always','agent_decides','skip'));`
-3. Inline comment on the column referencing this task spec and the design doc.
+1. `ALTER TABLE tasks ADD COLUMN memory_mode TEXT NOT NULL DEFAULT 'always' CHECK (memory_mode IN ('always','agent_decides','skip'));`
+2. `UPDATE tasks SET memory_mode = CASE WHEN skip_memory_write THEN 'skip' ELSE 'always' END;` — value-preserving backfill. Maps the old boolean to the new enum so queued/running/paused tasks submitted with `skip_memory_write=true` keep their skip intent through the migration. Without this, a pre-migration task that asked to skip memory would silently flip to `always` (the column DEFAULT) and write a memory anyway — a privacy regression.
+3. `ALTER TABLE tasks DROP COLUMN skip_memory_write;`
+4. Inline comment on the new column referencing this task spec and the design doc.
 
-CI's migration glob `[0-9][0-9][0-9][0-9]_*.sql` picks up the file automatically. Existing `skip_memory_write` data is NOT preserved — user waived.
+CI's migration glob `[0-9][0-9][0-9][0-9]_*.sql` picks up the file automatically.
 
 ### Worker — gate predicate & state (`memory_graph.py`)
 
@@ -141,7 +142,7 @@ No new timeline marker is required for `agent_decides` + no-opt. The absence of 
 
 ## Acceptance Criteria
 
-- [ ] Migration 0012 drops `tasks.skip_memory_write` and adds `tasks.memory_mode` with the CHECK constraint.
+- [ ] Migration 0012 adds `tasks.memory_mode` with the CHECK constraint, backfills `memory_mode` from the old `skip_memory_write` column (`true → 'skip'`, `false → 'always'`), then drops `skip_memory_write`. A row seeded with `skip_memory_write=true` before the migration ends with `memory_mode='skip'` after; a row seeded with `false` ends with `'always'`.
 - [ ] `POST /v1/tasks` with no `memory_mode` persists `memory_mode='always'`.
 - [ ] `POST /v1/tasks` with each of `memory_mode ∈ {always, agent_decides, skip}` persists the correct value.
 - [ ] `POST /v1/tasks` with `memory_mode: "invalid"` rejects with 400.
@@ -224,7 +225,6 @@ Preconditions: two agents seeded — `agent-memory-on` (`memory.enabled=true`) a
 - Do NOT persist the `save_memory` reason into `agent_memory_entries`. It lands in the observations snapshot only; the existing memory row schema is unchanged.
 - Do NOT add a new Console timeline marker for `agent_decides` + no-opt. Absence of the "Memory Saved" marker combined with the task-detail `memory_mode` field communicates the state.
 - Do NOT expand the memory-write budget carve-out to `save_memory` invocations — the tool itself is zero-rated; only the summarizer + embedding costs still flow through the existing carve-out.
-- Do NOT attempt in-flight migration of running tasks. Only newly-submitted tasks after migration 0012 use the new column.
 
 ## Assumptions
 
@@ -233,6 +233,6 @@ Preconditions: two agents seeded — `agent-memory-on` (`memory.enabled=true`) a
 - The Console's shared `<Select>` component supports a `disabled` prop and helper-text rendering (verify in `services/console/src/components/ui/`; fall back to the existing agent picker's pattern if needed).
 - No change to the existing agent-level `agent_config.memory` sub-object shape.
 - The `save_memory` reason is free-form; length bounds match `memory_note` (1–2048 chars).
-- Running this task's migration against a database that holds in-flight tasks is acceptable — those tasks default to `memory_mode='always'` via the ALTER DEFAULT.
+- Running this task's migration against a database that holds in-flight (queued / running / paused) tasks is safe: the `UPDATE tasks SET memory_mode = CASE WHEN skip_memory_write THEN 'skip' ELSE 'always' END` step preserves the existing skip intent for every row before the old column is dropped. Terminal rows (`completed` / `dead_letter`) get the same mapping for audit consistency.
 
 <!-- AGENT_TASK_END: task-12-task-memory-mode.md -->
