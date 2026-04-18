@@ -90,14 +90,13 @@ export function AttachMemoryPicker({
     const searchInputRef = useRef<HTMLInputElement | null>(null);
 
     // Lazy-load: only fetch list data once the picker has been opened.
-    const listQuery = useAgentMemoryList(agentId, {
-        enabled: open,
-        limit: 50,
-    });
-    const searchQuery = useAgentMemorySearch(agentId, searchTerm, {
-        enabled: open,
-        limit: 20,
-    });
+    const listQuery = useAgentMemoryList(agentId, { limit: 50 }, { enabled: open });
+    const searchQuery = useAgentMemorySearch(
+        agentId,
+        searchTerm,
+        { limit: 20 },
+        { enabled: open }
+    );
 
     const activeItems: MemoryEntrySummary[] = useMemo(() => {
         if (searchTerm.trim().length > 0) {

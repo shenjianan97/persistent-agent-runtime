@@ -127,7 +127,7 @@ public class TaskAttachedMemoryRepository {
                 (UUID) rs.getObject("memory_id"),
                 rs.getString("title"));
 
-        return jdbcTemplate.query(sql, mapper, taskId, tenantId, agentId);
+        return jdbcTemplate.query(sql, mapper, tenantId, agentId, taskId);
     }
 
     private Array toUuidArray(List<UUID> uuids) {

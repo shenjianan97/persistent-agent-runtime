@@ -137,7 +137,7 @@ class TaskAttachedMemoryRepositoryTest {
         AttachedMemoryPreview preview = new AttachedMemoryPreview(m1, "Resolved cache bug");
 
         when(jdbcTemplate.query(anyString(), any(RowMapper.class),
-                eq(taskId), eq("default"), eq("agent1")))
+                eq("default"), eq("agent1"), eq(taskId)))
                 .thenReturn(List.of(preview));
 
         List<AttachedMemoryPreview> results = repository.findAttachedMemoriesPreview(
@@ -148,7 +148,7 @@ class TaskAttachedMemoryRepositoryTest {
         assertEquals("Resolved cache bug", results.get(0).title());
         ArgumentCaptor<String> sqlCaptor = ArgumentCaptor.forClass(String.class);
         verify(jdbcTemplate).query(sqlCaptor.capture(), any(RowMapper.class),
-                eq(taskId), eq("default"), eq("agent1"));
+                eq("default"), eq("agent1"), eq(taskId));
         String sql = sqlCaptor.getValue();
         assertTrue(sql.contains("task_attached_memories"));
         assertTrue(sql.contains("agent_memory_entries"));

@@ -113,10 +113,11 @@ export function SubmitTaskPage() {
 
     // List data enriches the cache with summary_preview so newly-selected rows
     // render their badge + date before their detail call lands.
-    const listQuery = useAgentMemoryList(selectedAgentId, {
-        enabled: memoryEnabled,
-        limit: 50,
-    });
+    const listQuery = useAgentMemoryList(
+        selectedAgentId,
+        { limit: 50 },
+        { enabled: memoryEnabled }
+    );
     useEffect(() => {
         const items = listQuery.data?.items;
         if (!items || items.length === 0) return;
