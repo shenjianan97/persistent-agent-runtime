@@ -108,8 +108,10 @@ async def test_calculate_cost_returns_metadata():
 @pytest.mark.asyncio
 async def test_resolve_found():
     executor = _make_executor()
+    # Loopback host — the url_safety re-check accepts it (dev-friendly) and does
+    # not hit real DNS.
     executor.pool.fetchrow = AsyncMock(return_value={
-        "host": "https://langfuse.example.com",
+        "host": "http://127.0.0.1:3300",
         "public_key": "pk-lf-test-public",
         "secret_key": "sk-lf-test-secret",
     })
@@ -117,10 +119,27 @@ async def test_resolve_found():
     result = await executor._resolve_langfuse_credentials("aaaabbbb-0000-0000-0000-000000000001")
 
     assert result is not None
-    assert result["host"] == "https://langfuse.example.com"
+    assert result["host"] == "http://127.0.0.1:3300"
     assert result["public_key"] == "pk-lf-test-public"
     assert result["secret_key"] == "sk-lf-test-secret"
     executor.pool.fetchrow.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_rejects_unsafe_host():
+    """A stored host that now resolves to a metadata IP must not return creds —
+    tracing just degrades off rather than shipping the bearer credentials
+    somewhere unsafe."""
+    executor = _make_executor()
+    executor.pool.fetchrow = AsyncMock(return_value={
+        "host": "http://169.254.169.254/",
+        "public_key": "pk-lf-test-public",
+        "secret_key": "sk-lf-test-secret",
+    })
+
+    result = await executor._resolve_langfuse_credentials("aaaabbbb-0000-0000-0000-000000000004")
+
+    assert result is None
 
 
 @pytest.mark.asyncio
