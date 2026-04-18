@@ -140,6 +140,11 @@ class ApiClient:
             payload["langfuse_endpoint_id"] = overrides.pop("langfuse_endpoint_id")
         if "tenant_id" in overrides:
             payload["tenant_id"] = overrides.pop("tenant_id")
+        # Phase 2 Track 5: memory-related fields on POST /v1/tasks.
+        if "attached_memory_ids" in overrides:
+            payload["attached_memory_ids"] = overrides.pop("attached_memory_ids")
+        if "skip_memory_write" in overrides:
+            payload["skip_memory_write"] = overrides.pop("skip_memory_write")
         return self._request("POST", "/tasks", payload, expected_status, raise_for_status)
 
     def get_task(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
