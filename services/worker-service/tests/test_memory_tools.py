@@ -105,6 +105,7 @@ def _make_ctx(
     pool: Any | None = None,
     http_client: Any | None = None,
     base_url: str = "http://api.internal:8080",
+    checkpointer: Any | None = None,
 ) -> MemoryToolContext:
     return MemoryToolContext(
         tenant_id=tenant_id,
@@ -113,6 +114,7 @@ def _make_ctx(
         pool=pool if pool is not None else _FakePool(),
         memory_api_base_url=base_url,
         http_client=http_client if http_client is not None else _FakeHttpClient([]),
+        checkpointer=checkpointer,
     )
 
 
@@ -326,9 +328,81 @@ class TestTaskHistoryGetTool:
         assert result["input"] == "Investigate X"
         assert result["status"] == "completed"
         assert result["final_output"] == "All done."
+        # Without a checkpointer on the context the reader degrades to [].
         assert result["tool_calls"] == []
         assert result["memory_id"] == "mem-1"
         assert result["created_at"].startswith("2026-04-01")
+
+    @pytest.mark.asyncio
+    async def test_populates_tool_calls_from_checkpointer(self) -> None:
+        """When the context carries a checkpointer, ``tool_calls`` is filled
+        from the target task's message history. Verifies the tool→reader
+        wiring end to end (with a stub checkpointer, not a real DB)."""
+        created_at = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)
+        row = {
+            "task_id": "22222222-2222-2222-2222-222222222222",
+            "agent_id": "agent-A",
+            "input": "Investigate X",
+            "status": "completed",
+            "output": {"response": "All done."},
+            "last_error_code": None,
+            "last_error_message": None,
+            "created_at": created_at,
+            "memory_id": "mem-1",
+        }
+
+        class _StubAIMessage:
+            def __init__(self, tool_calls):
+                self.tool_calls = tool_calls
+                self.content = None
+
+        class _StubToolMessage:
+            def __init__(self, tool_call_id, content):
+                self.tool_call_id = tool_call_id
+                self.content = content
+
+        class _StubTuple:
+            def __init__(self, checkpoint):
+                self.checkpoint = checkpoint
+
+        class _StubCheckpointer:
+            def __init__(self, messages):
+                self._messages = messages
+                self.calls = []
+
+            async def aget_tuple(self, config):
+                self.calls.append(config)
+                return _StubTuple({"channel_values": {"messages": self._messages}})
+
+        ai = _StubAIMessage(tool_calls=[
+            {"id": "c-1", "name": "web_search", "args": {"q": "cache bug"}},
+        ])
+        tool_result = _StubToolMessage("c-1", "Found 3 matches")
+        checkpointer = _StubCheckpointer([ai, tool_result])
+
+        pool = _FakePool(fetchrow_return=row)
+        ctx = _make_ctx(
+            tenant_id="default",
+            agent_id="agent-A",
+            pool=pool,
+            checkpointer=checkpointer,
+        )
+        tool = _tool_by_name(
+            build_memory_tools(ctx, effective_memory_enabled=False),
+            "task_history_get",
+        )
+
+        result = await tool.ainvoke(
+            {"task_id": "22222222-2222-2222-2222-222222222222"}
+        )
+
+        assert len(result["tool_calls"]) == 1
+        assert result["tool_calls"][0]["name"] == "web_search"
+        assert result["tool_calls"][0]["result_preview"] == "Found 3 matches"
+        # Reader was invoked with the queried task_id as thread_id.
+        assert checkpointer.calls == [
+            {"configurable": {"thread_id": "22222222-2222-2222-2222-222222222222"}}
+        ]
 
     @pytest.mark.asyncio
     async def test_cross_agent_miss_returns_not_found(self) -> None:

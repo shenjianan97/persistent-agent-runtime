@@ -451,6 +451,7 @@ class GraphExecutor:
         injected_files: list[str] | None = None,
         memory_enabled: bool = False,
         task_input: str | None = None,
+        checkpointer: PostgresDurableCheckpointer | None = None,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -497,6 +498,7 @@ class GraphExecutor:
             http_client=self._get_memory_api_http_client(),
             cancel_event=cancel_event,
             await_or_cancel_fn=self._await_or_cancel,
+            checkpointer=checkpointer,
         )
         tools = tools + build_memory_tools(
             memory_tool_ctx,
@@ -1503,6 +1505,7 @@ class GraphExecutor:
                 injected_files=injected_files if sandbox_enabled else None,
                 memory_enabled=memory_enabled_for_task,
                 task_input=task_input,
+                checkpointer=checkpointer,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 

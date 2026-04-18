@@ -252,6 +252,20 @@ class MemorySearchResult(BaseModel):
     ranking_used: str | None = None
 
 
+class TaskHistoryToolCall(BaseModel):
+    """One ``tool_calls`` entry in a ``task_history_get`` result.
+
+    ``args_preview`` and ``result_preview`` are truncated to a byte cap
+    defined in :mod:`tools.memory_tools` (``TASK_HISTORY_PREVIEW_BYTES``).
+    ``result_preview`` is ``None`` when the tool call returned no
+    matching ``ToolMessage`` in the agent's message history.
+    """
+
+    name: str
+    args_preview: str | None = None
+    result_preview: str | None = None
+
+
 class TaskHistoryGetResult(BaseModel):
     """Bounded structured view returned by ``task_history_get``."""
 
@@ -260,7 +274,7 @@ class TaskHistoryGetResult(BaseModel):
     input: str | None = None
     status: str
     final_output: str | None = None
-    tool_calls: list[dict[str, Any]] = []
+    tool_calls: list[TaskHistoryToolCall] = []
     error_code: str | None = None
     error_message: str | None = None
     created_at: str

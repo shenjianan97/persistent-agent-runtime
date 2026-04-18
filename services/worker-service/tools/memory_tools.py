@@ -54,6 +54,8 @@ from langchain_core.tools import StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from tools.task_history_reader import read_tool_calls as _read_tool_calls
+
 logger = logging.getLogger(__name__)
 
 
@@ -163,6 +165,12 @@ class MemoryToolContext:
     # helper so a cancellation event tears the tool call down cleanly.
     # Matches the pattern already used for MCP tool invocations.
     await_or_cancel_fn: Callable[..., Awaitable[Any]] | None = None
+    # Optional — the LangGraph checkpointer. When present, ``task_history_get``
+    # uses it to populate ``tool_calls`` from the target task's message
+    # history. Safe to omit: the tool falls back to an empty list with a
+    # structured log so a LangGraph-version drift can only degrade, never
+    # crash.
+    checkpointer: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +404,10 @@ TASK_HISTORY_GET_DESCRIPTION = (
     "Fetch a bounded structured view of one past task in this same agent "
     "scope. Returns {task_id, agent_id, input, status, final_output, "
     "tool_calls, error_code, error_message, created_at, memory_id}. "
-    "Inputs and outputs are truncated; tool_calls capped at "
-    f"{TASK_HISTORY_TOOL_CALLS_CAP} items. Cross-agent or cross-tenant "
-    "task ids return 'not found'."
+    "Each tool_calls entry is {name, args_preview, result_preview}; "
+    f"previews are truncated to {TASK_HISTORY_PREVIEW_BYTES} bytes and "
+    f"the list is capped at {TASK_HISTORY_TOOL_CALLS_CAP} items. "
+    "Cross-agent or cross-tenant task ids return 'not found'."
 )
 
 
@@ -491,16 +500,17 @@ def _build_task_history_get_tool(ctx: MemoryToolContext) -> StructuredTool:
             TASK_HISTORY_OUTPUT_TRUNCATE_BYTES,
         )
 
-        # tool_calls: best-effort extraction. Reading raw checkpoint blobs
-        # and LangGraph message-trace is out-of-scope for v1 — it would
-        # require deserializing message pickles which is fragile across
-        # LangGraph versions. Returning an empty list is the documented
-        # safe default: the structured view still surfaces task_id, input,
-        # final_output, status, error fields, and the memory_id link which
-        # satisfies the "drill down from a memory_search hit" use case.
-        # Future iterations can enrich this by joining on task_events or
-        # indexing tool-call summaries at write time.
-        tool_calls: list[dict[str, Any]] = []
+        # tool_calls: read from the LangGraph checkpointer. The adapter lives
+        # in :mod:`tools.task_history_reader` so LangGraph field-name drift
+        # needs a fix in exactly one place. Any deserialization failure
+        # degrades to an empty list with a structured log — never crashes
+        # the calling agent.
+        tool_calls = await _read_tool_calls(
+            ctx.checkpointer,
+            task_id,
+            cap=TASK_HISTORY_TOOL_CALLS_CAP,
+            preview_bytes=TASK_HISTORY_PREVIEW_BYTES,
+        )
 
         created_at = row["created_at"]
         created_at_iso = (
