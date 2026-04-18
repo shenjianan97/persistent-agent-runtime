@@ -12,6 +12,14 @@ from pydantic import BaseModel, Field
 from langgraph.types import interrupt
 
 from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
+from tools.memory_tools import (
+    MemoryNoteArguments,
+    MemorySearchArguments,
+    TaskHistoryGetArguments,
+    MEMORY_NOTE_DESCRIPTION,
+    MEMORY_SEARCH_DESCRIPTION,
+    TASK_HISTORY_GET_DESCRIPTION,
+)
 from tools.providers.search import DuckDuckGoSearchProvider, SearchProvider, SearchResult
 from tools.read_url import ReadUrlFetcher
 from tools.runtime_logging import get_tools_logger
@@ -212,6 +220,70 @@ EXPORT_SANDBOX_FILE_TOOL = ToolDefinition(
     description="Export a file from the sandbox and save it as an output artifact. The file will be available via the task artifacts API.",
     input_model=ExportSandboxFileArguments,
     output_model=ExportSandboxFileResult,
+)
+
+
+class MemoryNoteResult(BaseModel):
+    """Result schema for the ``memory_note`` tool catalog entry."""
+
+    ok: bool
+    count: int
+
+
+class MemorySearchResultSummary(BaseModel):
+    memory_id: str
+    title: str
+    summary_preview: str | None = None
+    outcome: str | None = None
+    task_id: str | None = None
+    created_at: str | None = None
+    score: float | None = None
+
+
+class MemorySearchResult(BaseModel):
+    """Result schema for ``memory_search``. ``ranking_used`` is the ranking
+    path the server actually executed (``hybrid`` | ``text`` | ``vector``)."""
+
+    results: list[MemorySearchResultSummary]
+    ranking_used: str | None = None
+
+
+class TaskHistoryGetResult(BaseModel):
+    """Bounded structured view returned by ``task_history_get``."""
+
+    task_id: str
+    agent_id: str
+    input: str | None = None
+    status: str
+    final_output: str | None = None
+    tool_calls: list[dict[str, Any]] = []
+    error_code: str | None = None
+    error_message: str | None = None
+    created_at: str
+    memory_id: str | None = None
+
+
+# --- Phase 2 Track 5 built-in memory tools (Task 7) -----------------------
+# Registered per-task from ``executor.graph`` via
+# :func:`tools.memory_tools.build_memory_tools`. Included here so tooling
+# that iterates the catalog (schema introspection, docs) can see them.
+MEMORY_NOTE_TOOL = ToolDefinition(
+    name="memory_note",
+    description=MEMORY_NOTE_DESCRIPTION,
+    input_model=MemoryNoteArguments,
+    output_model=MemoryNoteResult,
+)
+MEMORY_SEARCH_TOOL = ToolDefinition(
+    name="memory_search",
+    description=MEMORY_SEARCH_DESCRIPTION,
+    input_model=MemorySearchArguments,
+    output_model=MemorySearchResult,
+)
+TASK_HISTORY_GET_TOOL = ToolDefinition(
+    name="task_history_get",
+    description=TASK_HISTORY_GET_DESCRIPTION,
+    input_model=TaskHistoryGetArguments,
+    output_model=TaskHistoryGetResult,
 )
 
 TOOL_DEFINITIONS = (WEB_SEARCH_TOOL, READ_URL_TOOL, CALCULATOR_TOOL)
