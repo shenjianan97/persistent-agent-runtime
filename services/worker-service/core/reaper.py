@@ -17,6 +17,7 @@ import random
 
 import asyncpg
 
+from core.agent_runtime_state_repository import decrement_running_count
 from core.config import WorkerConfig
 from core.logging import (
     REAPER_DEAD_LETTERED,
@@ -125,16 +126,6 @@ WHERE status = 'online'
 RETURNING worker_id;
 """
 
-# Track 3: Running-count decrement SQL (used after each reaper terminal transition)
-DECREMENT_RUNNING_COUNT_SQL = """
-INSERT INTO agent_runtime_state (tenant_id, agent_id, running_task_count, hour_window_cost_microdollars, scheduler_cursor, updated_at)
-VALUES ($1, $2, 0, 0, '1970-01-01T00:00:00Z', NOW())
-ON CONFLICT (tenant_id, agent_id) DO UPDATE
-SET running_task_count = GREATEST(agent_runtime_state.running_task_count - 1, 0),
-    updated_at = NOW()
-"""
-
-
 class ReaperTask:
     """Distributed reaper that scans for expired leases and timed-out tasks.
 
@@ -227,9 +218,8 @@ class ReaperTask:
                     results["requeued"].append(task_id)
                     self._metrics.increment("leases.expired")
                     # Track 3: Decrement running_task_count on requeue
-                    await conn.execute(
-                        DECREMENT_RUNNING_COUNT_SQL,
-                        row["tenant_id"], row["agent_id"]
+                    await decrement_running_count(
+                        conn, row["tenant_id"], row["agent_id"]
                     )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
@@ -249,9 +239,8 @@ class ReaperTask:
                     self._metrics.increment("leases.expired")
                     self._metrics.increment("tasks.dead_letter")
                     # Track 3: Decrement running_task_count on dead-letter
-                    await conn.execute(
-                        DECREMENT_RUNNING_COUNT_SQL,
-                        row["tenant_id"], row["agent_id"]
+                    await decrement_running_count(
+                        conn, row["tenant_id"], row["agent_id"]
                     )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
@@ -271,9 +260,8 @@ class ReaperTask:
                     results["dead_lettered_timeout"].append(task_id)
                     self._metrics.increment("tasks.dead_letter")
                     # Track 3: Decrement running_task_count on timeout
-                    await conn.execute(
-                        DECREMENT_RUNNING_COUNT_SQL,
-                        row["tenant_id"], row["agent_id"]
+                    await decrement_running_count(
+                        conn, row["tenant_id"], row["agent_id"]
                     )
                     await _insert_task_event(
                         conn, task_id, row["tenant_id"], row["agent_id"],
