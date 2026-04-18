@@ -51,7 +51,7 @@ os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "test")
 os.environ.setdefault("AWS_REGION", "us-east-1")
 
 PG_CONTAINER = os.getenv("E2E_PG_CONTAINER", "par-e2e-postgres")
-PG_IMAGE = os.getenv("E2E_PG_IMAGE", "postgres:16")
+PG_IMAGE = os.getenv("E2E_PG_IMAGE", "pgvector/pgvector:pg16")
 
 
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
