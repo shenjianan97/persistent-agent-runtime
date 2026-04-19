@@ -79,13 +79,31 @@ def cap_tool_result(raw: str, tool_name: str) -> tuple[str, CapEvent | None]:
     """Head+tail truncate a tool result if it exceeds the byte cap.
 
     Returns (raw, None) when within cap; otherwise (capped, CapEvent).
+
+    The total output byte length is guaranteed `<= PER_TOOL_RESULT_CAP_BYTES`
+    (hard cap). Marker bytes are reserved from the head/tail allocation
+    rather than added on top.
     """
     raw_bytes = raw.encode("utf-8")
     orig_bytes = len(raw_bytes)
     if orig_bytes <= PER_TOOL_RESULT_CAP_BYTES:
         return raw, None
 
-    half = PER_TOOL_RESULT_CAP_BYTES // 2
+    # Build the marker first (using the deterministic dropped-byte count
+    # computed AFTER head/tail sizes are known — see below), then reserve
+    # its byte length from the cap so head + marker + tail fits the cap.
+    # We upper-bound marker length with the final values since `dropped`
+    # depends on the final head/tail sizes. Simplest stable formulation:
+    # size the marker using the worst-case dropped count (orig_bytes),
+    # then allocate head/tail from the remaining budget.
+    max_marker = (
+        f"\n[... truncated {orig_bytes} bytes. "
+        f"Tool returned {orig_bytes} bytes total; use a narrower query or "
+        f"smaller offset/limit to read the rest. ...]\n"
+    )
+    reserve = len(max_marker.encode("utf-8"))
+    budget = max(0, PER_TOOL_RESULT_CAP_BYTES - reserve)
+    half = budget // 2
     head = raw_bytes[:half].decode("utf-8", errors="replace")
     tail = raw_bytes[-half:].decode("utf-8", errors="replace")
     dropped = orig_bytes - (2 * half)
@@ -95,12 +113,21 @@ def cap_tool_result(raw: str, tool_name: str) -> tuple[str, CapEvent | None]:
         f"smaller offset/limit to read the rest. ...]\n"
     )
     capped = f"{head}{marker}{tail}"
+    # Defensive: if UTF-8 replace characters caused a small overrun, trim
+    # the tail to keep the hard-cap invariant true.
+    capped_encoded = capped.encode("utf-8")
+    if len(capped_encoded) > PER_TOOL_RESULT_CAP_BYTES:
+        capped = capped_encoded[:PER_TOOL_RESULT_CAP_BYTES].decode(
+            "utf-8", errors="replace"
+        )
     return capped, CapEvent(
         tool=tool_name,
         orig_bytes=orig_bytes,
         capped_bytes=len(capped.encode("utf-8")),
     )
 ```
+
+**Hard-cap invariant:** `len(capped.encode("utf-8")) <= PER_TOOL_RESULT_CAP_BYTES` for all inputs, including pathological ones (UTF-8 replacement expansion, tiny cap values). Enforced by the final defensive trim. Unit test covers a cap value smaller than the marker itself — the function returns an empty-head, empty-tail, marker-only (possibly truncated) string, still respecting the cap.
 
 ### `graph.py` integration
 
@@ -147,7 +174,8 @@ When `cap_tool_result` fires, in addition to the structured log, emit an annotat
 
 - [ ] `cap_tool_result("hello", "web_search")` returns `("hello", None)`.
 - [ ] `cap_tool_result("x" * 30_000, "web_search")` returns a capped string strictly shorter than the original and a non-None `CapEvent` with `orig_bytes=30_000`.
-- [ ] Capped output begins with the first 12,500 bytes and ends with the last 12,500 bytes of the original.
+- [ ] Capped output's total UTF-8 byte length is `<= PER_TOOL_RESULT_CAP_BYTES` for every input, including pathological cases — no output exceeds the hard cap by even one byte.
+- [ ] Head and tail together consume approximately `PER_TOOL_RESULT_CAP_BYTES - len(marker)` bytes; head and tail each get roughly half that budget. Test on a 500KB input asserts head ≈ tail ≈ (cap - marker_bytes) / 2.
 - [ ] Middle marker contains the byte counts (`orig_bytes` and `dropped`).
 - [ ] `cap_tool_result` handles UTF-8 multi-byte boundaries without raising (assert on a payload with `"日"` characters near the cut points).
 - [ ] Every tool registered in `_get_tools` applies the cap decorator — grep-test that asserts `@_apply_result_cap` or equivalent wraps each tool function.

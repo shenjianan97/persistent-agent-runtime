@@ -218,7 +218,13 @@ Earlier tasks (2–6) import directly from submodules:
 
 ## Acceptance Criteria
 
-- [ ] `from executor.compaction import resolve_thresholds, KEEP_TOOL_USES` (and the full `__all__` list) succeeds. (Worker-service cwd-based import root — same pattern as `from executor.graph import GraphExecutor` used elsewhere.)
+- [ ] Submodule imports succeed (worker-service cwd-based import root — same pattern as `from executor.graph import GraphExecutor`):
+  - `from executor.compaction.defaults import KEEP_TOOL_USES`
+  - `from executor.compaction.defaults import PER_TOOL_RESULT_CAP_BYTES`
+  - `from executor.compaction.defaults import get_platform_default_summarizer_model`
+  - `from executor.compaction.thresholds import resolve_thresholds, Thresholds`
+
+  Package-root imports (`from executor.compaction import ...`) are NOT required in this task. Task 7 owns `compaction/__init__.py` and adds the public re-exports there; downstream tasks (3–6) always import from submodules directly per the task-2 `__init__.py` docstring.
 - [ ] `resolve_thresholds(200_000)` returns `Thresholds(tier1≈95_000, tier3≈142_500)` — exact values depend on `OUTPUT_BUDGET_RESERVE_TOKENS`, assert within tolerance.
 - [ ] `resolve_thresholds(1_000_000)` returns `Thresholds(tier1≈495_000, tier3≈742_500)`.
 - [ ] `resolve_thresholds(8_000)` returns a Thresholds value where `tier3 - tier1 >= MIN_TIER_SEPARATION_TOKENS`.

@@ -133,7 +133,7 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 - [ ] With `memory.enabled=false`, the flush never fires regardless of `pre_tier3_memory_flush` value; Tier 3 proceeds normally if threshold met.
 - [ ] With `pre_tier3_memory_flush=false`, the flush never fires; Tier 3 proceeds normally.
 - [ ] With `context_management.enabled=false`, compaction is disabled entirely — flush impossible.
-- [ ] Heartbeat detection: two consecutive `AIMessage`s at the end of `raw_messages` → `_is_heartbeat_turn` returns True → flush is skipped even if other conditions hold. `compaction.memory_flush_fired` is NOT emitted.
+- [ ] Heartbeat detection (positional): when `len(raw_messages) <= state.last_super_step_message_count` (no new `ToolMessage` or `HumanMessage` since the last agent super-step), `_is_heartbeat_turn` returns True → flush is skipped even if all other conditions hold. `compaction.memory_flush_fired` is NOT emitted. This deliberately does NOT use the "last two messages are both AIMessage" heuristic, which misfires on rate-limit retries and pure-reasoning turns.
 - [ ] The flush `SystemMessage` is appended at the END of the compacted messages list (so it's the most recent system-context before the agent acts).
 - [ ] The flush message byte content exactly matches `_PRE_TIER3_FLUSH_PROMPT`.
 - [ ] The flush is one-shot across the task — even on redrive / follow-up that resumes from a post-flush checkpoint, the flag remains True and the flush does NOT re-fire. Explicit test: construct a state with `memory_flush_fired_this_task=True`, trigger checkpoint save, trigger redrive from that checkpoint, verify the flag is restored to True and the flush does not re-insert.
@@ -143,7 +143,7 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 ## Testing Requirements
 
 - **Unit tests (pipeline-level, mocked summarizer):** all gating paths — each condition flipped independently, confirm flush fires only in the correct combination.
-- **Heartbeat detection:** assert `_is_heartbeat_turn` returns True for `[..., AIMessage, AIMessage]` and False for every other terminal shape.
+- **Heartbeat detection (positional):** assert `_is_heartbeat_turn` returns True when `len(raw_messages) <= last_super_step_message_count` and False when new messages have been appended since the previous super-step. Include explicit test fixtures for: (a) rate-limit retry (consecutive AIMessages but new message count unchanged → True), (b) pure-reasoning turn followed by normal tool call (message count advanced → False), (c) redrive from mid-task checkpoint (count restored correctly → False when tool result lands).
 - **Redrive-safety test:** construct a state with `memory_flush_fired_this_task=True` and assert flush does NOT re-fire on subsequent calls.
 - **Integration test:** simulate a multi-turn task that crosses the Tier 3 threshold; assert the flush fires exactly once and `memory_note` is callable (tool is registered — this depends on Track 5 being live; if not, the integration test is flagged as requiring Track 5 and skipped in its absence).
 
