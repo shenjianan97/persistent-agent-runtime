@@ -4,11 +4,11 @@
 |------|-----------|--------|-------------|
 | Task 1 | Agent Config Extension | Not started | `agent_config.context_management` sub-object (3 fields, no `enabled`): Jackson, validation, canonicalisation |
 | Task 2 | State Schema Unification | Not started | **Pure refactor.** Unified `RuntimeState` TypedDict replaces Track 5's binary `MemoryEnabledState if stack_enabled else MessagesState`. All existing Track 5 tests pass. Blocks every subsequent worker-side task. |
-| Task 3 | Compaction Constants + Thresholds | Not started | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()`; `PLATFORM_EXCLUDE_TOOLS` includes memory_search + task_history_get |
+| Task 3 | Compaction Constants + Thresholds | Partial (defaults.py shipped by Task 7) | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()`; `PLATFORM_EXCLUDE_TOOLS` includes memory_search + task_history_get. `defaults.py` created by Task 7; `thresholds.py` still pending. |
 | Task 4 | Per-Tool-Result Cap | Not started | `compaction/caps.py` head+tail byte cap; tool-wrapper integration |
 | Task 5 | Tier 1 Transform | Not started | `clear_tool_results()` pure function with monotone `cleared_through_turn_index` |
 | Task 6 | Tier 1.5 Transform | Not started | `truncate_tool_call_args()` pure function with monotone `truncated_args_through_turn_index` |
-| Task 7 | Tier 3 Summarizer | Not started | `summarize_slice()` + retry + cost ledger (`compaction.tier3`) + Langfuse span |
+| Task 7 | Tier 3 Summarizer | Done | `summarize_slice()` + retry + cost ledger (`compaction.tier3`) + Langfuse callbacks. Migration `0016_agent_cost_ledger_compaction.sql` adds operation/model_id/tokens_in/tokens_out/idempotency-index. `cost_ledger_repository.insert_cost_row` extended with backward-compatible kwargs. 22 unit tests pass. |
 | Task 8 | Pipeline + Graph Integration | Not started | Track 7 state fields added to `RuntimeState`; `compact_for_llm()`; `agent_node` wiring; budget carve-out for `compaction.tier3` |
 | Task 9 | Pre-Tier-3 Memory Flush | Not started | One-shot pre-Tier-3 `memory_note` nudge; positional heartbeat detection; `memory_flush_fired_this_task` one-shot |
 | Task 10 | Dead-Letter Reason Enum | Not started | Migration (CHECK-constraint DROP+ADD) + Java/Python plumbing for `context_exceeded_irrecoverable` |
