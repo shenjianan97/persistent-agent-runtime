@@ -37,8 +37,19 @@ from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnect
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
 from executor.compaction.state import RuntimeState
+from executor.compaction.pipeline import (
+    compact_for_llm,
+    HardFloorEvent,
+    Tier1AppliedEvent,
+    Tier15AppliedEvent,
+    Tier3FiredEvent,
+    Tier3SkippedEvent,
+)
+from executor.compaction.tokens import estimate_tokens as _estimate_tokens
+from executor.compaction.summarizer import summarize_slice
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
+    DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
     MemoryDecision,
     MEMORY_WRITE_NODE_NAME,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
@@ -127,6 +138,15 @@ from core.logging import get_logger as _get_structlog_logger
 _compaction_logger = _get_structlog_logger(worker_id="graph")
 
 
+class _ContextExceededIrrecoverableError(Exception):
+    """Internal sentinel: raised from agent_node when compaction's HardFloorEvent fires.
+
+    The astream loop catches this and invokes ``_handle_dead_letter`` with
+    ``reason=DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE``.  The name
+    is prefixed with ``_`` to signal it is not part of the public API.
+    """
+
+
 def _handle_tool_error(e: Exception) -> str:
     """Route tool errors: re-raise infra failures for task-level retry,
     return user-fixable errors as messages so the LLM can self-correct."""
@@ -175,6 +195,12 @@ def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id:
 
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
+
+    # Track 7 — conservative fallback when model not found in models table.
+    # 32_000 tokens chosen deliberately below most modern model limits to
+    # ensure compaction triggers early rather than silently blowing a 4K-
+    # context model's ceiling. See design doc §Model context window lookup.
+    _DEFAULT_MODEL_CONTEXT_WINDOW: int = 32_000
 
     def __init__(self, config: WorkerConfig, pool: asyncpg.Pool, deps=None, s3_client=None):
         self.config = config
@@ -542,6 +568,7 @@ class GraphExecutor:
         memory_decision: MemoryDecision | None = None,
         task_input: str | None = None,
         checkpointer: PostgresDurableCheckpointer | None = None,
+        model_context_window: int = 32_000,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -661,6 +688,18 @@ class GraphExecutor:
         else:
             llm_with_tools = llm
 
+        # Built once per graph — captured by agent_node closure so it is not
+        # re-allocated on every LLM call.  cost_ledger and checkpoint_id are
+        # None here; Task 9/10 will wire the real objects when they land.
+        task_context = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "task_id": task_id,
+            "checkpoint_id": None,
+            "cost_ledger": None,
+            "callbacks": [],
+        }
+
         async def agent_node(state: RuntimeState, config: RunnableConfig):
             messages = state["messages"]
             if not any(isinstance(m, SystemMessage) for m in messages):
@@ -671,18 +710,93 @@ class GraphExecutor:
                     sys_messages.append(SystemMessage(content=platform_system_msg))
                 messages = sys_messages + messages
 
+            # Track 7 Task 8 — run compaction pipeline before every LLM call.
+            # The pipeline is pure: it returns the compacted message view, a
+            # state_updates dict (watermarks, summary_marker, etc.), and a list
+            # of structured-log events.  We emit those events here so the
+            # pipeline module itself has zero logger coupling.
+            pass_result = await compact_for_llm(
+                raw_messages=messages,
+                state=state,
+                agent_config=agent_config,
+                model_context_window=model_context_window,
+                task_context=task_context,
+                summarizer=summarize_slice,
+                estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+            )
+            messages_for_llm = pass_result.messages
+            compaction_state_updates = pass_result.state_updates
+
+            # Emit structured-log events from the pipeline and raise immediately
+            # on HardFloorEvent — single pass avoids re-iterating the list.
+            for ev in pass_result.events:
+                if isinstance(ev, HardFloorEvent):
+                    _compaction_logger.warning(
+                        "compaction.hard_floor",
+                        est_tokens=ev.est_tokens,
+                        model_context_window=ev.model_context_window,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                    # Raise a sentinel exception so the astream loop can catch it
+                    # and invoke _handle_dead_letter.
+                    raise _ContextExceededIrrecoverableError(
+                        f"Context window exceeded irrecoverably: "
+                        f"{ev.est_tokens} tokens > {ev.model_context_window} window"
+                    )
+                elif isinstance(ev, Tier1AppliedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier1_applied",
+                        messages_cleared=ev.messages_cleared,
+                        est_tokens_saved=ev.est_tokens_saved,
+                        new_watermark=ev.new_watermark,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier15AppliedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier15_applied",
+                        args_truncated=ev.args_truncated,
+                        bytes_saved=ev.bytes_saved,
+                        new_watermark=ev.new_watermark,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier3FiredEvent):
+                    _compaction_logger.info(
+                        "compaction.tier3_fired",
+                        summarizer_model_id=ev.summarizer_model_id,
+                        tokens_in=ev.tokens_in,
+                        tokens_out=ev.tokens_out,
+                        new_summarized_through=ev.new_summarized_through,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier3SkippedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier3_skipped",
+                        reason=ev.reason,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+
             # Retry on rate limits inside the execution loop instead of
             # crashing and burning a task-level retry.
             max_rate_limit_retries = 5
             for attempt in range(max_rate_limit_retries + 1):
                 try:
                     response = await self._await_or_cancel(
-                        llm_with_tools.ainvoke(messages, config),
+                        llm_with_tools.ainvoke(messages_for_llm, config),
                         cancel_event,
                         task_id=task_id,
                         operation="agent",
                     )
-                    return {"messages": [response]}
+                    return {"messages": [response], **compaction_state_updates}
                 except Exception as e:
                     if self._is_rate_limit_error(e) and attempt < max_rate_limit_retries:
                         backoff = self._get_retry_after(e) or min(30, 5 * (2 ** attempt))
@@ -835,6 +949,39 @@ class GraphExecutor:
 
         self._cost_rate_cache[model_name] = rates
         return rates
+
+    async def _get_model_context_window(self, model_name: str) -> int:
+        """Fetch the context window token count for a model from the models table.
+
+        Returns the model's ``context_window`` column value, or the platform
+        conservative default (32_000) when the model is unknown.  Logs a
+        structured warning when the default fires so operators can act.
+
+        This value is resolved once at graph-build time (``execute_task``)
+        and passed into ``_build_graph`` so ``compact_for_llm`` always has
+        a known-good value without an extra DB round-trip per LLM call.
+        """
+        try:
+            row = await self.pool.fetchrow(
+                "SELECT context_window FROM models WHERE model_id = $1",
+                model_name,
+            )
+            if row is None or row["context_window"] is None:
+                _compaction_logger.info(
+                    "compaction.model_context_window_unknown",
+                    model=model_name,
+                    fallback=self._DEFAULT_MODEL_CONTEXT_WINDOW,
+                )
+                return self._DEFAULT_MODEL_CONTEXT_WINDOW
+            return int(row["context_window"])
+        except Exception:
+            logger.warning(
+                "Failed to fetch context_window for model %s; using default %d",
+                model_name,
+                self._DEFAULT_MODEL_CONTEXT_WINDOW,
+                exc_info=True,
+            )
+            return self._DEFAULT_MODEL_CONTEXT_WINDOW
 
     @staticmethod
     def _extract_tokens(metadata: dict) -> tuple[int, int]:
@@ -1705,6 +1852,13 @@ class GraphExecutor:
                 tenant_id=tenant_id
             )
 
+            # Track 7 Task 8 — resolve model context window once at graph-build
+            # time (not per LLM call) and cache it for the lifetime of this
+            # execute_task invocation.  Passed through to compact_for_llm via
+            # _build_graph so agent_node always has the right value.
+            _model_name_for_ctx = agent_config.get("model", "claude-3-5-sonnet-latest")
+            _model_context_window = await self._get_model_context_window(_model_name_for_ctx)
+
             # 3. Build & Compile graph
             graph = await self._build_graph(
                 agent_config,
@@ -1719,6 +1873,7 @@ class GraphExecutor:
                 memory_decision=memory_decision,
                 task_input=task_input,
                 checkpointer=checkpointer,
+                model_context_window=_model_context_window,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
@@ -1865,6 +2020,20 @@ class GraphExecutor:
                         # guarantees the agent must re-earn the opt-in on each
                         # run.
                         "memory_opt_in": False,
+                        # Track 7 Task 8 — seed ALL compaction watermarks at
+                        # reducer-safe defaults so every task graph starts from
+                        # a known-good state.  Reducer-annotated fields use the
+                        # seed only on the FIRST write; subsequent node returns
+                        # go through the reducer (max / any / strict-append).
+                        # MUST be 0 / "" / False — NEVER None.
+                        "cleared_through_turn_index": 0,
+                        "truncated_args_through_turn_index": 0,
+                        "summarized_through_turn_index": 0,
+                        "summary_marker": "",
+                        "memory_flush_fired_this_task": False,
+                        "last_super_step_message_count": 0,
+                        "tier3_firings_count": 0,
+                        "tier3_fatal_short_circuited": False,
                     }
                     initial_input = _payload
                 else:
@@ -1938,7 +2107,16 @@ class GraphExecutor:
                     # explicit check provides defense in depth in case the
                     # pause enforcement ever widens to fire on non-agent
                     # nodes.
+                    # Track 7 Task 8: same carve-out for ``compaction.tier3``
+                    # — the Tier 3 summarizer LLM cost is written directly to
+                    # the cost ledger by ``summarize_slice`` (Task 7); it must
+                    # NOT also trip the per-task budget pause here.  The
+                    # "compaction.tier3" key is used as the operation tag in
+                    # the cost-ledger row and appears as the event key in
+                    # the astream update dict when the summarizer runs.
                     if MEMORY_WRITE_NODE_NAME in event:
+                        continue
+                    if "compaction.tier3" in event:
                         continue
 
                     # Per-checkpoint incremental cost tracking
@@ -2304,6 +2482,22 @@ class GraphExecutor:
             )
         except GraphInterrupt as gi:
             await self._handle_interrupt(task_data, gi, worker_id)
+        except _ContextExceededIrrecoverableError as e:
+            # Track 7 Task 8: compaction hard-floor — context window exceeded
+            # irrecoverably after all tiers.  Dead-letter with the dedicated
+            # reason code so operators can distinguish this from general errors.
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
+                str(e),
+                error_code=DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
+                memory_enabled=memory_enabled_for_task,
+                memory_mode=memory_mode,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except LeaseRevokedException:
             # Lease was explicitly stripped before a checkpoint write
             logger.warning("Task %s raised LeaseRevokedException, stopping gracefully.", task_id)

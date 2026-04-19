@@ -51,6 +51,7 @@ from langchain_core.messages import (
 )
 
 from executor.compaction.defaults import SUMMARIZER_MAX_RETRIES
+from executor.compaction.tokens import _extract_text_content as _extract_content_from_value
 
 if TYPE_CHECKING:
     pass
@@ -213,19 +214,13 @@ def format_messages_for_summary(slice_messages: list[BaseMessage]) -> str:
 
 
 def _extract_text_content(msg: BaseMessage) -> str:
-    """Flatten message content to a plain string (handles block-list format)."""
-    content = msg.content
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    return str(content)
+    """Flatten message content to a plain string.
+
+    Delegates to ``tokens._extract_content_from_value`` which is the
+    canonical implementation shared between the token-estimation and
+    summary-formatting paths.
+    """
+    return _extract_content_from_value(msg.content)
 
 
 # ---------------------------------------------------------------------------
@@ -535,14 +530,4 @@ async def summarize_slice(
 
 def _extract_text_content_from_response(content: Any) -> str:
     """Flatten block-list content from an LLM response to plain string."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    return str(content)
+    return _extract_content_from_value(content)
