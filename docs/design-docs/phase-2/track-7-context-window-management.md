@@ -510,16 +510,18 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 - Redrive with **rollback_last_checkpoint** (Phase 2 Track 2): watermarks roll back with the rest of state. If the rollback target is pre-Tier-3, the summary_marker is `None`; if it is post-Tier-3, the marker is restored. No cross-checkpoint contamination.
 - Follow-up (new task, seeded from prior): a follow-up task starts with fresh state (watermarks at 0, summary_marker None). Prior compaction is not inherited — the new task's history is a fresh slate, and pre-Tier-3 memory flush can fire on its first crossing.
 
-## Customer-visible behavior changes
+## Customer-visible behavior changes (v2, per Task 13)
 
-The task-detail API response (`GET /v1/tasks/{id}`) exposes message history via the task's checkpoint. Track 7 changes what customers see on that endpoint:
+Compaction is invisible to the customer by default. The Console's task-detail Conversation pane reads from a separate append-only `task_conversation_log` table, not from LangGraph checkpoints. Customers see:
 
-- **Tool results larger than 25KB are head+tail truncated** at ingestion. Customers who rely on verbatim tool output for audit, replay, or debugging will see `[... truncated N bytes ...]` markers in place of the middle content. Head and tail portions remain verbatim.
-- **Older tool-result content is masked** (Tier 1) once the task crosses the Tier 1 threshold. The placeholder (`[tool output not retained — {tool} returned {N} bytes at step {i}]`) gives enough anchor to identify which tool ran but not re-read its output. Customers wanting a full audit trail should pull the structured `compaction.per_result_capped` / `compaction.tier1_applied` logs from Langfuse, which preserve the original byte counts and tool names.
-- **Older tool-call arguments are truncated** (Tier 1.5) — large `content`/`new_string`/`body`/etc. args in old `tool_calls` records become `[N bytes — arg truncated after step i]`.
-- **On Tier 3 firing, a `SystemMessage` summary marker replaces the oldest prefix** in the LLM input view. Raw pre-summary messages are retained in state for audit/redrive; they just aren't sent to the LLM. The task-detail API can choose to show the marker OR the raw messages; document the chosen behavior in the API surface.
+- **Tier 0 per-result cap (25KB head+tail):** applied at ingestion; the conversation log stores the same capped form the model sees. The Console makes this explicit via capped-result copy so customers know the AI saw exactly what they see.
+- **Tier 1 (tool-result clearing):** INVISIBLE. The conversation log retains the full Tier-0-capped tool result; Tier 1 only affects what the model is shown.
+- **Tier 1.5 (tool-call arg truncation):** INVISIBLE.
+- **Tier 3 (retrospective summarization):** VISIBLE. A `compaction_boundary` entry is appended to the conversation log with the generated summary and turn range. The Console renders this as an expandable inline divider with turn-count copy; messages above and below remain fully visible.
+- **Pre-Tier-3 memory flush:** VISIBLE. A single-line banner indicates the one-shot was inserted.
+- **HITL pause/resume:** VISIBLE via the existing HITL handler emitting `hitl_pause` / `hitl_resume` entries with reason and resolution.
 
-**This is a breaking change for any customer relying on verbatim tool history in the task-detail response.** Release notes + STATUS.md update must call it out. Expected impact: audit consumers already have structured logs as an alternative, and no public API contract guarantees byte-for-byte preservation of tool results in state.
+The LangGraph checkpoint remains the source of truth for the model's view. The conversation log is best-effort audit data; an append failure logs WARN and increments a counter but does not fail the task. Rollback/redrive is Phase 3+.
 
 ## Observability
 
