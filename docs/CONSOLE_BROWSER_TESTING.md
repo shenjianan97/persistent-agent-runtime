@@ -259,6 +259,44 @@ Preconditions: at least one agent exists. Both a memory-enabled agent (`agent_co
 
 6. `browser_console_messages` shows no uncaught exceptions during any of the above flows.
 
+### Scenario 16: Langfuse Trace — Context Window Management (Track 7 AC 14 manual)
+
+Covers Track 7 Task 12 AC 14 (manual Langfuse UI portion). Verifies that a task
+which exercises all three compaction tiers leaves the expected trace structure in
+Langfuse: one `compaction.tier3` span per Tier 3 firing, one `compaction.inline`
+span per call that fires Tier 1/1.5, and per-result cap annotations on affected
+tool spans.
+
+Preconditions: Langfuse is enabled (`LANGFUSE_ENABLED=true`) and the live stack
+is running. Create an agent whose history will grow large enough to trigger all
+three compaction tiers — use a small `context_management.summarizer_model` or a
+model with a small context window so Tier 3 fires quickly.
+
+1. Submit a task to the agent and let it run to completion (or at least until the
+   compaction tiers fire). If Tier 3 did not fire, resubmit with more tool-heavy
+   steps so the history token count exceeds the Tier 3 threshold.
+
+2. Open Langfuse UI (default `http://localhost:3300`) and navigate to the trace
+   for the task. Locate the root trace span.
+
+3. Assert `compaction.inline` span(s) exist: at least one child span whose name
+   is `compaction.inline` should appear for each LLM call that ran Tier 1 or Tier
+   1.5. The span metadata/tags should include `tier: "1"` or `tier: "1.5"`.
+
+4. Assert `compaction.tier3` span exists: exactly one child span per Tier 3
+   firing should appear with name `compaction.tier3`. The span metadata should
+   include `tokens_in`, `tokens_out`, `cost_microdollars`, and
+   `summarizer_model_id`.
+
+5. Assert per-result cap annotations: for each tool call whose result was capped,
+   the tool span should carry an annotation or tag `result_capped: true` (or
+   equivalent — check the structured-log event shape from AC 14 automated tests).
+
+6. If a pre-Tier-3 memory flush fired, assert a `memory_flush` child span or
+   annotation is visible on the trace.
+
+7. `browser_console_messages` shows no uncaught exceptions in the Langfuse UI.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -278,6 +316,7 @@ Preconditions: at least one agent exists. Both a memory-enabled agent (`agent_co
 | Task submission memory-mode / `agent_decides` feature | 1, 3, 14 |
 | Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13, 14 |
 | Agent context management section feature | 1, 2, 15 |
+| Context window management / compaction observability | 1, 16 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
