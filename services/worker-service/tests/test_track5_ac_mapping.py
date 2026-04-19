@@ -70,7 +70,7 @@ AC_TO_TESTS: dict[int, list[str]] = {
     # granularity; visible in the final entry.
     5: [
         "services/worker-service/tests/test_memory_tools.py::TestMemoryNoteTool",
-        "services/worker-service/tests/test_memory_graph.py::TestMemoryEnabledState",
+        "services/worker-service/tests/test_memory_graph.py::TestRuntimeState",
     ],
     # AC-6: memory_search returns RRF hybrid results scoped to (tenant, agent);
     # scope bound from worker context, not LLM args.

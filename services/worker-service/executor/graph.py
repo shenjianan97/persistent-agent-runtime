@@ -36,10 +36,10 @@ from sandbox.provisioner import (
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
+from executor.compaction.state import RuntimeState
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
     MemoryDecision,
-    MemoryEnabledState,
     MEMORY_WRITE_NODE_NAME,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     SummarizerResult,
@@ -588,15 +588,14 @@ class GraphExecutor:
                     raise
 
         # Define the Graph layout.
-        # When the stack is enabled (``agent.memory.enabled`` AND
-        # ``memory_mode ∈ {always, agent_decides}``), we register a custom
-        # state schema (MemoryEnabledState) which adds ``observations``,
-        # ``pending_memory``, and ``memory_opt_in`` fields. Memory-disabled
-        # tasks (including ``memory_mode='skip'``) keep using the stock
-        # ``MessagesState`` — identical to pre-Track-5 behaviour.
+        # All tasks — memory-enabled and memory-disabled alike — use the
+        # unified ``RuntimeState`` schema (Track 7 Task 2 refactor). The
+        # ``stack_enabled`` flag still gates *topology* (whether the
+        # ``memory_write`` node is wired and memory tools are registered);
+        # only the *schema* is now unconditionally ``RuntimeState``.
         stack_enabled = decision.stack_enabled
         auto_write = decision.auto_write
-        state_type = MemoryEnabledState if stack_enabled else MessagesState
+        state_type = RuntimeState
         workflow = StateGraph(state_type)
         workflow.add_node("agent", agent_node, input_schema=state_type)
 
@@ -1734,15 +1733,27 @@ class GraphExecutor:
 
                 initial_input: Any
                 if first_execution:
-                    _payload: dict[str, Any] = {"messages": initial_messages}
-                    if memory_enabled_for_task and seeded_observations:
-                        _payload["observations"] = list(seeded_observations)
-                    # Phase 2 Track 5 Task 12 — per-run reset of the
-                    # ``agent_decides`` opt-in flag. The field has no reducer
-                    # (last-write-wins), so seeding ``False`` here guarantees
-                    # the agent must re-earn the opt-in on each run.
-                    if memory_enabled_for_task:
-                        _payload["memory_opt_in"] = False
+                    # Track 7 Task 2 — seed ALL RuntimeState fields with
+                    # reducer-safe defaults so every task graph starts from a
+                    # known-good state regardless of memory stack enablement.
+                    # LangGraph tolerates extra keys; memory-disabled tasks
+                    # simply never overwrite these fields.
+                    _observations: list[str] = (
+                        list(seeded_observations)
+                        if memory_enabled_for_task and seeded_observations
+                        else []
+                    )
+                    _payload: dict[str, Any] = {
+                        "messages": initial_messages,
+                        "observations": _observations,
+                        "pending_memory": {},
+                        # Phase 2 Track 5 Task 12 — per-run reset of the
+                        # ``agent_decides`` opt-in flag. The field has no
+                        # reducer (last-write-wins), so seeding ``False`` here
+                        # guarantees the agent must re-earn the opt-in on each
+                        # run.
+                        "memory_opt_in": False,
+                    }
                     initial_input = _payload
                 else:
                     initial_input = None
@@ -1759,18 +1770,19 @@ class GraphExecutor:
                         # {"kind":"input","message":"blue"} -> resume value is the message
                         # {"kind":"approval","approved":true} -> resume value is the payload itself
                         if payload.get("kind") == "follow_up":
-                            # Follow-up: inject new HumanMessage into existing conversation
-                            # Reset the opt-in flag so follow-up runs must
-                            # re-earn it (Task 12 per-run reset invariant).
+                            # Follow-up: inject new HumanMessage into existing
+                            # conversation. Reset the opt-in flag so follow-up
+                            # runs must re-earn it (Task 12 per-run reset
+                            # invariant). Track 7 Task 2: always include the
+                            # field — memory-disabled tasks simply hold False.
                             follow_up_payload: dict[str, Any] = {
                                 "messages": [
                                     HumanMessage(
                                         content=payload.get("message", "")
                                     )
-                                ]
+                                ],
+                                "memory_opt_in": False,
                             }
-                            if memory_enabled_for_task:
-                                follow_up_payload["memory_opt_in"] = False
                             initial_input = follow_up_payload
                         elif payload.get("kind") == "input":
                             resume_value = payload.get("message", "")

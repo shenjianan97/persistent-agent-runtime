@@ -3,8 +3,8 @@
 Verifies that :meth:`GraphExecutor._build_graph` emits the right shape based
 on the :class:`MemoryDecision` passed in:
 
-- ``skip`` / memory-disabled: no ``memory_write`` node; state schema stays
-  ``MessagesState``; no save_memory tool.
+- ``skip`` / memory-disabled: no ``memory_write`` node; state schema is
+  ``RuntimeState`` (unified — Track 7 Task 2 refactor); no save_memory tool.
 - ``always`` mode: ``memory_write`` node present; direct terminal routing
   from ``agent`` resolves to ``memory_write`` (via ``route_after_agent``)
   when no tool calls are pending.
@@ -23,14 +23,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
-from langgraph.graph import END, MessagesState, START
+from langgraph.graph import END, START
 
 from core.config import WorkerConfig
+from executor.compaction.state import RuntimeState
 from executor.graph import GraphExecutor
 from executor.memory_graph import (
     MEMORY_WRITE_NODE_NAME,
     MemoryDecision,
-    MemoryEnabledState,
 )
 
 
@@ -69,8 +69,8 @@ class TestBuildGraphSkipMode:
             MemoryDecision(stack_enabled=False, auto_write=False),
         )
 
-        # State schema is MessagesState — NOT MemoryEnabledState.
-        assert workflow.state_schema is MessagesState
+        # State schema is RuntimeState (unified — Track 7 Task 2 refactor).
+        assert workflow.state_schema is RuntimeState
 
         # No memory_write node exists.
         node_names = set(workflow.nodes.keys())
@@ -93,8 +93,8 @@ class TestBuildGraphAlwaysMode:
             MemoryDecision(stack_enabled=True, auto_write=True),
         )
 
-        assert workflow.state_schema is MemoryEnabledState
-        assert workflow.nodes["agent"].input_schema is MemoryEnabledState
+        assert workflow.state_schema is RuntimeState
+        assert workflow.nodes["agent"].input_schema is RuntimeState
 
         node_names = set(workflow.nodes.keys())
         assert MEMORY_WRITE_NODE_NAME in node_names
@@ -121,8 +121,8 @@ class TestBuildGraphAgentDecidesMode:
             MemoryDecision(stack_enabled=True, auto_write=False),
         )
 
-        assert workflow.state_schema is MemoryEnabledState
-        assert workflow.nodes["agent"].input_schema is MemoryEnabledState
+        assert workflow.state_schema is RuntimeState
+        assert workflow.nodes["agent"].input_schema is RuntimeState
         node_names = set(workflow.nodes.keys())
         assert MEMORY_WRITE_NODE_NAME in node_names
         assert "agent" in node_names
