@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-7-pipeline-and-graph-integration.md -->
+<!-- AGENT_TASK_START: task-8-pipeline-and-graph-integration.md -->
 
-# Task 7 — Pipeline Orchestrator + State Schema + `agent_node` Integration
+# Task 8 — Pipeline Orchestrator + State Schema + `agent_node` Integration
 
 ## Agent Instructions
 
@@ -12,34 +12,64 @@
 5. `services/worker-service/core/worker.py` — post-astream cost attribution, dead-letter transitions.
 
 **CRITICAL POST-WORK:**
-1. Run `make worker-test` AND `make e2e-test`. **Mandatory**: confirm that agents with `context_management.enabled=false` are behaviourally identical to pre-Track-7 (no new state fields, no pipeline invocation, no new log events, no new cost rows). This is the opt-out correctness gate.
-2. Update Task 7 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+1. Run `make worker-test` AND `make e2e-test`. **Mandatory**: confirm that workers started with `CONTEXT_MGMT_KILL_SWITCH=true` are behaviourally identical to pre-Track-7 (no new state fields populated, no pipeline invocation, no new log events, no new cost rows). This is the kill-switch correctness gate.
+2. Update Task 8 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
 This task integrates Tasks 2–6 into a live LangGraph-driven task. It:
 
-1. Defines `CompactionEnabledState` with monotone reducers.
-2. Wires state selection so `MessagesState` is used when both Track 5 and Track 7 are disabled, `MemoryEnabledState` when only Track 5, `CompactionEnabledState` when only Track 7, and a merged state when both.
+1. Defines a **single unified `RuntimeState` TypedDict** with fields from both Track 5 (memory) and Track 7 (compaction). Replaces the current `MemoryEnabledState if stack_enabled else MessagesState` branching in `_build_graph`. Per LangGraph best practices research (langgraph-swarm-py, open_deep_research, chat-langchain all do this; [langgraphjs #536](https://github.com/langchain-ai/langgraphjs/issues/536) confirms LangGraph has no schema-migration API, so per-task schema swapping is on the unsupported side of the checkpointer).
+2. Branches **graph topology**, not state: `memory_write` node is added iff memory is enabled; compaction pipeline is called inside `agent_node` iff `CONTEXT_MGMT_KILL_SWITCH` is false.
 3. Exposes `compact_for_llm(state, raw_messages, agent_config, model_context_window, task_context) -> (compacted_messages, state_updates, events)` — the pipeline orchestrator.
-4. Calls `compact_for_llm` from `agent_node` before every `llm_with_tools.ainvoke`.
+4. Calls `compact_for_llm` from `agent_node` before every `llm_with_tools.ainvoke`, when not kill-switched.
 5. Adds `compaction.tier3` to the Track 3 per-step named-node budget carve-out alongside `memory_write`.
 6. Emits Langfuse spans and structured log events.
 
 ## Task-Specific Shared Contract
 
-### `CompactionEnabledState`
+### `RuntimeState` — unified state schema (replaces current branching)
 
 ```python
-class CompactionEnabledState(TypedDict):
+class RuntimeState(TypedDict):
+    # Core — always populated.
     messages: Annotated[list[BaseMessage], add_messages]
-    cleared_through_turn_index: Annotated[int, _max_reducer]
-    truncated_args_through_turn_index: Annotated[int, _max_reducer]
-    summarized_through_turn_index: Annotated[int, _max_reducer]
-    summary_marker: Annotated[str | None, _summary_marker_strict_append_reducer]
-    memory_flush_fired_this_task: Annotated[bool, _any_reducer]
-    last_super_step_message_count: Annotated[int, _max_reducer]
+
+    # Track 5 (memory) fields — populated by memory-enabled graphs only.
+    # Defaults are reducer-safe (`[]`, not `None`) because LangGraph's
+    # `operator.add` raises on None. See langgraph #4305 for why we avoid
+    # `Optional[T]` on reducer-backed fields.
+    observations: Annotated[list[str], operator.add]         # default []
+    pending_memory: dict                                     # default {}
+    memory_opt_in: bool                                      # default False
+
+    # Track 7 (compaction) fields — populated by compact_for_llm.
+    cleared_through_turn_index: Annotated[int, _max_reducer]             # default 0
+    truncated_args_through_turn_index: Annotated[int, _max_reducer]      # default 0
+    summarized_through_turn_index: Annotated[int, _max_reducer]          # default 0
+    summary_marker: Annotated[str, _summary_marker_strict_append_reducer]  # default ""
+    memory_flush_fired_this_task: Annotated[bool, _any_reducer]          # default False
+    last_super_step_message_count: Annotated[int, _max_reducer]          # default 0
 ```
+
+**Initial state construction** — at task start, `agent_node` receives a state dict with all fields present and at their reducer-safe defaults:
+
+```python
+initial_state: RuntimeState = {
+    "messages": [],
+    "observations": [],        # MUST be [], not None — operator.add crashes on None
+    "pending_memory": {},      # MUST be {}, not None
+    "memory_opt_in": False,
+    "cleared_through_turn_index": 0,
+    "truncated_args_through_turn_index": 0,
+    "summarized_through_turn_index": 0,
+    "summary_marker": "",      # MUST be "", not None — strict-append reducer expects str
+    "memory_flush_fired_this_task": False,
+    "last_super_step_message_count": 0,
+}
+```
+
+**Why one state, not per-feature schemas:** see design doc §State schema extensions. Summary: LangGraph reducers only fire for keys present in a node's return value ([docs](https://docs.langchain.com/oss/python/langgraph/use-graph-api)), so unused fields cost nothing at runtime. The checkpointer has no schema-migration API; per-task schema swapping breaks resume / redrive / follow-up whenever agent config changes between super-steps. Every reference implementation at scale (langgraph-swarm-py, open_deep_research) uses one TypedDict with topology branching.
 
 Where:
 
@@ -52,76 +82,40 @@ Where:
   - Else: emit `compaction.summary_marker_non_append` structured log AND return `a` (REJECT the non-append write). Non-append rewrites invalidate KV-cache on every subsequent call and violate Design §Core design rule 1. There is no legitimate replace path in v1; regenerating the marker requires explicit state clearing, which is not in scope.
   - Rollback via `rollback_last_checkpoint` restores the state snapshot wholesale outside the reducer, so rollback is not constrained by this rule.
 
-### Effective-enabled resolution (the rollout-aware default)
+### Kill-switch resolution (incident escape hatch only)
 
-Task 1 persists `context_management.enabled` **verbatim** — an absent field stays absent on disk. The worker resolves the effective enabled boolean per task using a pure function:
-
-```python
-# services/worker-service/executor/compaction/gating.py (new, owned by Task 7)
-
-def effective_context_management_enabled(
-    agent_config: Mapping[str, Any],
-    agent_created_at: datetime,
-    *,
-    kill_switch: bool,                          # from CONTEXT_MGMT_KILL_SWITCH env
-    new_agents_default_at_or_after: datetime | None,
-                                                # CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER
-    existing_agents_default: bool,              # CONTEXT_MGMT_EXISTING_AGENT_DEFAULT
-) -> bool:
-    """Resolve Track 7 effective-enabled for an agent. Pure function.
-
-    Precedence (highest first):
-      1. Kill switch on → False. Global operator escape hatch.
-      2. Explicit agent config value → use it verbatim.
-      3. Agent created at/after the new-agent rollout date → True (or the
-         env-configured new-agent default, which is True for the standard
-         Week-1 rollout).
-      4. Otherwise → existing_agents_default. False during Week 1; flipped
-         to True by operator env change for the Week 2 sweep.
-    """
-    if kill_switch:
-        return False
-    explicit = (agent_config.get("context_management") or {}).get("enabled")
-    if explicit is not None:
-        return bool(explicit)
-    if new_agents_default_at_or_after is not None and agent_created_at >= new_agents_default_at_or_after:
-        return True
-    return existing_agents_default
-```
-
-Env-var plumbing lives in `worker_config.py` (or the existing equivalent). Defaults in the absence of env vars:
-
-- `CONTEXT_MGMT_KILL_SWITCH=false`
-- `CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER=<unset>` → falls through, so all agents go to `existing_agents_default`. This is safe-by-default: until operators flip the new-agent date, nothing changes.
-- `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=false` — Week-1 setting. Operators flip to `true` for the Week-2 sweep.
-
-The resolver is called **once per task** at `execute_task` entry (not per super-step); the result is threaded through `_build_graph` (for state-class selection + tool wrapping) and kept on a `TaskContext` struct shared with the pipeline. Task 3's tool wrapper receives the resolved boolean as `compaction_enabled`; `_build_graph` uses the same boolean to decide which state class to pick.
-
-### State selection in `_build_graph`
-
-Replace the current two-way selection (`MessagesState` / `MemoryEnabledState`) with a four-way selection:
+Track 7 is always-on. There is no per-agent `enabled` toggle and no per-agent resolver. The single runtime knob is the worker-process kill switch:
 
 ```python
-memory_enabled = decision.stack_enabled
-compaction_enabled = effective_context_management_enabled(
-    agent_config,
-    agent_created_at=agent_record["created_at"],
-    kill_switch=worker_config.context_mgmt_kill_switch,
-    new_agents_default_at_or_after=worker_config.context_mgmt_new_agent_default_at_or_after,
-    existing_agents_default=worker_config.context_mgmt_existing_agent_default,
-)
-
-if memory_enabled and compaction_enabled:
-    state_type = RuntimeState   # MemoryEnabledState + CompactionEnabledState fields merged
-elif memory_enabled:
-    state_type = MemoryEnabledState
-elif compaction_enabled:
-    state_type = CompactionEnabledState
-else:
-    state_type = MessagesState
+kill_switch = worker_config.context_mgmt_kill_switch   # CONTEXT_MGMT_KILL_SWITCH env
 ```
 
-`RuntimeState` is a combined TypedDict in `compaction/state.py` that inherits both sets of fields with the correct reducer annotations on each.
+Read once at worker startup. When `true`:
+
+- Tool wrappers (Task 4) are byte-identical pass-through — no cap, no log.
+- `agent_node` skips the `compact_for_llm` call — raw `state["messages"]` goes to the LLM.
+- `memory_write` node is still wired if memory is enabled (kill switch is Track 7 only, doesn't affect Track 5).
+
+When `false` (default), compaction runs normally on every task.
+
+**Track 5 refactor included here.** Track 5 currently branches: `state_type = MemoryEnabledState if stack_enabled else MessagesState`. This task replaces that with `state_type = RuntimeState` unconditionally. Track 5's existing `MemoryEnabledState` class and the conditional become dead code and are removed. Memory-disabled tasks now have the same state schema as memory-enabled tasks; they simply never write to memory fields (defaults remain `[]`/`{}`/False throughout the task). Graph topology still branches — `memory_write` node is added only when memory is enabled.
+
+### State selection in `_build_graph` (collapsed from four-way to one-way)
+
+```python
+memory_enabled = decision.stack_enabled                # unchanged — Track 5 gating
+kill_switch = worker_config.context_mgmt_kill_switch   # Track 7 kill switch only
+
+state_type = RuntimeState                              # ALWAYS
+workflow = StateGraph(state_type)
+workflow.add_node("agent", agent_node, input_schema=state_type)
+
+# Topology branches per feature, not schema.
+if memory_enabled:
+    workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
+    workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
+# compaction doesn't add nodes — it runs inside agent_node, gated by kill_switch.
+```
 
 ### `compact_for_llm`
 
@@ -158,14 +152,14 @@ Pipeline logic:
 3. Apply Tier 1 (`clear_tool_results`) if `est_input_tokens > thresholds.tier1`. Record event if watermark advanced. Update `est_input_tokens` after.
 4. Apply Tier 1.5 (`truncate_tool_call_args`) if `est_input_tokens > thresholds.tier1`. Same event handling.
 5. If `est_input_tokens > thresholds.tier3`:
-   a. Check Task 8's pre-flush hook (if Task 8 has landed; otherwise skip). Task 7 lands first and leaves the pre-flush a no-op until Task 8 wires it.
+   a. Check Task 9's pre-flush hook (if Task 9 has landed; otherwise skip). Task 8 lands first and leaves the pre-flush a no-op until Task 9 wires it.
    b. Call `summarize_slice(...)` for the newly-old slice.
    c. On success: append `summary_text` to the in-memory `summary_marker`, advance `summarized_through_turn_index`, emit `compaction.tier3_fired` event, and rebuild the compacted message list as `[SystemMessage(summary_marker), *messages[summarized_through_turn_index:]]`.
    d. On skip: emit `compaction.tier3_skipped` event; do NOT advance the watermark; leave the compacted messages from step 4 as final.
-6. If estimated tokens still exceed model context window AFTER all tiers: set `events.append(HardFloorEvent(...))` but do NOT transition dead-letter from the pipeline — the caller in `agent_node` inspects the event and invokes the worker's existing dead-letter path. (Coupling back into the worker's state machine belongs in Task 9.)
+6. If estimated tokens still exceed model context window AFTER all tiers: set `events.append(HardFloorEvent(...))` but do NOT transition dead-letter from the pipeline — the caller in `agent_node` inspects the event and invokes the worker's existing dead-letter path. (Coupling back into the worker's state machine belongs in Task 10.)
 7. Return `CompactionPassResult`.
 
-**No DB writes from the pipeline itself** except the summarizer's cost ledger row (Task 6 owns that). The pipeline's role is purely to compute the compacted view + state updates + event list.
+**No DB writes from the pipeline itself** except the summarizer's cost ledger row (Task 7 owns that). The pipeline's role is purely to compute the compacted view + state updates + event list.
 
 ### `agent_node` integration
 
@@ -178,7 +172,7 @@ async def agent_node(state, config: RunnableConfig):
         # existing system-prompt injection
         ...
 
-    if compaction_enabled:
+    if not kill_switch:
         pass_result = await compact_for_llm(
             raw_messages=messages,
             state=state,
@@ -193,6 +187,9 @@ async def agent_node(state, config: RunnableConfig):
         for ev in pass_result.events:
             ev.log()
     else:
+        # Kill switch on: Track 7 is a no-op. Raw messages to the LLM,
+        # no state updates for compaction fields (they stay at last
+        # persisted values).
         messages_for_llm = messages
         state_updates = {}
 
@@ -244,8 +241,8 @@ Read from the `models` table row for `agent_config.model` at graph-build time. C
   - `services/worker-service/executor/compaction/pipeline.py` (new — `compact_for_llm`, `CompactionPassResult`, event types, `estimate_tokens`)
   - `services/worker-service/executor/compaction/tokens.py` (new — real-tokenizer-preferred token estimation for Anthropic/OpenAI; heuristic for Gemini/BYOT)
 
-  (`compaction/gating.py` is owned by Task 2 — pure resolver with no dependency on state/pipeline internals. Task 3 and Task 7 both import it.)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — **SOLE OWNER** of the final public-API surface; consolidate all `compaction.*` re-exports here. Tasks 2–6 leave `__init__.py` empty-minus-docstring so the package can be imported; Task 7 fills it in. No other task edits this file.)
+  (`compaction/gating.py` is owned by Task 3 — pure resolver with no dependency on state/pipeline internals. Task 4 and Task 8 both import it.)
+  - `services/worker-service/executor/compaction/__init__.py` (modify — **SOLE OWNER** of the final public-API surface; consolidate all `compaction.*` re-exports here. Tasks 2–6 leave `__init__.py` empty-minus-docstring so the package can be imported; Task 8 fills it in. No other task edits this file.)
   - `services/worker-service/executor/graph.py` (modify — state selection, `agent_node` pipeline call, budget carve-out)
   - `services/worker-service/tests/test_compaction_pipeline.py` (new)
   - `services/worker-service/tests/test_compaction_state_reducers.py` (new)
@@ -255,8 +252,8 @@ Read from the `models` table row for `agent_config.model` at graph-build time. C
 ## Dependencies
 
 - **Must complete first:** Tasks 2, 3, 4, 5, 6.
-- **Parallel-safe with:** none that touch `graph.py`. Task 9 (dead-letter enum) edits migration/enum files only — can proceed in parallel.
-- **Provides output to:** Task 8 (extends pipeline with pre-Tier-3 flush), Task 11 (E2E tests).
+- **Parallel-safe with:** none that touch `graph.py`. Task 10 (dead-letter enum) edits migration/enum files only — can proceed in parallel.
+- **Provides output to:** Task 9 (extends pipeline with pre-Tier-3 flush), Task 12 (E2E tests).
 
 ## Implementation Specification
 
@@ -270,28 +267,25 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 
 ## Acceptance Criteria
 
-- [ ] Agents with `context_management.enabled=false` produce the pre-Track-7 behavior exactly: no state extension, no pipeline invocation, no new log lines, no new cost ledger rows. Verified via a regression test run with the flag toggled.
-- [ ] Agents with `context_management.enabled=true` (default) and a small task (few tool calls) produce raw message history below the Tier 1 threshold and do NOT fire Tier 1. `compaction.tier1_applied` is NOT logged on these calls.
+- [ ] Workers with `CONTEXT_MGMT_KILL_SWITCH=true` produce the pre-Track-7 behavior exactly: no cap, no pipeline invocation, no new log lines, no new cost ledger rows. Verified via a regression test that starts the worker with the env var set.
+- [ ] Normal workers (kill switch off) on a small task (few tool calls) produce raw message history below the Tier 1 threshold and do NOT fire Tier 1. `compaction.tier1_applied` is NOT logged on these calls.
 - [ ] A synthetic task that pushes past the Tier 1 threshold fires `compaction.tier1_applied` exactly on the turn the threshold is first crossed. Watermark advances.
 - [ ] Tier 1 and Tier 1.5 are idempotent across repeated calls — running the pipeline twice on the same state advances watermarks on the first call and is a no-op on the second.
 - [ ] Tier 3 fires ONLY when Tier 1 + 1.5 cannot bring estimated input below the Tier 3 threshold.
 - [ ] `summary_marker` after two Tier 3 firings has the second summary appended to the first (assert via unit test with a mocked summarizer).
 - [ ] When Tier 3 skips (summarizer fails after retries), `summarized_through_turn_index` is NOT advanced and the next call re-attempts.
 - [ ] `compaction.tier3` is in the Track 3 named-node budget carve-out — a task with `budget_max_per_task` close to Tier 3 cost does not pause mid-summarization. Regression test included.
-- [ ] When both Track 5 and Track 7 are enabled, the graph uses the merged `RuntimeState` — all of memory's fields AND all of compaction's fields are present in the state.
-- [ ] When only Track 5 is enabled, the graph uses `MemoryEnabledState` (pre-Track-7 behavior).
-- [ ] When neither is enabled, the graph uses `MessagesState` (pre-Phase-2 behavior).
-- [ ] Pipeline updates `last_super_step_message_count = len(raw_messages)` in every `CompactionPassResult.state_updates` so heartbeat detection in Task 8 has the watermark it needs.
-- [ ] `__init__.py` after Task 7 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `CompactionEnabledState`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
+- [ ] Every task on the worker — regardless of memory-enabled / memory-disabled, kill-switch-on / kill-switch-off — uses the same `RuntimeState` TypedDict. No conditional state-class selection remains in `_build_graph`.
+- [ ] Memory-disabled tasks have `observations=[]`, `pending_memory={}`, `memory_opt_in=False` throughout (reducer-safe defaults); no field is ever `None`.
+- [ ] Memory-enabled tasks have the `memory_write` node wired (topology branching). Memory-disabled tasks do not have it wired.
+- [ ] An existing Track 5 checkpoint (written with the pre-refactor `MemoryEnabledState`) deserialises cleanly against `RuntimeState` — the compaction fields default-initialise, memory fields match their old values. Regression test loads a V1 fixture and resumes.
+- [ ] Pipeline updates `last_super_step_message_count = len(raw_messages)` in every `CompactionPassResult.state_updates` so heartbeat detection in Task 9 has the watermark it needs.
+- [ ] `__init__.py` after Task 8 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `CompactionEnabledState`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
 - [ ] Summary marker strict-append reducer rejects non-append writes — unit test asserts a non-append second write returns the ORIGINAL marker value, and `compaction.summary_marker_non_append` is logged.
-- [ ] `effective_context_management_enabled` resolver table-driven tests cover every precedence level:
-  - Kill switch on → False, regardless of all other inputs.
-  - Explicit `enabled=true` → True, even if kill switch implied otherwise (kill switch wins first, then explicit wins next).
-  - Explicit `enabled=false` → False, even on a "new" agent past the rollout date.
-  - Absent config + agent created at/after new-agent rollout date → True.
-  - Absent config + agent created before rollout date + `existing_agents_default=false` → False (Week-1 behavior).
-  - Absent config + agent created before rollout date + `existing_agents_default=true` → True (Week-2 behavior).
-- [ ] Task 3's tool wrapper receives the resolved boolean and pass-throughs tool output verbatim when it's False — regression gate for the opt-out contract.
+- [ ] Kill-switch integration tests:
+  - Worker started with `CONTEXT_MGMT_KILL_SWITCH=false` (default) → compaction pipeline runs on every `agent_node` call; per-result cap fires on large tool outputs.
+  - Worker started with `CONTEXT_MGMT_KILL_SWITCH=true` → no pipeline call, raw messages to LLM, tool wrappers pass through verbatim. No `compaction.*` events logged.
+  - Kill-switch flip mid-test: a task running on worker A (kill switch off, accumulated compaction state) migrates to worker B (kill switch on) via lease loss + re-claim — worker B resumes with `RuntimeState` intact (schema is stable), but the pipeline skip means the checkpointed `summary_marker` goes unused on the resume. State is not corrupted, just temporarily un-compacted.
 - [ ] Watermark reducers are `max` — a synthetic stale super-step returning `{cleared_through_turn_index: 0}` while state is at 10 does NOT regress the value.
 - [ ] `summary_marker` reducer appends when the new value has the old as a prefix; logs `compaction.summary_marker_replaced` when it replaces.
 - [ ] `make worker-test` and `make e2e-test` green.
@@ -302,16 +296,16 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - **Cache-stability invariant:** call `compact_for_llm` twice on the same state with the same mock summarizer returning a deterministic response; assert byte-identical `messages` and state_updates from both calls.
 - **State reducer tests:** `max` reducer rejects regressions; `any` reducer for the memory-flush flag; summary_marker append vs replace.
 - **Opt-out parity tests:** every existing test in `test_graph_*` that runs with stock `MessagesState` MUST still pass when Track 7 is disabled.
-- **Integration test (with a real LangGraph compiled graph + mocked LLM):** a synthetic task runs 10 tool calls; Tier 1 fires at the right moment; watermarks advance; no memory-flush fires (Task 8 not yet wired in this task).
+- **Integration test (with a real LangGraph compiled graph + mocked LLM):** a synthetic task runs 10 tool calls; Tier 1 fires at the right moment; watermarks advance; no memory-flush fires (Task 9 not yet wired in this task).
 - **Budget carve-out test:** construct a task with `budget_max_per_task = Tier-3-cost + 1` microdollar; force Tier 3; assert the task does not pause.
 
 ## Constraints and Guardrails
 
-- Do not change tool-execution paths — Task 3 already wraps them with the cap.
+- Do not change tool-execution paths — Task 4 already wraps them with the cap.
 - Do not emit Langfuse spans or structured logs from `compact_for_llm` itself — the function returns events in `CompactionPassResult`; the caller (`agent_node`) emits them. This makes the pipeline testable without mocking the logger.
 - Do not load balance summarizer calls across multiple models — one call per Tier 3 firing.
 - Do not persist any Track 7 state outside LangGraph checkpoints — all of it lives in graph state.
-- Do not invoke Task 8's pre-flush here. Leave an `if pre_flush_should_fire(...):` hook with a `pass` body; Task 8 fills it in.
+- Do not invoke Task 9's pre-flush here. Leave an `if pre_flush_should_fire(...):` hook with a `pass` body; Task 9 fills it in.
 - Do not dead-letter from the pipeline — surface `HardFloorEvent` to the caller; caller handles the transition via the existing dead-letter API.
 
 ## Assumptions
@@ -320,4 +314,4 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - Track 3's per-step budget enforcement is already identifiable in `graph.py`. If not present, surface this back to the orchestrator — Track 3 is a dependency.
 - LangChain `add_messages` and TypedDict-with-Annotated reducer pattern work on the worker's pinned Python + LangGraph versions (Track 5 proved this).
 
-<!-- AGENT_TASK_END: task-7-pipeline-and-graph-integration.md -->
+<!-- AGENT_TASK_END: task-8-pipeline-and-graph-integration.md -->

@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-6-tier-3-summarizer.md -->
+<!-- AGENT_TASK_START: task-7-tier-3-summarizer.md -->
 
-# Task 6 — Tier 3 Summarizer
+# Task 7 — Tier 3 Summarizer
 
 ## Agent Instructions
 
@@ -13,7 +13,7 @@
 
 **CRITICAL POST-WORK:**
 1. Run `make worker-test`. Integration-level tests from this task require a mocked LLM client; do not require real provider credentials.
-2. Update Task 6 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+2. Update Task 7 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
@@ -105,14 +105,14 @@ Determinism is load-bearing — sort keys in JSON dumps, use a fixed step-index 
 - **Service/Module:** Worker Service — Compaction
 - **File paths:**
   - `services/worker-service/executor/compaction/summarizer.py` (new)
-  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `summarize_slice`, `SummarizeResult` directly from `executor.compaction.summarizer`.
+  - **Do NOT edit `compaction/__init__.py`** — Task 8 owns its final shape. Import `summarize_slice`, `SummarizeResult` directly from `executor.compaction.summarizer`.
   - `services/worker-service/tests/test_compaction_summarizer.py` (new)
 - **Change type:** new module + unit tests (with mocked LLM client)
 
 ## Dependencies
 
-- **Must complete first:** Task 2 (`SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`, `get_platform_default_summarizer_model`).
-- **Provides output to:** Task 7 (pipeline orchestrator calls `summarize_slice` as the Tier 3 step, branches on `skipped`).
+- **Must complete first:** Task 3 (`SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULTUMMARIZER_MODEL`, `get_platform_default_summarizer_model`).
+- **Provides output to:** Task 8 (pipeline orchestrator calls `summarize_slice` as the Tier 3 step, branches on `skipped`).
 - **Shared interfaces/contracts:** The `SummarizeResult` type + `summarize_slice` function.
 
 ## Implementation Specification
@@ -207,10 +207,10 @@ Reuse `_extract_tokens`, `_is_retryable_error`, `_get_retry_after` from `graph.p
 ## Constraints and Guardrails
 
 - Do not call the summarizer from this module at import time. No top-level network.
-- Do not hard-code the summarizer model — always read it from the caller's argument. The caller (Task 7 pipeline) resolves the effective model from agent config + platform default.
-- Do not use `budget_max_per_task` gating here — the Track 3 per-step budget carve-out that skips Tier 3's pause check lives in Task 7 (at the pipeline or worker post-astream layer).
+- Do not hard-code the summarizer model — always read it from the caller's argument. The caller (Task 8 pipeline) resolves the effective model from agent config + platform default.
+- Do not use `budget_max_per_task` gating here — the Track 3 per-step budget carve-out that skips Tier 3's pause check lives in Task 8 (at the pipeline or worker post-astream layer).
 - Do not silently swallow non-retryable errors — raise them, and let the caller surface the failure through the existing error path.
-- Do not write the summary to any state field — that is Task 7's job (pipeline merges the result into `summary_marker`).
+- Do not write the summary to any state field — that is Task 8's job (pipeline merges the result into `summary_marker`).
 
 ## Assumptions
 
@@ -218,4 +218,4 @@ Reuse `_extract_tokens`, `_is_retryable_error`, `_get_retry_after` from `graph.p
 - Token extraction helpers (`_extract_tokens`) exist in `graph.py` from Track 5 — reuse them rather than re-implementing.
 - Retryable-error classification (`_is_retryable_error`) likewise exists.
 
-<!-- AGENT_TASK_END: task-6-tier-3-summarizer.md -->
+<!-- AGENT_TASK_END: task-7-tier-3-summarizer.md -->

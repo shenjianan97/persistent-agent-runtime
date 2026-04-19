@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-9-dead-letter-reason.md -->
+<!-- AGENT_TASK_START: task-10-dead-letter-reason.md -->
 
-# Task 9 — Dead-Letter Reason: `context_exceeded_irrecoverable`
+# Task 10 — Dead-Letter Reason: `context_exceeded_irrecoverable`
 
 ## Agent Instructions
 
@@ -11,11 +11,11 @@
 4. `infrastructure/database/migrations/` — latest migration number to choose `0014_*`.
 5. `services/api-service/src/main/java/com/persistentagent/api/enums/` (or wherever `DeadLetterReason` lives) — current enum shape.
 6. `services/worker-service/core/worker.py` — `_handle_dead_letter` path; how existing reasons are plumbed.
-7. `services/worker-service/executor/compaction/pipeline.py` (from Task 7) — `HardFloorEvent` definition and the caller site in `agent_node`.
+7. `services/worker-service/executor/compaction/pipeline.py` (from Task 8) — `HardFloorEvent` definition and the caller site in `agent_node`.
 
 **CRITICAL POST-WORK:**
 1. Run `make test` AND `make e2e-test`. The enum addition affects API response serialisation; confirm existing Track 2 dead-letter tests still pass.
-2. Update Task 9 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+2. Update Task 10 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
@@ -52,9 +52,9 @@ The reason must be plumbed through:
 
 ## Dependencies
 
-- **Must complete first:** Task 7 (pipeline emits `HardFloorEvent`). Task 9 wires the event to the dead-letter transition.
-- **Parallel-safe with:** Tasks 2–6 (different files). Task 10 (Console — different area entirely).
-- **Provides output to:** Task 11 (E2E test verifies the dead-letter transition).
+- **Must complete first:** Task 8 (pipeline emits `HardFloorEvent`). Task 10 wires the event to the dead-letter transition.
+- **Parallel-safe with:** Tasks 2–6 (different files). Task 11 (Console — different area entirely).
+- **Provides output to:** Task 12 (E2E test verifies the dead-letter transition).
 
 ## Implementation Specification
 
@@ -86,7 +86,7 @@ ALTER TABLE tasks ADD CONSTRAINT tasks_dead_letter_reason_check
 
 **Verify the current allowed-values list.** The list above is the cumulative state as of `0010_sandbox_support.sql`. If any migration between `0010` and `0014` added or removed a reason, copy the full current list from the latest migration and add `context_exceeded_irrecoverable` to it. Run `grep -r tasks_dead_letter_reason_check infrastructure/database/migrations/` to find the latest.
 
-**Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 7 and later tasks depend on this migration being applied first.
+**Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 8 and later tasks depend on this migration being applied first.
 
 **`task_events` column.** If `task_events.dead_letter_reason` has its own CHECK constraint, extend that too. Otherwise the audit event insert will fail while the `tasks` update succeeds.
 
@@ -128,7 +128,7 @@ The existing `_handle_dead_letter` path persists the row to `task_events`, trans
 - [ ] A synthetic task that forces Tier 3 to fail AND the hard floor to hit transitions to `status='dead_letter'` with `dead_letter_reason='context_exceeded_irrecoverable'`.
 - [ ] The corresponding `task_events` row shows `event_type='task_dead_lettered'` with `details.floor_reason` populated.
 - [ ] `GET /v1/tasks/{id}` returns `dead_letter_reason='context_exceeded_irrecoverable'` in the response payload.
-- [ ] Console renders the new reason cleanly (Task 10 covers the UI mapping; Task 9 just needs to confirm no serialization errors).
+- [ ] Console renders the new reason cleanly (Task 11 covers the UI mapping; Task 10 just needs to confirm no serialization errors).
 - [ ] `make test` and `make e2e-test` green.
 
 ## Testing Requirements
@@ -153,4 +153,4 @@ The existing `_handle_dead_letter` path persists the row to `task_events`, trans
 - `task_events.dead_letter_reason` is the source of truth for the audit timeline; `tasks.dead_letter_reason` is the summary field.
 - `make db-reset` is the standard way to verify migrations in local dev.
 
-<!-- AGENT_TASK_END: task-9-dead-letter-reason.md -->
+<!-- AGENT_TASK_END: task-10-dead-letter-reason.md -->

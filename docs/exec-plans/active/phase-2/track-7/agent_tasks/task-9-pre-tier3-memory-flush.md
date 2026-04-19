@@ -1,19 +1,19 @@
-<!-- AGENT_TASK_START: task-8-pre-tier3-memory-flush.md -->
+<!-- AGENT_TASK_START: task-9-pre-tier3-memory-flush.md -->
 
-# Task 8 — Pre-Tier-3 Memory Flush
+# Task 9 — Pre-Tier-3 Memory Flush
 
 ## Agent Instructions
 
 **CRITICAL PRE-WORK:**
 1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Pre-Tier-3 memory flush" and Validation rule 7 ("Memory-disabled agents never fire the pre-Tier-3 flush").
 2. `docs/design-docs/phase-2/track-5-memory.md` — `memory_note` tool shape and how it's registered per-task.
-3. `services/worker-service/executor/compaction/pipeline.py` (from Task 7) — the pre-flush hook site.
+3. `services/worker-service/executor/compaction/pipeline.py` (from Task 8) — the pre-flush hook site.
 4. `services/worker-service/executor/graph.py` — how `agent_node` handles follow-up state and heartbeat resume after checkpoint restore.
-5. Task 7's `test_compaction_pipeline.py` — test patterns for pipeline units.
+5. Task 8's `test_compaction_pipeline.py` — test patterns for pipeline units.
 
 **CRITICAL POST-WORK:**
 1. Run `make worker-test` and `make e2e-test`.
-2. Update Task 8 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+2. Update Task 9 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
@@ -22,7 +22,7 @@ Before Tier 3 summarization would otherwise fire for the first time in a task, t
 - Fires at most once per task (`memory_flush_fired_this_task`).
 - Fires only when `agent.memory.enabled AND context_management.pre_tier3_memory_flush`.
 - Is skipped on heartbeat/recovery turns (detection: `len(raw_messages) <= state.last_super_step_message_count` — no new `ToolMessage` or `HumanMessage` since the last super-step; this is positional, NOT the "last two messages are both AIMessage" heuristic which misfires on rate-limit retries and pure-reasoning turns).
-- Does not fire when `context_management.enabled=false` (Track 7 off entirely).
+- Does not fire when `CONTEXT_MGMT_KILL_SWITCH=true` on the worker process (Track 7 off for that worker entirely).
 - Does not fire when `memory.enabled=false` even if `pre_tier3_memory_flush=true` in config.
 
 Control flow when the flush fires:
@@ -35,10 +35,9 @@ Control flow when the flush fires:
 
 ## Task-Specific Shared Contract
 
-Function: extend `compact_for_llm` in Task 7's pipeline with a new helper `should_fire_pre_tier3_flush(state, agent_config, raw_messages) -> bool`:
+Function: extend `compact_for_llm` in Task 8's pipeline with a new helper `should_fire_pre_tier3_flush(state, agent_config, raw_messages) -> bool`:
 
 - Returns `False` unless all of:
-  - `context_management.enabled=true`
   - `context_management.pre_tier3_memory_flush=true`
   - `agent.memory.enabled=true` (read from `agent_config.memory.enabled`)
   - `state.memory_flush_fired_this_task` is False
@@ -62,7 +61,7 @@ def _is_heartbeat_turn(
 
 This matches Design §Validation rule 10. The earlier "last two messages are both `AIMessage`" heuristic was wrong — it misfires on rate-limit retry loops (the previous call succeeded and wrote an AIMessage, the retry is legitimate new work) and on pure-reasoning turns (consecutive AIMessages can be valid). The positional comparison is unambiguous: new work = new message appended; no new work = no new message.
 
-`last_super_step_message_count` is a new state field introduced in Task 7 (see `CompactionEnabledState`). At the end of every agent super-step, the pipeline writes `last_super_step_message_count = len(raw_messages)` so the next call's heartbeat detection is accurate.
+`last_super_step_message_count` is a new state field introduced in Task 8 (see `CompactionEnabledState`). At the end of every agent super-step, the pipeline writes `last_super_step_message_count = len(raw_messages)` so the next call's heartbeat detection is accurate.
 
 Flush system-message shape (exact string):
 
@@ -79,22 +78,22 @@ Wrap in `SystemMessage(content=<above>, additional_kwargs={"compaction": True, "
 
 - **Service/Module:** Worker Service — Compaction pipeline
 - **File paths:**
-  - `services/worker-service/executor/compaction/pipeline.py` (modify — wire the flush hook that Task 7 left as a `pass`)
+  - `services/worker-service/executor/compaction/pipeline.py` (modify — wire the flush hook that Task 8 left as a `pass`)
   - `services/worker-service/tests/test_compaction_pre_tier3_flush.py` (new)
 - **Change type:** function addition + unit tests
 
 ## Dependencies
 
-- **Must complete first:** Task 7 (owns `compact_for_llm` and the hook site).
-- **Provides output to:** Task 11 (E2E tests exercise the full flush flow).
-- **Cross-track dependency:** Track 5 `memory_note` tool must be registered on the agent when `memory.enabled=true`. Task 8 does NOT register tools; it assumes Track 5's per-task tool registration is already correct.
+- **Must complete first:** Task 8 (owns `compact_for_llm` and the hook site).
+- **Provides output to:** Task 12 (E2E tests exercise the full flush flow).
+- **Cross-track dependency:** Track 5 `memory_note` tool must be registered on the agent when `memory.enabled=true`. Task 9 does NOT register tools; it assumes Track 5's per-task tool registration is already correct.
 
 ## Implementation Specification
 
 In `pipeline.py`, replace the Task-7 placeholder:
 
 ```python
-# Task 7 placeholder:
+# Task 8 placeholder:
 # if pre_flush_should_fire(...):
 #     pass
 ```
@@ -132,7 +131,7 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 - [ ] On the NEXT call with the same threshold situation, the flush does NOT re-fire (flag is True); Tier 3 proceeds.
 - [ ] With `memory.enabled=false`, the flush never fires regardless of `pre_tier3_memory_flush` value; Tier 3 proceeds normally if threshold met.
 - [ ] With `pre_tier3_memory_flush=false`, the flush never fires; Tier 3 proceeds normally.
-- [ ] With `context_management.enabled=false`, compaction is disabled entirely — flush impossible.
+- [ ] With `CONTEXT_MGMT_KILL_SWITCH=true` on the worker, compaction is disabled entirely — flush impossible.
 - [ ] Heartbeat detection (positional): when `len(raw_messages) <= state.last_super_step_message_count` (no new `ToolMessage` or `HumanMessage` since the last agent super-step), `_is_heartbeat_turn` returns True → flush is skipped even if all other conditions hold. `compaction.memory_flush_fired` is NOT emitted. This deliberately does NOT use the "last two messages are both AIMessage" heuristic, which misfires on rate-limit retries and pure-reasoning turns.
 - [ ] The flush `SystemMessage` is appended at the END of the compacted messages list (so it's the most recent system-context before the agent acts).
 - [ ] The flush message byte content exactly matches `_PRE_TIER3_FLUSH_PROMPT`.
@@ -149,7 +148,7 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 
 ## Constraints and Guardrails
 
-- Do not register `memory_note` from Task 7 — Track 5 owns that. Task 8 only inserts the system message.
+- Do not register `memory_note` from Task 8 — Track 5 owns that. Task 9 only inserts the system message.
 - Do not call `memory_note` directly from the pipeline — the agent decides whether to call it.
 - Do not fire the flush on every Tier 3 firing; one-shot only.
 - Do not reset `memory_flush_fired_this_task` within a task. (The flag naturally resets on a new task — new graph state.)
@@ -160,7 +159,7 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 ## Assumptions
 
 - Track 5's `memory_note` tool is registered on the agent when `agent.memory.enabled=true`. If Track 5 has not landed yet, the pipeline still inserts the flush message; the agent simply won't have the tool and will respond without calling it. That is acceptable — Track 7 should not hard-depend on Track 5 running.
-- `agent_config.memory.enabled` is reachable from the agent config Task 7 receives.
+- `agent_config.memory.enabled` is reachable from the agent config Task 8 receives.
 - The agent LLM call handles the added SystemMessage gracefully — verified by LangChain behavior.
 
-<!-- AGENT_TASK_END: task-8-pre-tier3-memory-flush.md -->
+<!-- AGENT_TASK_END: task-9-pre-tier3-memory-flush.md -->

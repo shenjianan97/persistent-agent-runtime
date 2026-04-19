@@ -1,18 +1,18 @@
-<!-- AGENT_TASK_START: task-4-tier-1-transform.md -->
+<!-- AGENT_TASK_START: task-5-tier-1-transform.md -->
 
-# Task 4 — Tier 1 Transform: Tool-Result Clearing
+# Task 5 — Tier 1 Transform: Tool-Result Clearing
 
 ## Agent Instructions
 
 **CRITICAL PRE-WORK:**
 1. `docs/design-docs/phase-2/track-7-context-window-management.md` — sections "Core design rules" (rules 1, 2, 3) and "Tier 1: tool-result clearing".
-2. `services/worker-service/executor/compaction/defaults.py` (from Task 2) — `KEEP_TOOL_USES`, `PLATFORM_EXCLUDE_TOOLS`.
+2. `services/worker-service/executor/compaction/defaults.py` (from Task 3) — `KEEP_TOOL_USES`, `PLATFORM_EXCLUDE_TOOLS`.
 3. LangChain / LangGraph message types — `ToolMessage`, `AIMessage`, `SystemMessage`, `HumanMessage` — and how `tool_call_id` / `.name` are set on `ToolMessage`.
 4. Track 5 `clear_tool_results`-adjacent code (if any) — prior-art for message-list transforms in this worker.
 
 **CRITICAL POST-WORK:**
 1. Run `make worker-test`. Every new unit test must pass.
-2. Update `docs/exec-plans/active/phase-2/track-7/progress.md` to "Done" for Task 4.
+2. Update `docs/exec-plans/active/phase-2/track-7/progress.md` to "Done" for Task 5.
 
 ## Context
 
@@ -66,16 +66,16 @@ Semantics:
 
 - **Service/Module:** Worker Service — Compaction transforms
 - **File paths:**
-  - `services/worker-service/executor/compaction/transforms.py` (new — Task 4 adds `clear_tool_results`; Task 5 adds `truncate_tool_call_args` alongside)
-  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `clear_tool_results`, `ClearResult` directly from `executor.compaction.transforms`.
+  - `services/worker-service/executor/compaction/transforms.py` (new — Task 5 adds `clear_tool_results`; Task 6 adds `truncate_tool_call_args` alongside)
+  - **Do NOT edit `compaction/__init__.py`** — Task 8 owns its final shape. Import `clear_tool_results`, `ClearResult` directly from `executor.compaction.transforms`.
   - `services/worker-service/tests/test_compaction_transforms_clear.py` (new)
 - **Change type:** new module + new function + unit tests
 
 ## Dependencies
 
-- **Must complete first:** Task 2 (imports `KEEP_TOOL_USES`, `PLATFORM_EXCLUDE_TOOLS`).
-- **Parallel-safe with:** Task 5 writes to the same file (`transforms.py`). Use `isolation: "worktree"` if parallelising — per AGENTS.md §Parallel Subagent Safety.
-- **Provides output to:** Task 7 (pipeline invokes `clear_tool_results` as the Tier 1 step).
+- **Must complete first:** Task 3 (imports `KEEP_TOOL_USES`, `PLATFORM_EXCLUDE_TOOLS`).
+- **Parallel-safe with:** Task 6 writes to the same file (`transforms.py`). Use `isolation: "worktree"` if parallelising — per AGENTS.md §Parallel Subagent Safety.
+- **Provides output to:** Task 8 (pipeline invokes `clear_tool_results` as the Tier 1 step).
 
 ## Implementation Specification
 
@@ -97,7 +97,7 @@ def clear_tool_results(messages, cleared_through_turn_index, keep, exclude_tools
     # Build tool_call_id → tool_name map from preceding AIMessages so we can
     # recover the tool name even if ToolMessage.name is None. Note:
     # LangChain 0.2+ represents tool_calls as a list of dicts with string
-    # keys (id, name, args, type) — not attribute access. Task 5 uses the
+    # keys (id, name, args, type) — not attribute access. Task 6 uses the
     # same shape; keep them consistent.
     tool_name_by_call_id = {}
     for m in messages:
@@ -172,9 +172,9 @@ def _already_cleared(content: str) -> bool:
 
 - Do not mutate input messages. Construct a new list.
 - Do not call `datetime.now()`, `uuid.uuid4()`, or any other non-deterministic function in the placeholder — all placeholder bytes must be derivable from `(tool_name, orig_bytes, index)`.
-- Do not emit log lines from this function — logging is the pipeline orchestrator's job (Task 7).
+- Do not emit log lines from this function — logging is the pipeline orchestrator's job (Task 8).
 - Do not read the summarizer model, provider credentials, or anything from the worker runtime — this is a pure transform.
-- Do not combine with Task 5's `truncate_tool_call_args` into one function — they are independent.
+- Do not combine with Task 6's `truncate_tool_call_args` into one function — they are independent.
 
 ## Assumptions
 
@@ -182,4 +182,4 @@ def _already_cleared(content: str) -> bool:
 - Tool name recovery via `AIMessage.tool_calls[*]` relies on LangChain's `ToolCall` shape (`id` + `name`). Verify against the version pinned in `pyproject.toml`.
 - The worker ships Python 3.11+.
 
-<!-- AGENT_TASK_END: task-4-tier-1-transform.md -->
+<!-- AGENT_TASK_END: task-5-tier-1-transform.md -->

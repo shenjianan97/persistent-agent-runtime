@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-2-compaction-constants-and-thresholds.md -->
+<!-- AGENT_TASK_START: task-3-compaction-constants-and-thresholds.md -->
 
-# Task 2 — Compaction Constants + Threshold Resolver
+# Task 3 — Compaction Constants + Threshold Resolver
 
 ## Agent Instructions
 
@@ -33,19 +33,17 @@ Threshold resolution is fraction-only in v1 — no absolute token cap. A 1M-cont
 
 - **Service/Module:** Worker Service — Compaction
 - **File paths:**
-  - `services/worker-service/executor/compaction/__init__.py` (new — docstring-only; Task 7 owns re-exports)
+  - `services/worker-service/executor/compaction/__init__.py` (new — docstring-only; Task 8 owns re-exports)
   - `services/worker-service/executor/compaction/defaults.py` (new)
   - `services/worker-service/executor/compaction/thresholds.py` (new)
-  - `services/worker-service/executor/compaction/gating.py` (new — `effective_context_management_enabled` pure resolver)
   - `services/worker-service/tests/test_compaction_defaults.py` (new)
   - `services/worker-service/tests/test_compaction_thresholds.py` (new)
-  - `services/worker-service/tests/test_compaction_gating.py` (new)
 - **Change type:** New package + new modules + unit tests
 
 ## Dependencies
 
 - **Must complete first:** None.
-- **Provides output to:** Tasks 3 (imports `PER_TOOL_RESULT_CAP_BYTES`), 4 (imports `KEEP_TOOL_USES`), 5 (imports `TRUNCATABLE_TOOL_ARG_KEYS`, `ARG_TRUNCATION_CAP_BYTES`), 6 (imports `SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`), 7 (imports everything + calls `resolve_thresholds`).
+- **Provides output to:** Tasks 3 (imports `PER_TOOL_RESULT_CAP_BYTES`), 4 (imports `KEEP_TOOL_USES`), 5 (imports `TRUNCATABLE_TOOL_ARG_KEYS`, `ARG_TRUNCATION_CAP_BYTES`), 6 (imports `SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULTUMMARIZER_MODEL`), 7 (imports everything + calls `resolve_thresholds`).
 - **Shared interfaces/contracts:** The set of module-level constants and the `Thresholds` type.
 
 ## Implementation Specification
@@ -77,7 +75,7 @@ OUTPUT_BUDGET_RESERVE_TOKENS: int = 10_000
 # Minimum gap (in tokens) enforced between Tier 1 and Tier 3 triggers on tiny-
 # context models. Without this, 8K-context models can collapse both tiers to
 # the same value.
-MIN_TIER_SEPARATION_TOKENS: int = 2_000
+MIN_TIEREPARATION_TOKENS: int = 2_000
 
 # Most recent tool-use turns kept intact (never cleared by Tier 1).
 KEEP_TOOL_USES: int = 3
@@ -122,11 +120,11 @@ SUMMARIZER_MAX_RETRIES: int = 2
 
 # Platform-default summarizer model when agent_config.context_management
 # .summarizer_model is unset. Resolved per-call; not cached.
-PLATFORM_DEFAULT_SUMMARIZER_MODEL: str = "claude-haiku-4-5"
+PLATFORM_DEFAULTUMMARIZER_MODEL: str = "claude-haiku-4-5"
 
 # Env-var override for the platform-default summarizer. Read lazily by the
 # pipeline at invocation time via get_platform_default_summarizer_model().
-PLATFORM_DEFAULT_SUMMARIZER_MODEL_ENV: str = "CONTEXT_MGMT_DEFAULT_SUMMARIZER_MODEL"
+PLATFORM_DEFAULTUMMARIZER_MODEL_ENV: str = "CONTEXT_MGMT_DEFAULTUMMARIZER_MODEL"
 ```
 
 Add a small helper:
@@ -139,8 +137,8 @@ def get_platform_default_summarizer_model() -> str:
     """
     import os
     return os.environ.get(
-        PLATFORM_DEFAULT_SUMMARIZER_MODEL_ENV,
-        PLATFORM_DEFAULT_SUMMARIZER_MODEL,
+        PLATFORM_DEFAULTUMMARIZER_MODEL_ENV,
+        PLATFORM_DEFAULTUMMARIZER_MODEL,
     )
 ```
 
@@ -149,7 +147,7 @@ Add a validation function at import time that sanity-checks the constants:
 ```python
 assert 0 < TIER_1_TRIGGER_FRACTION < TIER_3_TRIGGER_FRACTION < 1.0
 assert OUTPUT_BUDGET_RESERVE_TOKENS >= 0
-assert MIN_TIER_SEPARATION_TOKENS > 0
+assert MIN_TIEREPARATION_TOKENS > 0
 assert KEEP_TOOL_USES >= 1
 assert PER_TOOL_RESULT_CAP_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
@@ -167,7 +165,7 @@ extension for the threshold shape and model-size behavior.
 from typing import NamedTuple
 
 from executor.compaction.defaults import (
-    MIN_TIER_SEPARATION_TOKENS,
+    MIN_TIEREPARATION_TOKENS,
     OUTPUT_BUDGET_RESERVE_TOKENS,
     TIER_1_TRIGGER_FRACTION,
     TIER_3_TRIGGER_FRACTION,
@@ -195,52 +193,10 @@ def resolve_thresholds(model_context_window: int) -> Thresholds:
     effective_budget = max(0, model_context_window - OUTPUT_BUDGET_RESERVE_TOKENS)
     tier1 = int(effective_budget * TIER_1_TRIGGER_FRACTION)
     tier3 = int(effective_budget * TIER_3_TRIGGER_FRACTION)
-    if tier3 - tier1 < MIN_TIER_SEPARATION_TOKENS:
-        tier3 = tier1 + MIN_TIER_SEPARATION_TOKENS
+    if tier3 - tier1 < MIN_TIEREPARATION_TOKENS:
+        tier3 = tier1 + MIN_TIEREPARATION_TOKENS
     return Thresholds(tier1=tier1, tier3=tier3)
 ```
-
-### `gating.py`
-
-Pure resolver — no LangGraph / LangChain / asyncpg imports. Full spec lives in the design doc and in Task 7's §"Effective-enabled resolution." Ship here because Task 3 needs to import it at tool-wrapper construction time:
-
-```python
-"""Rollout-aware effective-enabled resolver for Track 7.
-
-See docs/design-docs/phase-2/track-7-context-window-management.md §Rollout
-and Task 7 agent-task §Effective-enabled resolution for the precedence rules.
-"""
-from datetime import datetime
-from typing import Any, Mapping
-
-
-def effective_context_management_enabled(
-    agent_config: Mapping[str, Any],
-    agent_created_at: datetime,
-    *,
-    kill_switch: bool,
-    new_agents_default_at_or_after: datetime | None,
-    existing_agents_default: bool,
-) -> bool:
-    if kill_switch:
-        return False
-    explicit = (agent_config.get("context_management") or {}).get("enabled")
-    if explicit is not None:
-        return bool(explicit)
-    if (
-        new_agents_default_at_or_after is not None
-        and agent_created_at >= new_agents_default_at_or_after
-    ):
-        return True
-    return existing_agents_default
-```
-
-Precedence (highest first):
-
-1. Kill switch on → `False`. Global operator escape hatch.
-2. Explicit agent config `enabled` value → use it verbatim (respects both `true` and `false`).
-3. Agent `created_at >= new_agents_default_at_or_after` → `True`.
-4. Otherwise → `existing_agents_default` (Week-1 `false`; Week-2 sweep `true`).
 
 ### `__init__.py`
 
@@ -251,7 +207,7 @@ Create a **minimal** `__init__.py` with only the package docstring — NO re-exp
 
 See docs/design-docs/phase-2/track-7-context-window-management.md.
 
-Public API is re-exported from this package in Task 7 (pipeline integration).
+Public API is re-exported from this package in Task 8 (pipeline integration).
 Earlier tasks (2–6) import directly from submodules:
 
     from executor.compaction.defaults import KEEP_TOOL_USES
@@ -263,7 +219,7 @@ Earlier tasks (2–6) import directly from submodules:
 """
 ```
 
-**Why no re-exports here:** Tasks 2–6 each create separate modules; consolidating all re-exports into `__init__.py` would require every downstream task to edit the same file, creating merge conflicts when Tasks 3–6 run in parallel. Task 7 owns the final `__init__.py` shape as part of its integration work. Downstream tasks import from submodules directly.
+**Why no re-exports here:** Tasks 2–6 each create separate modules; consolidating all re-exports into `__init__.py` would require every downstream task to edit the same file, creating merge conflicts when Tasks 3–6 run in parallel. Task 8 owns the final `__init__.py` shape as part of its integration work. Downstream tasks import from submodules directly.
 
 ## Acceptance Criteria
 
@@ -273,31 +229,21 @@ Earlier tasks (2–6) import directly from submodules:
   - `from executor.compaction.defaults import get_platform_default_summarizer_model`
   - `from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS` — MUST include `memory_note`, `save_memory`, `request_human_input`, `memory_search`, `task_history_get` (all five).
   - `from executor.compaction.thresholds import resolve_thresholds, Thresholds`
-  - `from executor.compaction.gating import effective_context_management_enabled`
-- [ ] `effective_context_management_enabled` precedence table:
-  - Kill switch True → False (ignores everything else).
-  - Explicit `context_management.enabled=true` → True (even on pre-rollout-date agent).
-  - Explicit `context_management.enabled=false` → False (even on post-rollout-date agent).
-  - Absent config + `agent.created_at >= new_agents_default_at_or_after` → True.
-  - Absent config + `agent.created_at < new_agents_default_at_or_after` + `existing_agents_default=false` → False.
-  - Absent config + `agent.created_at < new_agents_default_at_or_after` + `existing_agents_default=true` → True.
-  - Absent config + `new_agents_default_at_or_after=None` + `existing_agents_default=false` → False (safe pre-rollout).
-
-  Package-root imports (`from executor.compaction import ...`) are NOT required in this task. Task 7 owns `compaction/__init__.py` and adds the public re-exports there; downstream tasks (3–6) always import from submodules directly per the task-2 `__init__.py` docstring.
+  Package-root imports (`from executor.compaction import ...`) are NOT required in this task. Task 8 owns `compaction/__init__.py` and adds the public re-exports there; downstream tasks (3–6) always import from submodules directly per the task-2 `__init__.py` docstring.
 - [ ] `resolve_thresholds(200_000)` returns `Thresholds(tier1≈95_000, tier3≈142_500)` — exact values depend on `OUTPUT_BUDGET_RESERVE_TOKENS`, assert within tolerance.
 - [ ] `resolve_thresholds(1_000_000)` returns `Thresholds(tier1≈495_000, tier3≈742_500)`.
-- [ ] `resolve_thresholds(8_000)` returns a Thresholds value where `tier3 - tier1 >= MIN_TIER_SEPARATION_TOKENS`.
+- [ ] `resolve_thresholds(8_000)` returns a Thresholds value where `tier3 - tier1 >= MIN_TIEREPARATION_TOKENS`.
 - [ ] `resolve_thresholds(0)` raises `ValueError`.
 - [ ] `resolve_thresholds(-1)` raises `ValueError`.
 - [ ] Running the module (via `services/worker-service/.venv/bin/python -c "import executor.compaction.defaults"` with cwd set to `services/worker-service`) produces no output and no errors (import-time assertions pass).
-- [ ] `get_platform_default_summarizer_model()` returns `"claude-haiku-4-5"` with no env override; returns the override value when `CONTEXT_MGMT_DEFAULT_SUMMARIZER_MODEL=xyz` is set in `os.environ`.
+- [ ] `get_platform_default_summarizer_model()` returns `"claude-haiku-4-5"` with no env override; returns the override value when `CONTEXT_MGMT_DEFAULTUMMARIZER_MODEL=xyz` is set in `os.environ`.
 - [ ] No import of LangChain / LangGraph / asyncpg / langfuse from `defaults.py` or `thresholds.py` — unit test asserts these modules are absent from the imported module object's graph.
 - [ ] `make worker-test` — full worker unit suite passes.
 
 ## Testing Requirements
 
 - **Unit tests for `defaults.py`:** import-time sanity-check assertions hold (tests may re-import the module after patching constants to verify the assertion guards catch a regression); env-var helper honors overrides.
-- **Unit tests for `thresholds.py`:** table-driven coverage for 4K, 8K, 16K, 32K, 128K, 200K, 1M, 2M context windows; assertion on `tier3 > tier1 + MIN_TIER_SEPARATION_TOKENS - 1` (using `-1` to allow exact separation); negative/zero inputs raise `ValueError`.
+- **Unit tests for `thresholds.py`:** table-driven coverage for 4K, 8K, 16K, 32K, 128K, 200K, 1M, 2M context windows; assertion on `tier3 > tier1 + MIN_TIEREPARATION_TOKENS - 1` (using `-1` to allow exact separation); negative/zero inputs raise `ValueError`.
 - **Import-purity test:** asserting that importing the compaction package does NOT load LangChain, LangGraph, asyncpg, or langfuse (check via `sys.modules`).
 - Use pytest conventions already present in `services/worker-service/tests/`.
 
@@ -306,7 +252,7 @@ Earlier tasks (2–6) import directly from submodules:
 - No env-var reads at module import time. The only exception is the lazy helper `get_platform_default_summarizer_model`.
 - No logger config at import. No side-effecting imports.
 - Do not expose per-agent override knobs in this task — constants are platform-owned.
-- Do not wire these constants into `agent_node` or any graph — Task 7 does that.
+- Do not wire these constants into `agent_node` or any graph — Task 8 does that.
 - Do not add a cache / memoization to `resolve_thresholds` — it's trivially cheap and called at most once per LLM call. Premature optimization.
 - Use `frozenset` for the tool-name allowlists so they cannot be mutated at runtime by a confused caller.
 
@@ -316,4 +262,4 @@ Earlier tasks (2–6) import directly from submodules:
 - The `services.worker_service.executor.compaction` package path matches existing import conventions.
 - `make worker-test` is invoked from the repo root and uses the pinned `.venv` per `CLAUDE.md`.
 
-<!-- AGENT_TASK_END: task-2-compaction-constants-and-thresholds.md -->
+<!-- AGENT_TASK_END: task-3-compaction-constants-and-thresholds.md -->

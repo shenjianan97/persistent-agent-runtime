@@ -73,9 +73,9 @@ Track 7 follows the same rule. Tool-result placeholders use neutral language ("t
 
 **Exception:** the pre-Tier-3 memory flush is a one-shot nudge *before* summarization to give the agent a chance to preserve salient context via `memory_note`. This is opt-in per agent via `memory.enabled` AND `context_management.pre_tier3_memory_flush`, and it fires at most once per task.
 
-### 4. Platform-owned defaults with narrow per-agent overrides
+### 4. Platform-owned defaults with narrow per-agent tuning knobs
 
-Per the "managed runtime, not a personal agent" positioning: customers do not need to tune knobs to get a working agent. Platform defaults (25KB per-result cap, keep=3 tool uses, 50% / 75% trigger fractions) apply to every agent unless explicitly overridden. The override set is **narrow on purpose** — `enabled`, `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`. Thresholds (`trigger_fraction_*`, `keep`, `per_result_cap_bytes`) are platform-owned in v1 and are promoted to per-agent only if production metrics show a clear use case.
+Per the "managed runtime, not a personal agent" positioning: customers do not need to tune knobs to get a working agent. Platform defaults (25KB per-result cap, keep=3 tool uses, 50% / 75% trigger fractions) apply to every agent. The per-agent tuning surface is **narrow on purpose** — `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`. None of these are kill switches; they're tuning for agents with unusual tool surfaces. Thresholds (`trigger_fraction_*`, `keep`, `per_result_cap_bytes`) are platform-owned and are promoted to per-agent only if production metrics show a clear use case. Context management itself is not toggleable per agent — see §Scope for why.
 
 ## Architecture overview
 
@@ -125,9 +125,8 @@ New sub-object on `agent_config`:
 ```json
 {
   "context_management": {
-    "enabled": true,
     "summarizer_model": "claude-haiku-4-5",
-    "exclude_tools": ["memory_note", "request_human_input"],
+    "exclude_tools": ["web_search", "custom_tool_x"],
     "pre_tier3_memory_flush": true
   }
 }
@@ -137,12 +136,13 @@ New sub-object on `agent_config`:
 
 | Field | Type | Default | Override scope |
 |-------|------|---------|----------------|
-| `enabled` | bool | `true` | per-agent escape hatch |
 | `summarizer_model` | string (model id) | platform default (`claude-haiku-4-5`) | per-agent |
 | `exclude_tools` | list\[string\] | `[]` | per-agent additive to platform allowlist |
 | `pre_tier3_memory_flush` | bool | `true` | per-agent, no-ops when `memory.enabled=false` |
 
-**`enabled=false` semantics:** full opt-out. No tier fires, no per-result cap, no state mutation. The task runs with the pre-Track-7 behavior exactly. This exists for workloads that genuinely need verbatim history (e.g., legal/audit agents) and is expected to be rare.
+**No per-agent opt-out.** Context management is platform infrastructure, not a feature. An agent that hits the provider's context-window ceiling without compaction simply fails — there is no graceful "verbatim history" mode, because the per-tool-result cap already makes "verbatim history" impossible the moment compaction exists at all. Every agent gets all three tiers + the per-result cap.
+
+**Global kill switch** — `CONTEXT_MGMT_KILL_SWITCH=true` on a worker process forces Track 7 off for every task that worker runs. This is an **operator-only incident escape hatch**, not customer-facing. Flipping requires a worker restart, no DB change, no deploy. In-flight tasks that were using Track 7 state lose it on resume (their checkpointed `summary_marker` and watermarks are dropped from the schema), which triggers a fresh Tier 3 firing at extra cost — acceptable cost for an emergency revert.
 
 **`exclude_tools`:** tools whose *results* must never be masked. Use case: `request_human_input`'s response is load-bearing even after dozens of follow-up turns; if it is masked to `[tool output not retained]` the agent forgets what the human said. Platform seeds the list with:
 
@@ -426,7 +426,7 @@ Implementation: track `last_super_step_message_count` as part of `CompactionEnab
 
 - `agent.memory.enabled = false` → flush never fires (no memory system to note into)
 - `context_management.pre_tier3_memory_flush = false` → flush never fires on this agent regardless of memory state
-- `context_management.enabled = false` → entire Track 7 off, flush moot
+- `CONTEXT_MGMT_KILL_SWITCH=true` on the worker process → entire Track 7 off for that worker, flush moot
 
 **Edge case: flush turn pushes input past the model's hard context limit.** The flush inserts one SystemMessage and skips Tier 3 *for this call only*. If the Tier 1 + 1.5 output plus the flush prompt exceeds the model's hard context window (rare — requires history to be within ~200 bytes of the ceiling before the flush adds its ~500-byte message), the LLM call will error with provider-side context-limit. This surfaces through the worker's existing rate-limit / retryable-error path — the agent-node retry re-enters `compact_for_llm`, the `memory_flush_fired_this_task` flag is now True (already written by the flush turn), so Tier 3 proceeds normally on the retry. The flush is not re-inserted. No special handling is needed; the existing retry path covers it.
 
@@ -447,33 +447,61 @@ If, after Tier 1 + 1.5 + 3 + protection-window shrink, the estimated input still
 
 ## State schema extensions
 
-New fields added to the graph state when Track 7 is active (equivalent to Track 5's `MemoryEnabledState` extension pattern):
+**One unified `RuntimeState` schema, feature-independent.** Every task on the worker uses the same TypedDict regardless of which features are enabled for its agent. Features branch by *graph topology* (which nodes and edges get wired) and *runtime pipeline checks* (which transforms run), **not** by schema swapping. This is the idiomatic LangGraph pattern (langgraph-swarm-py, open_deep_research, chat-langchain all do this) and the only one the framework's persistence layer supports — LangGraph explicitly provides no schema-migration API ([langgraphjs #536](https://github.com/langchain-ai/langgraphjs/issues/536)), so per-task schema swapping puts redrive / follow-up on the unsupported side of the checkpointer.
 
 ```python
-class CompactionEnabledState(TypedDict):
+class RuntimeState(TypedDict):
+    # Core (always populated)
     messages: Annotated[list[BaseMessage], add_messages]
-    cleared_through_turn_index: int          # Tier 1 watermark, default 0
-    truncated_args_through_turn_index: int   # Tier 1.5 watermark, default 0
-    summarized_through_turn_index: int       # Tier 3 watermark, default 0
-    summary_marker: str | None               # Tier 3 output, default None
-    memory_flush_fired_this_task: bool       # pre-Tier-3 flush one-shot, default False
-    last_super_step_message_count: int       # heartbeat-detection watermark, default 0
 
-    # if Track 5 also enabled, MemoryEnabledState fields are added on top:
-    # observations: Annotated[list[str], operator.add]
-    # pending_memory: dict | None
-    # memory_opt_in: bool
+    # Track 5 (Memory) fields — populated by memory-enabled graphs; untouched
+    # otherwise. Note: default is `[]`, not None. LangGraph's operator.add
+    # reducer crashes on None; sentinels must be reducer-safe.
+    observations: Annotated[list[str], operator.add]    # default []
+    pending_memory: dict                                # default {}
+    memory_opt_in: bool                                 # default False
+
+    # Track 7 (Context Management) fields — populated by the compaction
+    # pipeline. Kill-switch runs mean the pipeline is a no-op; fields stay
+    # at defaults.
+    cleared_through_turn_index: Annotated[int, _max_reducer]             # default 0
+    truncated_args_through_turn_index: Annotated[int, _max_reducer]      # default 0
+    summarized_through_turn_index: Annotated[int, _max_reducer]          # default 0
+    summary_marker: Annotated[str, _summary_marker_strict_append]        # default ""
+    memory_flush_fired_this_task: Annotated[bool, _any_reducer]          # default False
+    last_super_step_message_count: Annotated[int, _max_reducer]          # default 0
 ```
 
-Both Track 5 and Track 7 state extensions merge cleanly into a single `RuntimeState` type that the worker picks based on which tracks are enabled for the agent. When **neither** Track 5 nor Track 7 is enabled, stock `MessagesState` is used (pre-Phase-2 behavior preserved).
+**Field-typing discipline derived from LangGraph research:**
 
-**Reducers:** watermark fields use a `max` reducer (not stock `operator.add`), expressing monotonicity at the schema level. A stale LangGraph super-step that returns `{cleared_through_turn_index: 5}` when the current value is `10` will be ignored by the reducer rather than silently regressing the watermark.
+- **No `Optional[T]` on reducer-backed fields.** LangGraph [issue #4305](https://github.com/langchain-ai/langgraph/issues/4305) shows custom reducers get silently bypassed on `Optional` / `| None` fields. Use direct types + sentinel defaults (`""` for strings, `{}` for dicts, `[]` for lists, `0` for counters).
+- **Reducer-safe defaults.** `operator.add` on `None` raises; initial state is constructed with empty-but-typed values so no call-site hits a bare `None`.
+- **Append-only schema discipline.** Adding fields is safe (old checkpoints deserialize with the new fields missing, TypedDict tolerates). Removing or renaming fields is not safe — the checkpointer has no migration story, so schema evolution is strictly append-only. A regression test (load a V1 checkpoint fixture against the current schema, assert it deserialises cleanly) guards this.
+- **Subgraph composition as the future escape hatch.** If state outgrows ~15 fields or features become truly orthogonal, we carve the biggest feature into a subgraph with its own schema and transform at the boundary. That's the framework-sanctioned split; we don't need it yet.
 
-The `summary_marker` uses a **strict-append reducer**: the new value MUST start with the old value (prefix check). Any other input raises a structured error (`compaction.summary_marker_non_append`) and the reducer returns the *old* value — the non-append write is rejected. This is a hard invariant, not a soft "log and fallback." Rationale: any non-append rewrite changes byte 0 of the compacted prefix, which invalidates the KV-cache for every subsequent LLM call in the task. Silently accepting a replace would make cache-stability (§Core design rule 1) unenforceable.
+**Reducers:** watermark fields use a `max` reducer (not stock `operator.add`), expressing monotonicity at the schema level. A stale LangGraph super-step that returns `{cleared_through_turn_index: 5}` when the current value is `10` is ignored by the reducer rather than silently regressing the watermark.
 
-`memory_flush_fired_this_task` uses an `or` reducer (monotone one-shot — once True, stays True).
+The `summary_marker` uses a **strict-append reducer**: the new value MUST start with the old value (prefix check). Any other input raises a structured error (`compaction.summary_marker_non_append`) and the reducer returns the *old* value — the non-append write is rejected. This is a hard invariant. Rationale: any non-append rewrite changes byte 0 of the compacted prefix, which invalidates the KV-cache for every subsequent LLM call in the task.
 
-Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the reducer: the checkpointer restores a prior state snapshot wholesale, including a prior `summary_marker`. Rollback is the legitimate way to "move backward" on the marker; reducers never execute that path.
+`memory_flush_fired_this_task` uses an `or` reducer (monotone one-shot).
+
+Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the reducer: the checkpointer restores a prior state snapshot wholesale. Rollback is the legitimate way to "move backward" on the marker; reducers never execute that path.
+
+**Why unified-state over feature-switched schemas:**
+
+1. **Checkpoint shape is stable.** A task checkpointed today and resumed next month after the agent's config has been edited (memory flipped on/off, exclude_tools changed) deserialises cleanly into the same schema. No silent field drops.
+2. **One test matrix.** Every state test covers one TypedDict. No N×M combinatorics across enabled/disabled feature pairs.
+3. **The kill switch becomes trivial.** It doesn't change the schema; it just causes the compaction pipeline to be a no-op. State fields stay at whatever they were; in-flight tasks are unaffected *structurally*, just temporarily uncompacted.
+4. **Future features add fields, not branches.** Track 9 (planning primitive), Track 10 (deep research), etc., each extend `RuntimeState` additively. No per-feature schema class.
+5. **Cost is negligible.** LangGraph reducers on unused fields are O(1) calls with empty updates; the checkpointer serializes `None` / `[]` / `0` in a few bytes.
+
+**Features still branch on topology**, not state:
+
+- Track 5 `memory_write` node is registered iff `agent.memory.enabled`. Memory-disabled agents have no `memory_write` node; the `agent → END` edge is used.
+- Track 7 compaction pipeline runs inside `agent_node` iff `CONTEXT_MGMT_KILL_SWITCH != true`. Kill-switched workers skip the pipeline; `agent_node` sends raw `state["messages"]` to the LLM.
+- Track 5 memory tools (`memory_note`, `memory_search`, `task_history_get`) are registered on the LLM iff memory is enabled — same as today.
+
+This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState if stack_enabled else MessagesState`). The plan rolls that migration into Task 7 so both tracks end up consistent.
 
 ## Checkpoint interaction
 
@@ -535,28 +563,12 @@ Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the r
 
 **Target cache hit rate:** the compaction transform is deterministic and monotone, so cache-hit rate should approach the pre-Track-7 baseline within 5% for any task whose watermarks advance linearly. Measurement: compare cached-token-fraction from Langfuse before and after enabling Track 7 on the same agent.
 
-**Rollout is governed by a pure worker-side resolver**, not by the persisted config. Agent config with `enabled` absent stays absent on disk; the worker computes effective-enabled per task via:
+**Rollout is a traditional deploy + watch.** Track 7 is always-on for all agents from the moment the worker ships; there is no per-agent config toggle and no phased config-driven canary. The kill switch (`CONTEXT_MGMT_KILL_SWITCH` env var) is the incident escape hatch.
 
-```
-effective_context_management_enabled(agent_config, agent_created_at, *, kill_switch, new_agents_default_at_or_after, existing_agents_default)
-```
-
-Precedence, highest first:
-
-1. `CONTEXT_MGMT_KILL_SWITCH=true` → False. Global operator escape hatch; worker restart only, no DB change.
-2. Explicit `context_management.enabled` on the agent config → use it verbatim (respects both `true` and `false`).
-3. `agent.created_at >= CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER` (the deploy timestamp) → `True`. This is how new agents pick up compaction.
-4. Otherwise → `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT` (env var). `False` during Week 1; flipped to `True` for Week 2.
-
-**Phased rollout:**
-
-1. **Week 1 — New agents only.** Deploy with `CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER=<deploy timestamp>` and `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=false`. New agents get compaction; pre-existing agents (their absent config is preserved) stay off. Operators watch Langfuse metrics.
-2. **Week 2 — Sweep.** If Week 1 metrics are clean (tier3_fire_rate < 1 per 100 LLM calls, cache_hit_rate_ratio within 5% of pre-deploy baseline on the same agents), flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true`. Pre-existing agents with no explicit `enabled` now resolve to `True`. Agents with explicit `enabled=false` remain off — the resolver always prefers explicit config.
-3. **Kill switch.** `CONTEXT_MGMT_KILL_SWITCH=true` forces every agent to `False` regardless of config. Runbook-documented: "flip kill switch, inspect Langfuse, fix, reverse."
-4. **Customer opt-out.** `context_management.enabled=false` on the agent is the permanent per-agent override. Expected < 5% of agents.
-5. **Metrics** watched continuously. If Tier 3 fires more than 1 call in 100 on average, lower `TIER_1_TRIGGER_FRACTION` (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
-
-**Per-result cap honors the resolver.** When `effective_context_management_enabled` returns `False`, the tool-wrapper cap is a no-op (byte-identical pass-through) and `compaction.per_result_capped` is never emitted. This preserves the "disabled = pre-Track-7 behavior exactly" invariant.
+1. **Staging.** Deploy to staging. Run synthetic long-running tasks that cross the Tier 1 threshold. Verify metrics: `tier3_fire_rate` < 1 per 100 LLM calls on the synthetic load; `cache_hit_rate_ratio` within 5% of pre-Track-7 baseline; `compaction.summary_marker_non_append` count is zero.
+2. **Production.** Deploy to prod. Track 7 activates for every new and in-flight task on the next `_build_graph` call. Continue watching the same metrics.
+3. **Kill switch.** `CONTEXT_MGMT_KILL_SWITCH=true` on a worker process forces Track 7 off for that worker's task runs. Flipping requires a worker restart only — no DB change, no deploy. Runbook-documented: "flip kill switch, inspect Langfuse, fix, revert." In-flight tasks using Track 7 state lose it when the worker re-builds the graph for their resume: the schema downgrades to `MessagesState` and the `summary_marker`/watermark fields are dropped. Tier 3 will re-fire on that task at extra cost — acceptable for an emergency revert.
+4. **Metrics** watched continuously. If Tier 3 fires more than 1 per 100 calls on average, lower `TIER_1_TRIGGER_FRACTION` (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
 
 **Regression test gate:** every agent-node unit test suite in `services/worker-service/tests/` runs twice — once with compaction enabled, once with it disabled — to guard the "disabled = pre-Track-7 behavior" invariant.
 
@@ -571,12 +583,12 @@ Precedence, highest first:
 
 ## Acceptance criteria
 
-1. Agents with `context_management.enabled=true` (default) serve LLM calls with raw history below the Tier 1 threshold and with masked/truncated history above it — verifiable by observing `compaction.tier1_applied` in Langfuse during a long task.
+1. All agents (Track 7 is always-on) serve LLM calls with raw history below the Tier 1 threshold and with masked/truncated history above it — verifiable by observing `compaction.tier1_applied` in Langfuse during a long task.
 2. The per-tool-result cap is applied before a `ToolMessage` enters state. A BYOT tool returning 500KB is visible in state as ~25KB; the structured log `compaction.per_result_capped` is emitted.
 3. Tier 3 fires only when Tier 1 + 1.5 together cannot bring input below `TIER_3_TRIGGER_FRACTION`. Verifiable by test that constructs a synthetic history and confirms the tier ordering.
 4. Watermark fields on graph state only advance — a unit test that feeds back a regressing watermark confirms the reducer ignores it.
 5. Cache-stability invariant: running the same compaction pipeline on the same state twice produces byte-identical output.
-6. `context_management.enabled=false` on an agent yields zero compaction-related state fields, zero pipeline invocations, zero structured log lines, zero cost ledger rows. Regression suite passes unchanged.
+6. `CONTEXT_MGMT_KILL_SWITCH=true` on a worker yields zero pipeline invocations, zero new structured log lines, zero new cost ledger rows, and byte-identical tool output pass-through. Worker unit tests run twice (kill switch off + on) as a regression gate.
 7. `exclude_tools` entries are never masked. Given a task with `memory_note` results scattered through history, after Tier 1 runs, every `memory_note` `ToolMessage` retains its original content.
 8. Pre-Tier-3 memory flush fires at most once per task. Fires for agents with `memory.enabled=true AND pre_tier3_memory_flush=true`. Does not fire on heartbeat / recovery turns.
 9. `summary_marker` is append-only. A second Tier 3 firing within the same task appends a new summary rather than rewriting the existing one; cache-hit rate on the marker region stays high.

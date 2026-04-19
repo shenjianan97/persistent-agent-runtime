@@ -1,6 +1,6 @@
-<!-- AGENT_TASK_START: task-10-console-context-management-form.md -->
+<!-- AGENT_TASK_START: task-11-console-context-management-form.md -->
 
-# Task 10 — Console: Agent Edit Form "Context Management" Section
+# Task 11 — Console: Agent Edit Form "Context Management" Section
 
 ## Agent Instructions
 
@@ -14,7 +14,7 @@
 **CRITICAL POST-WORK:**
 1. Run `make console-test` — React unit tests.
 2. Orchestrator runs Playwright verification per AGENTS.md §Browser Verification. Subagent DOES NOT run `make start` or Playwright MCP tools.
-3. Update Task 10 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+3. Update Task 11 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
@@ -58,7 +58,7 @@ The section reuses styling and validation patterns from Track 5's memory section
 
 - **Must complete first:** Task 1 (API accepts the sub-object).
 - **Parallel-safe with:** Tasks 2–9 (different code areas).
-- **Provides output to:** Task 11 (scenarios run by orchestrator).
+- **Provides output to:** Task 12 (scenarios run by orchestrator).
 
 ## Implementation Specification
 
@@ -98,7 +98,6 @@ Import `ContextManagementSection`, place it after the memory section, pipe throu
 Add **Scenario 14: Context Management section**. Covers:
 
 - Create agent → fill all four fields → save → reload → fields persist
-- Edit agent → disable `context_management.enabled` → save → reload → reflects disabled
 - Invalid `summarizer_model` (pick a disabled row) → save → 400 surfaces inline
 - Exclude tools > 50 entries → inline error
 - `pre_tier3_memory_flush` toggle is visually disabled when memory is off → enabling memory unblocks it
@@ -141,4 +140,4 @@ Add **Scenario 14: Context Management section**. Covers:
 - `AgentConfig` type has been extended on the API client side to include `context_management: ContextManagementConfig`.
 - The Console test harness uses React Testing Library + Vitest (or whatever Track 5 added).
 
-<!-- AGENT_TASK_END: task-10-console-context-management-form.md -->
+<!-- AGENT_TASK_END: task-11-console-context-management-form.md -->

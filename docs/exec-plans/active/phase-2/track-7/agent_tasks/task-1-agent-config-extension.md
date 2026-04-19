@@ -20,19 +20,18 @@ You are a software engineer implementing one module of a larger system. Your sco
 
 ## Context
 
-Track 7 (Context Window Management) is opt-*out* per agent via `agent_config.context_management.enabled` (default `true`). Customers who need verbatim message history can disable compaction entirely by setting `enabled=false`. Three other fields expose narrow tuning: `summarizer_model` (for Tier 3), `exclude_tools` (tool results never masked by Tier 1), and `pre_tier3_memory_flush` (interaction with Track 5).
+Track 7 (Context Window Management) is platform infrastructure — every agent gets compaction, no per-agent opt-out. The `context_management` sub-object exposes three tuning fields: `summarizer_model` (for Tier 3), `exclude_tools` (tool results never masked by Tier 1), and `pre_tier3_memory_flush` (interaction with Track 5).
 
 Because Spring Boot's default Jackson is configured with `FAIL_ON_UNKNOWN_PROPERTIES = true`, the `AgentConfigRequest` record MUST be extended with a typed `ContextManagementConfigRequest contextManagement` field. Without this extension, requests carrying `context_management` fail schema validation before reaching the service layer, and `AgentService.canonicalizeConfig` drops the field on round-trip.
 
 ## Task-Specific Shared Contract
 
-- `agent_config.context_management` has four optional fields — all four must be absent-friendly:
-  - `enabled: bool`, optional. When present, persisted verbatim and used verbatim by the worker. When absent, the worker resolves the effective default at runtime based on rollout env vars + the agent's `created_at` — **Task 1 does NOT inject a default**. See Task 7 §"Effective-enabled resolution" for the runtime logic.
-  - `summarizer_model: string`, optional. When present, must reference an active row in `models` for the agent's provider. When absent, the worker falls back to `claude-haiku-4-5` (platform default, defined worker-side in Task 2).
-  - `exclude_tools: list[string]`, optional. Default `[]`. Max 50 entries (matches `tool_servers`). Each string is a tool name; unknown names are allowed (customer tools can be added before they are wired).
+- `agent_config.context_management` has three optional tuning fields — all three absent-friendly. **There is no `enabled` field.** Track 7 is platform infrastructure, not a feature with a per-agent toggle; customers cannot disable compaction on an agent because an agent without compaction simply fails once history exceeds the provider's context window. A worker-process kill switch (`CONTEXT_MGMT_KILL_SWITCH` env var) is the operator-only incident escape hatch, not a customer-facing knob.
+  - `summarizer_model: string`, optional. When present, must reference an active row in `models` for the agent's provider. When absent, the worker falls back to `claude-haiku-4-5` (platform default, defined worker-side in Task 3).
+  - `exclude_tools: list[string]`, optional. Default `[]`. Max 50 entries (matches `tool_servers`). Each string is a tool name; unknown names are allowed (customer tools can be added before they are wired). Platform defaults (`memory_note`, `save_memory`, `request_human_input`, `memory_search`, `task_history_get`) are always applied regardless of this field — the agent list is *additive*, not a replacement.
   - `pre_tier3_memory_flush: bool`, optional. When absent the worker treats it as `true`, matching the design default. No-op if `agent.memory.enabled=false` — validation does not enforce memory coupling; runtime skipping does.
-- Canonicalisation: `AgentService.canonicalizeConfig` MUST round-trip the `context_management` sub-object exactly as stored. When the sub-object is absent on the request, the persisted JSON omits the key entirely (no default populated). When present, preserve all four fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list. **Critical:** do not inject `enabled=true` on behalf of the caller — an absent `enabled` must remain absent in the persisted JSON so the worker's rollout-aware resolution logic can distinguish "never configured" from "explicitly true/false."
-- Compaction-disabled agents (`enabled=false`) must behave identically to pre-Track-7 behavior. This task does not change worker runtime behavior; subsequent tasks (7/8) enforce the gating.
+- Canonicalisation: `AgentService.canonicalizeConfig` MUST round-trip the `context_management` sub-object exactly as stored. When the sub-object is absent on the request, the persisted JSON omits the key entirely (no default populated). When present, preserve all three fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list.
+- This task does not change worker runtime behavior; it only lands the API config surface. Worker behavior is wired in Task 8.
 - Validation runs at both `POST /v1/agents` and `PUT /v1/agents/{agent_id}` — reuse the helper for both paths.
 
 ## Affected Component
@@ -49,8 +48,8 @@ Because Spring Boot's default Jackson is configured with `FAIL_ON_UNKNOWN_PROPER
 
 ## Dependencies
 
-- **Must complete first:** None. Task 1 is independent of Task 2 (worker constants).
-- **Provides output to:** Task 7 (worker pipeline reads `context_management.enabled`, `summarizer_model`, `exclude_tools`), Task 8 (reads `pre_tier3_memory_flush`), Task 10 (Console form mirrors these fields).
+- **Must complete first:** None. Task 1 is independent of Task 3 (worker constants).
+- **Provides output to:** Task 8 (worker pipeline reads `summarizer_model`, `exclude_tools` from the persisted sub-object), Task 9 (reads `pre_tier3_memory_flush`), Task 11 (Console form mirrors these fields).
 - **Shared interfaces/contracts:** The JSON shape of `agent_config.context_management`.
 
 ## Implementation Specification
@@ -59,12 +58,13 @@ Because Spring Boot's default Jackson is configured with `FAIL_ON_UNKNOWN_PROPER
 
 Create a Java `record` mirroring `MemoryConfigRequest` style with:
 
-- `Boolean enabled` — nullable, treated as `true` when absent.
 - `String summarizerModel` — nullable. Snake-case JSON key `summarizer_model`.
 - `List<String> excludeTools` — nullable. Snake-case JSON key `exclude_tools`. Max size 50.
 - `Boolean preTier3MemoryFlush` — nullable. Snake-case JSON key `pre_tier3_memory_flush`.
 
-All fields nullable so partial payloads are accepted. The validator enforces bounds; absence is always valid.
+Three fields total. No `enabled` field — the sub-object is purely for tuning and carries no opt-out knob. All fields nullable so partial payloads are accepted.
+
+**Unknown-property rejection.** Because Spring Boot's Jackson is configured with `FAIL_ON_UNKNOWN_PROPERTIES = true`, the request record MUST reject an `enabled` key if a client sends one. This is the correct behavior — it surfaces a 400 with "Unrecognized field 'enabled'" rather than silently dropping the field. No manual guard needed; the default Jackson behavior enforces it.
 
 ### Modify: `AgentConfigRequest`
 
@@ -92,7 +92,7 @@ Do NOT write defaults into the canonical config (see next section). Validation e
 Add the `context_management` sub-object to the round-trip identically to how `memory` is handled:
 
 - When `contextManagement` is absent on the request, the persisted JSON omits the key entirely.
-- When present, preserve all four fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list.
+- When present, preserve all three fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list.
 - Verify round-trip by reading the persisted `agent_config` and deserialising it back into `AgentConfigRequest`.
 
 ### Consumer expectations
@@ -102,13 +102,14 @@ This task is a PURE config surface task. Do not:
 - Register any compaction behavior on the worker.
 - Add compaction state fields anywhere.
 - Change the task-submission payload or task-detail response.
-- Add Console UI (Task 10).
+- Add Console UI (Task 11).
 
 All of those belong to later tasks. The only user-visible effect of this task is that `POST /v1/agents` and `PUT /v1/agents/{agent_id}` now accept and persist the `context_management` sub-object.
 
 ## Acceptance Criteria
 
-- [ ] `POST /v1/agents` with `agent_config.context_management.enabled = true` and no other fields succeeds; the row reads back with the sub-object intact.
+- [ ] `POST /v1/agents` with `agent_config.context_management = {}` (empty sub-object) succeeds; the row reads back with an empty sub-object.
+- [ ] `POST /v1/agents` with `agent_config.context_management.enabled = true` fails with a 400 "Unrecognized field 'enabled'" — Track 7 has no enabled toggle.
 - [ ] `POST /v1/agents` with `agent_config.context_management.summarizer_model = "claude-haiku-4-5"` and a matching active row in `models` succeeds.
 - [ ] `POST /v1/agents` with `agent_config.context_management.summarizer_model = "nonexistent-model"` fails with a 400 and an error message consistent with the existing "unknown model" path.
 - [ ] `POST /v1/agents` with `agent_config.context_management.summarizer_model = "<valid-but-disabled-row>"` fails with a 400.
@@ -131,12 +132,12 @@ All of those belong to later tasks. The only user-visible effect of this task is
 
 - Do not change the `agents` table schema.
 - Do not write default values into the persisted config — defaults apply at read time only. Absence must stay absent.
-- Do not add Console UI — Task 10 covers that.
-- Do not add runtime gating or pipeline invocation — that is Task 7.
+- Do not add Console UI — Task 11 covers that.
+- Do not add runtime gating or pipeline invocation — that is Task 8.
 - Do not introduce new Jackson global config (no `IGNORE_UNKNOWN_PROPERTIES=true`). The explicit typed field is the correct fix.
 - Do not add context-management fields to `TaskSubmissionRequest` — Track 7 has no per-task knobs in v1.
 - Error messages must match existing style. Do not invent new error codes.
-- Do not cross-validate `pre_tier3_memory_flush` against `memory.enabled` — runtime gating is the worker's job (Task 8).
+- Do not cross-validate `pre_tier3_memory_flush` against `memory.enabled` — runtime gating is the worker's job (Task 9).
 
 ## Assumptions
 

@@ -1,18 +1,18 @@
-<!-- AGENT_TASK_START: task-5-tier-1-5-transform.md -->
+<!-- AGENT_TASK_START: task-6-tier-1-5-transform.md -->
 
-# Task 5 — Tier 1.5 Transform: Tool-Call Argument Truncation
+# Task 6 — Tier 1.5 Transform: Tool-Call Argument Truncation
 
 ## Agent Instructions
 
 **CRITICAL PRE-WORK:**
 1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Tier 1.5: tool-call argument truncation".
 2. `services/worker-service/executor/compaction/defaults.py` — `KEEP_TOOL_USES`, `TRUNCATABLE_TOOL_ARG_KEYS`, `ARG_TRUNCATION_CAP_BYTES`.
-3. `services/worker-service/executor/compaction/transforms.py` (from Task 4) — pattern for monotone pure transforms.
+3. `services/worker-service/executor/compaction/transforms.py` (from Task 5) — pattern for monotone pure transforms.
 4. LangChain `AIMessage.tool_calls` shape — how `tool_calls` list is structured (each entry has `id`, `name`, `args` dict).
 
 **CRITICAL POST-WORK:**
 1. Run `make worker-test`. Every new unit test must pass.
-2. Update Task 5 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+2. Update Task 6 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
 
 ## Context
 
@@ -66,16 +66,16 @@ Semantics:
 
 - **Service/Module:** Worker Service — Compaction transforms
 - **File paths:**
-  - `services/worker-service/executor/compaction/transforms.py` (modify — add `truncate_tool_call_args` alongside Task 4's `clear_tool_results`)
-  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `truncate_tool_call_args`, `TruncateResult` directly from `executor.compaction.transforms`.
+  - `services/worker-service/executor/compaction/transforms.py` (modify — add `truncate_tool_call_args` alongside Task 5's `clear_tool_results`)
+  - **Do NOT edit `compaction/__init__.py`** — Task 8 owns its final shape. Import `truncate_tool_call_args`, `TruncateResult` directly from `executor.compaction.transforms`.
   - `services/worker-service/tests/test_compaction_transforms_truncate.py` (new)
 - **Change type:** function addition + unit tests
 
 ## Dependencies
 
-- **Must complete first:** Task 2 (imports constants).
-- **Parallel-safe with:** Task 4 writes to the same file. Use `isolation: "worktree"` if parallelising.
-- **Provides output to:** Task 7 (pipeline invokes `truncate_tool_call_args` as the Tier 1.5 step).
+- **Must complete first:** Task 3 (imports constants).
+- **Parallel-safe with:** Task 5 writes to the same file. Use `isolation: "worktree"` if parallelising.
+- **Provides output to:** Task 8 (pipeline invokes `truncate_tool_call_args` as the Tier 1.5 step).
 
 ## Implementation Specification
 
@@ -154,7 +154,7 @@ def _already_truncated(val: str) -> bool:
 
 ## Testing Requirements
 
-- Mirror Task 4's test structure: table-driven coverage of cap-threshold, idempotency, determinism, non-AIMessage pass-through, non-string args, protection-window boundary.
+- Mirror Task 5's test structure: table-driven coverage of cap-threshold, idempotency, determinism, non-AIMessage pass-through, non-string args, protection-window boundary.
 - Cache-stability regression: run twice, assert byte-identical outputs.
 - Cross-version LangChain compatibility: if `tool_calls` is a list of dicts, and if it's a list of `ToolCall` typed dicts — both representations must work. Add a test that injects each shape.
 
@@ -164,11 +164,11 @@ def _already_truncated(val: str) -> bool:
 - Do NOT introduce a new LangChain dependency. Use whatever version is pinned in `pyproject.toml`.
 - Do NOT truncate non-string args. Track 7 v1 scope is string args only.
 - Do NOT read any env var, DB, or network. Pure transform.
-- Do NOT combine Task 4 and Task 5 transforms — two orthogonal functions.
+- Do NOT combine Task 5 and Task 6 transforms — two orthogonal functions.
 
 ## Assumptions
 
 - LangChain version in use supports both `m.model_copy(update={...})` and direct `AIMessage(content=..., tool_calls=...)` construction. If neither works cleanly in the version pinned, use `m.copy(update={...})` or fall back to `AIMessage(**{**m.dict(), "tool_calls": new_tool_calls})`.
 - The worker ships Python 3.11+.
 
-<!-- AGENT_TASK_END: task-5-tier-1-5-transform.md -->
+<!-- AGENT_TASK_END: task-6-tier-1-5-transform.md -->
