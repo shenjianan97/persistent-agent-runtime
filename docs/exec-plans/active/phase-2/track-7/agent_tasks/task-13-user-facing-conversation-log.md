@@ -4,13 +4,19 @@
 
 ## Agent Instructions
 
-Task 13 is **parallelizable across multiple subagents**. Three independent slices can proceed concurrently once the shared contracts (table schema + API response shape) are agreed in §Task-Specific Shared Contract:
+Task 13 is **parallelizable across three independent subagents**. The shared contract (§Task-Specific Shared Contract — schema, `content` schema per `kind`, API response shape, ownership split) is fully specified so slices don't need to coordinate mid-flight.
 
-- **Slice A — DB + Worker**: migration `0017`, `ConversationLogRepository` (Python), dual-write in `agent_node`, worker tests.
-- **Slice B — API**: Java `ConversationLogRepository` / `ConversationLogService` / new endpoint on `TaskController`, Java tests, backend-integration E2E.
-- **Slice C — Console**: `ConversationPane.tsx` + types + client helper + unit tests, `TaskDetailPage.tsx` integration, Playwright Scenario 17 spec addition in `CONSOLE_BROWSER_TESTING.md`.
+- **Slice A — DB + Worker**: migration `0017`, `ConversationLogRepository` (Python, write-only), dual-write in `agent_node` including idempotency key + branch_id handling, worker unit + DB tests.
+- **Slice B — API**: Java `ConversationLogRepository` (read-only), `ConversationLogService`, new endpoint on `TaskController`, Java unit + serialization tests, backend-integration E2E (runs against Slice A's migration — Slice A merges first OR Slice B stubs the repo behind a feature flag until A lands).
+- **Slice C — Console**: `ConversationPane.tsx` + types + `client.ts` helper + unit tests against a mocked fixture of the §API endpoint response shape. `TaskDetailPage.tsx` integration. Playwright Scenario 17 added to `CONSOLE_BROWSER_TESTING.md`.
 
-Slice A must ship the migration and repository before Slice B's backend-integration E2E can run end-to-end, but both can be implemented and unit-tested in parallel. Slice C can be built against a mocked client until Slice B's endpoint is live. The docs update (`track-7-context-window-management.md`, `progress.md`) is ownerless — whichever slice lands last owns it.
+**Ownership rules (non-negotiable — these keep slices independent):**
+- The Python repository is **write-only**. It has NO `list_entries` method. Slice A MUST NOT add one.
+- The Java repository is **read-only**. It reads Postgres directly. Slice B MUST NOT call into Slice A's Python code.
+- The `content` shape per `kind` and the API response JSON are authoritative in §Content schema + §API endpoint. Neither slice may deviate.
+- Idempotency key format is authoritative: `sha256(task_id || branch_id || checkpoint_id || origin_ref)`. Origin ref rules are specified in §Worker write path.
+
+**Merge order:** Slice A merges first (defines the schema); Slices B and C can merge in either order after that. The docs update (`track-7-context-window-management.md` §Customer-visible behavior changes, `progress.md` Task 13 row) is owned by whichever slice lands last.
 
 Use `isolation: "worktree"` for every parallel slice.
 
@@ -49,58 +55,112 @@ Track 7 compaction is persisted in LangGraph checkpoints. Today the task-detail 
 
 ## Task-Specific Shared Contract
 
-- New table `task_conversation_log` (migration `0017_task_conversation_log.sql`):
+### Schema (migration `0017_task_conversation_log.sql`)
 
-  ```sql
-  CREATE TABLE task_conversation_log (
-      entry_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      tenant_id      TEXT NOT NULL,
-      task_id        UUID NOT NULL REFERENCES tasks(task_id),
-      sequence       BIGINT NOT NULL,
-      kind           TEXT NOT NULL CHECK (kind IN (
-          'user_turn',
-          'agent_turn',
-          'tool_call',
-          'tool_result',
-          'system_note',
-          'compaction_boundary',
-          'memory_flush'
-      )),
-      role           TEXT,                   -- 'user'|'assistant'|'tool'|'system'
-      content        JSONB NOT NULL,         -- {"text": "...", "tool_name": "...", ...}
-      content_size   INTEGER NOT NULL,       -- byte length of serialized content
-      metadata       JSONB NOT NULL DEFAULT '{}'::jsonb,
-      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (task_id, sequence)
-  );
-  CREATE INDEX idx_task_conversation_log_task_seq
-      ON task_conversation_log (task_id, sequence);
-  CREATE INDEX idx_task_conversation_log_tenant
-      ON task_conversation_log (tenant_id, created_at DESC);
-  ```
+```sql
+CREATE TABLE task_conversation_log (
+    entry_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id        TEXT NOT NULL,
+    task_id          UUID NOT NULL REFERENCES tasks(task_id),
+    -- Monotone ordering — NOT gapless. Consumers must page via `sequence > N`,
+    -- never assume a contiguous 1..N range (gaps arise from redrive-branch
+    -- soft-deletes and occasional insert retries). Postgres IDENTITY gives
+    -- a single source of truth that survives rollback without holes in the
+    -- write path.
+    sequence         BIGINT GENERATED ALWAYS AS IDENTITY,
+    -- Redrive attempt / branch this entry belongs to. When a task is redriven
+    -- from an earlier checkpoint, a NEW branch_id is allocated and fresh
+    -- entries get that branch_id. Pre-redrive entries stay in the table
+    -- (soft-retained for audit) but are filtered out of the Console view by
+    -- default. `task_branches.current_branch_id` or equivalent is the
+    -- source of truth — see §Redrive below.
+    branch_id        UUID NOT NULL,
+    -- LangGraph checkpoint this entry was produced in (for cross-ref with
+    -- the checkpointer and for dedup). NULL only for `system_note` entries
+    -- that are not tied to a specific super-step.
+    checkpoint_id    TEXT,
+    -- Idempotency key — `sha256(task_id || branch_id || checkpoint_id ||
+    -- origin_ref)` where origin_ref is the LangGraph message id for
+    -- model/tool messages or a deterministic compaction-event id (e.g.,
+    -- "tier3:<watermark_before>->{watermark_after}") for compaction entries.
+    -- A duplicate insert with the same key is a no-op (ON CONFLICT DO NOTHING)
+    -- — this makes every worker write idempotent across retries and crashes.
+    idempotency_key  TEXT NOT NULL,
+    kind             TEXT NOT NULL CHECK (kind IN (
+        'user_turn',
+        'agent_turn',
+        'tool_call',
+        'tool_result',
+        'system_note',
+        'compaction_boundary',
+        'memory_flush'
+    )),
+    role             TEXT,                  -- 'user' | 'assistant' | 'tool' | 'system'
+    content_version  SMALLINT NOT NULL DEFAULT 1,   -- bumped on schema change
+    content          JSONB NOT NULL,                 -- shape per-kind (see §Content schema)
+    content_size     INTEGER NOT NULL,               -- bytes of serialized content
+    metadata         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (task_id, idempotency_key)
+);
 
-- Python repository `services/worker-service/core/conversation_log_repository.py`:
-  - `append_entry(task_id, tenant_id, kind, role, content, metadata) -> int` — returns the new `sequence`.
-  - `list_entries(task_id, after_sequence=None, limit=None) -> list[dict]` — for the API service to consume (or the API queries Postgres directly — see §Implementation).
-  - Uses the existing asyncpg pool pattern; sequence is computed as `COALESCE(MAX(sequence), 0) + 1` in a single UPSERT or acquired via an advisory lock on `(task_id)` to avoid races.
+CREATE INDEX idx_task_conversation_log_task_seq
+    ON task_conversation_log (task_id, sequence);
+CREATE INDEX idx_task_conversation_log_task_branch_seq
+    ON task_conversation_log (task_id, branch_id, sequence);
+CREATE INDEX idx_task_conversation_log_tenant
+    ON task_conversation_log (tenant_id, created_at DESC);
+```
 
-- Worker write points (in `executor/graph.py` `agent_node`):
-  - **BEFORE** `compact_for_llm(raw_messages, state, agent_config, ...)`: append each NEW message in `raw_messages[state.last_super_step_message_count:]` to the log. Tool messages are appended with their full (Tier-0-capped) content.
-  - **AFTER** the LLM responds and returns an `AIMessage`: append the AIMessage to the log as `kind='agent_turn'` (text) plus one `kind='tool_call'` entry per `tool_call` in the response.
-  - **WHEN** Tier 3 fires (detect via `Tier3FiredEvent` in the pipeline result): append a `kind='compaction_boundary'` entry with `metadata={"summarizer_model": ..., "summary_bytes": ..., "turns_summarized": ...}` and `content={"summary_text": <summary>}`.
-  - **WHEN** pre-Tier-3 memory flush fires (detect via `MemoryFlushFiredEvent`): append a `kind='memory_flush'` entry.
+`UNIQUE(task_id, idempotency_key)` replaces the earlier `UNIQUE(task_id, sequence)` — it's what dedups retries, and it lets `sequence` be a plain IDENTITY column (no `MAX+1` race, no advisory lock, no retry-on-23505 loop). Consumers paginate via `sequence > after_sequence` and tolerate gaps.
 
-- New REST endpoint `GET /v1/tasks/{taskId}/conversation`:
-  - Returns `{entries: [...], next_sequence: N | null}`.
-  - Supports `?after_sequence=<n>&limit=<m>` for pagination and incremental-poll clients.
-  - Tenant-scoped (reuses existing `TaskController` tenant guard).
-  - NOT derived from checkpoints.
+### Content schema per `kind` (v1)
 
-- Console task-detail "Conversation" pane:
-  - New tab/section alongside the existing `CheckpointTimeline` (do NOT delete the timeline — it remains the source for checkpoint-level infrastructure telemetry).
-  - Renders `task_conversation_log` entries in sequence order.
-  - Compaction-boundary entries render as a collapsible divider. Memory-flush entries render as a single-line banner.
-  - Polls every 5 s while task is active; stops when task reaches a terminal state.
+Content is a JSONB blob whose shape is a function of `kind`. Every entry also has `content_version` (int, default 1). Implementers MUST NOT diverge from these shapes; new fields require bumping `content_version`.
+
+| `kind` | `content` shape | `metadata` shape |
+|--------|-----------------|------------------|
+| `user_turn` | `{"text": str}` | `{}` |
+| `agent_turn` | `{"text": str}` — text portion of the AIMessage | `{"message_id": str, "finish_reason": str \| null}` |
+| `tool_call` | `{"tool_name": str, "args": object, "call_id": str}` — one entry per `AIMessage.tool_calls[*]` | `{"message_id": str}` |
+| `tool_result` | `{"call_id": str, "tool_name": str, "text": str, "is_error": bool}` — `text` is Tier-0-capped (≤ 25KB) | `{"orig_bytes": int, "capped": bool}` |
+| `system_note` | `{"text": str}` — platform-owned notes (rarely used in v1) | `{}` |
+| `compaction_boundary` | `{"summary_text": str}` | `{"summarizer_model": str, "turns_summarized": int, "summary_bytes": int, "cost_microdollars": int, "tier3_firing_index": int}` |
+| `memory_flush` | `{}` | `{}` |
+
+Unknown-field behavior on the API read path: Java unmarshals via Jackson with `FAIL_ON_UNKNOWN_PROPERTIES=false` on `content`/`metadata` only, so a schema-v2 entry served to a schema-v1 Console degrades gracefully. Console renders any unrecognized `kind` as a neutral "system event" banner with raw JSON in a debug fold.
+
+### Worker write path
+
+Dual-write happens inside `agent_node` — NEVER inside `compact_for_llm` (pipeline stays pure). Write points:
+
+1. **Pre-LLM turns** — after `agent_node` resolves the incoming `raw_messages` for the super-step, iterate `raw_messages[state.last_super_step_message_count:]` and append one entry per message. Each entry's `idempotency_key = sha256(task_id || branch_id || checkpoint_id || message_id)` where `message_id` is the LangChain message ID. The `ON CONFLICT DO NOTHING` clause turns redrive-re-processing into a no-op.
+2. **LLM response** — append the response as `agent_turn` (text content only), plus one `tool_call` per `response.tool_calls[*]`. Same idempotency-key scheme.
+3. **Compaction events** — iterate `PassResult.events` returned by `compact_for_llm`. For each `Tier3FiredEvent`: append `compaction_boundary`. For each `MemoryFlushFiredEvent`: append `memory_flush`. Idempotency key uses `f"tier3:{watermark_before}->{watermark_after}"` or `f"flush:{checkpoint_id}"` — stable across retries.
+
+Write ordering guarantee: appends happen BEFORE the LangGraph super-step commits its checkpoint. If the checkpoint commit fails, the next super-step retry re-runs and the idempotency key prevents duplicate log entries.
+
+Transaction boundaries: each log append is its own statement (no outer transaction around the super-step's log + checkpoint write). This is intentional — LangGraph's checkpointer owns its own transaction, and the log is best-effort audit. In the rare case where the log append succeeds but the super-step crashes before producing an AIMessage, the pre-LLM entries are correct (they describe what went in); the missing agent_turn/tool_call entries are re-emitted on retry with the same idempotency keys.
+
+### API read path
+
+**Java owns the read path.** The Python `ConversationLogRepository` is write-only. The API service has its own Java `ConversationLogRepository` reading directly from Postgres — no cross-service RPC.
+
+`GET /v1/tasks/{taskId}/conversation?after_sequence={N}&limit={M}&include_archived_branches={bool}`:
+
+- Default `include_archived_branches=false` — returns only entries from the task's current branch (what the user should see).
+- When `true`, returns all branches; the Console's debug/operator mode may use this, but the default pane does not.
+- Default `limit=200`; max `limit=1000`. (Lowered from the earlier draft after Codex review — large pages are unnecessary given 5s polling.)
+- Pagination: `next_sequence` is the max `sequence` of the returned page when `len(entries) == limit`, else `null`.
+- Tenant-scoped via existing `TaskController` tenant guard.
+- 404 when task doesn't exist or belongs to another tenant.
+
+### Console task-detail "Conversation" pane
+
+- New tab alongside the existing `CheckpointTimeline` (Timeline is kept — serves operator/infra audience).
+- `ConversationPane` polls `/v1/tasks/{id}/conversation?after_sequence={lastSeq}` every 5 s while task is non-terminal.
+- Entry rendering by `kind` (see §Content schema for exact shapes).
+- Compaction-boundary entries render as an expandable inline divider. Memory-flush entries render as a single-line banner.
 
 ## Affected Component
 
@@ -138,17 +198,21 @@ Track 7 compaction is persisted in LangGraph checkpoints. Today the task-detail 
 
 ### Migration `0017_task_conversation_log.sql`
 
-As shown in §Task-Specific Shared Contract. The table is additive; no existing row changes. CHECK constraint on `kind` follows the Track 2 precedent (DROP+ADD pattern applies for future additions).
+As shown in §Task-Specific Shared Contract. Table is additive; no existing row changes. CHECK constraint on `kind` follows the Track 2 DROP+ADD pattern for future additions. `content_version` starts at 1; schema evolution bumps it.
 
-### Worker write path
+### Redrive and `branch_id` semantics
 
-The dual-write is inserted into `agent_node` at two sites:
+LangGraph's `rollback_last_checkpoint` restores graph state from a prior checkpoint. Post-rollback, the next super-step re-runs with the restored state. Without `branch_id`, this would either (a) write duplicate entries (if idempotency key alone dedups by message id, the redriven super-step produces the *same* message ids and dedups correctly) or (b) produce divergent continuations that contradict earlier entries.
 
-1. Immediately after receiving `raw_messages` for this super-step, iterate `raw_messages[state["last_super_step_message_count"]:]` and append each as a log entry. Do NOT re-append messages already logged (the watermark makes this deterministic).
-2. After the LLM response returns, append the response as `agent_turn` plus one `tool_call` per `response.tool_calls[*]`.
-3. After `compact_for_llm` returns events, iterate and append `compaction_boundary` for any `Tier3FiredEvent`, `memory_flush` for any `MemoryFlushFiredEvent`.
+**Rule:** allocate a fresh `branch_id` (UUID) every time the worker's redrive path restores from an earlier checkpoint. Track the current branch on the task itself (new `tasks.current_branch_id UUID` column, or piggyback on the existing `task_events` stream — ADR pick one at implementation time; favor the column for query simplicity). The worker writes new log entries with the current `branch_id`. The API's read path filters `branch_id = tasks.current_branch_id` by default.
 
-Repository signature:
+**Ordering under redrive:** `sequence` is a global IDENTITY, so it keeps increasing across branches. Within a given branch, `sequence` is monotone but NOT gapless (redriven-over entries stay in the table with older `branch_id`s; their sequences live in the earlier range). Pagination works uniformly: `sequence > after_sequence` always returns entries the client hasn't seen.
+
+**Idempotency interaction with redrive:** the idempotency key includes `branch_id`, so the same message re-emitted under a new branch writes a new row. Redrive that does NOT advance the branch (no rollback, just retry) reuses the same `branch_id` and dedups cleanly via the idempotency key.
+
+### Worker ownership & repository
+
+**Python side — write only.** `services/worker-service/core/conversation_log_repository.py`:
 
 ```python
 class ConversationLogRepository:
@@ -157,76 +221,104 @@ class ConversationLogRepository:
         *,
         task_id: str,
         tenant_id: str,
-        kind: Literal["user_turn","agent_turn","tool_call","tool_result",
-                      "system_note","compaction_boundary","memory_flush"],
+        branch_id: str,
+        checkpoint_id: str | None,
+        idempotency_key: str,
+        kind: Literal[
+            "user_turn", "agent_turn", "tool_call", "tool_result",
+            "system_note", "compaction_boundary", "memory_flush",
+        ],
         role: str | None,
         content: dict,
         metadata: dict | None = None,
-    ) -> int: ...
-    async def list_entries(
-        self,
-        *,
-        task_id: str,
-        after_sequence: int | None = None,
-        limit: int | None = None,
-    ) -> list[dict]: ...
+    ) -> int | None:
+        """Insert one entry. Returns assigned `sequence`, or None if the
+        idempotency key already existed (ON CONFLICT DO NOTHING swallowed it).
+        """
 ```
 
-Sequence assignment via `INSERT ... VALUES (..., COALESCE((SELECT MAX(sequence)+1 FROM task_conversation_log WHERE task_id=$1), 1), ...)` wrapped in a single statement (Postgres serialises it under the `UNIQUE(task_id, sequence)` constraint; retry on 23505 with bounded attempts if needed). An advisory lock keyed on `hashtext(task_id::text)` is an acceptable alternative.
+Python MUST NOT expose a `list_entries` method; the API reads Postgres directly (see next).
 
-**Failure mode:** if the log append fails (DB down), log a structured warning and continue. The task MUST NOT dead-letter just because the audit log is unavailable — model execution is the critical path. Best-effort semantics.
+**Java side — read only.** `services/api-service/src/main/java/com/persistentagent/api/repository/ConversationLogRepository.java` with a single method:
+
+```java
+List<ConversationEntryRow> findByTask(
+    UUID taskId,
+    UUID currentBranchId,
+    long afterSequence,
+    int limit,
+    boolean includeArchivedBranches
+);
+```
+
+No cross-service calls. The two repositories speak to the same table from opposite directions.
 
 ### API endpoint
 
-`GET /v1/tasks/{taskId}/conversation?after_sequence={N}&limit={M}`:
+`GET /v1/tasks/{taskId}/conversation?after_sequence={N}&limit={M}&include_archived_branches={bool}`:
 
 - Response shape (Java record `ConversationEntryResponse`):
   ```json
   {
     "entries": [
       {
-        "sequence": 1,
+        "sequence": 101,
+        "branch_id": "9a6b...-4a",
         "kind": "user_turn",
         "role": "user",
+        "content_version": 1,
         "content": {"text": "Do the thing"},
         "metadata": {},
         "created_at": "2026-04-19T..."
       },
       {
-        "sequence": 2,
+        "sequence": 102,
+        "branch_id": "9a6b...-4a",
         "kind": "tool_call",
         "role": "assistant",
-        "content": {"tool_name": "sandbox_read_file", "args": {"path": "/..."}, "call_id": "..."},
-        "metadata": {}
+        "content_version": 1,
+        "content": {"tool_name": "sandbox_read_file", "args": {"path": "/..."}, "call_id": "call_abc"},
+        "metadata": {"message_id": "ai_xyz"}
       },
       {
-        "sequence": 3,
+        "sequence": 140,
+        "branch_id": "9a6b...-4a",
         "kind": "compaction_boundary",
         "role": "system",
+        "content_version": 1,
         "content": {"summary_text": "Earlier: the agent explored /tmp and found 14 log files..."},
-        "metadata": {"summarizer_model": "claude-haiku-4-5", "turns_summarized": 18, "summary_bytes": 412}
+        "metadata": {"summarizer_model": "claude-haiku-4-5", "turns_summarized": 18, "summary_bytes": 412, "cost_microdollars": 238, "tier3_firing_index": 1}
       }
     ],
     "next_sequence": null
   }
   ```
-- `next_sequence` is non-null when the page was truncated by `limit`; clients re-request with `after_sequence=next_sequence`.
-- Default `limit=500`; max `limit=2000`.
-- Tenant check via existing `TaskController` tenant guard.
-- Returns 404 if task doesn't exist or belongs to another tenant.
+- `next_sequence = max(sequence)` when `len(entries) == limit`, else `null`.
+- Default `limit=200`; max `limit=1000`.
+- `include_archived_branches` default `false` — shows only current-branch entries.
+- Tenant guard reuses the existing `TaskController` pattern.
+- 404 when task doesn't exist or belongs to another tenant.
 
 ### Console "Conversation" pane
 
-- Add a second tab to `TaskDetailPage` labelled "Conversation" (next to the existing Timeline tab).
-- Component `ConversationPane` polls `/v1/tasks/{id}/conversation?after_sequence={lastSeq}` every 5 s while task is non-terminal.
-- Entry rendering by `kind`:
-  - `user_turn` — user bubble (left-aligned or styled as user input).
-  - `agent_turn` — assistant bubble.
-  - `tool_call` — collapsed card showing tool name + args preview; click to expand.
-  - `tool_result` — collapsed card with head of output + "expand" to see full; head/tail if the result was Tier-0 capped.
-  - `compaction_boundary` — inline divider: "— Context summarized at this point —" with a caret that expands to show `content.summary_text` and `metadata.summarizer_model / turns_summarized / summary_bytes`.
-  - `memory_flush` — single-line system banner: "— Memory flush fired (one-shot) —".
-- The existing `CheckpointTimeline` pane is unchanged — it continues to surface checkpoint counts, cost, HITL events, redrives, and tier-event structured logs for operator debugging. The two panes serve different audiences.
+- New tab on `TaskDetailPage` alongside the existing Timeline. Timeline is kept unchanged (operator/infra audience; Conversation pane is customer audience).
+- `ConversationPane` polls `GET /v1/tasks/{id}/conversation?after_sequence={lastSeq}` every 5 s while task is non-terminal. Stops on terminal state.
+- Entry rendering by `kind` (using the content schema in §Content schema):
+  - `user_turn` — user bubble
+  - `agent_turn` — assistant bubble
+  - `tool_call` — collapsed card: tool name + args preview; expandable to full args
+  - `tool_result` — collapsed card: head of `text` + expand; `metadata.capped=true` surfaces a "truncated at ingestion" tag
+  - `compaction_boundary` — expandable inline divider: "— Context summarized at this point —"; expanded view shows `summary_text`, `summarizer_model`, `turns_summarized`, `summary_bytes`
+  - `memory_flush` — single-line system banner
+  - Unknown `kind` or future `content_version` — neutral "system event" banner with raw JSON in a debug fold
+
+### Retention (v1 → Phase 3+ follow-up)
+
+The log stores Tier-0-capped tool results (≤ 25KB each) in `jsonb`. A long-running task with hundreds of tool calls can produce multi-MB log footprints per task.
+
+**v1 posture:** accept unbounded per-task growth. `make e2e-test` should include a 500-tool-call fixture that confirms Postgres handles the volume (hundreds of rows, tens of MB total, sub-100ms queries per page). No per-task row cap, no TTL.
+
+**Phase 3+ follow-up (deferred, NOT in scope of Task 13):** for `tool_result` entries > N KB (N TBD based on telemetry), store a 2KB preview in `content.text` and a pointer into the existing `task_artifacts` table (`content.artifact_s3_key`). Console renders the preview + a "Load full result" button. This is a clean follow-on because the `content_version` field already exists — bump to 2 and ship.
 
 ### Docs update
 
@@ -246,17 +338,21 @@ Sequence assignment via `INSERT ... VALUES (..., COALESCE((SELECT MAX(sequence)+
 
 ## Acceptance Criteria
 
-- [ ] Migration `0017_task_conversation_log.sql` applies cleanly on a fresh DB and on an existing DB with pre-existing tasks (no row churn).
-- [ ] Worker appends exactly one entry per new user/tool/agent message per super-step. No duplicates on redrive (watermark-gated).
-- [ ] Tier 3 firing produces exactly one `compaction_boundary` entry per firing; the entry's `content.summary_text` equals the generated summary; `metadata.turns_summarized` matches the `Tier3FiredEvent` payload.
-- [ ] Pre-Tier-3 memory flush produces exactly one `memory_flush` entry per task (matches the one-shot invariant).
-- [ ] Tier 1 / Tier 1.5 firings do NOT produce any conversation-log entries (they're invisible per design).
-- [ ] Per-tool-result cap still applies to conversation-log entries (the log does not store multi-MB outputs — 25KB is the ceiling).
-- [ ] `GET /v1/tasks/{taskId}/conversation` returns entries in sequence order; pagination via `after_sequence` works; tenant isolation enforced.
+- [ ] Migration `0017_task_conversation_log.sql` applies cleanly on a fresh DB and on an existing DB with pre-existing tasks (no row churn). `branch_id` column present; `sequence` is `GENERATED ALWAYS AS IDENTITY`; `UNIQUE(task_id, idempotency_key)` is the dedup constraint.
+- [ ] Worker appends exactly one entry per new user/tool/agent message per super-step. Retrying the same super-step (same `branch_id`, same `checkpoint_id`, same message id) produces ZERO new rows (ON CONFLICT DO NOTHING path is exercised by the test).
+- [ ] Redrive that allocates a new `branch_id` produces a fresh entry per re-emitted message (same message re-emitted under a new branch does NOT collide on the idempotency key).
+- [ ] Tier 3 firing produces exactly one `compaction_boundary` entry per firing; `content.summary_text` equals the generated summary; `metadata.turns_summarized` matches the `Tier3FiredEvent` payload.
+- [ ] Pre-Tier-3 memory flush produces exactly one `memory_flush` entry per task per branch.
+- [ ] Tier 1 / Tier 1.5 firings do NOT produce any conversation-log entries.
+- [ ] Per-tool-result cap still applies to conversation-log `tool_result` entries (≤ 25KB; `metadata.capped=true` when truncated at ingestion).
+- [ ] `GET /v1/tasks/{taskId}/conversation` returns entries with `sequence > after_sequence`, filtered to the current branch when `include_archived_branches=false`. Pagination `next_sequence = max(sequence)` when page is full, else `null`. Tenant isolation enforced.
+- [ ] `content` shapes per `kind` match §Content schema exactly (test asserts Jackson deserialises every `kind` into its documented shape).
+- [ ] `content_version=1` for every v1 entry; a deliberately injected entry with `content_version=2` is still served by the API and rendered as a debug-fold by the Console.
 - [ ] Console Conversation pane renders all seven `kind` values correctly; polling stops at terminal state.
 - [ ] Console CheckpointTimeline pane still renders its existing checkpoint/HITL/redrive events — no regression.
 - [ ] Task with a forced Tier 3 firing renders an expandable compaction-boundary divider; expanding shows the summary text.
 - [ ] If the conversation-log append fails (simulated DB error on the log write path), the task still completes successfully; a structured warning is logged.
+- [ ] If the LangGraph checkpoint commit fails AFTER log entries landed, the super-step retry re-emits the same message ids and the ON CONFLICT path prevents duplicates.
 - [ ] `make worker-test`, `make api-test`, `make console-test`, `make e2e-test` all pass.
 - [ ] Orchestrator Playwright Scenario 17 passes.
 
@@ -274,12 +370,16 @@ Sequence assignment via `INSERT ... VALUES (..., COALESCE((SELECT MAX(sequence)+
 - Do NOT derive the Conversation pane from LangGraph checkpoints. The separation is the whole point.
 - Do NOT remove or rename the existing `CheckpointTimeline` — it serves a different purpose (operator/infra view).
 - Do NOT apply Tier 1 / 1.5 / 3 transforms to the conversation log. Tier 0 (per-result cap) still applies — the log is NOT a raw-binary blob store.
-- Do NOT fail a task on conversation-log write failure — best-effort semantics.
-- Do NOT inline `summary_text` into the `messages` channel in state (that's already done by Task 8's summarizer). The conversation log's `compaction_boundary.content.summary_text` MAY duplicate the summary text — that's intentional (the log is self-contained for audit export).
-- Do NOT expose the conversation-log write path to customer tools or MCP servers. It's platform-owned.
+- Do NOT fail a task on conversation-log write failure — best-effort semantics. Log a structured warning and continue.
+- Do NOT inline `summary_text` into the `messages` channel in state (that's already done by Task 8's summarizer). The conversation log's `compaction_boundary.content.summary_text` MAY duplicate the summary — intentional (log is self-contained for export).
+- Do NOT expose the conversation-log write path to customer tools or MCP servers. Platform-owned.
 - Do NOT batch conversation-log writes across super-steps. Append per-message, synchronously, within the super-step boundary.
 - Do NOT add conversation-log content to Langfuse traces. Tracing is the operator's channel; the log is the customer's.
-- Sequence allocation: one statement `INSERT ... (SELECT COALESCE(MAX(sequence)+1, 1) ...)` with retry on 23505, OR `pg_advisory_xact_lock(hashtext(task_id))` at transaction start. Do NOT use a sequence object — sequences don't guarantee gapless ordering under aborted transactions, and the UI's pagination relies on contiguous sequences.
+- `sequence` is monotone but **NOT gapless** — Postgres IDENTITY column, consumers MUST page via `sequence > after_sequence`. Do NOT introduce `MAX+1` retry loops, advisory locks, or per-task sequences; the earlier draft's "gapless" requirement was a design error.
+- Dedup is **idempotency-key-based**, not sequence-based. Every write constructs `idempotency_key = sha256(task_id || branch_id || checkpoint_id || origin_ref)` and uses `INSERT ... ON CONFLICT (task_id, idempotency_key) DO NOTHING`. Implementers MUST NOT swap this for a different dedup strategy — it's what makes crash-retry and redrive safe.
+- `content` shape is **versioned**. Every entry has `content_version: SMALLINT NOT NULL DEFAULT 1`. New fields in an existing `kind` bump the version. Unknown versions are rendered as a debug fold by the Console, not silently ignored.
+- **Java owns the API read path; Python is write-only.** Do NOT add a `list_entries` method to the Python repository; the Java repository reads Postgres directly. No cross-service RPC for reads.
+- Retention: v1 accepts unbounded per-task log growth (Tier-0-capped entries only, so per-entry size is bounded). Blob-storage offload for large `tool_result` entries is a Phase 3+ follow-up; `content_version=2` is reserved for that schema bump.
 
 ## Assumptions
 
