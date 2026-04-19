@@ -1,11 +1,12 @@
 """Regression fixtures and reducer-safety tests for ``RuntimeState``.
 
 Phase 2 Track 7 Task 2 — State Schema Unification.
+Updated Task 8 — Track 7 compaction fields added to RuntimeState.
 
 Covers three categories per the task spec acceptance criteria:
 
-1. **Schema shape** — ``RuntimeState`` has the correct fields and reducers
-   (Track 5 fields only; no Track 7 fields).
+1. **Schema shape** — ``RuntimeState`` has the correct fields and reducers.
+   After Task 8: 4 Track 5 + 8 Track 7 = 12 total fields.
 
 2. **Reducer safety** — ``operator.add`` on ``observations`` succeeds when the
    initial value is ``[]`` and raises a clear ``TypeError`` when the initial
@@ -87,19 +88,34 @@ class TestRuntimeStateSchemaShape:
         assert metadata is None
         assert ann is bool
 
-    def test_no_track7_fields_present(self) -> None:
-        """Track 7 fields must NOT exist yet — Task 8 adds them."""
+    def test_track7_fields_present(self) -> None:
+        """Task 8 added Track 7 compaction fields — confirm they exist."""
         hints = get_type_hints(RuntimeState, include_extras=True)
         track7_fields = {
             "cleared_through_turn_index",
+            "truncated_args_through_turn_index",
+            "summarized_through_turn_index",
             "summary_marker",
+            "memory_flush_fired_this_task",
+            "last_super_step_message_count",
+            "tier3_firings_count",
+            "tier3_fatal_short_circuited",
         }
-        overlap = track7_fields & set(hints)
-        assert not overlap, f"Unexpected Track 7 fields found: {overlap}"
+        missing = track7_fields - set(hints)
+        assert not missing, f"Missing Track 7 fields after Task 8: {missing}"
 
-    def test_exactly_four_fields(self) -> None:
+    def test_exactly_twelve_fields(self) -> None:
+        """Task 8: 4 Track 5 + 8 Track 7 = 12 total fields."""
         hints = get_type_hints(RuntimeState, include_extras=True)
-        expected = {"messages", "observations", "pending_memory", "memory_opt_in"}
+        expected = {
+            # Track 5
+            "messages", "observations", "pending_memory", "memory_opt_in",
+            # Track 7
+            "cleared_through_turn_index", "truncated_args_through_turn_index",
+            "summarized_through_turn_index", "summary_marker",
+            "memory_flush_fired_this_task", "last_super_step_message_count",
+            "tier3_firings_count", "tier3_fatal_short_circuited",
+        }
         assert set(hints) == expected
 
 
