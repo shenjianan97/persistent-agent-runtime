@@ -94,6 +94,7 @@ class TestBuildGraphAlwaysMode:
         )
 
         assert workflow.state_schema is MemoryEnabledState
+        assert workflow.nodes["agent"].input_schema is MemoryEnabledState
 
         node_names = set(workflow.nodes.keys())
         assert MEMORY_WRITE_NODE_NAME in node_names
@@ -121,6 +122,7 @@ class TestBuildGraphAgentDecidesMode:
         )
 
         assert workflow.state_schema is MemoryEnabledState
+        assert workflow.nodes["agent"].input_schema is MemoryEnabledState
         node_names = set(workflow.nodes.keys())
         assert MEMORY_WRITE_NODE_NAME in node_names
         assert "agent" in node_names

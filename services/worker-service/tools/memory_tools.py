@@ -52,7 +52,8 @@ from typing import Annotated, Any, Awaitable, Callable
 
 import asyncpg
 import httpx
-from langchain_core.tools import StructuredTool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -91,6 +92,11 @@ class MemoryNoteArguments(BaseModel):
             ),
         ),
     ]
+    # Injected by ToolNode at runtime; hidden from the LLM schema so the model
+    # never tries to supply it. Required so the tool can return a matching
+    # ``ToolMessage`` paired to the agent's tool call — LangGraph's ``ToolNode``
+    # rejects a ``Command`` update that lacks the pairing.
+    tool_call_id: Annotated[str, InjectedToolCallId]
 
 
 # Phase 2 Track 5 Task 12 — ``save_memory`` mirror shape. Same 1..2048 char
@@ -111,6 +117,9 @@ class SaveMemoryArguments(BaseModel):
             ),
         ),
     ]
+    # Injected by ToolNode at runtime; hidden from the LLM schema. See
+    # ``MemoryNoteArguments.tool_call_id`` for rationale.
+    tool_call_id: Annotated[str, InjectedToolCallId]
 
 
 class MemorySearchArguments(BaseModel):
@@ -282,15 +291,24 @@ def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
     bound_agent = ctx.agent_id
     bound_task = ctx.task_id
 
-    def memory_note(text: str) -> Command:
+    def memory_note(
+        text: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
         # Argument validation is enforced by ``MemoryNoteArguments`` — if we
         # reach here, ``text`` already satisfies length 1..MEMORY_NOTE_MAX_LEN.
+        # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
+        # Command's ``messages`` update — without it the next agent step
+        # rejects the orphan tool call as a fatal graph error.
         logger.debug(
             "memory.note.appended tenant_id=%s agent_id=%s task_id=%s "
             "note_chars=%d",
             bound_tenant, bound_agent, bound_task, len(text),
         )
-        return Command(update={"observations": [text]})
+        return Command(update={
+            "messages": [ToolMessage(content="ok", tool_call_id=tool_call_id)],
+            "observations": [text],
+        })
 
     return StructuredTool.from_function(
         func=memory_note,
@@ -337,7 +355,10 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
     bound_agent = ctx.agent_id
     bound_task = ctx.task_id
 
-    def save_memory(reason: str) -> Command:
+    def save_memory(
+        reason: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
         stripped = reason.strip()
         if not stripped:
             # Schema already rejects empty strings; post-strip emptiness
@@ -361,8 +382,16 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             "reason_chars=%d",
             bound_tenant, bound_agent, bound_task, len(stripped),
         )
+        # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
+        # Command's ``messages`` update — every LLM tool call needs a paired
+        # reply or the next agent step rejects the orphan as a fatal graph
+        # error (surfaced on the dead_letter task
+        # c385a4e4-e88c-4a2a-9796-f409ebec18cc).
         return Command(
             update={
+                "messages": [
+                    ToolMessage(content="ok", tool_call_id=tool_call_id),
+                ],
                 "memory_opt_in": True,
                 "observations": [f"[save_memory] {stripped}"],
             }

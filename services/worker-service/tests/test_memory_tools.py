@@ -134,27 +134,47 @@ def _tool_by_name(tools: list[Any], name: str) -> Any:
 
 class TestMemoryNoteArguments:
     def test_accepts_normal_text(self) -> None:
-        parsed = MemoryNoteArguments(text="Observed that X correlates with Y")
+        parsed = MemoryNoteArguments(
+            text="Observed that X correlates with Y", tool_call_id="call_x"
+        )
         assert parsed.text.startswith("Observed")
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(text="")
+            MemoryNoteArguments(text="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(text="a" * (MEMORY_NOTE_MAX_LEN + 1))
+            MemoryNoteArguments(
+                text="a" * (MEMORY_NOTE_MAX_LEN + 1), tool_call_id="call_x"
+            )
+
+
+def _invoke_with_tool_call(tool, args: dict, tool_call_id: str = "call_test"):
+    """Invoke a StructuredTool via the full tool_call envelope so
+    ``InjectedToolCallId``-annotated parameters get populated. Direct
+    ``tool.invoke({"arg": ...})`` bypasses the injection path and fails."""
+    return tool.invoke({
+        "args": args,
+        "id": tool_call_id,
+        "type": "tool_call",
+        "name": tool.name,
+    })
 
 
 class TestMemoryNoteTool:
-    def test_returns_command_appending_observation(self) -> None:
+    def test_returns_command_with_tool_message_and_observation(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         tool = _tool_by_name(tools, "memory_note")
 
-        result = tool.invoke({"text": "hello"})
+        result = _invoke_with_tool_call(tool, {"text": "hello"}, "call_xyz")
         assert isinstance(result, Command)
-        assert result.update == {"observations": ["hello"]}
+        assert result.update["observations"] == ["hello"]
+        # LangGraph requires a matching ToolMessage paired to the tool_call_id.
+        messages = result.update["messages"]
+        assert len(messages) == 1
+        assert messages[0].tool_call_id == "call_xyz"
 
     def test_not_registered_when_disabled(self) -> None:
         ctx = _make_ctx()
@@ -170,16 +190,21 @@ class TestMemoryNoteTool:
 
 class TestSaveMemoryArguments:
     def test_accepts_normal_reason(self) -> None:
-        parsed = SaveMemoryArguments(reason="this run shipped the fix")
+        parsed = SaveMemoryArguments(
+            reason="this run shipped the fix", tool_call_id="call_x"
+        )
         assert parsed.reason.startswith("this run")
 
     def test_rejects_empty_reason(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(reason="")
+            SaveMemoryArguments(reason="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(reason="a" * (SAVE_MEMORY_REASON_MAX_LEN + 1))
+            SaveMemoryArguments(
+                reason="a" * (SAVE_MEMORY_REASON_MAX_LEN + 1),
+                tool_call_id="call_x",
+            )
 
 
 class TestSaveMemoryTool:
@@ -188,19 +213,20 @@ class TestSaveMemoryTool:
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
         tool = _tool_by_name(tools, "save_memory")
 
-        result = tool.invoke({"reason": "shipped the fix"})
+        result = _invoke_with_tool_call(tool, {"reason": "shipped the fix"}, "call_save_1")
         assert isinstance(result, Command)
-        assert result.update == {
-            "memory_opt_in": True,
-            "observations": ["[save_memory] shipped the fix"],
-        }
+        assert result.update["memory_opt_in"] is True
+        assert result.update["observations"] == ["[save_memory] shipped the fix"]
+        messages = result.update["messages"]
+        assert len(messages) == 1
+        assert messages[0].tool_call_id == "call_save_1"
 
     def test_strips_whitespace_around_reason(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
         tool = _tool_by_name(tools, "save_memory")
 
-        result = tool.invoke({"reason": "   trimmed    "})
+        result = _invoke_with_tool_call(tool, {"reason": "   trimmed    "})
         assert result.update["observations"] == ["[save_memory] trimmed"]
 
     def test_whitespace_only_reason_raises_tool_error(self) -> None:
@@ -209,7 +235,7 @@ class TestSaveMemoryTool:
         tool = _tool_by_name(tools, "save_memory")
 
         with pytest.raises(MemoryToolError):
-            tool.invoke({"reason": "     "})
+            _invoke_with_tool_call(tool, {"reason": "     "})
 
     def test_not_registered_in_always_mode(self) -> None:
         """``save_memory`` is unnecessary when the run will write

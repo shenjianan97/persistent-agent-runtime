@@ -597,7 +597,7 @@ class GraphExecutor:
         auto_write = decision.auto_write
         state_type = MemoryEnabledState if stack_enabled else MessagesState
         workflow = StateGraph(state_type)
-        workflow.add_node("agent", agent_node)
+        workflow.add_node("agent", agent_node, input_schema=state_type)
 
         # Wire the ``memory_write`` node whenever the stack is enabled.
         # Terminal path out of the agent runs through this node on the
@@ -645,18 +645,23 @@ class GraphExecutor:
                 messages = getattr(state, "messages", None)
             last = messages[-1] if messages else None
             pending = bool(getattr(last, "tool_calls", None)) if last else False
+            opt_in = bool(
+                state.get("memory_opt_in", False)
+                if isinstance(state, dict)
+                else getattr(state, "memory_opt_in", False)
+            )
             if pending:
-                return "tools"
-            if stack_enabled and (
-                auto_write
-                or bool(
-                    state.get("memory_opt_in", False)
-                    if isinstance(state, dict)
-                    else getattr(state, "memory_opt_in", False)
-                )
-            ):
-                return MEMORY_WRITE_NODE_NAME
-            return END
+                decision = "tools"
+            elif stack_enabled and (auto_write or opt_in):
+                decision = MEMORY_WRITE_NODE_NAME
+            else:
+                decision = END
+            logger.info(
+                "memory.route_after_agent task_id=%s decision=%s "
+                "pending_tool_calls=%s stack_enabled=%s auto_write=%s opt_in=%s",
+                task_id, decision, pending, stack_enabled, auto_write, opt_in,
+            )
+            return decision
 
         if tools:
             tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
