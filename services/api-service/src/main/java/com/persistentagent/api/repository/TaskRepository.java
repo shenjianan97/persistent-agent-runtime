@@ -55,7 +55,7 @@ public class TaskRepository {
     public Optional<Map<String, Object>> insertTaskFromAgent(
             String tenantId, String agentId, String workerPoolId,
             String input, int maxRetries, int maxSteps, int taskTimeoutSeconds,
-            UUID langfuseEndpointId, boolean skipMemoryWrite) {
+            UUID langfuseEndpointId, String memoryMode) {
         String sql = """
                 WITH agent AS (
                     SELECT a.agent_id, a.display_name, a.agent_config
@@ -70,7 +70,7 @@ public class TaskRepository {
                     INSERT INTO tasks (tenant_id, agent_id, agent_config_snapshot, worker_pool_id,
                                        input, max_retries, max_steps, task_timeout_seconds, status,
                                        langfuse_endpoint_id, agent_display_name_snapshot,
-                                       skip_memory_write)
+                                       memory_mode)
                     SELECT ?, a.agent_id, a.agent_config, ?,
                            ?, ?, ?, ?, 'queued',
                            ?, a.display_name,
@@ -91,7 +91,7 @@ public class TaskRepository {
                 tenantId, workerPoolId,
                 input, maxRetries, maxSteps, taskTimeoutSeconds,
                 langfuseEndpointId,
-                skipMemoryWrite,
+                memoryMode,
                 workerPoolId);
         return results.isEmpty() ? Optional.empty() : Optional.of(results.get(0));
     }
@@ -129,7 +129,7 @@ public class TaskRepository {
                        t.langfuse_endpoint_id,
                        t.pending_input_prompt, t.pending_approval_action, t.human_input_timeout_at,
                        t.pause_reason, t.pause_details, t.resume_eligible_at,
-                       t.skip_memory_write,
+                       t.memory_mode,
                        (SELECT COALESCE(COUNT(*), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS checkpoint_count,
                        (SELECT COALESCE(SUM(c.cost_microdollars), 0) FROM checkpoints c WHERE c.task_id = t.task_id AND c.checkpoint_ns = '') AS total_cost_microdollars
                 FROM tasks t

@@ -205,7 +205,7 @@ class TaskControllerTest {
         }
 
         @Test
-        void submitTask_withAttachedMemoryIdsAndSkipMemoryWrite_returns201() throws Exception {
+        void submitTask_withAttachedMemoryIdsAndMemoryModeSkip_returns201() throws Exception {
                 UUID taskId = UUID.randomUUID();
                 UUID m1 = UUID.randomUUID();
                 UUID m2 = UUID.randomUUID();
@@ -223,7 +223,7 @@ class TaskControllerTest {
                                   "agent_id": "agent1",
                                   "input": "test",
                                   "attached_memory_ids": ["%s", "%s"],
-                                  "skip_memory_write": true
+                                  "memory_mode": "skip"
                                 }
                                 """, m1, m2);
 
@@ -237,6 +237,45 @@ class TaskControllerTest {
                                 .andExpect(jsonPath("$.attached_memories_preview").isArray())
                                 .andExpect(jsonPath("$.attached_memories_preview[0].memory_id").value(m1.toString()))
                                 .andExpect(jsonPath("$.attached_memories_preview[0].title").value("Resolved bug A"));
+        }
+
+        @Test
+        void submitTask_withInvalidMemoryMode_returns400() throws Exception {
+                String body = """
+                                {
+                                  "agent_id": "agent1",
+                                  "input": "test",
+                                  "memory_mode": "invalid"
+                                }
+                                """;
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest());
+        }
+
+        @Test
+        void submitTask_withEachValidMemoryMode_returns201() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
+                TaskSubmissionResponse response = new TaskSubmissionResponse(
+                                taskId, "agent1", "Agent One", "queued", now, List.of(), List.of());
+                when(taskService.submitTask(any())).thenReturn(response);
+
+                for (String mode : new String[]{"always", "agent_decides", "skip"}) {
+                        String body = String.format("""
+                                        {
+                                          "agent_id": "agent1",
+                                          "input": "test",
+                                          "memory_mode": "%s"
+                                        }
+                                        """, mode);
+                        mockMvc.perform(post("/v1/tasks")
+                                        .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                        .content(body))
+                                        .andExpect(status().isCreated());
+                }
         }
 
         @Test
@@ -304,14 +343,15 @@ class TaskControllerTest {
                                 0, List.of(), 5, 12500L, "worker-abc-123",
                                 null, null, null, null, null, now, now, null,
                                 null, null, null,
-                                null, null, null, null, List.of(), List.of());
+                                null, null, null, null, List.of(), List.of(), "always");
                 when(taskService.getTaskStatus(taskId)).thenReturn(response);
 
                 mockMvc.perform(get("/v1/tasks/" + taskId))
                                 .andExpect(status().isOk())
                                 .andExpect(jsonPath("$.task_id").value(taskId.toString()))
                                 .andExpect(jsonPath("$.checkpoint_count").value(5))
-                                .andExpect(jsonPath("$.total_cost_microdollars").value(12500));
+                                .andExpect(jsonPath("$.total_cost_microdollars").value(12500))
+                                .andExpect(jsonPath("$.memory_mode").value("always"));
         }
 
         @Test

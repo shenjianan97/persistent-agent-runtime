@@ -168,7 +168,7 @@ async def _seed_running_task(
         "task_timeout_seconds": 60,
         "retry_count": 0,
         "max_retries": 3,
-        "skip_memory_write": False,
+        "memory_mode": "always",
     }
 
 

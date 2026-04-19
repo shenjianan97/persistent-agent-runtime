@@ -73,8 +73,9 @@ async function fetchApi<T>(path: string, options?: RequestInit): Promise<T> {
 /**
  * Serialize the submit-task body to JSON. Extracted so the JSON and multipart
  * code paths share the same shape, including the Track-5 `attached_memory_ids`
- * and `skip_memory_write` fields. Empty attachment list and `false` skip flag
- * are omitted from the payload so the wire shape stays backward-compatible.
+ * and `memory_mode` fields. Empty attachment list is omitted from the payload
+ * so the wire shape stays compact; `memory_mode` is always included (defaults
+ * to `'always'` when unset).
  */
 function buildSubmitTaskBody(request: TaskSubmissionRequest): string {
     const body: Record<string, unknown> = {
@@ -84,12 +85,10 @@ function buildSubmitTaskBody(request: TaskSubmissionRequest): string {
         max_retries: request.max_retries,
         task_timeout_seconds: request.task_timeout_seconds,
         langfuse_endpoint_id: request.langfuse_endpoint_id,
+        memory_mode: request.memory_mode ?? 'always',
     };
     if (request.attached_memory_ids && request.attached_memory_ids.length > 0) {
         body.attached_memory_ids = request.attached_memory_ids;
-    }
-    if (request.skip_memory_write) {
-        body.skip_memory_write = true;
     }
     return JSON.stringify(body);
 }

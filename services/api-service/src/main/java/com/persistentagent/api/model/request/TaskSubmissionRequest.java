@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
 
 import java.util.List;
@@ -53,12 +54,21 @@ public record TaskSubmissionRequest(
         List<UUID> attachedMemoryIds,
 
         /**
-         * Per-task privacy override. When {@code true}, the worker treats the task
-         * as if the agent's memory were disabled (no memory tools, no write node,
-         * no dead-letter memory hook) — even if {@code agent.memory.enabled} is true.
-         * Defaults to {@code false} when absent.
+         * Per-task memory mode. One of:
+         * <ul>
+         *   <li>{@code "always"} — default: every successful task writes a memory.</li>
+         *   <li>{@code "agent_decides"} — memory is written only if the agent calls
+         *       the new {@code save_memory(reason)} tool during the run.</li>
+         *   <li>{@code "skip"} — no memory is written for this task.</li>
+         * </ul>
+         *
+         * <p>Optional; defaults to {@code "always"} when absent. Cross-field
+         * invariant: the API rejects {@code "always"} and {@code "agent_decides"}
+         * when the target agent has {@code memory.enabled=false}.
          */
-        @JsonProperty("skip_memory_write")
-        Boolean skipMemoryWrite
+        @Pattern(regexp = "always|agent_decides|skip",
+                message = "memory_mode must be one of 'always', 'agent_decides', 'skip'")
+        @JsonProperty("memory_mode")
+        String memoryMode
 ) {
 }

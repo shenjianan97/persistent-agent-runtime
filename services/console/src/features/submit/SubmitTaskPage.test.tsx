@@ -162,21 +162,41 @@ describe('SubmitTaskPage empty state', () => {
 });
 
 describe('SubmitTaskPage — memory disabled agent', () => {
-    it('hides the memory attach card when memory.enabled is false', async () => {
+    it('hides the memory attach picker when memory.enabled is false', async () => {
         mocks.agentFixture.agent_config.memory = { enabled: false };
         mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
         render(<SubmitTaskPage />, { wrapper: createWrapper() });
-        await waitFor(() =>
-            expect(screen.queryByTestId('memory-attach-card')).not.toBeInTheDocument()
-        );
+        // The memory card now always renders when an agent is selected so the
+        // mode dropdown can show in its disabled state.
+        expect(await screen.findByTestId('memory-attach-card')).toBeInTheDocument();
+        // But the attach picker itself is gone.
+        expect(screen.queryByTestId('attach-memory-picker')).not.toBeInTheDocument();
     });
 
-    it('hides the memory attach card when memory field is absent', async () => {
+    it('shows the memory-mode select disabled + locked to skip when memory is disabled', async () => {
+        mocks.agentFixture.agent_config.memory = { enabled: false };
         mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
         render(<SubmitTaskPage />, { wrapper: createWrapper() });
-        await waitFor(() =>
-            expect(screen.queryByTestId('memory-attach-card')).not.toBeInTheDocument()
-        );
+        const trigger = await screen.findByTestId('memory-mode-select');
+        expect(trigger).toBeInTheDocument();
+        expect(trigger).toBeDisabled();
+        // The displayed value snaps to "Don't save memory".
+        expect(trigger).toHaveTextContent(/don'?t save memory/i);
+        expect(screen.getByText(/this agent has memory disabled/i)).toBeInTheDocument();
+    });
+
+    it('forces memory_mode=skip in the payload when memory is disabled', async () => {
+        mocks.agentFixture.agent_config.memory = { enabled: false };
+        mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
+        render(<SubmitTaskPage />, { wrapper: createWrapper() });
+        const input = screen.getByLabelText(/Input Directive/i);
+        fireEvent.change(input, { target: { value: 'hello' } });
+        await act(async () => {
+            fireEvent.click(screen.getByRole('button', { name: /submit task/i }));
+        });
+        await waitFor(() => expect(mocks.mutateMock).toHaveBeenCalled());
+        const [{ request }] = mocks.mutateMock.mock.calls[mocks.mutateMock.mock.calls.length - 1];
+        expect(request.memory_mode).toBe('skip');
     });
 });
 
@@ -186,29 +206,16 @@ describe('SubmitTaskPage — memory enabled agent', () => {
         mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
     });
 
-    it('renders the memory attach card with skip-memory-write toggle', async () => {
+    it('renders the memory card with the memory-mode select defaulting to always', async () => {
         render(<SubmitTaskPage />, { wrapper: createWrapper() });
         expect(await screen.findByTestId('memory-attach-card')).toBeInTheDocument();
-        expect(screen.getByTestId('skip-memory-write-checkbox')).toBeInTheDocument();
+        const trigger = screen.getByTestId('memory-mode-select');
+        expect(trigger).toBeInTheDocument();
+        expect(trigger).not.toBeDisabled();
+        expect(trigger).toHaveTextContent(/always save memory/i);
     });
 
-    it('includes skip_memory_write=true in the payload when the toggle is on', async () => {
-        render(<SubmitTaskPage />, { wrapper: createWrapper() });
-        const input = screen.getByLabelText(/Input Directive/i);
-        fireEvent.change(input, { target: { value: 'hello memory' } });
-
-        const checkbox = await screen.findByTestId('skip-memory-write-checkbox');
-        fireEvent.click(checkbox);
-
-        await act(async () => {
-            fireEvent.click(screen.getByRole('button', { name: /submit task/i }));
-        });
-        await waitFor(() => expect(mocks.mutateMock).toHaveBeenCalled());
-        const [{ request }] = mocks.mutateMock.mock.calls[mocks.mutateMock.mock.calls.length - 1];
-        expect(request.skip_memory_write).toBe(true);
-    });
-
-    it('omits skip_memory_write + attached_memory_ids from the payload when untouched', async () => {
+    it('includes memory_mode=always in the payload by default', async () => {
         render(<SubmitTaskPage />, { wrapper: createWrapper() });
         const input = screen.getByLabelText(/Input Directive/i);
         fireEvent.change(input, { target: { value: 'hello' } });
@@ -218,6 +225,7 @@ describe('SubmitTaskPage — memory enabled agent', () => {
         });
         await waitFor(() => expect(mocks.mutateMock).toHaveBeenCalled());
         const [{ request }] = mocks.mutateMock.mock.calls[mocks.mutateMock.mock.calls.length - 1];
+        expect(request.memory_mode).toBe('always');
         expect(request.skip_memory_write).toBeUndefined();
         expect(request.attached_memory_ids).toBeUndefined();
     });
@@ -236,7 +244,9 @@ describe('SubmitTaskPage — deep-link pre-selection', () => {
                 expect.stringMatching(/memory is disabled/i)
             )
         );
-        expect(screen.queryByTestId('memory-attach-card')).not.toBeInTheDocument();
+        // Attach picker must NOT render for a memory-disabled agent even though
+        // the mode-select card now shows unconditionally.
+        expect(screen.queryByTestId('attach-memory-picker')).not.toBeInTheDocument();
     });
 
     it('pre-selects the entry when the agent has memory enabled and detail resolves', async () => {

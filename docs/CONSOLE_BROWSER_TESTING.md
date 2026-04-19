@@ -228,6 +228,19 @@ What to verify, in order (a single browser session):
 6. **Memory-disabled agent negative path**: navigate to the disabled agent's `/tasks/new`, confirm the Memory card does NOT render. Submitting a task there produces no memory row. Navigate to that agent's Memory tab and confirm the disabled notice + any historical entries render as read-only.
 7. `browser_console_messages` shows zero uncaught exceptions across the full walkthrough.
 
+### Scenario 14: Task Memory Mode Dropdown
+
+Covers Track 5 Task 12 — the `memory_mode` submission field replaces the old `skip_memory_write` checkbox with a three-value dropdown whose options are `always`, `agent_decides`, and `skip`. Verifies the `agent_decides` end-to-end flow (with and without the agent calling `save_memory`), the disabled-when-memory-off branch, and the cross-field API validation.
+
+Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.enabled = true`) and `agent-memory-off` (`agent_config.memory.enabled = false`).
+
+1. Navigate to Submit Task. Select `agent-memory-on`. Assert the `memory-mode-select` trigger exists, defaults to "Always save memory", and is enabled.
+2. Change the dropdown to "Let agent decide". Submit a task whose prompt instructs the agent to call `save_memory(reason="test reason")`. After completion, navigate to the Memories page and assert a new row appears for this task. Open task detail; confirm the `memory_mode` metadata reads `agent_decides` and the timeline includes the `save_memory` tool call carrying the reason.
+3. Repeat with a prompt that does NOT call `save_memory`. Assert no memory row is created, no "Memory Saved" timeline marker appears, and task detail shows `memory_mode = agent_decides`.
+4. Change the dropdown to "Don't save memory". Submit a task. Assert no memory row is written, no memory-related timeline entries appear, and task detail shows `memory_mode = skip`.
+5. Select `agent-memory-off`. Assert the dropdown snaps to "Don't save memory", is disabled, and the helper text reads "This agent has memory disabled". Submission succeeds and persists `memory_mode = skip`.
+6. Craft a `POST /v1/tasks` (via devtools / `browser_evaluate`) for `agent-memory-off` with `memory_mode: "always"`. Assert the API responds 400 with a validation error referencing the memory-enabled invariant.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -244,7 +257,8 @@ What to verify, in order (a single browser session):
 | HITL / approval / input feature | 1, 4, 8 |
 | Settings / Langfuse feature | 1, 9 |
 | Agent Memory tab feature | 1, 11 |
-| Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13 |
+| Task submission memory-mode / `agent_decides` feature | 1, 3, 14 |
+| Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13, 14 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
