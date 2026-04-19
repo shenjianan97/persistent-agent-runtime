@@ -13,7 +13,7 @@
 | Task 9 | Pre-Tier-3 Memory Flush | Not started | One-shot pre-Tier-3 `memory_note` nudge; positional heartbeat detection; `memory_flush_fired_this_task` one-shot |
 | Task 10 | Dead-Letter Reason Enum | Not started | Migration (CHECK-constraint DROP+ADD) + Java/Python plumbing for `context_exceeded_irrecoverable` |
 | Task 11 | Console — Context Management Form | Done | Agent edit form "Context management" section (3 fields, no `enabled` toggle); `ContextManagementSection.tsx` + 22 unit tests; `AgentConfig` type extended; Scenario 15 added to `CONSOLE_BROWSER_TESTING.md` |
-| Task 12 | Integration + Browser Tests | Not started | 14-AC E2E + cache-stability regression + Playwright scenarios |
+| Task 12 | Integration + Browser Tests | Done | `test_track7_ac_mapping.py` manifest (14 ACs, 16 tests); 8 new worker test files (ACs 5, 6, 7-redrive, 8, 9, 10, 13, 14; 59 tests pass); `tests/backend-integration/test_context_management_validation.py` (AC 12); Scenario 16 added to `CONSOLE_BROWSER_TESTING.md` |
 
 ## Notes
 
