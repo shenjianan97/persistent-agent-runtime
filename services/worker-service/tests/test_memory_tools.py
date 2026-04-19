@@ -40,12 +40,14 @@ import asyncpg
 from tools.memory_tools import (
     MEMORY_NOTE_MAX_LEN,
     MEMORY_SEARCH_TOOL_LIMIT_MAX,
+    SAVE_MEMORY_REASON_MAX_LEN,
     MemoryNoteArguments,
     MemorySearchArguments,
     MemorySearchVectorUnavailableError,
     MemoryToolContext,
     MemoryToolError,
     MemoryToolNotFoundError,
+    SaveMemoryArguments,
     TaskHistoryGetArguments,
     build_memory_tools,
 )
@@ -147,7 +149,7 @@ class TestMemoryNoteArguments:
 class TestMemoryNoteTool:
     def test_returns_command_appending_observation(self) -> None:
         ctx = _make_ctx()
-        tools = build_memory_tools(ctx, effective_memory_enabled=True)
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         tool = _tool_by_name(tools, "memory_note")
 
         result = tool.invoke({"text": "hello"})
@@ -156,9 +158,70 @@ class TestMemoryNoteTool:
 
     def test_not_registered_when_disabled(self) -> None:
         ctx = _make_ctx()
-        tools = build_memory_tools(ctx, effective_memory_enabled=False)
+        tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
         assert "memory_note" not in names
+
+
+# ---------------------------------------------------------------------------
+# save_memory (Task 12)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveMemoryArguments:
+    def test_accepts_normal_reason(self) -> None:
+        parsed = SaveMemoryArguments(reason="this run shipped the fix")
+        assert parsed.reason.startswith("this run")
+
+    def test_rejects_empty_reason(self) -> None:
+        with pytest.raises(ValidationError):
+            SaveMemoryArguments(reason="")
+
+    def test_rejects_over_limit(self) -> None:
+        with pytest.raises(ValidationError):
+            SaveMemoryArguments(reason="a" * (SAVE_MEMORY_REASON_MAX_LEN + 1))
+
+
+class TestSaveMemoryTool:
+    def test_returns_command_opts_in_and_appends_observation(self) -> None:
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "save_memory")
+
+        result = tool.invoke({"reason": "shipped the fix"})
+        assert isinstance(result, Command)
+        assert result.update == {
+            "memory_opt_in": True,
+            "observations": ["[save_memory] shipped the fix"],
+        }
+
+    def test_strips_whitespace_around_reason(self) -> None:
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "save_memory")
+
+        result = tool.invoke({"reason": "   trimmed    "})
+        assert result.update["observations"] == ["[save_memory] trimmed"]
+
+    def test_whitespace_only_reason_raises_tool_error(self) -> None:
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "save_memory")
+
+        with pytest.raises(MemoryToolError):
+            tool.invoke({"reason": "     "})
+
+    def test_not_registered_in_always_mode(self) -> None:
+        """``save_memory`` is unnecessary when the run will write
+        unconditionally — keep the tool list lean."""
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
+        assert "save_memory" not in [t.name for t in tools]
+
+    def test_not_registered_in_skip_or_memory_disabled(self) -> None:
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
+        assert "save_memory" not in [t.name for t in tools]
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +263,7 @@ class TestMemorySearchTool:
         }
         http = _FakeHttpClient([_FakeHttpResponse(status_code=200, json_payload=payload)])
         ctx = _make_ctx(agent_id="agent-A", http_client=http)
-        tools = build_memory_tools(ctx, effective_memory_enabled=True)
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         tool = _tool_by_name(tools, "memory_search")
 
         result = await tool.ainvoke({"query": "onboarding", "mode": "hybrid", "limit": 5})
@@ -217,7 +280,7 @@ class TestMemorySearchTool:
         http = _FakeHttpClient([_FakeHttpResponse(status_code=200, json_payload=payload)])
         ctx = _make_ctx(http_client=http)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=True), "memory_search"
+            build_memory_tools(ctx, stack_enabled=True, auto_write=True), "memory_search"
         )
         result = await tool.ainvoke({"query": "x"})
         assert result["ranking_used"] == "text"
@@ -227,7 +290,7 @@ class TestMemorySearchTool:
         http = _FakeHttpClient([_FakeHttpResponse(status_code=503)])
         ctx = _make_ctx(http_client=http)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=True), "memory_search"
+            build_memory_tools(ctx, stack_enabled=True, auto_write=True), "memory_search"
         )
         with pytest.raises(MemorySearchVectorUnavailableError) as excinfo:
             await tool.ainvoke({"query": "x", "mode": "vector"})
@@ -238,7 +301,7 @@ class TestMemorySearchTool:
         http = _FakeHttpClient([_FakeHttpResponse(status_code=404)])
         ctx = _make_ctx(http_client=http)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=True), "memory_search"
+            build_memory_tools(ctx, stack_enabled=True, auto_write=True), "memory_search"
         )
         result = await tool.ainvoke({"query": "x", "mode": "hybrid"})
         assert result == {"results": [], "ranking_used": "hybrid"}
@@ -248,7 +311,7 @@ class TestMemorySearchTool:
         http = _FakeHttpClient(httpx.ConnectError("unreachable"))
         ctx = _make_ctx(http_client=http)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=True), "memory_search"
+            build_memory_tools(ctx, stack_enabled=True, auto_write=True), "memory_search"
         )
         with pytest.raises(MemoryToolError):
             await tool.ainvoke({"query": "x"})
@@ -260,7 +323,7 @@ class TestMemorySearchTool:
         http = _FakeHttpClient([_FakeHttpResponse(status_code=200, json_payload=payload)])
         ctx = _make_ctx(agent_id="agent-A", http_client=http)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=True), "memory_search"
+            build_memory_tools(ctx, stack_enabled=True, auto_write=True), "memory_search"
         )
         await tool.ainvoke(
             {
@@ -305,7 +368,7 @@ class TestTaskHistoryGetTool:
         pool = _FakePool(fetchrow_return=row)
         ctx = _make_ctx(tenant_id="default", agent_id="agent-A", pool=pool)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
 
@@ -388,7 +451,7 @@ class TestTaskHistoryGetTool:
             checkpointer=checkpointer,
         )
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
 
@@ -411,7 +474,7 @@ class TestTaskHistoryGetTool:
         pool = _FakePool(fetchrow_return=None)
         ctx = _make_ctx(agent_id="agent-A", pool=pool)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
         with pytest.raises(MemoryToolNotFoundError):
@@ -423,7 +486,7 @@ class TestTaskHistoryGetTool:
         pool = _FakePool(fetchrow_return=None)
         ctx = _make_ctx(tenant_id="tenant-A", agent_id="agent-A", pool=pool)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
         with pytest.raises(MemoryToolNotFoundError):
@@ -436,7 +499,7 @@ class TestTaskHistoryGetTool:
         )
         ctx = _make_ctx(pool=pool)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
         with pytest.raises(MemoryToolNotFoundError):
@@ -459,7 +522,7 @@ class TestTaskHistoryGetTool:
         pool = _FakePool(fetchrow_return=row)
         ctx = _make_ctx(pool=pool)
         tool = _tool_by_name(
-            build_memory_tools(ctx, effective_memory_enabled=False),
+            build_memory_tools(ctx, stack_enabled=False, auto_write=False),
             "task_history_get",
         )
         result = await tool.ainvoke(
@@ -476,14 +539,27 @@ class TestTaskHistoryGetTool:
 
 
 class TestBuildMemoryToolsGating:
-    def test_enabled_registers_all_three(self) -> None:
+    def test_always_mode_registers_memory_note_search_and_history(self) -> None:
         ctx = _make_ctx()
-        tools = build_memory_tools(ctx, effective_memory_enabled=True)
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         names = sorted(t.name for t in tools)
+        # ``save_memory`` is NOT registered in ``always`` mode — the run
+        # writes unconditionally, so the tool would be a no-op.
         assert names == ["memory_note", "memory_search", "task_history_get"]
 
-    def test_disabled_registers_only_task_history_get(self) -> None:
+    def test_agent_decides_mode_also_registers_save_memory(self) -> None:
         ctx = _make_ctx()
-        tools = build_memory_tools(ctx, effective_memory_enabled=False)
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        names = sorted(t.name for t in tools)
+        assert names == [
+            "memory_note",
+            "memory_search",
+            "save_memory",
+            "task_history_get",
+        ]
+
+    def test_skip_mode_registers_only_task_history_get(self) -> None:
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
         assert names == ["task_history_get"]

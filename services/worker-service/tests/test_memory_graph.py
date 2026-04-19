@@ -13,7 +13,7 @@ Covers the ``memory_write`` LangGraph node and its fallback helper:
 - Embedding returning ``None`` → ``pending_memory['content_vec']`` is ``None``.
 - ``tags`` is always an empty list in v1.
 - The fallback helper produces a stable shape independently.
-- ``effective_memory_enabled`` truth-table.
+- ``effective_memory_decision`` truth-table (Task 12).
 
 The node is designed to take injected callables (summarizer / embedding / cost
 recorder) so unit tests never touch a provider, the network, or Postgres.
@@ -30,59 +30,94 @@ from langgraph.types import Command
 
 from executor.embeddings import EmbeddingResult
 from executor.memory_graph import (
+    MemoryDecision,
     MemoryEnabledState,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     build_pending_memory_template_fallback,
-    effective_memory_enabled,
+    effective_memory_decision,
     memory_write_node,
 )
 
 
-class TestEffectiveMemoryEnabled:
-    def test_enabled_agent_without_skip(self) -> None:
-        assert (
-            effective_memory_enabled(
-                agent_config={"memory": {"enabled": True}},
-                skip_memory_write=False,
-            )
-            is True
-        )
+class TestEffectiveMemoryDecisionTruthTable:
+    """Task 12 — full (enabled ∈ {True, False}) × (mode ∈ {always,
+    agent_decides, skip}) truth table. Assertions cover both
+    ``stack_enabled`` and ``auto_write`` so regressions in either column
+    surface here first.
+    """
 
-    def test_enabled_agent_with_skip(self) -> None:
-        assert (
-            effective_memory_enabled(
-                agent_config={"memory": {"enabled": True}},
-                skip_memory_write=True,
-            )
-            is False
+    def test_enabled_always(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": True}},
+            memory_mode="always",
         )
+        assert d == MemoryDecision(stack_enabled=True, auto_write=True)
 
-    def test_disabled_agent_without_skip(self) -> None:
-        assert (
-            effective_memory_enabled(
-                agent_config={"memory": {"enabled": False}},
-                skip_memory_write=False,
-            )
-            is False
+    def test_enabled_agent_decides(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": True}},
+            memory_mode="agent_decides",
         )
+        assert d == MemoryDecision(stack_enabled=True, auto_write=False)
+
+    def test_enabled_skip(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": True}},
+            memory_mode="skip",
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
+
+    def test_disabled_always(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": False}},
+            memory_mode="always",
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
+
+    def test_disabled_agent_decides(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": False}},
+            memory_mode="agent_decides",
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
+
+    def test_disabled_skip(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": False}},
+            memory_mode="skip",
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
 
     def test_agent_without_memory_section(self) -> None:
-        assert (
-            effective_memory_enabled(
-                agent_config={},
-                skip_memory_write=False,
-            )
-            is False
+        d = effective_memory_decision(
+            agent_config={},
+            memory_mode="always",
         )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
 
     def test_memory_section_but_no_enabled_key(self) -> None:
-        assert (
-            effective_memory_enabled(
-                agent_config={"memory": {"max_entries": 50}},
-                skip_memory_write=False,
-            )
-            is False
+        d = effective_memory_decision(
+            agent_config={"memory": {"max_entries": 50}},
+            memory_mode="always",
         )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
+
+    def test_unrecognised_mode_collapses_to_disabled_stack(self) -> None:
+        """Guards against a mis-serialized payload silently writing a memory
+        the customer didn't ask for — unknown modes must behave like ``skip``.
+        """
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": True}},
+            memory_mode="banana",
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
+
+    def test_non_string_mode_collapses_to_disabled_stack(self) -> None:
+        d = effective_memory_decision(
+            agent_config={"memory": {"enabled": True}},
+            memory_mode=None,  # type: ignore[arg-type]
+        )
+        assert d == MemoryDecision(stack_enabled=False, auto_write=False)
 
 
 class TestTemplateFallback:
@@ -156,6 +191,22 @@ class TestMemoryEnabledState:
         # ``Annotated[list[str], operator.add]`` — the metadata tuple holds
         # operator.add as the reducer.
         assert getattr(obs_annotation, "__metadata__", ()) == (operator.add,)
+
+    def test_memory_opt_in_field_declared_without_reducer(self) -> None:
+        """Task 12 — ``memory_opt_in`` is a bool field with no reducer, so
+        the ``save_memory`` tool's ``Command(update={"memory_opt_in": True})``
+        overwrites via last-write-wins and the per-run reset in
+        :meth:`GraphExecutor.execute_task` can cleanly seed ``False`` on
+        every new run.
+        """
+        from typing import get_type_hints
+
+        hints = get_type_hints(MemoryEnabledState, include_extras=True)
+        assert "memory_opt_in" in hints
+        opt_in_annotation = hints["memory_opt_in"]
+        # Bare ``bool`` — no ``Annotated[..., reducer]`` metadata attached.
+        assert getattr(opt_in_annotation, "__metadata__", None) is None
+        assert opt_in_annotation is bool
 
 
 class TestMemoryWriteNodeHappyPath:

@@ -119,17 +119,19 @@ AC_TO_TESTS: dict[int, list[str]] = {
         "tests/backend-integration/test_memory_task_submission.py::test_ac8_attach_cross_agent_rejected_uniform",
         "services/worker-service/tests/test_memory_follow_up_seeding.py::TestScopeBinding",
     ],
-    # AC-11: Memory-disabled (agent-level or skip_memory_write) → no tool
+    # AC-11: Memory-disabled (agent-level or memory_mode='skip') → no tool
     # registration, no memory_write node, no rows, no cost; task_history_get
-    # still available.
+    # still available. Task 12 replaced the legacy ``skip_memory_write``
+    # boolean with the three-value ``memory_mode`` enum; the backend-
+    # integration test names evolved to match.
     11: [
-        "services/worker-service/tests/test_memory_graph_topology.py::TestBuildGraphMemoryDisabled",
+        "services/worker-service/tests/test_memory_graph_topology.py::TestBuildGraphSkipMode",
         "services/worker-service/tests/test_memory_dead_letter.py::TestMemoryDisabledSkipsWrite",
         "services/worker-service/tests/test_memory_tools.py::TestBuildMemoryToolsGating",
-        "services/worker-service/tests/test_memory_graph.py::TestEffectiveMemoryEnabled",
-        "tests/backend-integration/test_memory_task_submission.py::test_ac11_skip_memory_write_persists_on_task",
-        "tests/backend-integration/test_memory_task_submission.py::test_ac11_skip_memory_write_defaults_false",
-        "tests/backend-integration/test_memory_task_submission.py::test_ac11_skip_memory_write_on_disabled_agent_is_noop_but_persisted",
+        "services/worker-service/tests/test_memory_graph.py::TestEffectiveMemoryDecisionTruthTable",
+        "tests/backend-integration/test_memory_task_submission.py::test_ac11_memory_mode_skip_persists_on_task",
+        "tests/backend-integration/test_memory_task_submission.py::test_ac11_memory_mode_defaults_always",
+        "tests/backend-integration/test_memory_task_submission.py::test_ac11_memory_mode_skip_on_disabled_agent_is_noop_but_persisted",
     ],
     # AC-12: Memory write does not block completion — summarizer outage →
     # template; embedding outage → content_vec = NULL; task still completed.

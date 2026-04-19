@@ -29,7 +29,7 @@ Design invariants enforced here:
   ``[100, 100_000]`` with platform default ``10_000`` per the design doc.
 
 Memory-disabled agents never reach this module — gating happens upstream in
-:func:`executor.memory_graph.effective_memory_enabled`.
+:func:`executor.memory_graph.effective_memory_decision`.
 """
 
 from __future__ import annotations
