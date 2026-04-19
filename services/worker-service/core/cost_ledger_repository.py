@@ -9,6 +9,12 @@ The caller owns the asyncpg connection and the transaction boundary. Ledger
 rows always live in the same transaction as the lease-validated ``UPDATE
 tasks ...`` that produced them; passing ``conn`` in from the caller keeps
 that invariant explicit.
+
+Migration 0016 extended the table with ``operation``, ``model_id``,
+``tokens_in``, ``tokens_out``, and ``summarized_through_turn_index_after``
+columns for Track 7 compaction attribution. The extended :func:`insert_cost_row`
+signature keeps all new columns as keyword args with defaults so existing callers
+are unaffected.
 """
 
 from __future__ import annotations
@@ -21,10 +27,19 @@ import asyncpg
 # ``checkpoint_id`` is TEXT so callers can pass either the UUID-shaped id of a
 # real checkpoint row or the literal ``'sandbox'`` used for sandbox-runtime
 # spend, which is attributed per-task but not to a specific step.
+#
+# The INSERT uses ON CONFLICT DO NOTHING against the partial unique index
+# ``idx_agent_cost_ledger_tier3_idempotency`` (Track 7 / migration 0016).
+# For non-compaction operations (model_token_spend, sandbox_runtime) no
+# conflict will ever fire because the partial index is scoped to
+# ``operation = 'compaction.tier3'``.
 _INSERT_COST_ROW_SQL = """
 INSERT INTO agent_cost_ledger
-    (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars)
-VALUES ($1, $2, $3::uuid, $4, $5)
+    (tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars,
+     operation, model_id, tokens_in, tokens_out,
+     summarized_through_turn_index_after)
+VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT DO NOTHING
 """
 
 _SUM_TASK_COST_SQL = """
@@ -55,6 +70,14 @@ async def insert_cost_row(
     task_id: str,
     checkpoint_id: str,
     cost_microdollars: int,
+    # Track 7 / migration 0016 extended columns.  Default values keep
+    # all pre-Track-7 callers (model_token_spend, sandbox_runtime,
+    # memory_write) working without source changes.
+    operation: str = "model_token_spend",
+    model_id: str | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    summarized_through_turn_index_after: int | None = None,
 ) -> None:
     """Append one attribution row to the ledger.
 
@@ -62,6 +85,14 @@ async def insert_cost_row(
     model-token spend, or the literal ``'sandbox'`` for per-task sandbox
     runtime spend. The ledger is append-only; aggregation happens at read
     time via :func:`sum_task_cost` / :func:`sum_hourly_cost_for_agent`.
+
+    For ``operation='compaction.tier3'`` rows the INSERT uses
+    ``ON CONFLICT DO NOTHING`` against the partial unique index on
+    ``(tenant_id, task_id, checkpoint_id, operation, summarized_through_turn_index_after)``
+    so that a crash-after-insert-before-state-commit replay is swallowed
+    rather than double-charging.  The ``ON CONFLICT DO NOTHING`` is
+    unconditional but the partial index ensures it never fires for
+    other operation types, which rely on application-level dedup.
     """
     await conn.execute(
         _INSERT_COST_ROW_SQL,
@@ -70,6 +101,11 @@ async def insert_cost_row(
         task_id,
         checkpoint_id,
         cost_microdollars,
+        operation,
+        model_id,
+        tokens_in,
+        tokens_out,
+        summarized_through_turn_index_after,
     )
 
 
