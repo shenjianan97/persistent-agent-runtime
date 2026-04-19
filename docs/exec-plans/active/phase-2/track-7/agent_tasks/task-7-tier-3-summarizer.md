@@ -46,7 +46,11 @@ async def summarize_slice(
 @dataclass(frozen=True)
 class SummarizeResult:
     summary_text: str | None        # None iff skipped
-    skipped: bool                   # True iff summarizer failed after retries
+    skipped: bool                   # True iff summarizer did not produce text
+    skipped_reason: str | None      # None iff skipped=False; "empty_slice",
+                                    # "retryable" (retries exhausted), or
+                                    # "fatal" (non-retryable error). Task 8
+                                    # pipeline branches on this value.
     summarizer_model_id: str        # echoed back for event emission
     tokens_in: int                  # prompt token count
     tokens_out: int                 # completion token count
@@ -103,12 +107,74 @@ Determinism is load-bearing — sort keys in JSON dumps, use a fixed step-index 
 
 ## Affected Component
 
-- **Service/Module:** Worker Service — Compaction
+- **Service/Module:** Worker Service — Compaction + DB schema
 - **File paths:**
+  - `infrastructure/database/migrations/0015_agent_cost_ledger_compaction.sql` (new — extends `agent_cost_ledger` with the columns this task writes)
+  - `services/worker-service/core/cost_ledger_repository.py` (modify — extend `insert_cost_row` signature with the new columns; keep the existing callers working by defaulting `operation='model_token_spend'`, `tokens_in=0`, `tokens_out=0`, `model_id=agent_config.model` at the call site)
   - `services/worker-service/executor/compaction/summarizer.py` (new)
   - **Do NOT edit `compaction/__init__.py`** — Task 8 owns its final shape. Import `summarize_slice`, `SummarizeResult` directly from `executor.compaction.summarizer`.
   - `services/worker-service/tests/test_compaction_summarizer.py` (new)
-- **Change type:** new module + unit tests (with mocked LLM client)
+  - `tests/backend-integration/test_cost_ledger_schema.py` (new or extend — asserts the new columns + unique constraint exist)
+- **Change type:** migration + repository extension + new module + unit tests + integration test
+
+### Migration `0015_agent_cost_ledger_compaction.sql`
+
+The current `agent_cost_ledger` table (see `infrastructure/database/migrations/0007_scheduler_and_budgets.sql`) has only `tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars, created_at`. Track 7's ledger writes require additional attribution + idempotency. Exact shape:
+
+```sql
+-- 0015: Extend agent_cost_ledger for Track 7 compaction attribution.
+-- Adds: operation (what spent the money), model_id (which model), tokens_in/out
+-- (for reconciliation), and a unique key so crash-after-insert-before-state
+-- replay is swallowed by ON CONFLICT DO NOTHING rather than double-charging.
+
+ALTER TABLE agent_cost_ledger
+    ADD COLUMN operation TEXT NOT NULL DEFAULT 'model_token_spend'
+        CHECK (operation IN (
+            'model_token_spend',
+            'sandbox_runtime',
+            'memory_write',
+            'compaction.tier3'
+        )),
+    ADD COLUMN model_id TEXT,
+    ADD COLUMN tokens_in BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN tokens_out BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN summarized_through_turn_index_after INT;
+
+-- Partial unique index — idempotency key for compaction.tier3 only.
+-- The existing model_token_spend / sandbox paths already rely on application-
+-- level dedup and must NOT be constrained here (would break backfill of
+-- in-flight rows). Index is partial to keep it scoped to Track 7.
+CREATE UNIQUE INDEX idx_agent_cost_ledger_tier3_idempotency
+    ON agent_cost_ledger (tenant_id, task_id, checkpoint_id,
+                          operation, summarized_through_turn_index_after)
+    WHERE operation = 'compaction.tier3';
+```
+
+Verify before writing: `grep -rn agent_cost_ledger infrastructure/database/migrations/` to confirm no intervening migration has already added any of these columns. If it has, update this migration to be additive-only against the current state.
+
+### `cost_ledger_repository.insert_cost_row` extension
+
+Extend the existing function to accept the new columns as keyword args with sensible defaults so existing callers don't break:
+
+```python
+async def insert_cost_row(
+    conn: asyncpg.Connection,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    task_id: str,
+    checkpoint_id: str,
+    cost_microdollars: int,
+    operation: str = "model_token_spend",
+    model_id: str | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    summarized_through_turn_index_after: int | None = None,
+) -> None:
+    ...  # INSERT ... ON CONFLICT DO NOTHING using the partial unique index.
+```
+
+Existing callers (`model_token_spend`, `sandbox_runtime` from Tracks 1–3) keep working unchanged — they pass only the original args. Task 7's summarizer passes the full set.
 
 ## Dependencies
 
@@ -165,11 +231,28 @@ async def summarize_slice(...):
         except Exception as e:
             last_error = e
             if not _is_retryable_error(e):
-                break
+                # Fatal — bad API key, model removed, auth failure.
+                # Short-circuit: caller (Task 8 pipeline) must set
+                # tier3_fatal_short_circuited=True on observing this.
+                _logger.info(
+                    "compaction.tier3_fatal",
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    summarizer_model=summarizer_model_id,
+                    error=str(e)[:200],
+                )
+                return SummarizeResult(
+                    summary_text=None,
+                    skipped=True,
+                    skipped_reason="fatal",
+                    summarizer_model_id=summarizer_model_id,
+                    tokens_in=0, tokens_out=0, cost_microdollars=0, latency_ms=0,
+                )
             backoff = _get_retry_after(e) or min(30, 2 ** attempt)
             await asyncio.sleep(backoff)
 
-    log_structured(
+    _logger.info(
         "compaction.tier3_skipped",
         tenant_id=tenant_id,
         agent_id=agent_id,
@@ -181,19 +264,25 @@ async def summarize_slice(...):
     return SummarizeResult(
         summary_text=None,
         skipped=True,
+        skipped_reason="retryable",
         summarizer_model_id=summarizer_model_id,
         tokens_in=0, tokens_out=0, cost_microdollars=0, latency_ms=0,
     )
 ```
 
+`_logger` is a module-level `core.logging.get_logger(worker_id=WORKER_ID)` — see Task 4's note on structured logging for the pattern.
+
 Reuse `_extract_tokens`, `_is_retryable_error`, `_get_retry_after` from `graph.py` (or move them into a shared `worker_util.py` in this task if they're private helpers on `GraphExecutor`).
 
 ## Acceptance Criteria
 
-- [ ] `summarize_slice` returns a non-None `summary_text` on a happy-path mocked LLM call and writes one `agent_cost_ledger` row with `operation='compaction.tier3'`.
-- [ ] Slice of < 2 messages returns `skipped=True` with no LLM call and no ledger write.
+- [ ] Migration `0015_agent_cost_ledger_compaction.sql` applies cleanly. `agent_cost_ledger` has `operation`, `model_id`, `tokens_in`, `tokens_out`, `summarized_through_turn_index_after` columns plus the partial unique index `idx_agent_cost_ledger_tier3_idempotency`. Integration test asserts columns + index exist (read `information_schema`).
+- [ ] `cost_ledger_repository.insert_cost_row` accepts the new kwargs with defaults; existing callers (model token spend, sandbox runtime) continue to write rows with `operation='model_token_spend'` / `'sandbox_runtime'` and zero-valued token columns without schema errors. Regression test covers both paths.
+- [ ] `summarize_slice` returns a non-None `summary_text` on a happy-path mocked LLM call and writes one `agent_cost_ledger` row with `operation='compaction.tier3'`, non-NULL `model_id`, `tokens_in`, `tokens_out`, and `summarized_through_turn_index_after`.
+- [ ] Slice of < 2 messages returns `skipped=True`, `skipped_reason='empty_slice'` with no LLM call and no ledger write.
 - [ ] On a retryable error followed by success, the function succeeds and records one ledger row (not three).
-- [ ] On exhaustion of retries, the function returns `skipped=True`, emits `compaction.tier3_skipped` log, and writes NO ledger row.
+- [ ] On exhaustion of retries, the function returns `skipped=True`, `skipped_reason='retryable'`, emits `compaction.tier3_skipped` log, and writes NO ledger row.
+- [ ] On a non-retryable error, the function returns `skipped=True`, `skipped_reason='fatal'`, emits `compaction.tier3_fatal` log, and writes NO ledger row. The pipeline (Task 8) is expected to set `tier3_fatal_short_circuited=True` on observing this result.
 - [ ] **Cost-ledger idempotency.** The ledger insert uses a natural key of `(task_id, checkpoint_id, operation='compaction.tier3', summarized_through_turn_index_after)` — duplicate writes (e.g., crash-after-ledger-before-state-commit followed by retry) are swallowed by a unique constraint or `ON CONFLICT DO NOTHING`. Verified by test: invoke `summarize_slice` twice for the same target watermark and assert only one ledger row exists. Rationale: the summarizer LLM call + ledger insert + state.summary_marker advance are not one transactional unit; a crash between them can replay the summarizer on restart.
 - [ ] `format_messages_for_summary` is deterministic: two calls on the same slice produce byte-identical output (assert via unit test).
 - [ ] Cost ledger row fields match the existing schema — `tenant_id`, `agent_id`, `task_id`, `checkpoint_id`, `model_id`, `tokens_in`, `tokens_out`, `cost_microdollars`, `operation`.

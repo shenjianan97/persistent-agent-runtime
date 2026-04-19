@@ -286,7 +286,7 @@ return compacted, {"cleared_through_turn_index": new_cleared_through}
 
 **Monotonicity guarantee:** `cleared_through_turn_index` only advances. A message cleared at call N stays cleared at all calls ≥ N. This keeps the KV-cache prefix stable for each call boundary that has already been served.
 
-**Exclude list:** `exclude_tools_effective = PLATFORM_EXCLUDE + agent.exclude_tools`. Platform default: `[memory_note, save_memory, request_human_input]` — these tools' outputs are load-bearing across many turns.
+**Exclude list:** `exclude_tools_effective = PLATFORM_EXCLUDE + agent.exclude_tools`. Platform default: `[memory_note, save_memory, request_human_input, memory_search, task_history_get]` — these tools' outputs are load-bearing across many turns. See the per-tool rationale earlier in this doc (§Core design rule 3). The five-tool list is the canonical `PLATFORM_EXCLUDE_TOOLS` constant in `compaction/defaults.py` (Task 3).
 
 **No-op case:** if `cleared_through_turn_index` already points past all candidate older tool messages, Tier 1 produces `compacted == messages`. No cost, no state change.
 
@@ -496,7 +496,7 @@ Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the r
 - Track 7 compaction pipeline runs inside `agent_node` for every task; there is no per-worker or per-agent toggle.
 - Track 5 memory tools (`memory_note`, `memory_search`, `task_history_get`) are registered on the LLM iff memory is enabled — same as today.
 
-This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState if stack_enabled else MessagesState`). The plan rolls that migration into Task 7 so both tracks end up consistent.
+This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState if stack_enabled else MessagesState`). The plan rolls that migration into Task 2 (State Schema Unification — pure refactor with zero behaviour change; Track 5 tests stay green) so both tracks end up consistent before any Track 7 feature lands on top.
 
 ## Checkpoint interaction
 

@@ -19,7 +19,7 @@
 
 - Canonical design contract: `docs/design-docs/phase-2/track-7-context-window-management.md`. Read before implementing any task.
 - **Track 7 is always-on for all agents.** No per-agent `enabled` toggle and no runtime opt-out — context management is platform infrastructure. Incident response is the standard deploy-rollback path, the same as Tracks 3/4/5.
-- **Task 2 is a hard blocker for every other worker-side task.** It is a pure refactor (unified `RuntimeState`) with zero behavior change. All existing Track 5 tests pass before Tasks 3–9 begin. This isolates refactor failures from feature failures.
+- **Task 2 is a hard blocker for every other worker-side task.** It is a pure refactor (unified `RuntimeState`) with zero behavior change. All existing Track 5 tests pass before Tasks 3–8 begin (Task 9 serialises after Task 8). This isolates refactor failures from feature failures.
 - **State schema is append-only.** LangGraph has no schema-migration API ([langgraphjs #536](https://github.com/langchain-ai/langgraphjs/issues/536)); we add fields, never remove or rename. Regression test in Task 2 loads a pre-refactor checkpoint fixture and asserts clean resume.
 - **Reducer-safe defaults.** Every list-reducer field defaults to `[]`, every dict to `{}`, every string to `""`, every int to `0`, every bool to `False`. Never `None` — `operator.add` crashes on None, and any non-instantiable type (unions, `Optional[T]`, etc.) leaves the LangGraph channel MISSING so the reducer is bypassed on the seed write (see closed-as-by-design [langgraph #4305](https://github.com/langchain-ai/langgraph/issues/4305)).
 - Only DB schema change in this track: enum addition for `dead_letter_reason = context_exceeded_irrecoverable` (Task 10).

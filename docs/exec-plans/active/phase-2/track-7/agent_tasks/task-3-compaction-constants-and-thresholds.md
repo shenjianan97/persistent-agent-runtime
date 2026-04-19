@@ -43,7 +43,7 @@ Threshold resolution is fraction-only in v1 — no absolute token cap. A 1M-cont
 ## Dependencies
 
 - **Must complete first:** None.
-- **Provides output to:** Tasks 3 (imports `PER_TOOL_RESULT_CAP_BYTES`), 4 (imports `KEEP_TOOL_USES`), 5 (imports `TRUNCATABLE_TOOL_ARG_KEYS`, `ARG_TRUNCATION_CAP_BYTES`), 6 (imports `SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`), 7 (imports everything + calls `resolve_thresholds`).
+- **Provides output to:** Task 4 (imports `PER_TOOL_RESULT_CAP_BYTES`), Task 5 (imports `KEEP_TOOL_USES`, `PLATFORM_EXCLUDE_TOOLS`), Task 6 (imports `TRUNCATABLE_TOOL_ARG_KEYS`, `ARG_TRUNCATION_CAP_BYTES`), Task 7 (imports `SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`, `get_platform_default_summarizer_model`), Task 8 (imports everything + calls `resolve_thresholds`; uses `TIER_3_MAX_FIRINGS_PER_TASK`).
 - **Shared interfaces/contracts:** The set of module-level constants and the `Thresholds` type.
 
 ## Implementation Specification
@@ -117,6 +117,14 @@ PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
 # pass. Giving up does NOT escalate to dead-letter; the next agent-node call
 # re-attempts if the threshold is still exceeded.
 SUMMARIZER_MAX_RETRIES: int = 2
+
+# Maximum number of Tier 3 firings allowed per task. Beyond this cap the
+# pipeline stops invoking the summarizer and falls through to the hard-floor
+# path if the input still exceeds the floor. Bounds worst-case cost for
+# pathological tasks (long-running agent with tight protection window + large
+# exclude_tools). 10 firings × ~400-word summary × typical 20K-token slice
+# roughly $0.50 at current Sonnet summarizer pricing.
+TIER_3_MAX_FIRINGS_PER_TASK: int = 10
 
 # Platform-default summarizer model when agent_config.context_management
 # .summarizer_model is unset. Resolved per-call; not cached.

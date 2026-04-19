@@ -40,7 +40,7 @@ Track 7 extends the Phase 2 worker runtime with:
 | Tier 1 transform | `services/worker-service/executor/compaction/transforms.py` | new code | `clear_tool_results()` pure function with monotone watermark |
 | Tier 1.5 transform | same module | new code | `truncate_tool_call_args()` pure function with monotone watermark |
 | Tier 3 summarizer | `services/worker-service/executor/compaction/summarizer.py` | new code | LLM call wrapper + retry + cost ledger + Langfuse span |
-| State schema | `services/worker-service/executor/compaction/state.py` | new code | `RuntimeState` TypedDict (extended from Task 2) with `max` reducers for Track 7 watermarks + strict-append reducer for `summary_marker` |
+| State schema | `services/worker-service/executor/compaction/state.py` | modification | Task 2 creates the file with the Track 5 base `RuntimeState`; Task 8 extends it with Track 7 watermark fields + `max`/`any` reducers + strict-append reducer for `summary_marker` |
 | Pipeline orchestrator | `services/worker-service/executor/compaction/pipeline.py` | new code | `compact_for_llm(state, messages, config) -> (messages, watermarks, events)` |
 | `agent_node` integration | `services/worker-service/executor/graph.py` | modification | Call pipeline before every LLM invocation; merge state class with `MemoryEnabledState` when Track 5 also on; pick plain `MessagesState` when both off |
 | Pre-Tier-3 memory flush | `services/worker-service/executor/compaction/pipeline.py` (extension) | modification | Detect trigger, check gating flags, insert one-shot `SystemMessage`, set `memory_flush_fired_this_task` |
@@ -82,11 +82,11 @@ Task 1 ──► Task 11 (Console Edit Form) ───────────�
 **Parallelisation opportunities:**
 
 - **Task 1 and Task 2 can run in parallel** — Task 1 is Java API surface, Task 2 is Python worker refactor; zero file overlap.
-- **Task 2 is a hard blocker for every other worker-side task.** The state-schema refactor must land, all existing Track 5 tests must pass, and the commit must be green before Tasks 3–9 begin. This isolates refactor failures from feature failures.
+- **Task 2 is a hard blocker for every other worker-side task.** The state-schema refactor must land, all existing Track 5 tests must pass, and the commit must be green before Tasks 3–8 begin (Task 9 serializes after Task 8 per the dependency graph). This isolates refactor failures from feature failures.
 - **Tasks 4, 5, 6, 7 can run in parallel** after Task 3 completes — they all add distinct new files under `services/worker-service/executor/compaction/`. **`compaction/__init__.py` is owned by Task 8** — Tasks 2–7 leave it as a minimal docstring-only file; Task 8 fills in the full public API. This avoids the shared-file conflict that would otherwise require worktree isolation for every parallel task.
 - **Task 8 is the integration step** — must wait for Tasks 3–7. Touches `services/worker-service/executor/graph.py` (swap `MemoryEnabledState` references for `RuntimeState`, add pipeline call site) and `executor/compaction/__init__.py`. Adds `pipeline.py`, `tokens.py`. Task 2 already did the state-schema refactor, so Task 8 ONLY adds Track 7 fields to `RuntimeState` and the `compact_for_llm` call — smaller than if Task 8 owned the schema work too.
 - **Task 9 must serialize after Task 8** — extends the pipeline added in Task 8.
-- **Task 10 can run in parallel with Tasks 3–9** — migration + enum addition in a different area, no overlap with compaction module.
+- **Task 10 can run in parallel with Tasks 3–9** — migration + enum addition in a different area, no overlap with compaction module. **Deploy-order constraint:** the migration (`0014`) MUST reach production before Task 8's worker code that can emit `context_exceeded_irrecoverable`; otherwise the `UPDATE tasks` violates the CHECK constraint. In practice: merge Task 10's migration commit before Task 8's hard-floor path ships to prod. Task 8's `agent_node` wiring that handles `HardFloorEvent` has a build-time dependency on Task 8's event contract only.
 - **Task 11 can run in parallel with Tasks 3–10** — Console TypeScript, no overlap with worker Python or migration. Depends on Task 1 for the API contract.
 - **Task 12 depends on everything.**
 
@@ -216,7 +216,7 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 - Thresholds are **fraction-only** in v1 (no absolute token caps). Customers picking large-context models (1M Gemini) get proportionally higher thresholds. Deferred `aggressive_compaction` override is explicitly out of scope.
 - Tier 3 summarizer uses the agent's `context_management.summarizer_model` when set, else the platform default `claude-haiku-4-5` (same pattern as Track 5's `memory.summarizer_model`). Reuse the existing `models`-table validation helper.
 - Follow the **silent compaction rule** — placeholder language is neutral ("tool output not retained"), never "you are being compacted." Exception: the pre-Tier-3 memory flush system message (explicitly documented to the agent).
-- Pre-Tier-3 memory flush fires **at most once per task**. Heartbeat/recovery turns (last two messages both `AIMessage`) skip the flush. `memory_flush_fired_this_task` flag is monotone.
+- Pre-Tier-3 memory flush fires **at most once per task**. Heartbeat/recovery turns — detected positionally via `len(raw_messages) <= state.last_super_step_message_count` (no new `ToolMessage` or `HumanMessage` appended since the last agent super-step) — skip the flush. This is NOT the "last two messages are both `AIMessage`" heuristic (which misfires on rate-limit retries and pure-reasoning turns). `memory_flush_fired_this_task` flag is monotone.
 - Do NOT implement: Anthropic native API primitive usage (`clear_tool_uses_20250919`, `compact_20260112`) — deferred to Phase 3+. Per-task knobs on `POST /v1/tasks`. Learned / RL-trained policies. Cross-task compaction inheritance. `aggressive_compaction` override.
 - Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 4/5 both edit `compaction/transforms.py`; Task 7 edits `graph.py` heavily; any parallel agent touching the same file must use `isolation: "worktree"`.
 

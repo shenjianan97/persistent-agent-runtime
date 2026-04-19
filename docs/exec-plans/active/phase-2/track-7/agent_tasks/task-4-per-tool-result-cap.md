@@ -135,9 +135,12 @@ For every tool registered via the `_get_tools` path (both built-in and MCP-proxi
 
 ```python
 from executor.compaction.caps import cap_tool_result
-from core.logging import log_structured
+from core.logging import get_logger
 
-def _apply_result_cap(tool_name: str):
+_logger = get_logger(worker_id=WORKER_ID)  # reuse the module-level logger
+                                           # pattern already in graph.py
+
+def _apply_result_cap(tool_name: str, *, tenant_id, agent_id, task_id):
     """Wraps a tool so its return value is head+tail capped to
     PER_TOOL_RESULT_CAP_BYTES before being handed to the ToolNode.
     """
@@ -147,18 +150,21 @@ def _apply_result_cap(tool_name: str):
             result_str = result if isinstance(result, str) else str(result)
             capped, event = cap_tool_result(result_str, tool_name)
             if event is not None:
-                log_structured(
+                _logger.info(
                     "compaction.per_result_capped",
                     tool=event.tool,
                     orig_bytes=event.orig_bytes,
                     capped_bytes=event.capped_bytes,
-                    # include tenant_id, agent_id, task_id from the surrounding
-                    # closure variables already available in _get_tools
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
                 )
             return capped
         return wrapper
     return decorator
 ```
+
+Note: `core.logging` exposes `configure_logging` + `get_logger` (structlog `BoundLogger`). There is no `log_structured` module-level function — use `logger.info("event_name", **kwargs)` for structured events (structlog handles JSON rendering). `tenant_id`, `agent_id`, `task_id` are threaded from `_get_tools`'s caller (where they are already available) through this factory's closure.
 
 Apply this decorator to every tool returned by `_get_tools`. For MCP tools (Track 4), wrap the existing MCP-call wrapper the same way. The cap happens before the `ToolNode` constructs the `ToolMessage`.
 
@@ -202,7 +208,7 @@ When `cap_tool_result` fires, in addition to the structured log, emit an annotat
 ## Assumptions
 
 - Tool return values are always strings (or stringifiable). If an MCP tool returns structured JSON, the existing wrapper already serializes it to a string before LangGraph sees it.
-- `log_structured` is the worker's existing structured-logger helper. If not present, use the worker's existing JSON-logger pattern (look at how Track 5's `memory.write.committed` event is emitted).
+- Structured logging uses `core.logging.get_logger(...).info("event_name", **kwargs)` — structlog renders the JSON. There is no `log_structured` helper in the worker; all prior structured events (Track 5 `memory.write.committed`, Track 3 budget events) follow this pattern.
 - LangGraph's `ToolNode` constructs `ToolMessage(content=<return value>, tool_call_id=...)` — we cap the return value before it reaches `ToolNode`.
 
 <!-- AGENT_TASK_END: task-4-per-tool-result-cap.md -->

@@ -90,7 +90,12 @@ ALTER TABLE tasks ADD CONSTRAINT tasks_dead_letter_reason_check
 
 **Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 8 and later tasks depend on this migration being applied first.
 
-**`task_events` column — MANDATORY inspection step.** Run `grep -rn task_events_dead_letter_reason_check infrastructure/database/migrations/` before writing the migration. If a CHECK constraint exists on `task_events.dead_letter_reason`, the migration MUST extend it identically (DROP + re-ADD with the same allowed-values list). If no constraint exists, document that explicitly in the migration comment so future maintainers know. Skipping this inspection is a deploy blocker — the `tasks` row flips successfully but the audit event insert fails, leaving the worker stuck mid-transition and the reaper unable to re-claim. An AC checks both constraints post-migration.
+**`task_events` column — MANDATORY inspection step (mechanically enforced).** Run `grep -rn task_events_dead_letter_reason_check infrastructure/database/migrations/` before writing the migration. If a CHECK constraint exists on `task_events.dead_letter_reason`, the migration MUST extend it identically (DROP + re-ADD with the same allowed-values list). If no constraint exists, document that explicitly in the migration comment so future maintainers know.
+
+This is a deploy blocker, not a reviewer note — the `tasks` row flips successfully but the audit event insert fails, leaving the worker stuck mid-transition and the reaper unable to re-claim. Two mechanical gates enforce it:
+
+1. **Integration test** (`tests/backend-integration/test_dead_letter_reasons.py`): a parameterised test invokes the dead-letter path for EVERY value in the `tasks.dead_letter_reason` CHECK constraint and asserts both the `tasks` row update AND the `task_events` row insert succeed within the same transaction. The new `context_exceeded_irrecoverable` value is added to the test's parameter list in this task. If a second CHECK constraint exists on `task_events` and was not extended, this test fails on the new reason.
+2. **Migration inspection assertion** (in the same integration test file or a new `test_dead_letter_check_constraints.py`): query `information_schema.check_constraints` for every constraint matching `%dead_letter_reason%` and assert the `context_exceeded_irrecoverable` string appears in each constraint's `check_clause`. This catches the "forgot one CHECK" failure mode even without exercising the write path.
 
 ### Java enum
 

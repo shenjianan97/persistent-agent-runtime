@@ -50,6 +50,9 @@ class RuntimeState(TypedDict):
     summary_marker: Annotated[str, _summary_marker_strict_append_reducer]  # default ""
     memory_flush_fired_this_task: Annotated[bool, _any_reducer]          # default False
     last_super_step_message_count: Annotated[int, _max_reducer]          # default 0
+    # Cost-safety fields — bound Tier 3 cost/blast-radius for pathological tasks.
+    tier3_firings_count: Annotated[int, _max_reducer]                    # default 0
+    tier3_fatal_short_circuited: Annotated[bool, _any_reducer]           # default False
 ```
 
 **Initial state construction** — at task start, `agent_node` receives a state dict with all fields present and at their reducer-safe defaults:
@@ -66,8 +69,15 @@ initial_state: RuntimeState = {
     "summary_marker": "",      # MUST be "", not None — strict-append reducer expects str
     "memory_flush_fired_this_task": False,
     "last_super_step_message_count": 0,
+    "tier3_firings_count": 0,
+    "tier3_fatal_short_circuited": False,
 }
 ```
+
+**Tier 3 cost-safety bounds** (new in Task 8 — address pathological-task and misconfigured-summarizer cost risks):
+
+- `TIER_3_MAX_FIRINGS_PER_TASK = 10` — platform constant in `compaction/defaults.py` (Task 3 owns the constant; Task 8 wires the gate). When `tier3_firings_count >= TIER_3_MAX_FIRINGS_PER_TASK`, the pipeline skips Tier 3 and logs `compaction.tier3_firing_cap_reached`. If the task still can't fit under the hard floor after the skip, the existing `HardFloorEvent` path dead-letters the task (see Task 10). Rationale: a long-running agent with a tight protection window + large `exclude_tools` can otherwise fire Tier 3 on nearly every agent-node call. 10 firings × typical 400-word summary × typical 20k-token slice ≈ $0.50 at current Sonnet summarizer pricing — bounded.
+- `tier3_fatal_short_circuited` — set to True when `SummarizeResult.skipped_reason == "fatal"` (misconfigured `summarizer_model`, bad API key). Once True, Tier 3 is skipped for the remainder of the task regardless of threshold. Reset only on a new task (new graph state). Rationale: retrying a fatally misconfigured summarizer on every agent-node call burns minimum per-call cost forever.
 
 **Why one state, not per-feature schemas:** see design doc §State schema extensions. Summary: LangGraph reducers only fire for keys present in a node's return value ([docs](https://docs.langchain.com/oss/python/langgraph/use-graph-api)), so unused fields cost nothing at runtime. The checkpointer has no schema-migration API; per-task schema swapping breaks resume / redrive / follow-up whenever agent config changes between super-steps. Every reference implementation at scale (langgraph-swarm-py, open_deep_research) uses one TypedDict with topology branching.
 
@@ -215,11 +225,9 @@ Read from the `models` table row for `agent_config.model` at graph-build time. C
 
 - **Service/Module:** Worker Service — Compaction + graph
 - **File paths:**
-  - `services/worker-service/executor/compaction/state.py` (new — `RuntimeState` TypedDict + reducers (Task 2 already created the file; Task 8 adds Track 7 fields))
+  - `services/worker-service/executor/compaction/state.py` (modify — Task 2 already created the file with the memory-only base `RuntimeState`; Task 8 extends it with the Track 7 fields below and the strict-append / max / any reducers)
   - `services/worker-service/executor/compaction/pipeline.py` (new — `compact_for_llm`, `CompactionPassResult`, event types, `estimate_tokens`)
   - `services/worker-service/executor/compaction/tokens.py` (new — real-tokenizer-preferred token estimation for Anthropic/OpenAI; heuristic for Gemini/BYOT)
-
-  (`compaction/gating.py` is owned by Task 3 — pure resolver with no dependency on state/pipeline internals. Task 4 and Task 8 both import it.)
   - `services/worker-service/executor/compaction/__init__.py` (modify — **SOLE OWNER** of the final public-API surface; consolidate all `compaction.*` re-exports here. Tasks 2–6 leave `__init__.py` empty-minus-docstring so the package can be imported; Task 8 fills it in. No other task edits this file.)
   - `services/worker-service/executor/graph.py` (modify — state selection, `agent_node` pipeline call, budget carve-out)
   - `services/worker-service/tests/test_compaction_pipeline.py` (new)
@@ -250,7 +258,9 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - [ ] Tier 1 and Tier 1.5 are idempotent across repeated calls — running the pipeline twice on the same state advances watermarks on the first call and is a no-op on the second.
 - [ ] Tier 3 fires ONLY when Tier 1 + 1.5 cannot bring estimated input below the Tier 3 threshold.
 - [ ] `summary_marker` after two Tier 3 firings has the second summary appended to the first (assert via unit test with a mocked summarizer).
-- [ ] When Tier 3 skips (summarizer fails after retries), `summarized_through_turn_index` is NOT advanced and the next call re-attempts.
+- [ ] When Tier 3 skips with `skipped_reason='retryable'` (summarizer fails after retries), `summarized_through_turn_index` is NOT advanced and the next call re-attempts.
+- [ ] When Tier 3 skips with `skipped_reason='fatal'`, `tier3_fatal_short_circuited` is set to True and Tier 3 is NOT re-attempted on subsequent agent-node calls within the same task. Unit test: mock summarizer raises a non-retryable error; assert the flag flips and a second `compact_for_llm` call on the same state does not invoke the summarizer.
+- [ ] `tier3_firings_count` increments on every successful Tier 3 firing. When `>= TIER_3_MAX_FIRINGS_PER_TASK` (10), subsequent Tier 3 attempts are skipped, `compaction.tier3_firing_cap_reached` is logged, and if the input still exceeds the hard floor, `HardFloorEvent` is emitted. Unit test: construct a state with `tier3_firings_count=10` and a Tier-3-worthy slice; assert no summarizer call + hard-floor path.
 - [ ] `compaction.tier3` is in the Track 3 named-node budget carve-out — a task with `budget_max_per_task` close to Tier 3 cost does not pause mid-summarization. Regression test included.
 - [ ] Every task on the worker — regardless of memory-enabled / memory-disabled — uses the same `RuntimeState` TypedDict. No conditional state-class selection remains in `_build_graph`.
 - [ ] Memory-disabled tasks have `observations=[]`, `pending_memory={}`, `memory_opt_in=False` throughout (reducer-safe defaults); no field is ever `None`.
