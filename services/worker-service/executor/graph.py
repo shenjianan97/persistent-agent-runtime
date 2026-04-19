@@ -113,10 +113,18 @@ from tools.memory_tools import (
 )
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
+from executor.compaction.caps import cap_tool_result
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Structlog logger for structured compaction events (e.g. compaction.per_result_capped).
+# Uses core.logging.get_logger which returns a structlog BoundLogger.  We bind
+# a placeholder worker_id here; the actual structured fields (tenant_id, agent_id,
+# task_id) are bound at emit time via kwargs.
+from core.logging import get_logger as _get_structlog_logger
+_compaction_logger = _get_structlog_logger(worker_id="graph")
 
 
 def _handle_tool_error(e: Exception) -> str:
@@ -125,6 +133,44 @@ def _handle_tool_error(e: Exception) -> str:
     if isinstance(e, (ToolTransportError, McpToolCallError)):
         raise e
     return f"Error: {e}\nPlease fix the error and try again."
+
+
+def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id: str):
+    """Decorator factory: wraps an async tool function to cap its result to
+    PER_TOOL_RESULT_CAP_BYTES before returning to the ToolNode.
+
+    Cap is applied to the string representation of the return value.  When the
+    cap fires a ``compaction.per_result_capped`` structured log is emitted.
+
+    This is Track 7 Tier 0 — always-on, no per-agent opt-out.
+
+    Args:
+        tool_name: Name of the tool (used in CapEvent and structured log).
+        tenant_id: Bound from the caller's task context (not LLM-supplied).
+        agent_id: Bound from the caller's task context.
+        task_id: Bound from the caller's task context.
+
+    Returns:
+        A decorator that wraps an async callable.
+    """
+    def decorator(fn):
+        async def wrapper(*args, **kwargs):
+            result = await fn(*args, **kwargs)
+            result_str = result if isinstance(result, str) else str(result)
+            capped, event = cap_tool_result(result_str, tool_name)
+            if event is not None:
+                _compaction_logger.info(
+                    "compaction.per_result_capped",
+                    tool=event.tool,
+                    orig_bytes=event.orig_bytes,
+                    capped_bytes=event.capped_bytes,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+            return capped
+        return wrapper
+    return decorator
 
 
 class GraphExecutor:
@@ -281,11 +327,25 @@ class GraphExecutor:
         cancel_event: asyncio.Event,
         task_id: str,
         tenant_id: str = "default",
+        agent_id: str = "unknown",
         sandbox=None,
         s3_client=None,
     ) -> list[StructuredTool]:
+        # Shorthand: build a per-tool-result cap decorator bound to this task's
+        # context.  Every tool coroutine is wrapped so its return value is
+        # head+tail capped to PER_TOOL_RESULT_CAP_BYTES before the ToolNode
+        # sees it.  The cap is Track 7 Tier 0 — always-on, no opt-out.
+        def _cap(name: str):
+            return _apply_result_cap(
+                name,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )
+
         tools = []
         if "web_search" in allowed_tools:
+            @_cap("web_search")
             async def web_search(query: str, max_results: int = 5):
                 results = await self._await_or_cancel(
                     self.deps.search_provider.search(query, max_results),
@@ -302,6 +362,7 @@ class GraphExecutor:
             ))
 
         if "read_url" in allowed_tools:
+            @_cap("read_url")
             async def read_url(url: str, max_chars: int = 5000):
                 result = await self._await_or_cancel(
                     self.deps.read_url_fetcher.fetch(url, max_chars),
@@ -318,14 +379,19 @@ class GraphExecutor:
             ))
 
         if "request_human_input" in allowed_tools:
+            @_cap("request_human_input")
+            async def _request_human_input_capped(*args, **kwargs):
+                # request_human_input is a sync function; wrap it for cap.
+                return request_human_input(*args, **kwargs)
             tools.append(StructuredTool.from_function(
-                func=request_human_input,
+                coroutine=_request_human_input_capped,
                 name="request_human_input",
                 description=REQUEST_HUMAN_INPUT_TOOL.description,
                 args_schema=RequestHumanInputArguments,
             ))
 
         if dev_task_controls_enabled() and "dev_sleep" in allowed_tools:
+            @_cap("dev_sleep")
             async def dev_sleep(seconds: int = 10):
                 await self._await_or_cancel(
                     asyncio.sleep(seconds),
@@ -351,6 +417,7 @@ class GraphExecutor:
                 execute_create_text_artifact,
             )
 
+            @_cap("create_text_artifact")
             async def create_text_artifact(
                 filename: str,
                 content: str,
@@ -379,6 +446,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_exec" in allowed_tools:
             exec_fn = create_sandbox_exec_fn(sandbox)
 
+            @_cap("sandbox_exec")
             async def sandbox_exec_wrapper(command: str):
                 return await self._await_or_cancel(
                     exec_fn(command),
@@ -397,6 +465,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_read_file" in allowed_tools:
             read_fn = create_sandbox_read_file_fn(sandbox)
 
+            @_cap("sandbox_read_file")
             async def sandbox_read_file_wrapper(path: str):
                 return await self._await_or_cancel(
                     read_fn(path),
@@ -415,6 +484,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_write_file" in allowed_tools:
             write_fn = create_sandbox_write_file_fn(sandbox)
 
+            @_cap("sandbox_write_file")
             async def sandbox_write_file_wrapper(path: str, content: str):
                 return await self._await_or_cancel(
                     write_fn(path, content),
@@ -439,6 +509,7 @@ class GraphExecutor:
                 tenant_id=tenant_id,
             )
 
+            @_cap("export_sandbox_file")
             async def export_sandbox_file_wrapper(path: str, filename: str | None = None):
                 return await self._await_or_cancel(
                     export_fn(path, filename),
@@ -496,6 +567,7 @@ class GraphExecutor:
             cancel_event=cancel_event,
             task_id=task_id,
             tenant_id=tenant_id,
+            agent_id=agent_id,
             sandbox=sandbox,
             s3_client=s3_client,
         )
@@ -527,15 +599,55 @@ class GraphExecutor:
             await_or_cancel_fn=self._await_or_cancel,
             checkpointer=checkpointer,
         )
-        tools = tools + build_memory_tools(
+        # Track 7 Tier 0: helper to cap any StructuredTool whose coroutine is
+        # not yet wrapped.  Used below for memory tools and MCP tools, which
+        # are built outside _get_tools.
+        def _wrap_tool_with_cap(structured_tool: StructuredTool) -> StructuredTool:
+            """Return a copy of *structured_tool* whose coroutine is capped."""
+            tool_nm = structured_tool.name
+            original_coro = structured_tool.coroutine
+            if original_coro is None:
+                # Sync tool — wrap its func instead.
+                original_func = structured_tool.func
+
+                @_apply_result_cap(
+                    tool_nm,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+                async def _capped_sync(*args, **kwargs):
+                    return original_func(*args, **kwargs)
+
+                return StructuredTool.from_function(
+                    coroutine=_capped_sync,
+                    name=structured_tool.name,
+                    description=structured_tool.description or "",
+                    args_schema=structured_tool.args_schema,
+                )
+            wrapped_coro = _apply_result_cap(
+                tool_nm,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )(original_coro)
+            return StructuredTool.from_function(
+                coroutine=wrapped_coro,
+                name=structured_tool.name,
+                description=structured_tool.description or "",
+                args_schema=structured_tool.args_schema,
+            )
+
+        raw_memory_tools = build_memory_tools(
             memory_tool_ctx,
             stack_enabled=decision.stack_enabled,
             auto_write=decision.auto_write,
         )
+        tools = tools + [_wrap_tool_with_cap(t) for t in raw_memory_tools]
 
-        # Merge custom tools from MCP servers
+        # Merge custom tools from MCP servers — cap each one.
         if custom_tools:
-            tools = tools + custom_tools
+            tools = tools + [_wrap_tool_with_cap(t) for t in custom_tools]
 
         # Enforce tool count limit
         if len(tools) > MAX_TOOLS_PER_AGENT:
