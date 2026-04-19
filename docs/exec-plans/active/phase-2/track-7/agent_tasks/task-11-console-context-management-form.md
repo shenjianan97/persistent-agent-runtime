@@ -18,9 +18,8 @@
 
 ## Context
 
-The Agent edit form grows a new "Context management" section exposing the four fields from Task 1:
+The Agent edit form grows a new "Context management" section exposing the three tuning fields from Task 1 — **no `enabled` toggle** (Track 7 is always-on platform infrastructure; the API rejects any `enabled` key with 400):
 
-- `enabled` (toggle, default true)
 - `summarizer_model` (model dropdown, optional)
 - `exclude_tools` (chip-input list, max 50 entries)
 - `pre_tier3_memory_flush` (toggle, only actionable when memory is enabled)
@@ -31,15 +30,15 @@ The section reuses styling and validation patterns from Track 5's memory section
 
 - New section component lives at `services/console/src/features/agents/ContextManagementSection.tsx`.
 - Section renders inside the agent edit form after the memory section.
+- Section header copy briefly clarifies "Context management is always-on platform infrastructure; the fields below are tuning knobs, not an enable toggle."
 - Field IDs (stable test IDs for Playwright):
-  - `data-testid="context-management-enabled"` — Switch/Toggle
   - `data-testid="context-management-summarizer-model"` — Select
   - `data-testid="context-management-exclude-tools"` — Tag input (react-select or similar)
   - `data-testid="context-management-pre-tier3-flush"` — Switch/Toggle
 - The summarizer_model dropdown is populated from the existing `models` API (same helper Track 5's summarizer model dropdown uses).
 - `pre_tier3_memory_flush` toggle is visually disabled (not hidden) when `memory.enabled=false`, with a tooltip "Requires memory to be enabled."
-- Form submission sends the four fields nested under `agent_config.context_management`; when `enabled=true` but no other fields set, the payload is `{ context_management: { enabled: true } }`.
-- Existing agents without a `context_management` sub-object render with `enabled=true` as the displayed default (because that's the runtime default); the form does NOT automatically POST defaults back on save — it sends the sub-object only when the user actually modified any field. If the user explicitly flips `enabled` and then back, the sub-object is still sent (with the last-set values).
+- Form submission sends the sub-object nested under `agent_config.context_management`; the payload contains only the fields the user actually set. If the user set none, no sub-object is sent at all.
+- Existing agents without a `context_management` sub-object load with all three fields empty / at their Track-5-style absent defaults — the form does NOT automatically POST defaults back on save.
 - The chip input caps at 50 entries; on the 51st attempt, show inline error "Maximum 50 entries".
 - Unknown tool names in `exclude_tools` are accepted silently (matches Task 1's validation).
 
@@ -76,13 +75,12 @@ interface Props {
 }
 ```
 
-Render fields in order: `enabled` toggle → `summarizer_model` dropdown → `exclude_tools` chip input → `pre_tier3_memory_flush` toggle (disabled when `!memoryEnabled`).
+Render fields in order: `summarizer_model` dropdown → `exclude_tools` chip input → `pre_tier3_memory_flush` toggle (disabled when `!memoryEnabled`). No `enabled` toggle.
 
 `ContextManagementConfig` type:
 
 ```ts
 export interface ContextManagementConfig {
-  enabled?: boolean;
   summarizer_model?: string;
   exclude_tools?: string[];
   pre_tier3_memory_flush?: boolean;
@@ -97,7 +95,7 @@ Import `ContextManagementSection`, place it after the memory section, pipe throu
 
 Add **Scenario 14: Context Management section**. Covers:
 
-- Create agent → fill all four fields → save → reload → fields persist
+- Create agent → fill all three fields → save → reload → fields persist
 - Invalid `summarizer_model` (pick a disabled row) → save → 400 surfaces inline
 - Exclude tools > 50 entries → inline error
 - `pre_tier3_memory_flush` toggle is visually disabled when memory is off → enabling memory unblocks it
@@ -105,14 +103,14 @@ Add **Scenario 14: Context Management section**. Covers:
 ## Acceptance Criteria
 
 - [ ] `make console-test` — all React unit tests pass, including the new `ContextManagementSection.test.tsx`.
-- [ ] The section renders the four fields in the correct order with the correct test IDs.
+- [ ] The section renders the three fields in the correct order with the correct test IDs. No `enabled` toggle present.
 - [ ] Form submission includes `agent_config.context_management` in the request body when any field is set.
 - [ ] Chip input accepts tool name strings and caps at 50 entries with inline error on the 51st.
 - [ ] `pre_tier3_memory_flush` toggle is visually disabled (but not hidden) when `memory.enabled=false`, with the tooltip copy.
 - [ ] `summarizer_model` dropdown lists models from the existing API helper; disabled models are visible but not selectable (or filtered — match Track 5's behavior).
-- [ ] An existing agent with no `context_management` sub-object loads into the form with the `enabled` toggle visually showing true (default) and no sub-object is sent on save if the user makes no change.
+- [ ] An existing agent with no `context_management` sub-object loads into the form with all three fields empty, and no sub-object is sent on save if the user makes no change.
 - [ ] The section has no console errors on initial render or on field changes.
-- [ ] `docs/CONSOLE_BROWSER_TESTING.md` contains Scenario 14 with the five verifications above.
+- [ ] `docs/CONSOLE_BROWSER_TESTING.md` contains Scenario 14 with the four verifications above.
 
 ## Testing Requirements
 

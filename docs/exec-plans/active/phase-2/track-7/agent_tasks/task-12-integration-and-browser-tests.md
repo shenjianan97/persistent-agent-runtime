@@ -133,12 +133,12 @@ Covers: Orchestrator runs a task long enough to cross Tier 1 threshold → inspe
 
 ## Acceptance Criteria
 
-- [ ] `services/worker-service/tests/test_track7_ac_mapping.py` lists all 15 Track 7 ACs and each references an existing test — all pass.
+- [ ] `services/worker-service/tests/test_track7_ac_mapping.py` lists all 14 Track 7 ACs and each references an existing test — all pass.
 - [ ] All eight new worker test files exist and pass under `make worker-test`.
 - [ ] `tests/backend-integration/test_context_management_validation.py` passes under `make e2e-test`.
 - [ ] `docs/CONSOLE_BROWSER_TESTING.md` contains Scenarios 14 + 15 with clear orchestrator-runnable steps.
 - [ ] `make test`, `make worker-test`, `make e2e-test` — all green.
-- [ ] `docs/exec-plans/active/phase-2/track-7/progress.md` shows all 11 tasks as Done.
+- [ ] `docs/exec-plans/active/phase-2/track-7/progress.md` shows all 12 tasks as Done.
 - [ ] `STATUS.md` row for Track 7 flipped from "Not started" to "Complete" with links to plan + progress.
 - [ ] The `docs/exec-plans/active/phase-2/track-7/` directory has been moved to `docs/exec-plans/completed/phase-2/track-7/`. **The orchestrator (not this subagent) performs the move** after Playwright verification passes — see AGENTS.md §Browser Verification and Task 12 CRITICAL POST-WORK. The subagent marks Task 12 internal status Done but does NOT move the directory.
 

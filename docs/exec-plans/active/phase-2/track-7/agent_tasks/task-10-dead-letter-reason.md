@@ -88,7 +88,7 @@ ALTER TABLE tasks ADD CONSTRAINT tasks_dead_letter_reason_check
 
 **Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 8 and later tasks depend on this migration being applied first.
 
-**`task_events` column.** If `task_events.dead_letter_reason` has its own CHECK constraint, extend that too. Otherwise the audit event insert will fail while the `tasks` update succeeds.
+**`task_events` column — MANDATORY inspection step.** Run `grep -rn task_events_dead_letter_reason_check infrastructure/database/migrations/` before writing the migration. If a CHECK constraint exists on `task_events.dead_letter_reason`, the migration MUST extend it identically (DROP + re-ADD with the same allowed-values list). If no constraint exists, document that explicitly in the migration comment so future maintainers know. Skipping this inspection is a deploy blocker — the `tasks` row flips successfully but the audit event insert fails, leaving the worker stuck mid-transition and the reaper unable to re-claim. An AC checks both constraints post-migration.
 
 ### Java enum
 

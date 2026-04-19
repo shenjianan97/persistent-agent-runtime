@@ -61,7 +61,8 @@ Semantics:
   - `SystemMessage` with the fixed `SUMMARIZER_PROMPT` string (see below).
   - `HumanMessage` with a formatted serialisation of `slice_messages` (see below).
 - Calls the summarizer model via `langchain.chat_models.init_chat_model` (or the worker's existing model-init helper — reuse Track 5's pattern).
-- Retries up to `SUMMARIZER_MAX_RETRIES` on transient errors (use the worker's existing `_is_retryable_error` classification from `graph.py`); on exhaustion, emits `compaction.tier3_skipped` log and returns `skipped=True`.
+- Retries up to `SUMMARIZER_MAX_RETRIES` on transient errors (use the worker's existing `_is_retryable_error` classification from `graph.py`).
+- **Fatal vs retryable distinction.** On a non-retryable error (bad API key, model removed, 4xx with invalid model, auth failure), `SummarizeResult.skipped=True` with `skipped_reason="fatal"` is returned AND a `compaction.tier3_fatal` structured log is emitted (distinct from `compaction.tier3_skipped` which is the retryable-exhausted path). The pipeline (Task 8) reads `skipped_reason` and — on `fatal` — applies a per-task short-circuit so the threshold check does NOT re-fire Tier 3 on every subsequent agent-node call (which would burn the minimum per-call cost forever). Short-circuit resets on a new task only. On retryable exhaustion (`skipped_reason="retryable"`), Tier 3 is re-attempted on the next call as before.
 - On success: writes one row to `agent_cost_ledger` with `operation='compaction.tier3'`, `model_id=summarizer_model_id`, tokens/cost from the response metadata. Uses the repository pattern.
 - Langfuse: if a Langfuse callback is passed in, the LLM call is automatically traced; no extra work beyond passing the callbacks list through to `ainvoke`.
 - Cost lookup: use `_get_model_cost_rates(summarizer_model_id)` (already in `graph.py`) or an equivalent lookup helper. If the model has zero cost rates (dev-mode), still write the ledger row with `cost_microdollars=0`.
@@ -111,7 +112,7 @@ Determinism is load-bearing — sort keys in JSON dumps, use a fixed step-index 
 
 ## Dependencies
 
-- **Must complete first:** Task 3 (`SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULTUMMARIZER_MODEL`, `get_platform_default_summarizer_model`).
+- **Must complete first:** Task 3 (`SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`, `get_platform_default_summarizer_model`).
 - **Provides output to:** Task 8 (pipeline orchestrator calls `summarize_slice` as the Tier 3 step, branches on `skipped`).
 - **Shared interfaces/contracts:** The `SummarizeResult` type + `summarize_slice` function.
 
@@ -193,6 +194,7 @@ Reuse `_extract_tokens`, `_is_retryable_error`, `_get_retry_after` from `graph.p
 - [ ] Slice of < 2 messages returns `skipped=True` with no LLM call and no ledger write.
 - [ ] On a retryable error followed by success, the function succeeds and records one ledger row (not three).
 - [ ] On exhaustion of retries, the function returns `skipped=True`, emits `compaction.tier3_skipped` log, and writes NO ledger row.
+- [ ] **Cost-ledger idempotency.** The ledger insert uses a natural key of `(task_id, checkpoint_id, operation='compaction.tier3', summarized_through_turn_index_after)` — duplicate writes (e.g., crash-after-ledger-before-state-commit followed by retry) are swallowed by a unique constraint or `ON CONFLICT DO NOTHING`. Verified by test: invoke `summarize_slice` twice for the same target watermark and assert only one ledger row exists. Rationale: the summarizer LLM call + ledger insert + state.summary_marker advance are not one transactional unit; a crash between them can replay the summarizer on restart.
 - [ ] `format_messages_for_summary` is deterministic: two calls on the same slice produce byte-identical output (assert via unit test).
 - [ ] Cost ledger row fields match the existing schema — `tenant_id`, `agent_id`, `task_id`, `checkpoint_id`, `model_id`, `tokens_in`, `tokens_out`, `cost_microdollars`, `operation`.
 - [ ] Langfuse callbacks passed in propagate into the `ainvoke` call.

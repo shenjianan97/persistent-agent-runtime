@@ -38,7 +38,7 @@ class RuntimeState(TypedDict):
     # Track 5 (memory) fields — populated by memory-enabled graphs only.
     # Defaults are reducer-safe (`[]`, not `None`) because LangGraph's
     # `operator.add` raises on None. See langgraph #4305 for why we avoid
-    # `Optional[T]` on reducer-backed fields.
+    # Non-instantiable types on reducer-backed fields (Optional, unions, etc.).
     observations: Annotated[list[str], operator.add]         # default []
     pending_memory: dict                                     # default {}
     memory_opt_in: bool                                      # default False
@@ -79,7 +79,7 @@ Where:
   - If `b is None`, return `a` (no update).
   - If `a is None`, return `b` (first write).
   - If `b.startswith(a)`: return `b` (append — normal second-Tier-3 path).
-  - Else: emit `compaction.summary_marker_non_append` structured log AND return `a` (REJECT the non-append write). Non-append rewrites invalidate KV-cache on every subsequent call and violate Design §Core design rule 1. There is no legitimate replace path in v1; regenerating the marker requires explicit state clearing, which is not in scope.
+  - Else: emit `compaction.summary_marker_non_append` structured log (no replace path exists in v1) AND return `a` (REJECT the non-append write). Non-append rewrites invalidate KV-cache on every subsequent call and violate Design §Core design rule 1. There is no legitimate replace path in v1; regenerating the marker requires explicit state clearing, which is not in scope.
   - Rollback via `rollback_last_checkpoint` restores the state snapshot wholesale outside the reducer, so rollback is not constrained by this rule.
 
 Track 7 is always-on; there is no runtime enable/disable knob. If compaction breaks in production, the operator path is a standard deploy rollback — matches Tracks 3/4/5.
@@ -201,7 +201,9 @@ def estimate_tokens(messages: list[BaseMessage], provider: str) -> int:
     return len(serialized) // 3
 ```
 
-`_serialize_for_token_count` must be deterministic (sort JSON keys, consistent message formatting) so two calls with the same messages produce the same token count — otherwise Tier 1 fires at different thresholds across retries. Both `tiktoken` and `anthropic.count_tokens` already exist in the worker's dependency tree (Track 1 / Track 5 added them).
+`_serialize_for_token_count` must be deterministic (sort JSON keys, consistent message formatting) so two calls with the same messages produce the same token count — otherwise Tier 1 fires at different thresholds across retries.
+
+**Serialization determinism across checkpoint save/load.** `AIMessage.additional_kwargs`, `response_metadata`, callback injection state, and tool-call `id` fields can drift between pre-checkpoint and post-checkpoint objects (different defaultdict ordering, stripped metadata, etc.). The serializer MUST use an explicit allow-list of fields — only `type`, `content`, `tool_calls[].name`, `tool_calls[].args` (with sorted keys), `tool_call_id` for tool messages. Everything else (IDs, response_metadata, additional_kwargs, usage_metadata) is excluded. Unit-tested via: `estimate_tokens(deserialize(serialize(msgs))) == estimate_tokens(msgs)` on a realistic checkpoint round-trip fixture. Without this, the compaction trigger boundary drifts across resume and KV-cache invalidates. Both `tiktoken` and `anthropic.count_tokens` already exist in the worker's dependency tree (Track 1 / Track 5 added them).
 
 `provider` comes from the agent config (`agent_config.provider`).
 
@@ -213,7 +215,7 @@ Read from the `models` table row for `agent_config.model` at graph-build time. C
 
 - **Service/Module:** Worker Service — Compaction + graph
 - **File paths:**
-  - `services/worker-service/executor/compaction/state.py` (new — `CompactionEnabledState`, `RuntimeState`, reducers)
+  - `services/worker-service/executor/compaction/state.py` (new — `RuntimeState` TypedDict + reducers (Task 2 already created the file; Task 8 adds Track 7 fields))
   - `services/worker-service/executor/compaction/pipeline.py` (new — `compact_for_llm`, `CompactionPassResult`, event types, `estimate_tokens`)
   - `services/worker-service/executor/compaction/tokens.py` (new — real-tokenizer-preferred token estimation for Anthropic/OpenAI; heuristic for Gemini/BYOT)
 
@@ -255,10 +257,10 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - [ ] Memory-enabled tasks have the `memory_write` node wired (topology branching). Memory-disabled tasks do not have it wired.
 - [ ] An existing Track 5 checkpoint (written with the pre-refactor `MemoryEnabledState`) deserialises cleanly against `RuntimeState` — the compaction fields default-initialise, memory fields match their old values. Regression test loads a V1 fixture and resumes.
 - [ ] Pipeline updates `last_super_step_message_count = len(raw_messages)` in every `CompactionPassResult.state_updates` so heartbeat detection in Task 9 has the watermark it needs.
-- [ ] `__init__.py` after Task 8 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `CompactionEnabledState`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
+- [ ] `__init__.py` after Task 8 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
 - [ ] Summary marker strict-append reducer rejects non-append writes — unit test asserts a non-append second write returns the ORIGINAL marker value, and `compaction.summary_marker_non_append` is logged.
 - [ ] Watermark reducers are `max` — a synthetic stale super-step returning `{cleared_through_turn_index: 0}` while state is at 10 does NOT regress the value.
-- [ ] `summary_marker` reducer appends when the new value has the old as a prefix; logs `compaction.summary_marker_replaced` when it replaces.
+- [ ] `summary_marker` reducer appends when the new value has the old as a prefix; logs `compaction.summary_marker_non_append` when a non-prefix write is rejected (strict-append reducer; replace is not allowed).
 - [ ] `make worker-test` and `make e2e-test` green.
 
 ## Testing Requirements
@@ -281,7 +283,7 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 
 ## Assumptions
 
-- Track 5 is already live (`MemoryEnabledState` exists and works). If Track 7 lands before Track 5, `RuntimeState` reduces to just `CompactionEnabledState` fields.
+- Track 5 is already live (`MemoryEnabledState` exists and works). If Track 7 lands before Track 5, `RuntimeState` already has the unified schema from Task 2; Task 8 only adds Track 7 fields to it.
 - Track 3's per-step budget enforcement is already identifiable in `graph.py`. If not present, surface this back to the orchestrator — Track 3 is a dependency.
 - LangChain `add_messages` and TypedDict-with-Annotated reducer pattern work on the worker's pinned Python + LangGraph versions (Track 5 proved this).
 

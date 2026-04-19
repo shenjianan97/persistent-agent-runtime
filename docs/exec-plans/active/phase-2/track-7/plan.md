@@ -14,13 +14,13 @@
 
 Track 7 extends the Phase 2 worker runtime with:
 
-1. **Agent config extension** — `agent_config.context_management` sub-object with four narrow fields (`enabled`, `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`). No DB migration. Jackson-safe, canonicalised, validated.
+1. **Agent config extension** — `agent_config.context_management` sub-object with three narrow tuning fields (`summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`) — no `enabled` toggle. No DB migration. Jackson-safe, canonicalised, validated.
 2. **Compaction constants + threshold resolver** — `compaction/defaults.py` holds platform-owned constants (fractions, `KEEP_TOOL_USES`, per-result cap, truncatable arg keys). `compaction/thresholds.py` exposes `resolve_thresholds(model_context_window)` returning per-model `(tier1, tier3)` tokens.
 3. **Per-tool-result ingestion cap** — every `ToolMessage` is head+tail truncated to 25KB before entering state; capped at the tool-execution wrapper inside `graph.py`; emits `compaction.per_result_capped` + Langfuse annotation when fired.
 4. **Tier 1 transform — tool-result clearing** — pure function `clear_tool_results()` in `compaction/transforms.py` that replaces older `ToolMessage` content with deterministic placeholders while keeping the most recent `KEEP_TOOL_USES` tool uses intact. Monotone via `cleared_through_turn_index` watermark.
 5. **Tier 1.5 transform — tool-call argument truncation** — pure function `truncate_tool_call_args()` in the same module that rewrites large string args (`content`, `new_string`, `old_string`, `text`, `body`) in older `AIMessage.tool_calls[*]` records. Monotone via `truncated_args_through_turn_index` watermark.
 6. **Tier 3 summarizer** — `compaction/summarizer.py` wraps the summarizer LLM call with retry, structured prompt, cost-ledger attribution (`operation='compaction.tier3'`), and Langfuse span. Returns append-only content that merges into `summary_marker`.
-7. **State schema + pipeline orchestrator + `agent_node` integration** — `compaction/state.py` defines `CompactionEnabledState` with `max`/append reducers. `compaction/pipeline.py` runs tiers in order (Tier 1 + 1.5 always; Tier 3 only above threshold) and returns the compacted view + watermark advances. `executor/graph.py` wires the pipeline into `agent_node` and picks the right state class when Track 5 is also on.
+7. **State schema + pipeline orchestrator + `agent_node` integration** — `compaction/state.py` (already shipped by Task 2 with Track 5 fields) gains Track 7 fields + their `max`/append reducers. `compaction/pipeline.py` runs tiers in order (Tier 1 + 1.5 always; Tier 3 only above threshold) and returns the compacted view + watermark advances. `executor/graph.py` wires the pipeline into `agent_node` and picks the right state class when Track 5 is also on.
 8. **Pre-Tier-3 memory flush** — before the first Tier 3 firing per task, when `agent.memory.enabled AND context_management.pre_tier3_memory_flush AND NOT memory_flush_fired_this_task`, the pipeline inserts a one-shot `SystemMessage` asking the agent to call `memory_note`. Heartbeat/recovery turns skip the flush.
 9. **Dead-letter reason + budget carve-out** — adds `context_exceeded_irrecoverable` to the Track 2 `dead_letter_reason` enum (schema migration) and wires it from the pipeline's hard-floor path. Adds `compaction.tier3` to the Track 3 named-node budget carve-out list (alongside `memory_write`).
 10. **Console UI** — extension to the Agent edit form adding a "Context management" section with the four narrow override fields. Mirrors Track 5 Memory tab's edit patterns. Browser-verified.
@@ -40,7 +40,7 @@ Track 7 extends the Phase 2 worker runtime with:
 | Tier 1 transform | `services/worker-service/executor/compaction/transforms.py` | new code | `clear_tool_results()` pure function with monotone watermark |
 | Tier 1.5 transform | same module | new code | `truncate_tool_call_args()` pure function with monotone watermark |
 | Tier 3 summarizer | `services/worker-service/executor/compaction/summarizer.py` | new code | LLM call wrapper + retry + cost ledger + Langfuse span |
-| State schema | `services/worker-service/executor/compaction/state.py` | new code | `CompactionEnabledState` TypedDict with `max` reducers for watermarks + custom reducer for `summary_marker` |
+| State schema | `services/worker-service/executor/compaction/state.py` | new code | `RuntimeState` TypedDict (extended from Task 2) with `max` reducers for Track 7 watermarks + strict-append reducer for `summary_marker` |
 | Pipeline orchestrator | `services/worker-service/executor/compaction/pipeline.py` | new code | `compact_for_llm(state, messages, config) -> (messages, watermarks, events)` |
 | `agent_node` integration | `services/worker-service/executor/graph.py` | modification | Call pipeline before every LLM invocation; merge state class with `MemoryEnabledState` when Track 5 also on; pick plain `MessagesState` when both off |
 | Pre-Tier-3 memory flush | `services/worker-service/executor/compaction/pipeline.py` (extension) | modification | Detect trigger, check gating flags, insert one-shot `SystemMessage`, set `memory_flush_fired_this_task` |
@@ -197,10 +197,10 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 | `exclude_tools` list grows unbounded and memory usage balloons | Cap at 50 entries (matches `tool_servers`). Validation rejects over-50 at `POST/PUT /v1/agents`. |
 | Cache-stability invariant silently broken by future refactor | Unit test runs the compaction pipeline twice on the same state and asserts `output == output`. CI gate. |
 | Customer workloads silently regress after Track 7 ships | Metrics watch in staging (synthetic long tasks) and prod (Langfuse dashboards). If metrics show a regression, roll back the deploy — same pattern as Tracks 3/4/5. Customers have no opt-out because an agent without compaction fails at the context ceiling anyway. |
-| Pre-Tier-3 memory flush fires on heartbeat turn, wasting a memory_note cycle | Detection rule: last two messages both `AIMessage` → heartbeat. Skip flush. Unit tested. |
+| Pre-Tier-3 memory flush fires on heartbeat turn, wasting a memory_note cycle | Detection rule: positional — `len(raw_messages) <= last_super_step_message_count` (no new ToolMessage/HumanMessage since the last super-step) → heartbeat. Skip flush. Unit-tested with rate-limit-retry and pure-reasoning fixtures. Unit tested. |
 | Budget carve-out omitted for `compaction.tier3` → Tier 3 pauses mid-compaction | Task 7 explicitly adds `compaction.tier3` to the Track 3 named-node carve-out list alongside `memory_write`. Regression test verifies carve-out by constructing a task with a tight per-task budget + forced Tier 3. |
 | Dead-letter reason enum migration ordering races with existing in-flight tasks | Enum additions are additive + non-breaking; in-flight tasks keep working with pre-existing reasons. Migration runs during normal deploy. |
-| Track 5 + Track 7 both extend graph state → accidental state field collision | Task 7 merges `CompactionEnabledState` + `MemoryEnabledState` into a single `RuntimeState` TypedDict with distinct field names; unit test instantiates the combined state and asserts all fields present. |
+| Track 5 + Track 7 both extend graph state → accidental state field collision | Task 2 unifies all state fields into a single `RuntimeState` TypedDict (Track 5 fields only); Task 8 adds Track 7 fields to the same TypedDict with distinct field names; unit test instantiates the combined state and asserts all fields present. |
 | Tier 3 summary marker grows unbounded across many Tier 3 firings | Append-only marker is still a budget-line item; if summary_marker itself grows past a secondary threshold, pipeline logs a `compaction.marker_oversized` warning (operator-visible), but v1 does not auto-collapse. Addressed in Phase 3+ if metrics warrant. |
 | Customer tool relies on old ToolMessage content surviving forever (e.g., a tool_call that references a previous tool_result by content) | `exclude_tools` documented as the opt-out for "load-bearing" tool results; `memory_note`, `save_memory`, `request_human_input` seeded by default. Customer tools can be added. |
 
@@ -225,8 +225,8 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 ## A10. Key Design Decisions
 
 1. **Fraction-only thresholds.** Tier 1 at 50%, Tier 3 at 75% of the model's effective budget. No absolute token caps — customers who pick 1M Gemini get proportionally higher thresholds. Minimum-separation guardrail prevents pathologically small models (8K) from firing both tiers simultaneously.
-2. **`enabled=true` by default.** The failure modes (context-limit, TPM, cost) affect every long task, not just opt-in ones. Opt-out is the escape hatch for verbatim-history workloads (< 5% expected).
-3. **Platform-owned constants, narrow per-agent overrides.** `keep`, per-result cap, trigger fractions live as module constants. Customer tuning surface is four fields only: `enabled`, `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`.
+2. **Always-on for every agent.** The failure modes (context-limit, TPM, cost) affect every long task. No per-agent `enabled` toggle; API rejects `enabled` with 400. If compaction breaks in prod, operators roll back the deploy (Tracks 3/4/5 precedent).
+3. **Platform-owned constants, narrow per-agent overrides.** `keep`, per-result cap, trigger fractions live as module constants. Customer tuning surface is three fields only: `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`.
 4. **Monotone watermark state with `max` reducers.** `cleared_through_turn_index`, `truncated_args_through_turn_index`, `summarized_through_turn_index` only advance. Cache-stability invariant enforced at the reducer level and unit-tested.
 5. **Observation masking (Tier 1) is the primary mechanism, not LLM summarization.** JetBrains paper empirical result: masking beats summarization on cost and solve rate. Tier 3 is last resort.
 6. **Silent compaction (no "context anxiety" induction).** Neutral placeholder language; no `SystemMessage` telling the agent it was compacted. Exception: the explicit pre-Tier-3 memory flush.
@@ -238,7 +238,7 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 12. **Server-side Anthropic primitives deferred to Phase 3+.** Client-side compaction for provider portability in v1; layering `clear_tool_uses_20250919` / `compact_20260112` on Anthropic agents is a follow-up optimization.
 13. **Traditional deploy-and-watch rollout.** Track 7 activates for all agents at worker ship. If rollout metrics regress, roll back the deploy — the same incident-response path as every other Phase 2 track. No Track-7-specific env-var escape hatch.
 14. **Real tokenizer preferred for Anthropic / OpenAI.** Heuristic-only estimation under-counts by 30–50% on code/JSON-heavy history (exactly the case Track 7 exists to address), so `tiktoken` / `anthropic.count_tokens` is mandatory on those providers; Gemini / BYOT use the cheap char-count heuristic until a specific provider proves persistently inaccurate.
-15. **`__init__.py` owned by Task 7.** Tasks 2–6 don't touch it, avoiding the parallel-task merge conflict that would otherwise require worktree isolation on every preceding task.
+15. **`__init__.py` owned by Task 8.** Tasks 2–7 don't touch it, avoiding the parallel-task merge conflict that would otherwise require worktree isolation on every preceding task.
 
 ---
 

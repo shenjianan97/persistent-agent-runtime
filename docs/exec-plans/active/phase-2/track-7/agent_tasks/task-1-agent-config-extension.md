@@ -79,6 +79,7 @@ Add a new helper `validateContextManagementConfig(ContextManagementConfigRequest
 1. When `cm.summarizerModel()` is non-null and non-empty:
    - Reuse the same `validateModel(String, String provider)` helper used for the agent's primary `model` and for `memory.summarizer_model`.
    - Reject when the row is not `active`, when the provider does not match the agent's provider, or when provider credentials are not resolvable.
+   - **Reject when the summarizer's context window is smaller than the primary model's Tier 3 trigger** (`summarizer_model.context_window < primary_model.tier3_trigger` — where `tier3_trigger` is derived at validation time via the same formula Task 3's `resolve_thresholds` uses; reuse that helper from the API side or duplicate the tiny formula with a comment linking to it). Without this check, a customer selecting a tiny summarizer (e.g., 32K-context model) would see silent Tier 3 failures the moment their agent's history crosses the primary model's trigger. Error message: `"summarizer_model {X} has context_window {N} but primary model {Y} triggers Tier 3 at {T} tokens — select a summarizer with context_window >= {T}"`.
    - Error message consistent with existing "unknown model" / "disabled model" messages.
 2. When `cm.excludeTools()` is non-null:
    - Reject when size > 50 with a message naming the 50-entry cap.

@@ -210,7 +210,7 @@ The per-tool-result cap is measured in **bytes** because it runs at tool-executi
 
 - `summarizer_model` must reference an active row in `models` for the agent's provider; otherwise 400 at `POST/PUT /v1/agents`.
 - `exclude_tools` must not exceed 50 entries (matches `tool_servers` cap).
-- `enabled`, `pre_tier3_memory_flush` bool-typed; no coercion.
+- `pre_tier3_memory_flush` bool-typed; no coercion.
 - Canonicalization preserves the sub-object verbatim; absence remains absence (no silent defaults written).
 
 ## Per-tool-result cap at ingestion
@@ -416,7 +416,7 @@ SystemMessage(
 
 This is the same rule used in §Validation #8, stated once here and once there. The "last two messages are both `AIMessage`" heuristic is NOT correct — it misfires on rate-limit retry loops (the previous call produced an AIMessage but the retry is a legitimate new super-step) and on pure-reasoning turns (two consecutive AIMessages can be valid).
 
-Implementation: track `last_super_step_message_count` as part of `CompactionEnabledState`. Before each compaction pass, compare `len(messages) > last_super_step_message_count` — true means new input arrived and the flush is eligible; false means heartbeat and the flush is skipped. Watermark is `max`-reduced.
+Implementation: track `last_super_step_message_count` as part of `RuntimeState` (added in Task 8 alongside the Track 7 watermark fields). Before each compaction pass, compare `len(messages) > last_super_step_message_count` — true means new input arrived and the flush is eligible; false means heartbeat and the flush is skipped. Watermark is `max`-reduced.
 
 **Follow-up / redrive interaction.** The `memory_flush_fired_this_task` flag lives in graph state, which is checkpointed and survives crash/resume. A follow-up or redrive that resumes from a pre-flush checkpoint continues to treat the flush as unfired; a follow-up / redrive that resumes after the flush already fired does not re-fire it.
 
@@ -470,7 +470,7 @@ class RuntimeState(TypedDict):
 
 **Field-typing discipline derived from LangGraph research:**
 
-- **No `Optional[T]` on reducer-backed fields.** LangGraph [issue #4305](https://github.com/langchain-ai/langgraph/issues/4305) shows custom reducers get silently bypassed on `Optional` / `| None` fields. Use direct types + sentinel defaults (`""` for strings, `{}` for dicts, `[]` for lists, `0` for counters).
+- **No `Optional[T]` (or any non-instantiable type) on reducer-backed fields.** When `typ()` is non-instantiable (unions, `Optional`, BaseModel with required fields), LangGraph's `BinaryOperatorAggregate` leaves the channel `MISSING` and the *first* node write becomes the seed without running the reducer. Strict-append and `max` invariants cannot hold on that first write. Use direct types + reducer-safe sentinel defaults (`""` for strings, `{}` for dicts, `[]` for lists, `0` for counters) so `typ()` always yields a usable initial value. See `langgraph/channels/binop.py` lines 65-68 + 105-107 and the closed-as-by-design [issue #4305](https://github.com/langchain-ai/langgraph/issues/4305).
 - **Reducer-safe defaults.** `operator.add` on `None` raises; initial state is constructed with empty-but-typed values so no call-site hits a bare `None`.
 - **Append-only schema discipline.** Adding fields is safe (old checkpoints deserialize with the new fields missing, TypedDict tolerates). Removing or renaming fields is not safe — the checkpointer has no migration story, so schema evolution is strictly append-only. A regression test (load a V1 checkpoint fixture against the current schema, assert it deserialises cleanly) guards this.
 - **Subgraph composition as the future escape hatch.** If state outgrows ~15 fields or features become truly orthogonal, we carve the biggest feature into a subgraph with its own schema and transform at the boundary. That's the framework-sanctioned split; we don't need it yet.
@@ -509,6 +509,17 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 - Redrive from the **last** checkpoint: watermarks and summary_marker are restored; compaction state continues monotonically. No re-summarization.
 - Redrive with **rollback_last_checkpoint** (Phase 2 Track 2): watermarks roll back with the rest of state. If the rollback target is pre-Tier-3, the summary_marker is `None`; if it is post-Tier-3, the marker is restored. No cross-checkpoint contamination.
 - Follow-up (new task, seeded from prior): a follow-up task starts with fresh state (watermarks at 0, summary_marker None). Prior compaction is not inherited — the new task's history is a fresh slate, and pre-Tier-3 memory flush can fire on its first crossing.
+
+## Customer-visible behavior changes
+
+The task-detail API response (`GET /v1/tasks/{id}`) exposes message history via the task's checkpoint. Track 7 changes what customers see on that endpoint:
+
+- **Tool results larger than 25KB are head+tail truncated** at ingestion. Customers who rely on verbatim tool output for audit, replay, or debugging will see `[... truncated N bytes ...]` markers in place of the middle content. Head and tail portions remain verbatim.
+- **Older tool-result content is masked** (Tier 1) once the task crosses the Tier 1 threshold. The placeholder (`[tool output not retained — {tool} returned {N} bytes at step {i}]`) gives enough anchor to identify which tool ran but not re-read its output. Customers wanting a full audit trail should pull the structured `compaction.per_result_capped` / `compaction.tier1_applied` logs from Langfuse, which preserve the original byte counts and tool names.
+- **Older tool-call arguments are truncated** (Tier 1.5) — large `content`/`new_string`/`body`/etc. args in old `tool_calls` records become `[N bytes — arg truncated after step i]`.
+- **On Tier 3 firing, a `SystemMessage` summary marker replaces the oldest prefix** in the LLM input view. Raw pre-summary messages are retained in state for audit/redrive; they just aren't sent to the LLM. The task-detail API can choose to show the marker OR the raw messages; document the chosen behavior in the API surface.
+
+**This is a breaking change for any customer relying on verbatim tool history in the task-detail response.** Release notes + STATUS.md update must call it out. Expected impact: audit consumers already have structured logs as an alternative, and no public API contract guarantees byte-for-byte preservation of tool results in state.
 
 ## Observability
 
@@ -567,7 +578,7 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 
 ## Cross-track coordination
 
-- **Track 2 (Runtime State Model):** adds `context_exceeded_irrecoverable` to `dead_letter_reason` enum. Small schema addition; picked up by the Track 7 exec plan.
+- **Track 2 (Runtime State Model):** adds `context_exceeded_irrecoverable` to the `dead_letter_reason` CHECK constraint (it is a TEXT column + CHECK, not a Postgres enum — see Task 10 for migration shape). Small schema addition; picked up by the Track 7 exec plan.
 - **Track 3 (Scheduler and Budgets):** adds `compaction.tier3` to the per-step budget carve-out list alongside `memory_write`. No new enforcement mechanism — reuses the existing named-node carve-out.
 - **Track 4 (BYOT):** no action required. Custom MCP tool results automatically flow through the per-tool-result cap.
 - **Track 5 (Memory):** adds `context_management.pre_tier3_memory_flush` as an opt-in dependency on memory. Integration point is narrow: one SystemMessage insertion + one state flag. No schema change on `agent_memory_entries` or tools.

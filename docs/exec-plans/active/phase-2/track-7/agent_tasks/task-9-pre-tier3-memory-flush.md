@@ -60,7 +60,7 @@ def _is_heartbeat_turn(
 
 This matches Design §Validation rule 10. The earlier "last two messages are both `AIMessage`" heuristic was wrong — it misfires on rate-limit retry loops (the previous call succeeded and wrote an AIMessage, the retry is legitimate new work) and on pure-reasoning turns (consecutive AIMessages can be valid). The positional comparison is unambiguous: new work = new message appended; no new work = no new message.
 
-`last_super_step_message_count` is a new state field introduced in Task 8 (see `CompactionEnabledState`). At the end of every agent super-step, the pipeline writes `last_super_step_message_count = len(raw_messages)` so the next call's heartbeat detection is accurate.
+`last_super_step_message_count` is a new state field introduced in Task 8 (added to `RuntimeState` in Task 8). At the end of every agent super-step, the pipeline writes `last_super_step_message_count = len(raw_messages)` so the next call's heartbeat detection is accurate.
 
 Flush system-message shape (exact string):
 

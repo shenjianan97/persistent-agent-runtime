@@ -20,7 +20,7 @@ You are a software engineer implementing one module of a larger system. Your sco
 4. LangGraph research findings:
    - Reducers only fire for keys present in a node's return value ([docs](https://docs.langchain.com/oss/python/langgraph/use-graph-api)) — unused fields cost nothing at runtime.
    - LangGraph has no schema-migration API ([langgraphjs #536](https://github.com/langchain-ai/langgraphjs/issues/536)); per-task schema swapping is on the unsupported side of the checkpointer.
-   - `Optional[T]` bypasses custom reducers in v0.3.30 ([langgraph #4305](https://github.com/langchain-ai/langgraph/issues/4305)) — always use direct types + reducer-safe sentinel defaults (`[]`, `{}`, `""`, `0`, `False`).
+   - Any non-instantiable reducer field type (`Optional[T]`, unions, BaseModel with required fields) leaves the channel MISSING on first write, bypassing the reducer on the seed (see `langgraph/channels/binop.py:65-68` and closed-as-by-design [langgraph #4305](https://github.com/langchain-ai/langgraph/issues/4305)). Always use direct types + reducer-safe sentinel defaults (`[]`, `{}`, `""`, `0`, `False`).
    - `operator.add` crashes on `None` — lists must default to `[]`.
 5. All Track 5 tests under `services/worker-service/tests/` that reference `MemoryEnabledState` or assume memory-disabled tasks use `MessagesState`. Identify them via `grep -rn MemoryEnabledState services/worker-service`.
 
