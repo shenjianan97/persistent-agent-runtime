@@ -535,13 +535,28 @@ Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the r
 
 **Target cache hit rate:** the compaction transform is deterministic and monotone, so cache-hit rate should approach the pre-Track-7 baseline within 5% for any task whose watermarks advance linearly. Measurement: compare cached-token-fraction from Langfuse before and after enabling Track 7 on the same agent.
 
-**Rollout (phased):**
+**Rollout is governed by a pure worker-side resolver**, not by the persisted config. Agent config with `enabled` absent stays absent on disk; the worker computes effective-enabled per task via:
 
-1. **Week 1 — New agents only.** Track 7 code ships; a deploy-time env var (`CONTEXT_MGMT_DEFAULT_ENABLED=true`) governs the default for agents created *after* the deploy. Pre-existing agents continue with Track 7 disabled (the worker reads `context_management.enabled` with a *false* default for pre-existing agents, distinguishing "not present on config" from "explicitly false"). New agents get compaction immediately; operators watch Langfuse metrics.
-2. **Week 2 — Canary sweep.** If Week 1 metrics are clean (tier3_fire_rate < 1 per 100, cache_hit_rate_ratio within 5%), flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true` and run a background job that marks pre-existing agents' effective default as `enabled=true`. Agents that explicitly set `enabled=false` before the sweep keep that setting.
-3. **Kill switch.** A worker-process-level env var `CONTEXT_MGMT_KILL_SWITCH=true` forces `enabled=false` for *every* agent regardless of config. This is the global-regression escape hatch — flipping it requires only a worker restart, no DB change. Documented runbook: "flip kill switch, inspect Langfuse, fix, reverse."
-4. **Customer opt-out.** `context_management.enabled=false` on an agent is the permanent, per-agent override. Expected < 5% of agents.
-5. **Metrics** (tier3_fire_rate, cache_hit_rate_ratio) are watched continuously. If Tier 3 fires more than 1 call in 100 on average, the platform default `TIER_1_TRIGGER_FRACTION` is lowered (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
+```
+effective_context_management_enabled(agent_config, agent_created_at, *, kill_switch, new_agents_default_at_or_after, existing_agents_default)
+```
+
+Precedence, highest first:
+
+1. `CONTEXT_MGMT_KILL_SWITCH=true` → False. Global operator escape hatch; worker restart only, no DB change.
+2. Explicit `context_management.enabled` on the agent config → use it verbatim (respects both `true` and `false`).
+3. `agent.created_at >= CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER` (the deploy timestamp) → `True`. This is how new agents pick up compaction.
+4. Otherwise → `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT` (env var). `False` during Week 1; flipped to `True` for Week 2.
+
+**Phased rollout:**
+
+1. **Week 1 — New agents only.** Deploy with `CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER=<deploy timestamp>` and `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=false`. New agents get compaction; pre-existing agents (their absent config is preserved) stay off. Operators watch Langfuse metrics.
+2. **Week 2 — Sweep.** If Week 1 metrics are clean (tier3_fire_rate < 1 per 100 LLM calls, cache_hit_rate_ratio within 5% of pre-deploy baseline on the same agents), flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true`. Pre-existing agents with no explicit `enabled` now resolve to `True`. Agents with explicit `enabled=false` remain off — the resolver always prefers explicit config.
+3. **Kill switch.** `CONTEXT_MGMT_KILL_SWITCH=true` forces every agent to `False` regardless of config. Runbook-documented: "flip kill switch, inspect Langfuse, fix, reverse."
+4. **Customer opt-out.** `context_management.enabled=false` on the agent is the permanent per-agent override. Expected < 5% of agents.
+5. **Metrics** watched continuously. If Tier 3 fires more than 1 call in 100 on average, lower `TIER_1_TRIGGER_FRACTION` (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
+
+**Per-result cap honors the resolver.** When `effective_context_management_enabled` returns `False`, the tool-wrapper cap is a no-op (byte-identical pass-through) and `compaction.per_result_capped` is never emitted. This preserves the "disabled = pre-Track-7 behavior exactly" invariant.
 
 **Regression test gate:** every agent-node unit test suite in `services/worker-service/tests/` runs twice — once with compaction enabled, once with it disabled — to guard the "disabled = pre-Track-7 behavior" invariant.
 

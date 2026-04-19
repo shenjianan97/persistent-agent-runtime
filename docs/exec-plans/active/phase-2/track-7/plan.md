@@ -111,9 +111,9 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 4 and 5 both add to `c
 
 | Task | Output |
 |------|--------|
-| Task 1 | `agent_config.context_management` accepted, validated, canonicalised; `summarizer_model` cross-checked against `models`; Jackson round-trips the sub-object |
-| Task 2 | `compaction/defaults.py` + `compaction/thresholds.py` — pure, unit-tested, no dependencies on LangGraph internals |
-| Task 3 | `compaction/caps.py` with `cap_tool_result()`; integrated into `executor/graph.py` tool wrappers; `compaction.per_result_capped` emitted when cap fires |
+| Task 1 | `agent_config.context_management` accepted, validated, canonicalised verbatim (absent fields stay absent — no `enabled=true` injected); `summarizer_model` cross-checked against `models`; Jackson round-trips the sub-object |
+| Task 2 | `compaction/defaults.py` + `compaction/thresholds.py` + `compaction/gating.py` — pure, unit-tested, no dependencies on LangGraph internals. `PLATFORM_EXCLUDE_TOOLS` includes `memory_search` and `task_history_get`. `effective_context_management_enabled` resolver implements the rollout precedence (kill switch > explicit config > created_at vs rollout date > existing_agents_default). |
+| Task 3 | `compaction/caps.py` with `cap_tool_result()`; tool wrappers gated on the resolver's boolean — cap skipped (byte-identical pass-through) when compaction is disabled for the agent; `compaction.per_result_capped` emitted only when the cap actually fires |
 | Task 4 | `compaction/transforms.py::clear_tool_results` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 5 | `compaction/transforms.py::truncate_tool_call_args` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 6 | `compaction/summarizer.py::summarize_slice` — retry + cost ledger + Langfuse span; handles summarizer outage with structured retries |
@@ -148,10 +148,10 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 4 and 5 both add to `c
 Same single-deployment pattern as Tracks 1–5. Key sequencing:
 
 1. **Migration `0014_context_exceeded_dead_letter_reason.sql`** ships with Task 9. CHECK-constraint DROP+re-ADD pattern (see Task 9 for exact shape — `dead_letter_reason` is a TEXT+CHECK column, not a Postgres enum). **Must land before Task 7 code** — otherwise a hard-floor transition produces a CHECK-violation and the reaper can't dead-letter a stuck task.
-2. **Phased rollout — NOT default-on-everything.**
-   - **Week 1:** Deploy with `CONTEXT_MGMT_DEFAULT_ENABLED=true` for *new* agents only. Pre-existing agents continue with Track 7 disabled (worker reads `context_management.enabled` with `false` fallback for agents whose config predates the deploy).
-   - **Week 2:** If Week 1 metrics are clean, flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true` and run a background job to default pre-existing agents to enabled. Agents that explicitly set `enabled=false` keep that setting.
-   - **Kill switch:** Worker-process env var `CONTEXT_MGMT_KILL_SWITCH=true` forces every agent to `enabled=false`. Flipping requires only a worker restart (no DB change, no deploy). Runbook-documented escape hatch.
+2. **Phased rollout via worker-side resolver — NOT default-on-everything.** The resolver is `effective_context_management_enabled(agent_config, agent_created_at, ...)` in `compaction/gating.py` (Task 2). Task 1 persists `enabled` verbatim — an absent field stays absent — so the resolver can distinguish "never configured" from "explicitly set."
+   - **Week 1:** Deploy with `CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER=<deploy timestamp>` and `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=false`. Agents created at or after the deploy get compaction; pre-existing agents do not (regardless of their absent config).
+   - **Week 2:** If Week 1 metrics are clean, flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true`. Pre-existing agents that never set `enabled` now get compaction. Agents with explicit `enabled=false` keep that setting — the resolver always prefers explicit config over any default.
+   - **Kill switch:** `CONTEXT_MGMT_KILL_SWITCH=true` forces `False` for every agent regardless of config. Worker-restart only; no DB change, no deploy. Runbook-documented escape hatch.
 3. **Opt-out path.** Customers can `PUT /v1/agents/{id}` with `context_management.enabled=false` at any time. Console edit form exposes the toggle (Task 10). Expected < 5% of agents.
 4. **Rollout watch.** Langfuse metrics tracked continuously:
    - `tier3_fire_rate` — target < 1 per 100 LLM calls. Exceeds → lower `TIER_1_TRIGGER_FRACTION` platform default.

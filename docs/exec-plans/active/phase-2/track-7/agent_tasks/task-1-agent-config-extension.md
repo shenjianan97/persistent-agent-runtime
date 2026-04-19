@@ -27,11 +27,11 @@ Because Spring Boot's default Jackson is configured with `FAIL_ON_UNKNOWN_PROPER
 ## Task-Specific Shared Contract
 
 - `agent_config.context_management` has four optional fields — all four must be absent-friendly:
-  - `enabled: bool`, default `true` when absent. (Contrast with Track 5 memory, which defaults to `false` — Track 7 is opt-out, not opt-in.)
+  - `enabled: bool`, optional. When present, persisted verbatim and used verbatim by the worker. When absent, the worker resolves the effective default at runtime based on rollout env vars + the agent's `created_at` — **Task 1 does NOT inject a default**. See Task 7 §"Effective-enabled resolution" for the runtime logic.
   - `summarizer_model: string`, optional. When present, must reference an active row in `models` for the agent's provider. When absent, the worker falls back to `claude-haiku-4-5` (platform default, defined worker-side in Task 2).
   - `exclude_tools: list[string]`, optional. Default `[]`. Max 50 entries (matches `tool_servers`). Each string is a tool name; unknown names are allowed (customer tools can be added before they are wired).
-  - `pre_tier3_memory_flush: bool`, default `true` when absent. No-op if `agent.memory.enabled=false` — validation does not enforce memory coupling; runtime skipping does.
-- Canonicalisation: `AgentService.canonicalizeConfig` MUST round-trip the `context_management` sub-object exactly as stored. When the sub-object is absent on the request, the persisted JSON omits the key entirely (no default populated). When present, preserve all four fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list.
+  - `pre_tier3_memory_flush: bool`, optional. When absent the worker treats it as `true`, matching the design default. No-op if `agent.memory.enabled=false` — validation does not enforce memory coupling; runtime skipping does.
+- Canonicalisation: `AgentService.canonicalizeConfig` MUST round-trip the `context_management` sub-object exactly as stored. When the sub-object is absent on the request, the persisted JSON omits the key entirely (no default populated). When present, preserve all four fields verbatim, including `null`-valued `summarizerModel` or an empty `excludeTools` list. **Critical:** do not inject `enabled=true` on behalf of the caller — an absent `enabled` must remain absent in the persisted JSON so the worker's rollout-aware resolution logic can distinguish "never configured" from "explicitly true/false."
 - Compaction-disabled agents (`enabled=false`) must behave identically to pre-Track-7 behavior. This task does not change worker runtime behavior; subsequent tasks (7/8) enforce the gating.
 - Validation runs at both `POST /v1/agents` and `PUT /v1/agents/{agent_id}` — reuse the helper for both paths.
 

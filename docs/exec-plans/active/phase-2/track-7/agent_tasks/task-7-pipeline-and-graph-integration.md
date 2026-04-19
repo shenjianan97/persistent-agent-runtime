@@ -52,13 +52,64 @@ Where:
   - Else: emit `compaction.summary_marker_non_append` structured log AND return `a` (REJECT the non-append write). Non-append rewrites invalidate KV-cache on every subsequent call and violate Design §Core design rule 1. There is no legitimate replace path in v1; regenerating the marker requires explicit state clearing, which is not in scope.
   - Rollback via `rollback_last_checkpoint` restores the state snapshot wholesale outside the reducer, so rollback is not constrained by this rule.
 
+### Effective-enabled resolution (the rollout-aware default)
+
+Task 1 persists `context_management.enabled` **verbatim** — an absent field stays absent on disk. The worker resolves the effective enabled boolean per task using a pure function:
+
+```python
+# services/worker-service/executor/compaction/gating.py (new, owned by Task 7)
+
+def effective_context_management_enabled(
+    agent_config: Mapping[str, Any],
+    agent_created_at: datetime,
+    *,
+    kill_switch: bool,                          # from CONTEXT_MGMT_KILL_SWITCH env
+    new_agents_default_at_or_after: datetime | None,
+                                                # CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER
+    existing_agents_default: bool,              # CONTEXT_MGMT_EXISTING_AGENT_DEFAULT
+) -> bool:
+    """Resolve Track 7 effective-enabled for an agent. Pure function.
+
+    Precedence (highest first):
+      1. Kill switch on → False. Global operator escape hatch.
+      2. Explicit agent config value → use it verbatim.
+      3. Agent created at/after the new-agent rollout date → True (or the
+         env-configured new-agent default, which is True for the standard
+         Week-1 rollout).
+      4. Otherwise → existing_agents_default. False during Week 1; flipped
+         to True by operator env change for the Week 2 sweep.
+    """
+    if kill_switch:
+        return False
+    explicit = (agent_config.get("context_management") or {}).get("enabled")
+    if explicit is not None:
+        return bool(explicit)
+    if new_agents_default_at_or_after is not None and agent_created_at >= new_agents_default_at_or_after:
+        return True
+    return existing_agents_default
+```
+
+Env-var plumbing lives in `worker_config.py` (or the existing equivalent). Defaults in the absence of env vars:
+
+- `CONTEXT_MGMT_KILL_SWITCH=false`
+- `CONTEXT_MGMT_NEW_AGENT_DEFAULT_AT_OR_AFTER=<unset>` → falls through, so all agents go to `existing_agents_default`. This is safe-by-default: until operators flip the new-agent date, nothing changes.
+- `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=false` — Week-1 setting. Operators flip to `true` for the Week-2 sweep.
+
+The resolver is called **once per task** at `execute_task` entry (not per super-step); the result is threaded through `_build_graph` (for state-class selection + tool wrapping) and kept on a `TaskContext` struct shared with the pipeline. Task 3's tool wrapper receives the resolved boolean as `compaction_enabled`; `_build_graph` uses the same boolean to decide which state class to pick.
+
 ### State selection in `_build_graph`
 
 Replace the current two-way selection (`MessagesState` / `MemoryEnabledState`) with a four-way selection:
 
 ```python
 memory_enabled = decision.stack_enabled
-compaction_enabled = (agent_config.get("context_management") or {}).get("enabled", True)
+compaction_enabled = effective_context_management_enabled(
+    agent_config,
+    agent_created_at=agent_record["created_at"],
+    kill_switch=worker_config.context_mgmt_kill_switch,
+    new_agents_default_at_or_after=worker_config.context_mgmt_new_agent_default_at_or_after,
+    existing_agents_default=worker_config.context_mgmt_existing_agent_default,
+)
 
 if memory_enabled and compaction_enabled:
     state_type = RuntimeState   # MemoryEnabledState + CompactionEnabledState fields merged
@@ -192,6 +243,8 @@ Read from the `models` table row for `agent_config.model` at graph-build time. C
   - `services/worker-service/executor/compaction/state.py` (new — `CompactionEnabledState`, `RuntimeState`, reducers)
   - `services/worker-service/executor/compaction/pipeline.py` (new — `compact_for_llm`, `CompactionPassResult`, event types, `estimate_tokens`)
   - `services/worker-service/executor/compaction/tokens.py` (new — real-tokenizer-preferred token estimation for Anthropic/OpenAI; heuristic for Gemini/BYOT)
+
+  (`compaction/gating.py` is owned by Task 2 — pure resolver with no dependency on state/pipeline internals. Task 3 and Task 7 both import it.)
   - `services/worker-service/executor/compaction/__init__.py` (modify — **SOLE OWNER** of the final public-API surface; consolidate all `compaction.*` re-exports here. Tasks 2–6 leave `__init__.py` empty-minus-docstring so the package can be imported; Task 7 fills it in. No other task edits this file.)
   - `services/worker-service/executor/graph.py` (modify — state selection, `agent_node` pipeline call, budget carve-out)
   - `services/worker-service/tests/test_compaction_pipeline.py` (new)
@@ -231,6 +284,14 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - [ ] Pipeline updates `last_super_step_message_count = len(raw_messages)` in every `CompactionPassResult.state_updates` so heartbeat detection in Task 8 has the watermark it needs.
 - [ ] `__init__.py` after Task 7 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `CompactionEnabledState`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
 - [ ] Summary marker strict-append reducer rejects non-append writes — unit test asserts a non-append second write returns the ORIGINAL marker value, and `compaction.summary_marker_non_append` is logged.
+- [ ] `effective_context_management_enabled` resolver table-driven tests cover every precedence level:
+  - Kill switch on → False, regardless of all other inputs.
+  - Explicit `enabled=true` → True, even if kill switch implied otherwise (kill switch wins first, then explicit wins next).
+  - Explicit `enabled=false` → False, even on a "new" agent past the rollout date.
+  - Absent config + agent created at/after new-agent rollout date → True.
+  - Absent config + agent created before rollout date + `existing_agents_default=false` → False (Week-1 behavior).
+  - Absent config + agent created before rollout date + `existing_agents_default=true` → True (Week-2 behavior).
+- [ ] Task 3's tool wrapper receives the resolved boolean and pass-throughs tool output verbatim when it's False — regression gate for the opt-out contract.
 - [ ] Watermark reducers are `max` — a synthetic stale super-step returning `{cleared_through_turn_index: 0}` while state is at 10 does NOT regress the value.
 - [ ] `summary_marker` reducer appends when the new value has the old as a prefix; logs `compaction.summary_marker_replaced` when it replaces.
 - [ ] `make worker-test` and `make e2e-test` green.
