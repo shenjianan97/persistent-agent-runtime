@@ -111,7 +111,82 @@ class Tier3SkippedEvent:
     agent_id: str = ""
 
 
-CompactionEvent = HardFloorEvent | Tier1AppliedEvent | Tier15AppliedEvent | Tier3FiredEvent | Tier3SkippedEvent
+@dataclass(frozen=True)
+class MemoryFlushFiredEvent:
+    """Emitted when the pre-Tier-3 memory flush fires for this task.
+
+    This event is one-shot per task: once ``memory_flush_fired_this_task`` is
+    True, it will never fire again.  The event is NOT emitted on heartbeat
+    turns (i.e., when ``_is_heartbeat_turn`` returns True).
+    """
+
+    fired_at_step: int
+    task_id: str = ""
+    tenant_id: str = ""
+    agent_id: str = ""
+
+
+CompactionEvent = HardFloorEvent | Tier1AppliedEvent | Tier15AppliedEvent | Tier3FiredEvent | Tier3SkippedEvent | MemoryFlushFiredEvent
+
+
+# ---------------------------------------------------------------------------
+# Pre-Tier-3 memory flush — prompt and helpers
+# ---------------------------------------------------------------------------
+
+_PRE_TIER3_FLUSH_PROMPT = (
+    "You are about to have older context summarized. This is your one chance in\n"
+    "this task to preserve cross-task-valuable facts. Call memory_note for anything\n"
+    "you want to remember in future tasks — decisions, user preferences, non-obvious\n"
+    "facts. If nothing qualifies, reply with an empty response."
+)
+
+
+def _is_heartbeat_turn(
+    raw_messages: list[BaseMessage],
+    last_super_step_message_count: int,
+) -> bool:
+    """Return True when no new messages have arrived since the last agent super-step.
+
+    A heartbeat/recovery turn has no new ToolMessage or HumanMessage since
+    the last agent super-step.  Detection is positional: compare the current
+    message-list length against the watermark persisted at the end of the
+    previous super-step.
+
+    This is NOT the "last two messages are both AIMessage" heuristic, which
+    misfires on rate-limit retry loops and pure-reasoning turns.
+    """
+    return len(raw_messages) <= last_super_step_message_count
+
+
+def should_fire_pre_tier3_flush(
+    state: dict[str, Any],
+    agent_config: dict[str, Any],
+    raw_messages: list[BaseMessage],
+) -> bool:
+    """Return True iff the pre-Tier-3 memory flush should fire on this call.
+
+    All four conditions must hold:
+    1. ``context_management.pre_tier3_memory_flush`` is True (default True).
+    2. ``memory.enabled`` is True.
+    3. ``memory_flush_fired_this_task`` is False (one-shot).
+    4. NOT a heartbeat turn (new messages have arrived since last super-step).
+    """
+    ctx_mgmt: dict[str, Any] = agent_config.get("context_management") or {}
+    if not ctx_mgmt.get("pre_tier3_memory_flush", True):
+        return False
+
+    memory_cfg: dict[str, Any] = agent_config.get("memory") or {}
+    if memory_cfg.get("enabled") is not True:
+        return False
+
+    if state.get("memory_flush_fired_this_task", False):
+        return False
+
+    last_count: int = state.get("last_super_step_message_count", 0)
+    if _is_heartbeat_turn(raw_messages, last_count):
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +410,40 @@ async def compact_for_llm(
             else:
                 protect_from_index = len(messages)
 
-            # Task 9 pre-flush hook placeholder (no-op until Task 9 lands)
-            # if pre_flush_should_fire(state, messages):
-            #     pass  # Task 9 fills this in
+            # Task 9: pre-Tier-3 memory flush hook.
+            # If conditions are met, insert the flush SystemMessage at the END
+            # of the compacted messages view (in-memory only — NOT persisted to
+            # graph state) and return early, skipping Tier 3 this call.
+            if should_fire_pre_tier3_flush(state, agent_config, raw_messages):
+                flush_message = SystemMessage(
+                    content=_PRE_TIER3_FLUSH_PROMPT,
+                    additional_kwargs={
+                        "compaction": True,
+                        "compaction_event": "pre_tier3_memory_flush",
+                    },
+                )
+                state_updates["memory_flush_fired_this_task"] = True
+                events.append(MemoryFlushFiredEvent(
+                    fired_at_step=len(raw_messages),
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                ))
+                # Hard floor check before returning
+                if est_tokens > model_context_window:
+                    events.append(HardFloorEvent(
+                        est_tokens=est_tokens,
+                        model_context_window=model_context_window,
+                        task_id=task_id,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                    ))
+                return CompactionPassResult(
+                    messages=[*messages, flush_message],
+                    state_updates=state_updates,
+                    events=events,
+                    tier3_skipped=False,
+                )
 
             slice_messages = messages[summarized_through:protect_from_index]
             new_summarized_through = protect_from_index

@@ -34,7 +34,7 @@ Tier 3 summarizer:
 Pipeline orchestrator:
     compact_for_llm, CompactionPassResult
     HardFloorEvent, Tier1AppliedEvent, Tier15AppliedEvent,
-    Tier3FiredEvent, Tier3SkippedEvent
+    Tier3FiredEvent, Tier3SkippedEvent, MemoryFlushFiredEvent
 
 Token estimation:
     estimate_tokens
@@ -95,6 +95,7 @@ from executor.compaction.summarizer import SummarizeResult, summarize_slice
 from executor.compaction.pipeline import (
     CompactionPassResult,
     HardFloorEvent,
+    MemoryFlushFiredEvent,
     Tier1AppliedEvent,
     Tier15AppliedEvent,
     Tier3FiredEvent,
@@ -139,6 +140,7 @@ __all__ = [
     # Pipeline
     "CompactionPassResult",
     "HardFloorEvent",
+    "MemoryFlushFiredEvent",
     "Tier1AppliedEvent",
     "Tier15AppliedEvent",
     "Tier3FiredEvent",
