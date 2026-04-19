@@ -12,7 +12,7 @@
 | Task 8 | Pipeline + Graph Integration | Not started | Track 7 state fields added to `RuntimeState`; `compact_for_llm()`; `agent_node` wiring; budget carve-out for `compaction.tier3` |
 | Task 9 | Pre-Tier-3 Memory Flush | Not started | One-shot pre-Tier-3 `memory_note` nudge; positional heartbeat detection; `memory_flush_fired_this_task` one-shot |
 | Task 10 | Dead-Letter Reason Enum | Not started | Migration (CHECK-constraint DROP+ADD) + Java/Python plumbing for `context_exceeded_irrecoverable` |
-| Task 11 | Console — Context Management Form | Not started | Agent edit form "Context management" section (3 fields, no `enabled` toggle) + Playwright scenario |
+| Task 11 | Console — Context Management Form | Done | Agent edit form "Context management" section (3 fields, no `enabled` toggle); `ContextManagementSection.tsx` + 22 unit tests; `AgentConfig` type extended; Scenario 15 added to `CONSOLE_BROWSER_TESTING.md` |
 | Task 12 | Integration + Browser Tests | Not started | 14-AC E2E + cache-stability regression + Playwright scenarios |
 
 ## Notes

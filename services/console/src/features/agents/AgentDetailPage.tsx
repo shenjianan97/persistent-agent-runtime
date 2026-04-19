@@ -7,10 +7,12 @@ import { useModels } from '@/features/submit/useModels';
 import { ALL_TOOL_LABELS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
 import { MemoryTab } from './memory/MemoryTab';
+import { ContextManagementSection } from './ContextManagementSection';
+import type { ContextManagementConfig } from './ContextManagementSection';
 
 import {
     Form, FormControl, FormField, FormItem, FormLabel, FormMessage,
@@ -66,6 +68,14 @@ export function AgentDetailPage() {
     const [isEditing, setIsEditing] = useState(false);
     const { data: toolServers = [] } = useToolServers('active');
 
+    // context_management is managed outside react-hook-form to preserve
+    // don't-send-defaults semantics: only include in PUT when the user
+    // has explicitly changed a field (or an existing value was loaded).
+    const [ctxMgmt, setCtxMgmt] = useState<ContextManagementConfig | undefined>(undefined);
+    // Track the value that was loaded from the server so we can detect changes.
+    const loadedCtxMgmt = useRef<ContextManagementConfig | undefined>(undefined);
+    const ctxMgmtDirty = useRef(false);
+
     // The memory tab mounts when the current route is `/agents/:id/memory[/:memoryId]`.
     const basePath = agentId ? `/agents/${encodeURIComponent(agentId)}` : '';
     const onMemoryRoute = !!agentId && location.pathname.startsWith(`${basePath}/memory`);
@@ -120,8 +130,18 @@ export function AgentDetailPage() {
                 memory_summarizer_model: agent.agent_config.memory?.summarizer_model ?? '',
                 memory_max_entries: agent.agent_config.memory?.max_entries?.toString() ?? '',
             });
+            // Reset context_management from the loaded agent data.
+            const loaded = agent.agent_config.context_management;
+            loadedCtxMgmt.current = loaded;
+            setCtxMgmt(loaded);
+            ctxMgmtDirty.current = false;
         }
     }, [agent, form]);
+
+    const handleCtxMgmtChange = useCallback((next: ContextManagementConfig) => {
+        ctxMgmtDirty.current = true;
+        setCtxMgmt(next);
+    }, []);
 
     function onSubmit(data: AgentDetailFormValues) {
         if (!agentId) return;
@@ -147,6 +167,14 @@ export function AgentDetailPage() {
                 ...(parsedMaxEntries !== undefined ? { max_entries: parsedMaxEntries } : {}),
             }
             : undefined;
+
+        // Include context_management in the payload only if:
+        //  (a) it was loaded from the server (preserve existing config), OR
+        //  (b) the user has explicitly changed a field in this edit session.
+        const hasExistingCtxMgmt = !!loadedCtxMgmt.current;
+        const contextManagementPayload =
+            (hasExistingCtxMgmt || ctxMgmtDirty.current) ? ctxMgmt : undefined;
+
         mutation.mutate(
             {
                 agentId,
@@ -160,6 +188,7 @@ export function AgentDetailPage() {
                         tool_servers: data.tool_servers,
                         ...(sandboxConfig ? { sandbox: sandboxConfig } : {}),
                         ...(memoryConfig ? { memory: memoryConfig } : {}),
+                        ...(contextManagementPayload ? { context_management: contextManagementPayload } : {}),
                     },
                     status: data.status,
                     max_concurrent_tasks: data.max_concurrent_tasks,
@@ -213,6 +242,8 @@ export function AgentDetailPage() {
 
     function handleCancel() {
         form.reset();
+        setCtxMgmt(loadedCtxMgmt.current);
+        ctxMgmtDirty.current = false;
         setIsEditing(false);
     }
 
@@ -353,6 +384,33 @@ export function AgentDetailPage() {
                                         <div><span className="text-muted-foreground text-[10px] uppercase block">vCPU</span>{agent.agent_config.sandbox.vcpu}</div>
                                         <div><span className="text-muted-foreground text-[10px] uppercase block">Memory</span>{agent.agent_config.sandbox.memory_mb} MB</div>
                                         <div><span className="text-muted-foreground text-[10px] uppercase block">Sandbox Lifetime</span>{agent.agent_config.sandbox.timeout_seconds}s</div>
+                                    </div>
+                                </div>
+                            )}
+                            {agent?.agent_config?.context_management && (
+                                <div className="pt-4 border-t border-white/8 space-y-2">
+                                    <div className="uppercase tracking-widest text-muted-foreground text-[10px]">Context Management</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                        <div>
+                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Summarizer Model</span>
+                                            <span className="text-foreground text-sm font-mono">
+                                                {agent.agent_config.context_management.summarizer_model || 'Platform default'}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Exclude Tools</span>
+                                            <span className="text-foreground text-sm font-mono">
+                                                {agent.agent_config.context_management.exclude_tools?.length
+                                                    ? agent.agent_config.context_management.exclude_tools.join(', ')
+                                                    : 'None'}
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Pre-Tier-3 Memory Flush</span>
+                                            <span className="text-foreground text-sm font-mono">
+                                                {agent.agent_config.context_management.pre_tier3_memory_flush ? 'Enabled' : 'Disabled'}
+                                            </span>
+                                        </div>
                                     </div>
                                 </div>
                             )}
@@ -753,6 +811,13 @@ export function AgentDetailPage() {
                                         )}
                                     </div>
                                 </div>
+
+                                <ContextManagementSection
+                                    value={ctxMgmt}
+                                    memoryEnabled={memoryEnabledInForm}
+                                    availableSummarizerModels={models}
+                                    onChange={handleCtxMgmtChange}
+                                />
                             </CardContent>
                         </Card>
 

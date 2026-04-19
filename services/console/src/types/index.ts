@@ -257,6 +257,12 @@ export interface MemoryConfig {
     max_entries?: number;
 }
 
+export interface ContextManagementConfig {
+    summarizer_model?: string;
+    exclude_tools?: string[];
+    pre_tier3_memory_flush?: boolean;
+}
+
 export interface AgentConfig {
     system_prompt: string;
     provider: string;
@@ -266,6 +272,7 @@ export interface AgentConfig {
     tool_servers?: string[];
     sandbox?: SandboxConfig;
     memory?: MemoryConfig;
+    context_management?: ContextManagementConfig;
 }
 
 export interface AgentResponse {

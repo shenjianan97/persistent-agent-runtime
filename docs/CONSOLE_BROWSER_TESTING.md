@@ -241,6 +241,24 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 5. Select `agent-memory-off`. Assert the dropdown snaps to "Don't save memory", is disabled, and the helper text reads "This agent has memory disabled". Submission succeeds and persists `memory_mode = skip`.
 6. Craft a `POST /v1/tasks` (via devtools / `browser_evaluate`) for `agent-memory-off` with `memory_mode: "always"`. Assert the API responds 400 with a validation error referencing the memory-enabled invariant.
 
+### Scenario 15: Context Management Section
+
+Covers Track 7 Task 11 — the new "Context management" section on the Agent edit form. Verifies all three tuning fields persist end-to-end, the 50-entry cap is enforced, and the `pre_tier3_memory_flush` toggle correctly reflects memory-enabled state.
+
+Preconditions: at least one agent exists. Both a memory-enabled agent (`agent_config.memory.enabled = true`) and a memory-disabled agent (or absent) are helpful for the disabled-toggle branch.
+
+1. Navigate to `/agents/:agentId` and click `Edit`. Assert the `Context management` section renders after the `Memory` section, contains a `Summarizer Model` dropdown, an `Exclude Tools` chip input, and a `Pre-Tier-3 Memory Flush` checkbox. Assert there is NO `enabled` toggle for context management. The section header reads "Context management is always-on platform infrastructure; the fields below are tuning knobs, not an enable toggle."
+
+2. Select a model from the `Summarizer Model` dropdown (`data-testid="context-management-summarizer-model"`). Type a tool name (e.g., `web_search`) into the chip input (`data-testid="context-management-exclude-tools"`) and press Enter. Confirm the chip appears. Toggle `pre_tier3_memory_flush` on (`data-testid="context-management-pre-tier3-flush"`). Click `Save Changes`. Navigate away and return to the agent. Re-enter edit mode and assert all three fields retain their saved values.
+
+3. With 50 chips already entered in `exclude_tools`, type a 51st tool name and press Enter. Assert the inline error "Maximum 50 entries" appears. Assert the chip count stays at 50. Assert `Save Changes` is not blocked by this client-side error — the user can still save (the 51st entry was rejected, not added).
+
+4. With a memory-disabled agent (or disable memory for the test agent), open edit mode. Assert the `Pre-Tier-3 Memory Flush` checkbox is visually disabled and a note reads "Requires memory to be enabled." Enable memory in the Memory section. Assert the `Pre-Tier-3 Memory Flush` checkbox becomes enabled.
+
+5. Open edit mode without touching any context management field. Click `Save Changes`. Inspect the PUT request body via `browser_network_requests`. Assert the `agent_config` does NOT contain a `context_management` key (don't-send-defaults).
+
+6. `browser_console_messages` shows no uncaught exceptions during any of the above flows.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -259,6 +277,7 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 | Agent Memory tab feature | 1, 11 |
 | Task submission memory-mode / `agent_decides` feature | 1, 3, 14 |
 | Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13, 14 |
+| Agent context management section feature | 1, 2, 15 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
