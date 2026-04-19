@@ -453,11 +453,15 @@ async def _convlog_append_compaction_events(
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
-    # Track 7 — conservative fallback when model not found in models table.
-    # 32_000 tokens chosen deliberately below most modern model limits to
-    # ensure compaction triggers early rather than silently blowing a 4K-
-    # context model's ceiling. See design doc §Model context window lookup.
-    _DEFAULT_MODEL_CONTEXT_WINDOW: int = 32_000
+    # Track 7 — fallback when a model is missing from the ``models`` table
+    # or has a NULL ``context_window``. 128_000 is the platform floor: the
+    # model-discovery service filters out sub-128K legacy models
+    # (``DEACTIVATE_MODEL_IDS`` in services/model-discovery/main.py) before
+    # they reach the table, so any active row is expected to support ≥128K.
+    # A WARN below logs every fallback so operators can detect and fix
+    # config holes (e.g. a brand-new provider model not yet in
+    # ``CONTEXT_WINDOW_DEFAULTS``).
+    _DEFAULT_MODEL_CONTEXT_WINDOW: int = 128_000
 
     def __init__(self, config: WorkerConfig, pool: asyncpg.Pool, deps=None, s3_client=None):
         self.config = config
@@ -825,7 +829,7 @@ class GraphExecutor:
         memory_decision: MemoryDecision | None = None,
         task_input: str | None = None,
         checkpointer: PostgresDurableCheckpointer | None = None,
-        model_context_window: int = 32_000,
+        model_context_window: int = 128_000,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -1340,8 +1344,8 @@ class GraphExecutor:
     async def _get_model_context_window(self, model_name: str) -> int:
         """Fetch the context window token count for a model from the models table.
 
-        Returns the model's ``context_window`` column value, or the platform
-        conservative default (32_000) when the model is unknown.  Logs a
+        Returns the model's ``context_window`` column value, or the
+        platform floor (128_000) when the model is unknown.  Logs a
         structured warning when the default fires so operators can act.
 
         This value is resolved once at graph-build time (``execute_task``)
@@ -1354,7 +1358,14 @@ class GraphExecutor:
                 model_name,
             )
             if row is None or row["context_window"] is None:
-                _compaction_logger.info(
+                # WARN (not INFO): a fallback means the model isn't in the
+                # ``models`` table or its ``context_window`` is NULL.
+                # Discovery should populate this; if it doesn't, the model-
+                # discovery service's CONTEXT_WINDOW_DEFAULTS / FALLBACKS
+                # (services/model-discovery/main.py) need an entry, or the
+                # agent is pointing at a model_id discovery never saw. A
+                # config hole operators should fix — not a routine event.
+                _compaction_logger.warning(
                     "compaction.model_context_window_unknown",
                     model=model_name,
                     fallback=self._DEFAULT_MODEL_CONTEXT_WINDOW,
@@ -3123,10 +3134,23 @@ class GraphExecutor:
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
         # Check exception type first (most reliable signal)
-        if isinstance(e, ToolTransportError):
+        if isinstance(e, (ToolTransportError, McpToolCallError)):
             return True
         if isinstance(e, (ConnectionError, TimeoutError)):
             return True
+        # botocore timeouts: botocore.exceptions.ReadTimeoutError /
+        # ConnectTimeoutError do NOT inherit from Python's builtin
+        # TimeoutError (urllib3 defines its own same-named base). Import
+        # lazily to avoid coupling the generic classifier to a specific
+        # provider SDK at module-load time.
+        try:
+            from botocore.exceptions import ReadTimeoutError as _BotoReadTimeoutError
+            from botocore.exceptions import ConnectTimeoutError as _BotoConnectTimeoutError
+
+            if isinstance(e, (_BotoReadTimeoutError, _BotoConnectTimeoutError)):
+                return True
+        except ImportError:
+            pass
 
         # Use HTTP status code from the provider exception if available
         status = self._extract_status_code(e)
@@ -3139,6 +3163,12 @@ class GraphExecutor:
         if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         if re.search(r'\b50[0234]\b', error_str):
+            return True
+        # Network-timeout phrasing produced by botocore / httpx / urllib3
+        # when no HTTP status was received. Matches the exact prefixes
+        # "Read timeout" and "Connect timeout" to avoid overmatching
+        # unrelated error strings that happen to contain the word "timeout".
+        if "read timeout" in error_str or "connect timeout" in error_str:
             return True
         if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
             return False

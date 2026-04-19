@@ -7,7 +7,7 @@ import { useModels } from '@/features/submit/useModels';
 import { ALL_TOOL_LABELS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
 import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
 import { MemoryTab } from './memory/MemoryTab';
@@ -143,6 +143,22 @@ export function AgentDetailPage() {
         setCtxMgmt(next);
     }, []);
 
+    const selectedProvider = form.watch('provider');
+    const providerFilteredModels = useMemo(
+        () => models.filter((m) => m.provider === selectedProvider),
+        [models, selectedProvider],
+    );
+
+    useEffect(() => {
+        if (!ctxMgmt?.summarizer_model) return;
+        if (!selectedProvider) return;
+        const stillValid = providerFilteredModels.some((m) => m.model_id === ctxMgmt.summarizer_model);
+        if (!stillValid) {
+            ctxMgmtDirty.current = true;
+            setCtxMgmt({ ...ctxMgmt, summarizer_model: undefined });
+        }
+    }, [providerFilteredModels, ctxMgmt, selectedProvider]);
+
     function onSubmit(data: AgentDetailFormValues) {
         if (!agentId) return;
         const sandboxConfig = data.sandbox_enabled
@@ -171,9 +187,20 @@ export function AgentDetailPage() {
         // Include context_management in the payload only if:
         //  (a) it was loaded from the server (preserve existing config), OR
         //  (b) the user has explicitly changed a field in this edit session.
+        // When included, always serialize pre_tier3_memory_flush explicitly so
+        // the saved value matches what the user sees in the UI — the worker
+        // defaults missing values to `true`, which would silently diverge.
         const hasExistingCtxMgmt = !!loadedCtxMgmt.current;
-        const contextManagementPayload =
-            (hasExistingCtxMgmt || ctxMgmtDirty.current) ? ctxMgmt : undefined;
+        const shouldSendCtxMgmt = hasExistingCtxMgmt || ctxMgmtDirty.current;
+        const summarizer = ctxMgmt?.summarizer_model?.trim();
+        const excludeTools = ctxMgmt?.exclude_tools ?? [];
+        const contextManagementPayload: ContextManagementConfig | undefined = shouldSendCtxMgmt
+            ? {
+                ...(summarizer ? { summarizer_model: summarizer } : {}),
+                ...(excludeTools.length ? { exclude_tools: excludeTools } : {}),
+                pre_tier3_memory_flush: !!ctxMgmt?.pre_tier3_memory_flush,
+            }
+            : undefined;
 
         mutation.mutate(
             {
@@ -815,7 +842,7 @@ export function AgentDetailPage() {
                                 <ContextManagementSection
                                     value={ctxMgmt}
                                     memoryEnabled={memoryEnabledInForm}
-                                    availableSummarizerModels={models}
+                                    availableSummarizerModels={providerFilteredModels}
                                     onChange={handleCtxMgmtChange}
                                 />
                             </CardContent>

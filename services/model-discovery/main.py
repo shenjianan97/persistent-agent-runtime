@@ -53,6 +53,99 @@ PRICING_FALLBACKS = {
     "bedrock": {"input": 15_000_000, "output": 75_000_000},
 }
 
+# Context window (input tokens) per model. Values verified against each
+# provider's official documentation as of 2026-04. The worker's compaction
+# pipeline (services/worker-service/executor/graph.py:_get_model_context_window)
+# reads this value out of the ``models`` table — a NULL or missing row
+# forces the conservative per-service default, which fires Tier 3
+# summarization aggressively on models that actually support much larger
+# windows. Keep this list in sync with supported model families; an unknown
+# model falls through to ``CONTEXT_WINDOW_FALLBACKS`` by provider.
+CONTEXT_WINDOW_DEFAULTS = {
+    # Anthropic direct API — Claude 4.6 / 4.7 have 1M, 4.5 family has 200K.
+    "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-haiku-4-5-20251001": 200_000,
+    "claude-opus-4-5-20251101": 200_000,
+    "claude-sonnet-4-5-20250929": 200_000,
+    "claude-opus-4-1-20250805": 200_000,
+    "claude-opus-4-20250514": 200_000,
+    "claude-sonnet-4-20250514": 200_000,
+    "claude-3-7-sonnet-20250219": 200_000,
+    "claude-3-5-sonnet-20241022": 200_000,
+    "claude-3-5-haiku-20241022": 200_000,
+    "claude-3-opus-20240229": 200_000,
+    # Anthropic via Bedrock (same models, different IDs).
+    "anthropic.claude-opus-4-7": 1_000_000,
+    "anthropic.claude-opus-4-6-v1": 1_000_000,
+    "anthropic.claude-sonnet-4-6": 1_000_000,
+    "anthropic.claude-haiku-4-5-20251001-v1:0": 200_000,
+    "anthropic.claude-opus-4-5-20251101-v1:0": 200_000,
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": 200_000,
+    "anthropic.claude-opus-4-1-20250805-v1:0": 200_000,
+    "anthropic.claude-opus-4-20250514-v1:0": 200_000,
+    "anthropic.claude-sonnet-4-20250514-v1:0": 200_000,
+    "anthropic.claude-3-7-sonnet-20250219-v1:0": 200_000,
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": 200_000,
+    "anthropic.claude-3-5-haiku-20241022-v1:0": 200_000,
+    "anthropic.claude-3-opus-20240229-v1:0": 200_000,
+    # OpenAI — gpt-4.1 family is 1M; gpt-4o is 128K; gpt-5 is 400K; o-series is 200K.
+    "gpt-4.1": 1_000_000,
+    "gpt-4.1-mini": 1_000_000,
+    "gpt-4.1-nano": 1_000_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    "gpt-5": 400_000,
+    "gpt-5-mini": 400_000,
+    "gpt-5-nano": 400_000,
+    "o1": 200_000,
+    "o1-mini": 128_000,
+    "o3": 200_000,
+    "o3-mini": 200_000,
+    # Z.AI GLM on Bedrock — 200K input, 128K output.
+    "zai.glm-5": 200_000,
+    "zai.glm-4.7": 200_000,
+    "zai.glm-4.7-flash": 200_000,
+    # Amazon Nova on Bedrock — 300K for Pro/Lite, 128K for Micro.
+    "amazon.nova-pro-v1:0": 300_000,
+    "amazon.nova-lite-v1:0": 300_000,
+    "amazon.nova-micro-v1:0": 128_000,
+}
+
+# Fallback per provider when a model isn't in CONTEXT_WINDOW_DEFAULTS. 128K is
+# the de-facto floor for modern LLMs (GPT-4o, Claude 3.x, Gemini 1.5, Nova
+# Micro, most Bedrock Converse models). Legacy sub-128K models are filtered
+# out via DEACTIVATE_MODEL_IDS before they reach the ``models`` table, so
+# a provider-level fallback at 128K is safe in practice. If a brand-new
+# sub-128K model shows up that discovery doesn't know about, we'll see it
+# in production via context-exceeded errors and add to the deny list then.
+CONTEXT_WINDOW_FALLBACKS = {
+    "anthropic": 200_000,
+    "openai": 128_000,
+    "bedrock": 128_000,
+}
+
+GLOBAL_FALLBACK_CONTEXT_WINDOW = 128_000
+
+# Models the provider's API lists that we do NOT want active in this platform,
+# typically because their context window is below the platform floor (128K)
+# or because they are non-chat modalities (audio/image/tts) that slipped past
+# the existing prefix filter. Models in this set are skipped at discovery
+# time — they won't appear in the agent-config model dropdown, and
+# ``upsert_models`` will leave any pre-existing row as ``is_active = false``.
+DEACTIVATE_MODEL_IDS = frozenset({
+    # OpenAI legacy chat models with sub-128K context windows.
+    "gpt-4",                         # 8K
+    "gpt-4-0613",                    # 8K
+    "gpt-3.5-turbo",                 # 16K
+    "gpt-3.5-turbo-0125",            # 16K
+    "gpt-3.5-turbo-1106",            # 16K
+    "gpt-3.5-turbo-16k",             # 16K
+    "gpt-3.5-turbo-instruct",        # 4K
+    "gpt-3.5-turbo-instruct-0914",   # 4K
+})
+
 LOCK_ID = 543210987
 DB_CREDENTIALS_SECRET_ENV = "DB_CREDENTIALS_SECRET_ARN"
 PROVIDER_SOURCES = (
@@ -102,6 +195,27 @@ def resolve_model_pricing(provider_id, model_id):
         f"using fallback pricing input={fallback['input']} output={fallback['output']}"
     )
     return dict(fallback)
+
+
+def resolve_model_context_window(provider_id, model_id):
+    """Return the context window (input tokens) for a model.
+
+    Lookup order:
+      1. Explicit entry in CONTEXT_WINDOW_DEFAULTS (verified value).
+      2. Provider-level fallback from CONTEXT_WINDOW_FALLBACKS.
+      3. Global fallback (GLOBAL_FALLBACK_CONTEXT_WINDOW).
+
+    The worker's compaction pipeline reads this value from the database.
+    Any model allowed to reach the ``models`` table (i.e. not in
+    DEACTIVATE_MODEL_IDS) is assumed to support at least the platform
+    floor of 128K — if that turns out to be wrong for a newly discovered
+    model, add it to DEACTIVATE_MODEL_IDS or to CONTEXT_WINDOW_DEFAULTS
+    with its real value.
+    """
+    explicit = CONTEXT_WINDOW_DEFAULTS.get(model_id)
+    if explicit is not None:
+        return explicit
+    return CONTEXT_WINDOW_FALLBACKS.get(provider_id, GLOBAL_FALLBACK_CONTEXT_WINDOW)
 
 
 def _load_secret_text(secret_arn: str) -> str:
@@ -234,13 +348,18 @@ def fetch_openai_models(api_key):
             for m in data.get("data", []):
                 # Filter to chat models only to avoid cluttering UI with whisper/dall-e/tts
                 m_id = m["id"]
-                if m_id.startswith("gpt-") or m_id.startswith("o1") or m_id.startswith("o3"):
-                    models.append(
-                        {
-                            "id": m_id,
-                            "display_name": m_id,
-                        }
-                    )
+                if not (m_id.startswith("gpt-") or m_id.startswith("o1") or m_id.startswith("o3")):
+                    continue
+                # Skip models on the platform deny list (legacy sub-128K context,
+                # non-chat modalities). Their rows stay is_active=false.
+                if m_id in DEACTIVATE_MODEL_IDS:
+                    continue
+                models.append(
+                    {
+                        "id": m_id,
+                        "display_name": m_id,
+                    }
+                )
     except HTTPError as e:
         print(f"[Discovery] Failed to fetch OpenAI models: HTTP {e.code}")
     except Exception as e:
@@ -346,7 +465,13 @@ def upsert_models(conn, provider_keys):
 
                 models = _fetch_models(provider_id, api_key)
                 for m in models:
+                    # Belt-and-suspenders: provider fetchers already filter
+                    # DEACTIVATE_MODEL_IDS, but keeping the check here means
+                    # any future fetcher is protected too.
+                    if m["id"] in DEACTIVATE_MODEL_IDS:
+                        continue
                     pricing = resolve_model_pricing(provider_id, m["id"])
+                    context_window = resolve_model_context_window(provider_id, m["id"])
                     cur.execute(
                         """
                         INSERT INTO models (
@@ -355,17 +480,26 @@ def upsert_models(conn, provider_keys):
                             display_name,
                             input_microdollars_per_million,
                             output_microdollars_per_million,
+                            context_window,
                             is_active,
                             created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, true, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, true, NOW())
                         ON CONFLICT (provider_id, model_id) DO UPDATE SET
                             is_active = true,
                             display_name = EXCLUDED.display_name,
                             input_microdollars_per_million = EXCLUDED.input_microdollars_per_million,
-                            output_microdollars_per_million = EXCLUDED.output_microdollars_per_million
+                            output_microdollars_per_million = EXCLUDED.output_microdollars_per_million,
+                            context_window = EXCLUDED.context_window
                         """,
-                        (m["id"], provider_id, m["display_name"], pricing["input"], pricing["output"]),
+                        (
+                            m["id"],
+                            provider_id,
+                            m["display_name"],
+                            pricing["input"],
+                            pricing["output"],
+                            context_window,
+                        ),
                     )
 
             conn.commit()

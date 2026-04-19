@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -7,9 +8,11 @@ import { groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
 import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
+import { ContextManagementSection } from './ContextManagementSection';
+import type { ContextManagementConfig } from './ContextManagementSection';
 
 import {
-    Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
+    Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog';
 import {
     Form, FormControl, FormField, FormItem, FormLabel, FormMessage,
@@ -54,11 +57,25 @@ interface CreateAgentDialogProps {
     onOpenChange: (open: boolean) => void;
 }
 
+function buildContextManagementPayload(
+    config: ContextManagementConfig | undefined,
+): ContextManagementConfig {
+    const summarizer = config?.summarizer_model?.trim();
+    const excludeTools = config?.exclude_tools ?? [];
+    return {
+        ...(summarizer ? { summarizer_model: summarizer } : {}),
+        ...(excludeTools.length ? { exclude_tools: excludeTools } : {}),
+        pre_tier3_memory_flush: !!config?.pre_tier3_memory_flush,
+    };
+}
+
 export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps) {
     const mutation = useCreateAgent();
     const { data: models = [], isLoading: isLoadingModels } = useModels();
     const modelGroups = groupModelsByProvider(models);
     const { data: toolServers = [] } = useToolServers('active');
+    const [ctxMgmt, setCtxMgmt] = useState<ContextManagementConfig | undefined>(undefined);
+    const ctxMgmtDirty = useRef(false);
 
     const form = useForm<CreateAgentFormValues>({
         resolver: zodResolver(createAgentSchema),
@@ -86,6 +103,25 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const selectedToolServers = form.watch('tool_servers');
     const sandboxEnabled = form.watch('sandbox_enabled');
     const memoryEnabled = form.watch('memory_enabled');
+    const selectedProvider = form.watch('provider');
+    const providerFilteredModels = useMemo(
+        () => models.filter((m) => m.provider === selectedProvider),
+        [models, selectedProvider],
+    );
+
+    useEffect(() => {
+        if (!ctxMgmt?.summarizer_model) return;
+        const stillValid = providerFilteredModels.some((m) => m.model_id === ctxMgmt.summarizer_model);
+        if (!stillValid) {
+            ctxMgmtDirty.current = true;
+            setCtxMgmt({ ...ctxMgmt, summarizer_model: undefined });
+        }
+    }, [providerFilteredModels, ctxMgmt]);
+
+    const handleCtxMgmtChange = useCallback((next: ContextManagementConfig) => {
+        ctxMgmtDirty.current = true;
+        setCtxMgmt(next);
+    }, []);
 
     function onSubmit(data: CreateAgentFormValues) {
         const sandboxConfig = data.sandbox_enabled
@@ -109,6 +145,9 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                 ...(parsedMaxEntries !== undefined ? { max_entries: parsedMaxEntries } : {}),
             }
             : undefined;
+        const contextManagementPayload = ctxMgmtDirty.current
+            ? buildContextManagementPayload(ctxMgmt)
+            : undefined;
 
         mutation.mutate(
             {
@@ -121,6 +160,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                     tool_servers: data.tool_servers,
                     ...(sandboxConfig ? { sandbox: sandboxConfig } : {}),
                     ...(memoryConfig ? { memory: memoryConfig } : {}),
+                    ...(contextManagementPayload ? { context_management: contextManagementPayload } : {}),
                 },
                 max_concurrent_tasks: data.max_concurrent_tasks,
                 budget_max_per_task: data.budget_max_per_task,
@@ -132,6 +172,8 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                         description: `Agent "${data.display_name}" is now active.`,
                     });
                     form.reset();
+                    setCtxMgmt(undefined);
+                    ctxMgmtDirty.current = false;
                     onOpenChange(false);
                 },
                 onError: (error: Error) => {
@@ -145,15 +187,19 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-[600px] max-h-[85vh] overflow-y-auto console-surface border-white/10 rounded-2xl">
-                <DialogHeader>
+            <DialogContent className="w-[calc(100vw-2rem)] max-h-[calc(100vh-2rem)] sm:max-w-[600px] sm:max-h-[calc(100vh-4rem)] overflow-hidden flex flex-col console-surface border-white/10 rounded-2xl p-0 gap-0">
+                <DialogHeader className="px-6 pt-6 shrink-0">
                     <DialogTitle className="text-lg font-display uppercase tracking-widest text-primary">
                         Create Agent
                     </DialogTitle>
+                    <DialogDescription className="sr-only">
+                        Create a new agent and configure its model, tools, memory, and context management settings.
+                    </DialogDescription>
                 </DialogHeader>
 
                 <Form {...form}>
-                    <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-5">
+                    <form onSubmit={form.handleSubmit(onSubmit)} className="min-h-0 flex flex-col flex-1">
+                        <div className="flex-1 overflow-y-auto px-6 space-y-5 pb-6">
                         <FormField
                             control={form.control}
                             name="display_name"
@@ -503,6 +549,13 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             </div>
                         </div>
 
+                        <ContextManagementSection
+                            value={ctxMgmt}
+                            memoryEnabled={memoryEnabled}
+                            availableSummarizerModels={providerFilteredModels}
+                            onChange={handleCtxMgmtChange}
+                        />
+
                         <div className="space-y-3">
                             <span className="text-xs font-medium uppercase tracking-widest text-muted-foreground">Scheduling & Budget</span>
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -571,23 +624,27 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             </div>
                         </div>
 
-                        <DialogFooter>
-                            <Button
-                                type="button"
-                                variant="ghost"
-                                onClick={() => onOpenChange(false)}
-                                className="uppercase tracking-widest text-xs"
-                            >
-                                Cancel
-                            </Button>
-                            <Button
-                                type="submit"
-                                disabled={mutation.isPending}
-                                className="font-bold uppercase tracking-widest px-6 hover:saturate-150 transition-all"
-                            >
-                                {mutation.isPending ? 'Creating...' : 'Create'}
-                            </Button>
-                        </DialogFooter>
+                        </div>
+
+                        <div className="shrink-0 px-6 py-4 border-t border-white/5 bg-background mt-auto">
+                            <DialogFooter>
+                                <Button
+                                    type="button"
+                                    variant="ghost"
+                                    onClick={() => onOpenChange(false)}
+                                    className="uppercase tracking-widest text-xs"
+                                >
+                                    Cancel
+                                </Button>
+                                <Button
+                                    type="submit"
+                                    disabled={mutation.isPending}
+                                    className="font-bold uppercase tracking-widest px-6 hover:saturate-150 transition-all"
+                                >
+                                    {mutation.isPending ? 'Creating...' : 'Create'}
+                                </Button>
+                            </DialogFooter>
+                        </div>
                     </form>
                 </Form>
             </DialogContent>

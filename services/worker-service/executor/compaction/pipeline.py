@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from langchain_core.messages import BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 
 from executor.compaction.defaults import (
     ARG_TRUNCATION_CAP_BYTES,
@@ -408,16 +408,42 @@ async def compact_for_llm(
             tier3_skipped = True
 
         else:
-            # Determine the slice to summarize:
-            # messages[summarized_through : protect_from_index]
-            # protect_from_index is where the KEEP_TOOL_USES window starts
+            # Determine the slice to summarize.
+            #
+            # All Tier 3 indexing — summarized_through, protect_from_index,
+            # new_summarized_through — must use the RAW (compaction-SystemMessage-
+            # stripped) view. ``state.summarized_through_turn_index`` is
+            # indexed into raw messages, and the tail-rebuild below strips
+            # compaction SystemMessages before slicing, so mixing indexing
+            # spaces stranded a ToolMessage off-by-one on subsequent Tier 3
+            # firings (the prior firing prepends a SystemMessage that shifts
+            # ``messages`` indices by +1). See test_compaction_tier3_
+            # second_firing_boundary.py for the regression.
+            #
+            # protect_from_index must also land on an AIMessage or
+            # HumanMessage, never a bare ToolMessage — otherwise the tail
+            # begins with an orphan toolResult whose tool_use was summarized
+            # away (first-firing variant of the bug).
+            raw_view: list[BaseMessage] = [
+                m for m in messages
+                if not (
+                    isinstance(m, SystemMessage)
+                    and m.additional_kwargs.get("compaction") is True
+                )
+            ]
             tool_positions = [
-                i for i, m in enumerate(messages) if isinstance(m, ToolMessage)
+                i for i, m in enumerate(raw_view) if isinstance(m, ToolMessage)
             ]
             if len(tool_positions) > KEEP_TOOL_USES:
                 protect_from_index = tool_positions[-KEEP_TOOL_USES]
+                if isinstance(raw_view[protect_from_index], ToolMessage):
+                    for j in range(protect_from_index - 1, -1, -1):
+                        candidate = raw_view[j]
+                        if isinstance(candidate, AIMessage) and candidate.tool_calls:
+                            protect_from_index = j
+                            break
             else:
-                protect_from_index = len(messages)
+                protect_from_index = len(raw_view)
 
             # Task 9: pre-Tier-3 memory flush hook.
             # If conditions are met, insert the flush SystemMessage at the END
@@ -461,7 +487,7 @@ async def compact_for_llm(
                     tier3_skipped=False,
                 )
 
-            slice_messages = messages[summarized_through:protect_from_index]
+            slice_messages = raw_view[summarized_through:protect_from_index]
             new_summarized_through = protect_from_index
 
             # Get the summarizer model ID
@@ -511,13 +537,9 @@ async def compact_for_llm(
                 state_updates["tier3_firings_count"] = tier3_firings_count + 1
 
                 # Rebuild message list: [SystemMessage(summary_marker), *tail]
-                tail_messages = [
-                    m for i, m in enumerate(messages)
-                    if not (
-                        isinstance(m, SystemMessage)
-                        and m.additional_kwargs.get("compaction") is True
-                    )
-                ][new_summarized_through:]
+                # Slice over raw_view so the index matches the space
+                # protect_from_index / new_summarized_through were computed in.
+                tail_messages = raw_view[new_summarized_through:]
 
                 sys_summary = SystemMessage(
                     content=new_marker,
