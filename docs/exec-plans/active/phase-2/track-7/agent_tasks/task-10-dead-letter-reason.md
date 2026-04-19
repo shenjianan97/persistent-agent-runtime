@@ -52,8 +52,10 @@ The reason must be plumbed through:
 
 ## Dependencies
 
-- **Must complete first:** Task 8 (pipeline emits `HardFloorEvent`). Task 10 wires the event to the dead-letter transition.
-- **Parallel-safe with:** Tasks 2–6 (different files). Task 11 (Console — different area entirely).
+- **Must complete first:**
+  - **Migration + enum plumbing** (the SQL file, Java `DeadLetterReason`, Python constant): independent — no prerequisite tasks. This part MUST land (merge + deploy) BEFORE any worker code that emits `context_exceeded_irrecoverable` (see "Deploy-order hard constraint" below). In practice this means merging Task 10's migration before Task 8's worker changes reach production, not before Task 8's code review.
+  - **`agent_node` wiring** (handling `HardFloorEvent` → invoking the dead-letter transition): needs Task 8's `HardFloorEvent` dataclass to exist. This is a build-time dependency on Task 8's contract only.
+- **Parallel-safe with:** Tasks 2–6 (different files). Task 11 (Console — different area entirely). The migration can be authored and merged in parallel with Tasks 3–8 since it touches no worker Python.
 - **Provides output to:** Task 12 (E2E test verifies the dead-letter transition).
 
 ## Implementation Specification
