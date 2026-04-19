@@ -25,7 +25,13 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Checkbox } from '@/components/ui/checkbox';
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from '@/components/ui/select';
 import { PlaySquare, AlertCircle, Bot, Brain } from 'lucide-react';
 
 export function SubmitTaskPage() {
@@ -50,7 +56,7 @@ export function SubmitTaskPage() {
             max_retries: 3,
             task_timeout_seconds: import.meta.env.VITE_DEV_TASK_CONTROLS_ENABLED === 'true' ? 60 : 3600,
             attached_memory_ids: [],
-            skip_memory_write: false,
+            memory_mode: 'always',
         },
     });
 
@@ -182,7 +188,7 @@ export function SubmitTaskPage() {
         // above without being wiped.
         if (prevAgentIdRef.current !== '') {
             form.setValue('attached_memory_ids', []);
-            form.setValue('skip_memory_write', false);
+            form.setValue('memory_mode', 'always');
             setMemoryCache({});
             deepLinkAppliedForAgentRef.current = '';
         }
@@ -231,8 +237,10 @@ export function SubmitTaskPage() {
                 memoryEnabled && data.attached_memory_ids && data.attached_memory_ids.length > 0
                     ? data.attached_memory_ids
                     : undefined,
-            skip_memory_write:
-                memoryEnabled && data.skip_memory_write ? true : undefined,
+            // When the agent has memory disabled, the only legal mode is `skip`
+            // (API enforces this invariant). Otherwise honour the form value,
+            // defaulting to `always`.
+            memory_mode: memoryEnabled ? (data.memory_mode ?? 'always') : 'skip',
         };
 
         mutation.mutate(
@@ -460,8 +468,10 @@ export function SubmitTaskPage() {
                             </CardContent>
                         </Card>
 
-                        {/* Memory Attachments — visible only when agent has memory enabled */}
-                        {selectedAgentId && memoryEnabled && (
+                        {/* Memory — the mode select is always shown once an agent is chosen
+                            (disabled + locked to `skip` when the agent has memory disabled).
+                            The attach picker only renders for memory-enabled agents. */}
+                        {selectedAgentId && (
                             <Card className="console-surface border-white/10" data-testid="memory-attach-card">
                                 <CardHeader className="border-b border-white/8 pb-3">
                                     <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2">
@@ -470,58 +480,77 @@ export function SubmitTaskPage() {
                                     </CardTitle>
                                 </CardHeader>
                                 <CardContent className="pt-4 space-y-4">
-                                    <FormField
-                                        control={form.control}
-                                        name="attached_memory_ids"
-                                        render={({ field }) => (
-                                            <FormItem>
-                                                <FormControl>
-                                                    <AttachMemoryPicker
-                                                        agentId={selectedAgentId}
-                                                        value={field.value ?? []}
-                                                        onChange={(ids) => field.onChange(ids)}
-                                                        selectedSummaries={memoryCache}
-                                                        footer={
-                                                            <TokenFootprintIndicator
-                                                                entries={footprintEntries}
-                                                                selectionCount={(field.value ?? []).length}
-                                                            />
-                                                        }
-                                                    />
-                                                </FormControl>
-                                                <FormDescription className="text-xs text-muted-foreground">
-                                                    Attached entries are injected into the initial prompt. The indicator above is informational; submission is never blocked by attachment size.
-                                                </FormDescription>
-                                                <FormMessage className="text-destructive font-bold text-xs" />
-                                            </FormItem>
-                                        )}
-                                    />
+                                    {memoryEnabled && (
+                                        <FormField
+                                            control={form.control}
+                                            name="attached_memory_ids"
+                                            render={({ field }) => (
+                                                <FormItem>
+                                                    <FormControl>
+                                                        <AttachMemoryPicker
+                                                            agentId={selectedAgentId}
+                                                            value={field.value ?? []}
+                                                            onChange={(ids) => field.onChange(ids)}
+                                                            selectedSummaries={memoryCache}
+                                                            footer={
+                                                                <TokenFootprintIndicator
+                                                                    entries={footprintEntries}
+                                                                    selectionCount={(field.value ?? []).length}
+                                                                />
+                                                            }
+                                                        />
+                                                    </FormControl>
+                                                    <FormDescription className="text-xs text-muted-foreground">
+                                                        Attached entries are injected into the initial prompt. The indicator above is informational; submission is never blocked by attachment size.
+                                                    </FormDescription>
+                                                    <FormMessage className="text-destructive font-bold text-xs" />
+                                                </FormItem>
+                                            )}
+                                        />
+                                    )}
 
                                     <FormField
                                         control={form.control}
-                                        name="skip_memory_write"
-                                        render={({ field }) => (
-                                            <FormItem>
-                                                <label className="flex items-start gap-3 cursor-pointer">
+                                        name="memory_mode"
+                                        render={({ field }) => {
+                                            // When the selected agent has memory disabled the value
+                                            // snaps to `skip` and the select is disabled. We don't
+                                            // mutate form state here; submission-time serialization
+                                            // forces `skip` in the payload.
+                                            const effectiveValue = memoryEnabled ? (field.value ?? 'always') : 'skip';
+                                            return (
+                                                <FormItem>
+                                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">
+                                                        Memory Write
+                                                    </FormLabel>
                                                     <FormControl>
-                                                        <Checkbox
-                                                            checked={!!field.value}
-                                                            onCheckedChange={(checked) => field.onChange(checked === true)}
-                                                            data-testid="skip-memory-write-checkbox"
-                                                        />
+                                                        <Select
+                                                            value={effectiveValue}
+                                                            onValueChange={(value) => field.onChange(value)}
+                                                            disabled={!memoryEnabled}
+                                                        >
+                                                            <SelectTrigger
+                                                                data-testid="memory-mode-select"
+                                                                className="rounded-none border-border bg-black/50"
+                                                            >
+                                                                <SelectValue />
+                                                            </SelectTrigger>
+                                                            <SelectContent>
+                                                                <SelectItem value="always">Always save memory</SelectItem>
+                                                                <SelectItem value="agent_decides">Let agent decide</SelectItem>
+                                                                <SelectItem value="skip">Don&apos;t save memory</SelectItem>
+                                                            </SelectContent>
+                                                        </Select>
                                                     </FormControl>
-                                                    <div className="space-y-1 leading-tight">
-                                                        <span className="text-xs font-display uppercase tracking-widest">
-                                                            Skip writing a memory entry for this task
-                                                        </span>
-                                                        <FormDescription className="text-xs text-muted-foreground">
-                                                            Per-task privacy opt-out. When checked, this task will not produce a memory entry even though the agent has memory enabled.
-                                                        </FormDescription>
-                                                    </div>
-                                                </label>
-                                                <FormMessage className="text-destructive font-bold text-xs" />
-                                            </FormItem>
-                                        )}
+                                                    <FormDescription className="text-xs text-muted-foreground">
+                                                        {memoryEnabled
+                                                            ? '"Let agent decide" lets the model call save_memory(reason) during the task; otherwise no memory is written.'
+                                                            : 'This agent has memory disabled'}
+                                                    </FormDescription>
+                                                    <FormMessage className="text-destructive font-bold text-xs" />
+                                                </FormItem>
+                                            );
+                                        }}
                                     />
                                 </CardContent>
                             </Card>

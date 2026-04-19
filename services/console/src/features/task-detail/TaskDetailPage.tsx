@@ -190,6 +190,11 @@ export function TaskDetailPage() {
                         <span>Agent: <Link to={`/agents/${encodeURIComponent(task.agent_id)}`} className="text-foreground hover:text-primary hover:underline underline-offset-4 decoration-primary/50 transition-colors">{task.agent_display_name ? `${task.agent_display_name} (${task.agent_id})` : task.agent_id}</Link></span>
                         <span>Retries: <span className="text-foreground">{task.retry_count}</span></span>
                         <span>Created: {new Date(task.created_at).toLocaleString()}</span>
+                        {task.memory_mode && (
+                            <span data-testid="task-memory-mode">
+                                Memory: <span className="text-foreground">{task.memory_mode}</span>
+                            </span>
+                        )}
                     </div>
                 </div>
 
