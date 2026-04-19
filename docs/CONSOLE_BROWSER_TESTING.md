@@ -20,6 +20,56 @@ These are not coded tests. They are verification instructions for AI agents to f
 - `browser_wait_for`: handle async loading, React Query polling, and status transitions
 - If the first snapshot shows `Loading...`, wait briefly and snapshot again
 
+## Scenario Authoring Rules
+
+Every Console task runs Scenario 1 + every scenario the §When to Run Which Scenarios table maps to the change. This section is the **canonical source** for authoring rules; AGENTS.md and CONSOLE_TASK_CHECKLIST.md defer here.
+
+**Definitions.** *Parity guard* = a single sub-object must render identically (same fields, labels, defaults, and visibility rules) on every surface that shows it; Template D enforces this. *Coverage matrix* = sub-object × surface grid below. *Selection matrix* = change-type → scenarios table near the bottom of this file.
+
+Rules (release-blocking):
+
+1. New page / dialog / form / tab → new scenario (Template B).
+2. New field on an existing form → extend the scenario that covers that form. Extending means **asserting the field by name and `data-testid`**, not merely mentioning the sub-section exists.
+3. Every interactive element has a stable `data-testid`.
+4. Same commit updates the §Agent-Config Coverage Matrix (if the change touches an agent-config sub-object) *and* the §When to Run Which Scenarios selection matrix.
+5. Scenarios state *what* to verify, not tool-by-tool steps.
+6. If the feature adds rendering of a sub-object to >1 surface, Template D is required **regardless of how many cells the author chose to cite**. The trigger is the code, not the matrix.
+
+## Agent-Config Coverage Matrix
+
+**Scope:** this matrix applies to **agent-config sub-objects only** (fields on `POST /v1/agents` / `PUT /v1/agents/:id`). Non-config UI additions (new tabs, new pages, filter controls, etc.) add scenarios via the selection matrix but do not appear here.
+
+**Cell legend:** `N` = Scenario N asserts this cell (field-level, not just presence). `N + M` = both scenarios required; each covers part of the cell. `—` = surface does not render this sub-object by design. `⚠ gap` = surface renders it but no scenario asserts it; the gap MUST have a matching row in [tech-debt-tracker.md](./exec-plans/tech-debt-tracker.md) AND be closed before the next feature that touches the sub-object merges.
+
+Adding a new sub-object or surface adds a row/column and populates every cell (scenario number or `—`) in the same commit. Filling a `⚠ gap` removes its tech-debt entry.
+
+| Sub-object | Create Dialog | Agent Detail | Edit Form | Submit (read-only) | Task Detail |
+|---|---|---|---|---|---|
+| `core` (name / prompt / model / temperature) | 2 | 2 | 2 | 3 | — |
+| `tools` | 2 | 2 | 2 | 3 | — |
+| `memory` | 2 | 11 | 2 + 11 | 12, 13, 14 | 12, 13 |
+| `context_management` | 2 + 16 | 2 | 2 + 15 | — | 17 |
+| `sandbox` | 2 | 2 | 2 | 10 (gating only) | — |
+| `budget` | 2 | 2 | 2 | 3 | 6 |
+| `HITL` (task-level, not agent-config) | — | — | — | — | 8 |
+| `max_concurrent_tasks` | 2 | 2 | 2 | 3 | — |
+
+## Scenario Templates
+
+Copy the matching template's assertions into a new scenario (or into the extended bullets of an existing scenario — the assertions must appear somewhere in a scenario that's cited from the coverage matrix, not just inline in code).
+
+- **A — Config field on one surface:** field renders with label + `data-testid`; default matches API; edit round-trips through save + reload; update the coverage-matrix cell.
+- **B — New dialog / tab:** entry affordance has `data-testid`; opens on click; empty + populated states both render; close/navigate-away is clean; `browser_console_messages` empty.
+- **C — List + filter + detail:** list columns render; each filter narrows then clears correctly; row click routes to detail; back-nav preserves filters.
+- **D — Cross-cutting config (>1 surface):** required whenever a sub-object's **code** renders on >1 surface (see Rule 6). Assert: sub-object renders on every non-`—` surface in its coverage-matrix row; labels + defaults identical across surfaces; write-surface round-trip visible on every read-surface; visibility/enable rules applied identically everywhere.
+
+**Worked example — adding a new agent-config sub-object across Create + Edit + Submit surfaces:**
+1. Extend Scenario 2 to assert the new sub-section in the Create dialog AND the Edit form (field names, defaults, `data-testid`s).
+2. Extend Scenario 3 to assert the read-only view on the Submit page.
+3. Add a new row to the Coverage Matrix: `Create Dialog = 2`, `Agent Detail = 2` (if rendered), `Edit Form = 2`, `Submit = 3` (or `—`), `Task Detail = —` (typically).
+4. Apply Template D's four assertions in the extended Scenario 2 (identical labels / defaults / round-trip / visibility rules across surfaces).
+5. Tick the checklist in your task spec; orchestrator runs Playwright post-merge.
+
 ## Standard Scenarios
 
 Each scenario describes what to verify, not exact click sequences. Agents should translate these checks into the right Playwright MCP calls.
@@ -43,14 +93,17 @@ What to verify:
 
 - `/agents` renders agent list with columns: Name, Agent ID, Provider, Model, Status, Max Tasks, Budget/Task, Budget/Hour, Created
 - `Create Agent` opens a dialog, not a new page
-- The dialog is scrollable and all fields are fillable: display name, model selector, system prompt, temperature, tools, human-in-the-loop toggle, max concurrent tasks, budget/task, budget/hour
+- The dialog is scrollable and all core fields are fillable: display name, model selector, system prompt, temperature, tools, max concurrent tasks, budget/task, budget/hour
 - Budget fields show dollar conversion below the microdollar input
-- After creating, the agent appears in the list
+- **Sandbox sub-section** renders with an enable toggle; enabling reveals template, vCPU, memory (MB), and timeout (seconds) inputs. Each input has a stable `data-testid`.
+- **Memory sub-section** renders with an enable toggle; enabling reveals summarizer-model selector and max-entries input.
+- **Context-management sub-section** renders (always visible — no enable toggle) with summarizer-model dropdown (`data-testid="context-management-summarizer-model"`), exclude-tools chip input (`data-testid="context-management-exclude-tools"`), and pre-Tier-3 memory-flush toggle (`data-testid="context-management-pre-tier3-flush"`, disabled when memory is off).
+- After creating, the agent appears in the list; values set in the sandbox / memory / context-management sub-sections are present on the detail page
 - Clicking the agent name navigates to `/agents/:agentId`
 - The detail page shows read-only mode by default
-- `Edit` switches to edit mode with form inputs plus `Save Changes` and `Cancel`
+- `Edit` switches to edit mode with form inputs plus `Save Changes` and `Cancel`. The edit form renders the same sandbox / memory / context-management sub-sections as the create dialog, with identical labels, defaults, and visibility rules (parity guard — see Template D)
 - `Cancel` reverts to read-only mode without saving
-- Changing a field and clicking `Save Changes` persists the change and shows success toast `Agent updated`
+- Changing a field in any sub-section and clicking `Save Changes` persists the change and shows success toast `Agent updated`; reloading the page surfaces the saved values
 
 ### Scenario 3: Task Submission Flow
 
@@ -241,6 +294,102 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 5. Select `agent-memory-off`. Assert the dropdown snaps to "Don't save memory", is disabled, and the helper text reads "This agent has memory disabled". Submission succeeds and persists `memory_mode = skip`.
 6. Craft a `POST /v1/tasks` (via devtools / `browser_evaluate`) for `agent-memory-off` with `memory_mode: "always"`. Assert the API responds 400 with a validation error referencing the memory-enabled invariant.
 
+### Scenario 15: Context Management Section
+
+Covers Track 7 Task 11 — the new "Context management" section on the Agent edit form. Verifies all three tuning fields persist end-to-end, the 50-entry cap is enforced, and the `pre_tier3_memory_flush` toggle correctly reflects memory-enabled state.
+
+Preconditions: at least one agent exists. Both a memory-enabled agent (`agent_config.memory.enabled = true`) and a memory-disabled agent (or absent) are helpful for the disabled-toggle branch.
+
+1. Navigate to `/agents/:agentId` and click `Edit`. Assert the `Context management` section renders after the `Memory` section, contains a `Summarizer Model` dropdown, an `Exclude Tools` chip input, and a `Pre-Tier-3 Memory Flush` checkbox. Assert there is NO `enabled` toggle for context management. The section header reads "Context management is always-on platform infrastructure; the fields below are tuning knobs, not an enable toggle."
+
+2. Select a model from the `Summarizer Model` dropdown (`data-testid="context-management-summarizer-model"`). Type a tool name (e.g., `web_search`) into the chip input (`data-testid="context-management-exclude-tools"`) and press Enter. Confirm the chip appears. Toggle `pre_tier3_memory_flush` on (`data-testid="context-management-pre-tier3-flush"`). Click `Save Changes`. Navigate away and return to the agent. Re-enter edit mode and assert all three fields retain their saved values.
+
+3. With 50 chips already entered in `exclude_tools`, type a 51st tool name and press Enter. Assert the inline error "Maximum 50 entries" appears. Assert the chip count stays at 50. Assert `Save Changes` is not blocked by this client-side error — the user can still save (the 51st entry was rejected, not added).
+
+4. With a memory-disabled agent (or disable memory for the test agent), open edit mode. Assert the `Pre-Tier-3 Memory Flush` checkbox is visually disabled and a note reads "Requires memory to be enabled." Enable memory in the Memory section. Assert the `Pre-Tier-3 Memory Flush` checkbox becomes enabled.
+
+5. Open edit mode without touching any context management field. Click `Save Changes`. Inspect the PUT request body via `browser_network_requests`. Assert the `agent_config` does NOT contain a `context_management` key (don't-send-defaults).
+
+6. `browser_console_messages` shows no uncaught exceptions during any of the above flows.
+
+### Scenario 16: Create Agent Context Management Parity
+
+What it validates: The Create Agent dialog exposes the same context-management tuning controls as the edit form, and the create payload persists them correctly.
+
+What to verify:
+
+1. Navigate to `/agents` and click `Create Agent`. Assert the dialog opens as a modal and is scrollable.
+2. In the create dialog, confirm a `Context Management` section renders after the `Memory` section. Assert it contains:
+   - the `Summarizer Model` dropdown (`data-testid="context-management-summarizer-model"`)
+   - the `Exclude Tools from Compaction` chip input (`data-testid="context-management-exclude-tools"`)
+   - the `Pre-Tier-3 Memory Flush` checkbox (`data-testid="context-management-pre-tier3-flush"`)
+   - no `Enable Context Management` toggle
+3. With memory disabled, assert `Pre-Tier-3 Memory Flush` is disabled and the helper text reads `Requires memory to be enabled.`
+4. Enable memory in the same dialog. Assert `Pre-Tier-3 Memory Flush` becomes enabled.
+5. Select a context summarizer model, add at least one excluded tool chip, enable `Pre-Tier-3 Memory Flush`, then submit the form. Inspect the POST request body via `browser_network_requests` and assert `agent_config.context_management` contains the selected `summarizer_model`, `exclude_tools`, and `pre_tier3_memory_flush: true`.
+6. **Partial-input faithfulness (P1 regression guard):** open a second create dialog. Set ONLY the `Summarizer Model`; leave the `Pre-Tier-3 Memory Flush` checkbox unchecked and do not add any excluded tools. Submit. Inspect the POST body and assert `agent_config.context_management.pre_tier3_memory_flush === false` — the key MUST be present and explicitly `false` (not missing, not `true`). Rationale: the worker defaults a missing value to `true`, so an absent key would silently override the UI's unchecked state.
+7. **Summarizer × provider parity (P2 regression guard):** in a third create dialog, keep the default `provider = anthropic` and open the `Summarizer Model` dropdown. Assert every option belongs to the `anthropic` provider (no OpenAI / other-provider options visible). Then change the primary model to an OpenAI entry. Assert the summarizer dropdown re-renders with only OpenAI options; if a summarizer was previously selected on `anthropic`, it is cleared (the dropdown reverts to `Platform default`).
+8. Re-open the created agent in `/agents/:agentId`, enter edit mode, and confirm the same context-management values are present there. Also confirm the edit form applies the same summarizer × provider filtering (only options for the agent's provider are visible).
+9. `browser_console_messages` shows no uncaught exceptions during the flow.
+
+### Scenario 17: Langfuse Trace — Context Window Management (Track 7 AC 14 manual)
+
+Covers Track 7 Task 12 AC 14 (manual Langfuse UI portion). Verifies that a task
+which exercises all three compaction tiers leaves the expected trace structure in
+Langfuse: one `compaction.tier3` span per Tier 3 firing, one `compaction.inline`
+span per call that fires Tier 1/1.5, and per-result cap annotations on affected
+tool spans.
+
+Preconditions: Langfuse is enabled (`LANGFUSE_ENABLED=true`) and the live stack
+is running. Create an agent whose history will grow large enough to trigger all
+three compaction tiers — use a small `context_management.summarizer_model` or a
+model with a small context window so Tier 3 fires quickly.
+
+1. Submit a task to the agent and let it run to completion (or at least until the
+   compaction tiers fire). If Tier 3 did not fire, resubmit with more tool-heavy
+   steps so the history token count exceeds the Tier 3 threshold.
+
+2. Open Langfuse UI (default `http://localhost:3300`) and navigate to the trace
+   for the task. Locate the root trace span.
+
+3. Assert `compaction.inline` span(s) exist: at least one child span whose name
+   is `compaction.inline` should appear for each LLM call that ran Tier 1 or Tier
+   1.5. The span metadata/tags should include `tier: "1"` or `tier: "1.5"`.
+
+4. Assert `compaction.tier3` span exists: exactly one child span per Tier 3
+   firing should appear with name `compaction.tier3`. The span metadata should
+   include `tokens_in`, `tokens_out`, `cost_microdollars`, and
+   `summarizer_model_id`.
+
+5. Assert per-result cap annotations: for each tool call whose result was capped,
+   the tool span should carry an annotation or tag `result_capped: true` (or
+   equivalent — check the structured-log event shape from AC 14 automated tests).
+
+6. If a pre-Tier-3 memory flush fired, assert a `memory_flush` child span or
+   annotation is visible on the trace.
+
+7. `browser_console_messages` shows no uncaught exceptions in the Langfuse UI.
+
+### Scenario 18: User-Facing Conversation Log
+
+Covers Phase 2 Track 7 Task 13 — the user-facing "Conversation" tab on task detail. The tab renders the rendered entry stream from `GET /v1/tasks/:taskId/conversation` (what the user sees), separately from the existing Timeline tab (infrastructure events, operator audience). Verifies that long-context runs surface a `compaction_boundary` divider with an operator-visible provenance fold, and that the Timeline tab continues to render unchanged.
+
+Preconditions:
+
+- `make start` stack running with the API at `:8080` and the Console at `:5173`.
+- One agent configured with `agent_config.context_management.tier3_trigger_fraction = 0.1` (low trigger fraction forces Tier 3 summarisation to fire quickly so the scenario can observe a `compaction_boundary`). If the console doesn't expose `tier3_trigger_fraction` directly, seed the config via the API.
+- Fixture file on disk at `/tmp/large_log.txt` — at least ~200 KB of plain text. Create with any deterministic generator (e.g. `yes 'x' | head -c 200000 > /tmp/large_log.txt`) so the task's tool calls produce oversized outputs and trigger compaction.
+- One in-flight task with at least one `hitl_pause` / `hitl_resume` cycle if available; otherwise skip those assertions but still run the rest.
+
+Steps:
+
+1. Submit a task against the configured agent whose prompt instructs it to `read_file` the `/tmp/large_log.txt` fixture several times (enough to exceed the 10% Tier-3 trigger). Navigate to `/tasks/:taskId`.
+2. **Default tab is Conversation.** Without any query string, confirm `[data-testid="tab-conversation"]` carries `aria-selected="true"` and `[data-testid="conversation-pane"]` is present. The subtitle reads "What the agent did". `browser_snapshot` shows entry rows with kind-specific testids (`conversation-entry-user_turn`, `conversation-entry-agent_turn`, `conversation-entry-tool_call`, `conversation-entry-tool_result` at minimum).
+3. **Compaction divider appears once Tier 3 fires.** Wait for the task to accumulate enough context to trigger compaction (poll task detail until checkpoints > ~10, or watch Langfuse for `compaction.tier3_fired`). Assert `[data-testid="conversation-compaction-divider"]` is present and its text matches `/Context summarized \(turns \d+–\d+, \d+ turns\)/`.
+4. **Operator fold reveals provenance.** Click the compaction divider to expand. Assert the summary text is visible (primary reveal). Then click `[data-testid="conversation-operator-fold"]` to expand the secondary fold and confirm the four operator-only fields render: `summarizer_model`, `summary_bytes`, `cost_microdollars`, `tier3_firing_index`.
+5. **Capped tool_result explicit copy.** Expand any `[data-testid="conversation-entry-tool_result"]` whose entry carries `metadata.capped=true` (reading `/tmp/large_log.txt` should trigger the per-result 25KB cap). Confirm the explicit copy renders: "Tool returned {orig_bytes} bytes; showing head+tail capped at 25KB (same view the model had)."
+6. **Timeline-tab regression check.** Navigate to `/tasks/:taskId?tab=timeline`. Confirm `[data-testid="tab-timeline"]` is now `aria-selected="true"`, the checkpoint timeline renders exactly as before (`Execution Timeline` heading, step cards, HITL markers, cost/duration footer), and the Conversation pane is unmounted. Switch back to the Conversation tab via the tab button; confirm the URL drops the `?tab=timeline` parameter. `browser_console_messages` shows zero uncaught exceptions across the tab switches.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -259,14 +408,18 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 | Agent Memory tab feature | 1, 11 |
 | Task submission memory-mode / `agent_decides` feature | 1, 3, 14 |
 | Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13, 14 |
+| Agent context management section feature | 1, 2, 15, 16 |
+| Context window management / compaction observability | 1, 17 |
+| Task detail conversation log feature | 1, 18 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
 
 ## Adding New Scenarios
 
-- When implementing a new page or major UI feature, add a corresponding scenario before marking the task done
-- When a browser verification session reveals a bug not covered by existing scenarios, add a regression scenario after fixing it
-- Keep scenarios at the level of what to verify, not step-by-step tool instructions
-- Number new scenarios sequentially as `Scenario 10`, `Scenario 11`, and so on, with descriptive titles
-- Update the scenario-selection matrix when a new scenario maps to a change type
+See **§Scenario Authoring Rules** at the top of this file for the authoritative rules. Quick checklist:
+
+- Number sequentially (next unused index — currently 18 and up).
+- Pick a template from §Scenario Templates and copy its always-required assertions.
+- Update the §When to Run Which Scenarios matrix and the §Agent-Config Coverage Matrix in the same commit.
+- If fixing a bug not covered by an existing scenario, add a regression scenario before merging the fix.

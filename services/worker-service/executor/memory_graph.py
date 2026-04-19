@@ -1,23 +1,12 @@
-"""Phase 2 Track 5 — ``memory_write`` LangGraph node + state schema.
+"""Phase 2 Track 5 — ``memory_write`` LangGraph node.
 
-The state schema :class:`MemoryEnabledState` extends LangGraph's stock
-``MessagesState`` with two memory-specific fields:
+The state schema has been moved to :mod:`executor.compaction.state` as
+:class:`RuntimeState` (Track 7 Task 2 refactor).  All task graphs now use ``RuntimeState`` regardless of
+whether the memory stack is enabled.
 
-* ``observations`` — a list of strings the agent appends via the Task 7
-  ``memory_note`` tool. Declared as ``Annotated[list[str], operator.add]`` so
-  LangGraph treats it as an **associative, append-only** channel; every tool
-  return that sets ``observations=[note]`` is merged via list concatenation and
-  the reducer becomes durable at super-step checkpoint granularity. The
-  ``operator.add`` reducer on a list-typed channel is the pattern documented in
-  the LangGraph state-management docs (see
-  https://langchain-ai.github.io/langgraph/how-tos/graph-api/#use-reducers-to-update-state) —
-  Phase 2 Track 5 is the first place in this worker that uses a custom state
-  schema, so the pattern was imported from that documentation rather than
-  copied from a sibling module.
-* ``pending_memory`` — written by the ``memory_write`` node on the agent's
-  terminal branch, then read once by the worker's post-``astream`` commit
-  path. Absent while execution is in-flight; a dictionary after the node
-  fires. Never merged — each run either writes it once or leaves it unset.
+``observations`` is an append-only list reduced by ``operator.add``.
+``pending_memory`` is written by the ``memory_write`` node on the agent's
+terminal branch and read once by the worker's post-``astream`` commit path.
 
 The node itself is intentionally factored so that the heavy external calls
 (summarizer LLM and embedding provider) are injected as plain async callables.
@@ -39,17 +28,16 @@ write — hybrid graph-node + worker commit".
 from __future__ import annotations
 
 import logging
-import operator
 import os
 import time
 from dataclasses import dataclass
-from typing import Annotated, Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Protocol
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import MessagesState
 from langgraph.types import Command
 
+from executor.compaction.state import RuntimeState
 from executor.embeddings import EmbeddingResult, compute_embedding
 
 logger = logging.getLogger(__name__)
@@ -78,9 +66,16 @@ SUMMARIZER_TEMPLATE_FALLBACK = "template:fallback"
 # dead-letter with observations.
 SUMMARIZER_TEMPLATE_DEAD_LETTER = "template:dead_letter"
 
-# Dead-letter reason constant reused across worker code. Keeps the string
-# from drifting across hook sites.
+# Dead-letter reason constants reused across worker code. Keep these strings
+# in sync with ValidationConstants.ALLOWED_DEAD_LETTER_REASONS (Java) and the
+# latest dead_letter_reason migration in infrastructure/database/migrations/.
 DEAD_LETTER_REASON_CANCELLED_BY_USER = "cancelled_by_user"
+
+# Track 7 — Context Window Management hard-floor safety net.
+# Emitted when Tier 1 + 1.5 + 3 compaction together cannot reduce estimated
+# input tokens below the model's context window.
+# Migration: 0015_context_exceeded_dead_letter_reason.sql
+DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE = "context_exceeded_irrecoverable"
 
 # Attached-memory prompt-prefix caps (Task 8). Observations and summary
 # are injected into the initial prompt; we cap per-block byte sizes so a
@@ -104,35 +99,15 @@ _EMPTY_TAGS: list[str] = []
 
 
 # ---------------------------------------------------------------------------
-# State schema
+# RuntimeState re-export — canonical location is executor.compaction.state
 # ---------------------------------------------------------------------------
 
-
-class MemoryEnabledState(MessagesState):
-    """LangGraph state type for memory-enabled tasks.
-
-    Adds three fields to ``MessagesState``:
-
-    * ``observations`` — append-only list. Reducer is ``operator.add`` so any
-      node that returns ``{"observations": [note]}`` is merged associatively.
-    * ``pending_memory`` — populated once by the terminal ``memory_write``
-      node; read once by the worker's post-astream commit.
-    * ``memory_opt_in`` — Task 12 ``agent_decides`` mode. Default ``False``;
-      the ``save_memory`` tool sets it to ``True`` via
-      ``Command(update={"memory_opt_in": True, ...})``. No reducer —
-      last-write-wins semantics; the initial-state seeding block in
-      :func:`executor.graph.GraphExecutor.execute_task` explicitly resets this
-      to ``False`` on every run (first execution AND follow-up/redrive) so the
-      opt-in must be re-earned per run.
-
-    Memory-disabled tasks keep using plain ``MessagesState`` (see graph
-    assembly in :mod:`executor.graph`). The effective-memory gate is
-    :func:`effective_memory_decision`.
-    """
-
-    observations: Annotated[list[str], operator.add]
-    pending_memory: dict[str, Any] | None
-    memory_opt_in: bool
+# Re-exported for the benefit of modules that imported the state type from
+# this module before the Track 7 Task 2 refactor.  New code should import
+# directly from executor.compaction.state.
+__all__ = [
+    "RuntimeState",
+]
 
 
 # ---------------------------------------------------------------------------

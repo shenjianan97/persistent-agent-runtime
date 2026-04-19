@@ -9,7 +9,7 @@ Gap the review flagged: the unit tests in ``test_memory_graph.py`` prove the
 node's ``operator.add`` reducer works in isolation, but they never drive the
 real compiled LangGraph with a real Postgres checkpointer through multiple
 super-steps and then through the commit path to an ``agent_memory_entries``
-row. This file closes that gap — the checkpointer, the ``MemoryEnabledState``
+row. This file closes that gap — the checkpointer, the ``RuntimeState``
 schema + ``operator.add`` reducer, the real ``memory_write`` node, the
 commit transaction, and the ``agent_memory_entries`` row are all real
 production code paths. The only things mocked are the two network-boundary
@@ -21,7 +21,7 @@ in sequence via a compiled graph with a real checkpointer + real asyncpg
 pool. The scripted ``agent`` node returns state updates of the same shape the
 ``memory_note`` tool produces (``{"observations": [text]}``) — that shape is
 merged by the ``operator.add`` reducer declared on
-:class:`MemoryEnabledState`, so verifying it here is the same integration
+:class:`RuntimeState`, so verifying it here is the same integration
 exercise a real tool-returned ``Command`` would produce at the reducer /
 checkpoint layer. See the BUG NOTE below.
 
@@ -55,10 +55,10 @@ from langgraph.graph import END, START, StateGraph
 
 from checkpointer.postgres import PostgresDurableCheckpointer
 from core.config import WorkerConfig
+from executor.compaction.state import RuntimeState
 from executor.graph import GraphExecutor
 from executor.memory_graph import (
     MEMORY_WRITE_NODE_NAME,
-    MemoryEnabledState,
     memory_write_node,
 )
 
@@ -154,7 +154,7 @@ async def _seed_running_task(pool: asyncpg.Pool, task_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Graph builder — real checkpointer + real MemoryEnabledState + real
+# Graph builder — real checkpointer + real RuntimeState + real
 # memory_write_node, scripted agent super-steps.
 # ---------------------------------------------------------------------------
 
@@ -193,7 +193,7 @@ def _build_note_appending_graph(
     The scripted agent node mirrors what a real ``memory_note`` tool return
     produces at the reducer layer: each super-step emits
     ``{"observations": [text]}`` and LangGraph's ``operator.add`` reducer on
-    :class:`MemoryEnabledState.observations` concatenates them across
+    :class:`RuntimeState.observations` concatenates them across
     super-step checkpoint commits. This is the production durability
     guarantee under test — see BUG NOTE in the module docstring for why we
     do not invoke ``ToolNode`` directly.
@@ -243,7 +243,7 @@ def _build_note_appending_graph(
             return "agent"
         return MEMORY_WRITE_NODE_NAME
 
-    workflow = StateGraph(MemoryEnabledState)
+    workflow = StateGraph(RuntimeState)
     workflow.add_node("agent", agent_node)
     workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
     workflow.add_edge(START, "agent")

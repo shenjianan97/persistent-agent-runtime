@@ -3,6 +3,7 @@ package com.persistentagent.api.controller;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.response.TaskSubmissionResponse;
+import com.persistentagent.api.service.ConversationLogService;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
 import org.junit.jupiter.api.Test;
@@ -34,6 +35,9 @@ class TaskMultipartTest {
 
     @MockitoBean
     private TaskEventService taskEventService;
+
+    @MockitoBean
+    private ConversationLogService conversationLogService;
 
     @Autowired
     private ObjectMapper objectMapper;

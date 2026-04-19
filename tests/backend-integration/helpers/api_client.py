@@ -291,6 +291,29 @@ class ApiClient:
         """GET /v1/tasks/{task_id}/events"""
         return self._request("GET", f"/tasks/{task_id}/events?limit={limit}", expected_status=expected_status, raise_for_status=raise_for_status)
 
+    def get_task_conversation(
+        self,
+        task_id: str,
+        *,
+        after_sequence: int | None = None,
+        limit: int | None = None,
+        expected_status: int | tuple[int, ...] = 200,
+        raise_for_status: bool = True,
+    ) -> dict[str, Any]:
+        """GET /v1/tasks/{task_id}/conversation (Phase 2 Track 7 Task 13)."""
+        params: dict[str, str] = {}
+        if after_sequence is not None:
+            params["after_sequence"] = str(after_sequence)
+        if limit is not None:
+            params["limit"] = str(limit)
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        path = f"/tasks/{task_id}/conversation" + (f"?{query}" if query else "")
+        return self._request(
+            "GET", path,
+            expected_status=expected_status,
+            raise_for_status=raise_for_status,
+        )
+
     def list_artifacts(self, task_id, direction=None, expected_status=200, raise_for_status=True):
         """List artifacts for a task."""
         params = {}

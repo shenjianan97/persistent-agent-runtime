@@ -1,0 +1,31 @@
+# Phase 2 Track 7 — Context Window Management: Progress
+
+| Task | Component | Status | Description |
+|------|-----------|--------|-------------|
+| Task 1 | Agent Config Extension | Done | `agent_config.context_management` sub-object (3 fields, no `enabled`): Jackson, validation, canonicalisation |
+| Task 2 | State Schema Unification | Done | **Pure refactor.** Unified `RuntimeState` TypedDict in `executor/compaction/state.py`. `MemoryEnabledState` deleted. All existing Track 5 tests pass (561 passed). `grep MemoryEnabledState services/worker-service` → zero hits. |
+| Task 3 | Compaction Constants + Thresholds | Done | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()`; `PLATFORM_EXCLUDE_TOOLS` includes memory_search + task_history_get |
+| Task 4 | Per-Tool-Result Cap | Done | `compaction/caps.py` head+tail byte cap; tool-wrapper integration in `_get_tools` |
+| Task 5 | Tier 1 Transform | Done | `clear_tool_results()` + `ClearResult` in `compaction/transforms.py`; 24 unit tests pass |
+| Task 6 | Tier 1.5 Transform | Done | `truncate_tool_call_args()` + `TruncateResult` in `compaction/transforms.py`; 27 unit tests pass |
+| Task 7 | Tier 3 Summarizer | Done | `summarize_slice()` + retry + cost ledger (`compaction.tier3`) + Langfuse callbacks. Migration `0016_agent_cost_ledger_compaction.sql` adds operation/model_id/tokens_in/tokens_out/idempotency-index. `cost_ledger_repository.insert_cost_row` extended with backward-compatible kwargs. 22 unit tests pass. |
+| Task 8 | Pipeline + Graph Integration | Done | Track 7 state fields added to `RuntimeState`; `compact_for_llm()` pipeline orchestrator; `agent_node` wiring; budget carve-out for `compaction.tier3`; `estimate_tokens()` with real tokenizers; migration `0015_context_exceeded_dead_letter_reason.sql`; 92 new tests (913 total pass) |
+| Task 9 | Pre-Tier-3 Memory Flush | Done | One-shot pre-Tier-3 `memory_note` nudge in `compaction/pipeline.py`; `memory_flush_fired_this_task` one-shot flag in `RuntimeState`; positional heartbeat detection via `last_super_step_message_count` |
+| Task 10 | Dead-Letter Reason Enum | Done | Migration `0015_context_exceeded_dead_letter_reason.sql` (CHECK-constraint DROP+ADD); Java `DeadLetterReason.CONTEXT_EXCEEDED_IRRECOVERABLE` with Jackson; Python `HardFloorEvent` → dead-letter path in `agent_node` |
+| Task 11 | Console — Context Management Form | Done | Agent edit form "Context management" section (3 fields, no `enabled` toggle); `ContextManagementSection.tsx` + 22 unit tests; `AgentConfig` type extended; Scenario 15 added to `CONSOLE_BROWSER_TESTING.md` |
+| Task 12 | Integration + Browser Tests | Done | `test_track7_ac_mapping.py` manifest (14 ACs, 16 tests); 8 new worker test files (ACs 5, 6, 7-redrive, 8, 9, 10, 13, 14; 59 tests pass); `tests/backend-integration/test_context_management_validation.py` (AC 12); Scenario 16 added to `CONSOLE_BROWSER_TESTING.md` |
+| Task 13 | User-Facing Conversation Log | Done | Separate append-only `task_conversation_log` store (migration `0017`), `GET /v1/tasks/{id}/conversation`, Console "Conversation" pane alongside CheckpointTimeline. Three parallel slices: **A (DB+Worker)** — append-only Python repo, dual-write in `agent_node` + HITL hookups; **B (API)** — Java read-only repo with `(tenant_id, task_id)` filter + 15 unit tests + 9 E2E scenarios; **C (Console)** — `ConversationPane.tsx` with 9 kind renderers + tab structure + Scenario 17. Full suites green: worker 1025, API 362, console 136, E2E 145. Playwright-verified end-to-end with a live task writing `user_turn`/`agent_turn` entries. |
+
+## Notes
+
+- Canonical design contract: `docs/design-docs/phase-2/track-7-context-window-management.md`. Read before implementing any task.
+- **Track 7 is always-on for all agents.** No per-agent `enabled` toggle and no runtime opt-out — context management is platform infrastructure. Incident response is the standard deploy-rollback path, the same as Tracks 3/4/5.
+- **Task 2 is a hard blocker for every other worker-side task.** It is a pure refactor (unified `RuntimeState`) with zero behavior change. All existing Track 5 tests pass before Tasks 3–8 begin (Task 9 serialises after Task 8). This isolates refactor failures from feature failures.
+- **State schema is append-only.** LangGraph has no schema-migration API ([langgraphjs #536](https://github.com/langchain-ai/langgraphjs/issues/536)); we add fields, never remove or rename. Regression test in Task 2 loads a pre-refactor checkpoint fixture and asserts clean resume.
+- **Reducer-safe defaults.** Every list-reducer field defaults to `[]`, every dict to `{}`, every string to `""`, every int to `0`, every bool to `False`. Never `None` — `operator.add` crashes on None, and any non-instantiable type (unions, `Optional[T]`, etc.) leaves the LangGraph channel MISSING so the reducer is bypassed on the seed write (see closed-as-by-design [langgraph #4305](https://github.com/langchain-ai/langgraph/issues/4305)).
+- Only DB schema change in this track: enum addition for `dead_letter_reason = context_exceeded_irrecoverable` (Task 10).
+- Tasks 5 and 6 both add functions to `compaction/transforms.py`; Task 8 edits `executor/graph.py` heavily. Parallelise only with `isolation: "worktree"` per AGENTS.md §Parallel Subagent Safety.
+- `compaction/__init__.py` is owned by Task 8 — Tasks 2–7 leave it as docstring-only to avoid parallel-merge conflicts.
+- Pre-Tier-3 memory flush is gated on Track 5's `agent.memory.enabled` — Track 7 does not ship Track 5 tool registration; it reuses the existing `memory_note` surface.
+- Track 7 integrates with Track 3's budget enforcement: `compaction.tier3` is a named-node carve-out alongside `memory_write`.
+- Thresholds are **fraction-only** in v1. An `aggressive_compaction=true` per-agent override is deliberately deferred — revisit only if post-rollout telemetry shows tier3_fire_rate above 1 per 100 calls.

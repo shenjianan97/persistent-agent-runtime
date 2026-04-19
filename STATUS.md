@@ -15,9 +15,9 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 2 | HITL & Unified Timeline | Complete | [plan](docs/exec-plans/completed/phase-2/track-2/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-2/progress.md) |
 | Track 3 | Scheduler & Budgets | Complete | [plan](docs/exec-plans/completed/phase-2/track-3/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-3/progress.md) |
 | Track 4 | Custom Tool Runtime (BYOT) | Complete | [plan](docs/exec-plans/completed/phase-2/track-4/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-4/progress.md) |
-| Track 5 | Memory | Design drafted ([track-5-memory.md](docs/design-docs/phase-2/track-5-memory.md)); plan not started | — | — |
+| Track 5 | Memory | Complete | [plan](docs/exec-plans/completed/phase-2/track-5/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-5/progress.md) |
 | Track 6 | GitHub Integration | Not started | — | — |
-| Track 7 | Context Window Management | Design complete ([track-7-context-window-management.md](docs/design-docs/phase-2/track-7-context-window-management.md)); plan drafted, implementation not started | [plan](docs/exec-plans/active/phase-2/track-7/plan.md) | [progress](docs/exec-plans/active/phase-2/track-7/progress.md) |
+| Track 7 | Context Window Management | Complete | [plan](docs/exec-plans/completed/phase-2/track-7/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-7/progress.md) |
 | Track 8 | Coding-Agent Primitives | Design proposed ([track-8-coding-primitives.md](docs/design-docs/phase-2/track-8-coding-primitives.md)); relocated from AC Track 3; plan not started | — | — |
 | Track 9 | Planning Primitive | Stub ([track-9-planning-primitive.md](docs/design-docs/phase-2/track-9-planning-primitive.md)); brainstorm pending | — | — |
 | Track 10 | Deep Research Mode | Not started (brainstorm after Track 9) | — | — |

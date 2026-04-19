@@ -120,9 +120,13 @@ If an external PR reference slips in, rewrite the commit / PR description before
 
 ### Browser Verification (Console Changes) — BLOCKING
 
-**Console changes are not done until verified in a real browser.** Unit tests with mocked data cannot catch cross-origin issues, encoding problems, stale data, or broken downloads.
+**Console changes are not done until verified in a real browser.** Unit tests with mocked data cannot catch cross-origin issues, encoding problems, stale data, or broken downloads. Verify with Playwright MCP tools against `make start` (Console at `localhost:5173`, API at `localhost:8080`).
 
-Verify with Playwright MCP tools against `make start` (Console at `localhost:5173`, API at `localhost:8080`). Run Scenario 1 (Navigation Smoke Test) plus the feature scenario covering your change. If your UI isn't covered, add a new scenario. See [CONSOLE_BROWSER_TESTING.md](./docs/CONSOLE_BROWSER_TESTING.md) for scenarios and the selection matrix.
+For Console tasks, **read [docs/CONSOLE_TASK_CHECKLIST.md](./docs/CONSOLE_TASK_CHECKLIST.md) first** — it is the per-task merge gate. The canonical authoring rules, coverage matrix, scenario templates, and change-type → scenarios selection matrix all live in [docs/CONSOLE_BROWSER_TESTING.md](./docs/CONSOLE_BROWSER_TESTING.md). At minimum:
+
+- Every Console change runs Scenario 1 (smoke) + every scenario the selection matrix maps to it.
+- New page / dialog / form / tab → new scenario; new field on an existing form → extend that form's scenario (not just mention the section — assert field + `data-testid`).
+- Changes that touch an agent-config sub-object (`memory` / `context_management` / `sandbox` / etc.) update the coverage matrix in the same commit; sub-objects rendered on >1 surface require Template D's parity assertions regardless of how many cells were cited.
 
 ---
 

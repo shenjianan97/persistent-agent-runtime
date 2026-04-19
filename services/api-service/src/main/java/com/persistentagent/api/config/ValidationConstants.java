@@ -33,7 +33,11 @@ public final class ValidationConstants {
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
 
-    /** Allowed dead-letter reasons matching the database constraint. */
+    /** Allowed dead-letter reasons matching the database constraint.
+     *
+     * <p>Must stay in sync with {@link DeadLetterReason} and with the latest
+     * {@code infrastructure/database/migrations/*_dead_letter_reason.sql}
+     * migration's CHECK constraint. */
     public static final Set<String> ALLOWED_DEAD_LETTER_REASONS = Set.of(
             "cancelled_by_user",
             "retries_exhausted",
@@ -43,7 +47,8 @@ public final class ValidationConstants {
             "human_input_timeout",
             "rejected_by_user",
             "sandbox_lost",
-            "sandbox_provision_failed"
+            "sandbox_provision_failed",
+            "context_exceeded_irrecoverable"
     );
 
     public static final String DEFAULT_DEAD_LETTER_REASON = "non_retryable_error";

@@ -98,6 +98,93 @@ def test_resolve_model_pricing_uses_global_fallback_for_unknown_provider():
 
 
 # ---------------------------------------------------------------------------
+# Context window resolution
+# ---------------------------------------------------------------------------
+#
+# The worker's compaction pipeline reads ``models.context_window`` to decide
+# when Tier 3 summarization fires. Under-populating it fires compaction too
+# aggressively; over-populating would blow the provider's real ceiling.
+# These tests pin down the lookup-order contract.
+
+
+def test_resolve_model_context_window_returns_explicit_value():
+    discover_models = load_discover_models_module()
+
+    # Known value from CONTEXT_WINDOW_DEFAULTS.
+    assert discover_models.resolve_model_context_window("bedrock", "zai.glm-5") == 200_000
+    assert discover_models.resolve_model_context_window("anthropic", "claude-opus-4-7") == 1_000_000
+    assert discover_models.resolve_model_context_window("openai", "gpt-4.1") == 1_000_000
+
+
+def test_resolve_model_context_window_falls_back_by_provider():
+    discover_models = load_discover_models_module()
+
+    assert (
+        discover_models.resolve_model_context_window("openai", "gpt-future-unknown")
+        == discover_models.CONTEXT_WINDOW_FALLBACKS["openai"]
+    )
+    assert (
+        discover_models.resolve_model_context_window("anthropic", "claude-future-unknown")
+        == discover_models.CONTEXT_WINDOW_FALLBACKS["anthropic"]
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "future.model-v1:0")
+        == discover_models.CONTEXT_WINDOW_FALLBACKS["bedrock"]
+    )
+
+
+def test_resolve_model_context_window_uses_global_fallback_for_unknown_provider():
+    discover_models = load_discover_models_module()
+
+    assert (
+        discover_models.resolve_model_context_window("some-unknown-provider", "x")
+        == discover_models.GLOBAL_FALLBACK_CONTEXT_WINDOW
+    )
+
+
+# ---------------------------------------------------------------------------
+# DEACTIVATE_MODEL_IDS — platform deny list
+# ---------------------------------------------------------------------------
+
+
+def test_deactivate_list_excludes_legacy_small_context_openai_models():
+    """Regression: the user reported that legacy sub-128K models (gpt-4,
+    gpt-3.5-turbo*) were polluting the agent-config dropdown and creating
+    unsafe fallback windows. These IDs must stay deny-listed."""
+    discover_models = load_discover_models_module()
+
+    required_denied = {
+        "gpt-4",
+        "gpt-4-0613",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-16k",
+        "gpt-3.5-turbo-0125",
+        "gpt-3.5-turbo-1106",
+        "gpt-3.5-turbo-instruct",
+        "gpt-3.5-turbo-instruct-0914",
+    }
+    assert required_denied.issubset(discover_models.DEACTIVATE_MODEL_IDS), (
+        "deny-list must include all legacy sub-128K OpenAI chat models. "
+        f"Missing: {required_denied - discover_models.DEACTIVATE_MODEL_IDS}"
+    )
+
+
+def test_platform_floor_consistent_with_deny_list():
+    """Any model in CONTEXT_WINDOW_DEFAULTS with a value below the global
+    fallback (128K) must also be on the deny list. Otherwise the worker's
+    fallback-to-128K would overshoot the model's real ceiling."""
+    discover_models = load_discover_models_module()
+
+    floor = discover_models.GLOBAL_FALLBACK_CONTEXT_WINDOW
+    for model_id, window in discover_models.CONTEXT_WINDOW_DEFAULTS.items():
+        if window < floor:
+            assert model_id in discover_models.DEACTIVATE_MODEL_IDS, (
+                f"{model_id} has context_window={window} < floor={floor} "
+                "but is not deny-listed — worker fallback would overshoot."
+            )
+
+
+# ---------------------------------------------------------------------------
 # Embedding provider validation (Phase 2 Track 5)
 # ---------------------------------------------------------------------------
 #

@@ -651,6 +651,14 @@ def test_tool_transport_error_is_retryable(mock_worker):
     ) is True
 
 
+def test_mcp_tool_call_error_is_retryable(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    assert executor._is_retryable_error(
+        McpToolCallError("aws-knowledge-mcp-server", "aws___search_documentation", "Tool call timed out after 30s")
+    ) is True
+
+
 def test_rate_limit_with_invalid_in_message_is_retryable(mock_worker):
     """Issue #14: 'invalid request rate exceeded' was previously dead-lettered because
     the 'invalid' string check ran before the 429/rate-limit check."""
@@ -658,6 +666,55 @@ def test_rate_limit_with_invalid_in_message_is_retryable(mock_worker):
 
     assert executor._is_retryable_error(Exception("invalid request rate exceeded")) is True
     assert executor._is_retryable_error(Exception("429 Too Many Requests")) is True
+
+
+# ─── Regression: Bedrock/botocore timeouts must be retryable ────────────────────
+#
+# Production task 1717c12b-aee3-4632-b29e-b3d0e269e87f dead-lettered on the
+# first read-timeout against bedrock-runtime — classified non-retryable because
+# botocore.exceptions.ReadTimeoutError does NOT inherit from Python's builtin
+# TimeoutError (urllib3 defines a same-named base class that's distinct), and
+# the error string "Read timeout on endpoint URL: ..." matches none of the
+# existing numeric / keyword patterns. Transient network failures MUST retry.
+
+
+def test_botocore_read_timeout_is_retryable(mock_worker):
+    """botocore.ReadTimeoutError — raised when Bedrock Converse doesn't respond
+    within the client read deadline. Transient. Must retry."""
+    import botocore.exceptions
+
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = botocore.exceptions.ReadTimeoutError(
+        endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com/model/zai.glm-5/converse"
+    )
+    assert executor._is_retryable_error(err) is True
+
+
+def test_botocore_connect_timeout_is_retryable(mock_worker):
+    """botocore.ConnectTimeoutError — couldn't open the TCP connection. Transient."""
+    import botocore.exceptions
+
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = botocore.exceptions.ConnectTimeoutError(
+        endpoint_url="https://bedrock-runtime.us-east-1.amazonaws.com/model/zai.glm-5/converse"
+    )
+    assert executor._is_retryable_error(err) is True
+
+
+def test_read_timeout_string_is_retryable(mock_worker):
+    """Safety net: if any wrapper strips the original exception type, the
+    characteristic 'Read timeout' string still classifies correctly."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = Exception(
+        'Read timeout on endpoint URL: "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse"'
+    )
+    assert executor._is_retryable_error(err) is True
+
+
+def test_connect_timeout_string_is_retryable(mock_worker):
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+    err = Exception("Connect timeout on endpoint URL: https://example.com")
+    assert executor._is_retryable_error(err) is True
 
 
 # ─── Custom Tool Integration Tests ────────────────────────────────────────────

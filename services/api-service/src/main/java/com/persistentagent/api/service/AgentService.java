@@ -8,6 +8,7 @@ import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.AgentCreateRequest;
 import com.persistentagent.api.model.request.AgentUpdateRequest;
+import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.model.response.AgentResponse;
@@ -206,6 +207,12 @@ public class AgentService {
         // Phase 2 Track 5 design.
         MemoryConfigRequest canonicalizedMemory = config.memory();
 
+        // Context-management sub-object round-trip: preserve verbatim when present,
+        // omit when absent. Same pattern as memory above. No platform defaults are
+        // written into the canonical config — defaults apply at read time in the
+        // worker (Task 3) per Phase 2 Track 7 design.
+        ContextManagementConfigRequest canonicalizedContextManagement = config.contextManagement();
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -218,7 +225,8 @@ public class AgentService {
                         ? config.toolServers()
                         : List.of(),
                 canonicalizedSandbox,
-                canonicalizedMemory);
+                canonicalizedMemory,
+                canonicalizedContextManagement);
     }
 
     private String serializeConfig(AgentConfigRequest config) {

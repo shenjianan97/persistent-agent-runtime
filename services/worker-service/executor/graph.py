@@ -9,18 +9,25 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable
 
 import asyncpg
 import executor.providers as providers
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.runnables import RunnableConfig
 
 from langchain_core.tools import StructuredTool
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError, GraphInterrupt
 from langgraph.types import Command
@@ -36,10 +43,22 @@ from sandbox.provisioner import (
 from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnectionError
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
+from executor.compaction.state import RuntimeState
+from executor.compaction.pipeline import (
+    compact_for_llm,
+    HardFloorEvent,
+    MemoryFlushFiredEvent,
+    Tier1AppliedEvent,
+    Tier15AppliedEvent,
+    Tier3FiredEvent,
+    Tier3SkippedEvent,
+)
+from executor.compaction.tokens import estimate_tokens as _estimate_tokens
+from executor.compaction.summarizer import summarize_slice
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
+    DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
     MemoryDecision,
-    MemoryEnabledState,
     MEMORY_WRITE_NODE_NAME,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     SummarizerResult,
@@ -61,6 +80,10 @@ from core.checkpoint_repository import (
     fetch_latest_terminal_checkpoint_id,
     set_cost_and_metadata,
     set_execution_metadata,
+)
+from core.conversation_log_repository import (
+    ConversationLogRepository,
+    compute_idempotency_key as _convlog_key,
 )
 from core.cost_ledger_repository import (
     insert_cost_row,
@@ -113,10 +136,27 @@ from tools.memory_tools import (
 )
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
+from executor.compaction.caps import cap_tool_result
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Structlog logger for structured compaction events (e.g. compaction.per_result_capped).
+# Uses core.logging.get_logger which returns a structlog BoundLogger.  We bind
+# a placeholder worker_id here; the actual structured fields (tenant_id, agent_id,
+# task_id) are bound at emit time via kwargs.
+from core.logging import get_logger as _get_structlog_logger
+_compaction_logger = _get_structlog_logger(worker_id="graph")
+
+
+class _ContextExceededIrrecoverableError(Exception):
+    """Internal sentinel: raised from agent_node when compaction's HardFloorEvent fires.
+
+    The astream loop catches this and invokes ``_handle_dead_letter`` with
+    ``reason=DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE``.  The name
+    is prefixed with ``_`` to signal it is not part of the public API.
+    """
 
 
 def _handle_tool_error(e: Exception) -> str:
@@ -127,8 +167,301 @@ def _handle_tool_error(e: Exception) -> str:
     return f"Error: {e}\nPlease fix the error and try again."
 
 
+def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id: str):
+    """Decorator factory: wraps an async tool function to cap its result to
+    PER_TOOL_RESULT_CAP_BYTES before returning to the ToolNode.
+
+    Cap is applied to the string representation of the return value.  When the
+    cap fires a ``compaction.per_result_capped`` structured log is emitted.
+
+    This is Track 7 Tier 0 — always-on, no per-agent opt-out.
+
+    Args:
+        tool_name: Name of the tool (used in CapEvent and structured log).
+        tenant_id: Bound from the caller's task context (not LLM-supplied).
+        agent_id: Bound from the caller's task context.
+        task_id: Bound from the caller's task context.
+
+    Returns:
+        A decorator that wraps an async callable.
+    """
+    def decorator(fn):
+        async def wrapper(*args, **kwargs):
+            result = await fn(*args, **kwargs)
+            result_str = result if isinstance(result, str) else str(result)
+            capped, event = cap_tool_result(result_str, tool_name)
+            if event is not None:
+                _compaction_logger.info(
+                    "compaction.per_result_capped",
+                    tool=event.tool,
+                    orig_bytes=event.orig_bytes,
+                    capped_bytes=event.capped_bytes,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+            return capped
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Track 7 Task 13 — user-facing conversation log dual-write helpers.
+#
+# These helpers keep the append logic out of ``agent_node`` so the node
+# stays readable.  Every function here is best-effort: all DB errors are
+# swallowed inside :class:`ConversationLogRepository` itself (see its
+# failure envelope).  None of these helpers ever raise.
+# ---------------------------------------------------------------------------
+
+
+def _convlog_origin_ref_for_message(msg: BaseMessage) -> str:
+    """Return a stable origin_ref for a LangChain message.
+
+    LangChain messages freshly constructed by the worker (e.g. a new
+    ``HumanMessage(content=...)``) have ``msg.id = None``; we substitute
+    ``f"seed:{uuid4()}"`` so the SHA-256 idempotency key is stable and
+    distinct across messages.  The generated UUID is persisted on the
+    message object (``msg.id``) so a super-step retry reuses the same
+    message instance and therefore the same idempotency key — the
+    ``ON CONFLICT DO NOTHING`` path then deduplicates correctly.
+    """
+    if getattr(msg, "id", None):
+        return str(msg.id)
+    seed = f"seed:{uuid.uuid4()}"
+    try:
+        msg.id = seed  # type: ignore[attr-defined]
+    except Exception:
+        # Defensive: if the underlying pydantic model forbids mutation,
+        # fall through with the generated seed.  Retries will produce a
+        # different key on this one message; ON CONFLICT then leaves the
+        # first write in place as the canonical row.
+        pass
+    return seed
+
+
+async def _convlog_append_pre_llm_turns(
+    repo: ConversationLogRepository,
+    *,
+    task_id: str,
+    tenant_id: str,
+    checkpoint_id: str | None,
+    messages: list[BaseMessage],
+    last_super_step_message_count: int,
+) -> None:
+    """Append one entry per NEW ``HumanMessage`` / ``ToolMessage`` in this super-step.
+
+    ``SystemMessage`` instances are intentionally excluded — they are
+    platform or agent config, not user-facing conversation.  ``AIMessage``
+    is also excluded here; it is appended separately after the LLM call.
+
+    The slice is computed against ``state["messages"]`` (NOT the locally-
+    prepended ``messages`` variable that may carry transient system
+    prompts); the caller guarantees that.
+    """
+    new_slice = messages[last_super_step_message_count:]
+    for msg in new_slice:
+        if isinstance(msg, SystemMessage):
+            continue
+        if isinstance(msg, HumanMessage):
+            origin_ref = _convlog_origin_ref_for_message(msg)
+            key = _convlog_key(
+                task_id=task_id,
+                checkpoint_id=checkpoint_id,
+                origin_ref=origin_ref,
+            )
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            await repo.append_entry(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=checkpoint_id,
+                idempotency_key=key,
+                kind="user_turn",
+                role="user",
+                content={"text": text},
+            )
+        elif isinstance(msg, ToolMessage):
+            origin_ref = _convlog_origin_ref_for_message(msg)
+            key = _convlog_key(
+                task_id=task_id,
+                checkpoint_id=checkpoint_id,
+                origin_ref=origin_ref,
+            )
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # v1: we do not preserve the per-tool-result CapEvent on the
+            # ToolMessage, so capped/orig_bytes are reported from the
+            # post-cap text.  Phase 3+ blob-offload will carry cap
+            # metadata explicitly.
+            orig_bytes = len(text.encode("utf-8"))
+            await repo.append_entry(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=checkpoint_id,
+                idempotency_key=key,
+                kind="tool_result",
+                role="tool",
+                content={
+                    "call_id": getattr(msg, "tool_call_id", "") or "",
+                    "tool_name": getattr(msg, "name", "") or "",
+                    "text": text,
+                    "is_error": bool(getattr(msg, "status", "success") == "error"),
+                },
+                metadata={"orig_bytes": orig_bytes, "capped": False},
+            )
+
+
+async def _convlog_append_llm_response(
+    repo: ConversationLogRepository,
+    *,
+    task_id: str,
+    tenant_id: str,
+    checkpoint_id: str | None,
+    response: AIMessage,
+) -> None:
+    """Append one ``agent_turn`` for the AIMessage text + one ``tool_call`` per tool call."""
+    msg_id = _convlog_origin_ref_for_message(response)
+    text = response.content if isinstance(response.content, str) else ""
+    agent_key = _convlog_key(
+        task_id=task_id,
+        checkpoint_id=checkpoint_id,
+        origin_ref=msg_id,
+    )
+    finish_reason = None
+    try:
+        rm = response.response_metadata or {}
+        finish_reason = (
+            rm.get("finish_reason")
+            or rm.get("stop_reason")
+            or None
+        )
+    except Exception:
+        finish_reason = None
+    await repo.append_entry(
+        task_id=task_id,
+        tenant_id=tenant_id,
+        checkpoint_id=checkpoint_id,
+        idempotency_key=agent_key,
+        kind="agent_turn",
+        role="assistant",
+        content={"text": text or ""},
+        metadata={"message_id": msg_id, "finish_reason": finish_reason},
+    )
+
+    for call in getattr(response, "tool_calls", None) or []:
+        # ``call`` may be a dict (``{"name": ..., "args": ..., "id": ...}``)
+        # or a LangChain ToolCall TypedDict — both expose key access.
+        call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
+        args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
+        origin = call_id or f"{msg_id}:{name}"
+        tc_key = _convlog_key(
+            task_id=task_id,
+            checkpoint_id=checkpoint_id,
+            origin_ref=f"toolcall:{origin}",
+        )
+        # json.dumps with default=str per spec §Content schema, applied
+        # here so the append_entry payload is pure dict already.
+        try:
+            args_safe = json.loads(json.dumps(args, default=str))
+        except Exception:
+            args_safe = {"__unserializable__": str(args)}
+        await repo.append_entry(
+            task_id=task_id,
+            tenant_id=tenant_id,
+            checkpoint_id=checkpoint_id,
+            idempotency_key=tc_key,
+            kind="tool_call",
+            role="assistant",
+            content={
+                "tool_name": name or "",
+                "args": args_safe,
+                "call_id": call_id or "",
+            },
+            metadata={"message_id": msg_id},
+        )
+
+
+async def _convlog_append_compaction_events(
+    repo: ConversationLogRepository,
+    *,
+    task_id: str,
+    tenant_id: str,
+    checkpoint_id: str | None,
+    events: list,
+    summarized_through_before: int,
+    summary_marker_before: str,
+    summary_marker_after: str,
+) -> None:
+    """Append one entry per Tier3Fired / MemoryFlushFired event from the pipeline.
+
+    Tier1/Tier1.5 events are intentionally skipped — spec says those are
+    invisible to the user.
+    """
+    for ev in events:
+        if isinstance(ev, Tier3FiredEvent):
+            # Compute the summary_text as the delta that was just
+            # appended to the marker (summary_marker is strict-append).
+            if summary_marker_before and summary_marker_after.startswith(summary_marker_before):
+                summary_text = summary_marker_after[len(summary_marker_before):]
+            else:
+                summary_text = summary_marker_after
+            origin = f"tier3:{summarized_through_before}->{ev.new_summarized_through}"
+            key = _convlog_key(
+                task_id=task_id,
+                checkpoint_id=checkpoint_id,
+                origin_ref=origin,
+            )
+            await repo.append_entry(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=checkpoint_id,
+                idempotency_key=key,
+                kind="compaction_boundary",
+                role="system",
+                content={
+                    "summary_text": summary_text,
+                    "first_turn_index": int(summarized_through_before),
+                    "last_turn_index": int(ev.new_summarized_through),
+                },
+                metadata={
+                    "summarizer_model": ev.summarizer_model_id,
+                    "turns_summarized": int(ev.new_summarized_through - summarized_through_before),
+                    "summary_bytes": len(summary_text.encode("utf-8")),
+                    "tokens_in": int(ev.tokens_in),
+                    "tokens_out": int(ev.tokens_out),
+                },
+            )
+        elif isinstance(ev, MemoryFlushFiredEvent):
+            origin = f"flush:{checkpoint_id or 'init'}"
+            key = _convlog_key(
+                task_id=task_id,
+                checkpoint_id=checkpoint_id,
+                origin_ref=origin,
+            )
+            await repo.append_entry(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=checkpoint_id,
+                idempotency_key=key,
+                kind="memory_flush",
+                role="system",
+                content={},
+                metadata={"fired_at_step": int(ev.fired_at_step)},
+            )
+
+
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
+
+    # Track 7 — fallback when a model is missing from the ``models`` table
+    # or has a NULL ``context_window``. 128_000 is the platform floor: the
+    # model-discovery service filters out sub-128K legacy models
+    # (``DEACTIVATE_MODEL_IDS`` in services/model-discovery/main.py) before
+    # they reach the table, so any active row is expected to support ≥128K.
+    # A WARN below logs every fallback so operators can detect and fix
+    # config holes (e.g. a brand-new provider model not yet in
+    # ``CONTEXT_WINDOW_DEFAULTS``).
+    _DEFAULT_MODEL_CONTEXT_WINDOW: int = 128_000
 
     def __init__(self, config: WorkerConfig, pool: asyncpg.Pool, deps=None, s3_client=None):
         self.config = config
@@ -281,11 +614,25 @@ class GraphExecutor:
         cancel_event: asyncio.Event,
         task_id: str,
         tenant_id: str = "default",
+        agent_id: str = "unknown",
         sandbox=None,
         s3_client=None,
     ) -> list[StructuredTool]:
+        # Shorthand: build a per-tool-result cap decorator bound to this task's
+        # context.  Every tool coroutine is wrapped so its return value is
+        # head+tail capped to PER_TOOL_RESULT_CAP_BYTES before the ToolNode
+        # sees it.  The cap is Track 7 Tier 0 — always-on, no opt-out.
+        def _cap(name: str):
+            return _apply_result_cap(
+                name,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )
+
         tools = []
         if "web_search" in allowed_tools:
+            @_cap("web_search")
             async def web_search(query: str, max_results: int = 5):
                 results = await self._await_or_cancel(
                     self.deps.search_provider.search(query, max_results),
@@ -302,6 +649,7 @@ class GraphExecutor:
             ))
 
         if "read_url" in allowed_tools:
+            @_cap("read_url")
             async def read_url(url: str, max_chars: int = 5000):
                 result = await self._await_or_cancel(
                     self.deps.read_url_fetcher.fetch(url, max_chars),
@@ -318,14 +666,19 @@ class GraphExecutor:
             ))
 
         if "request_human_input" in allowed_tools:
+            @_cap("request_human_input")
+            async def _request_human_input_capped(*args, **kwargs):
+                # request_human_input is a sync function; wrap it for cap.
+                return request_human_input(*args, **kwargs)
             tools.append(StructuredTool.from_function(
-                func=request_human_input,
+                coroutine=_request_human_input_capped,
                 name="request_human_input",
                 description=REQUEST_HUMAN_INPUT_TOOL.description,
                 args_schema=RequestHumanInputArguments,
             ))
 
         if dev_task_controls_enabled() and "dev_sleep" in allowed_tools:
+            @_cap("dev_sleep")
             async def dev_sleep(seconds: int = 10):
                 await self._await_or_cancel(
                     asyncio.sleep(seconds),
@@ -351,6 +704,7 @@ class GraphExecutor:
                 execute_create_text_artifact,
             )
 
+            @_cap("create_text_artifact")
             async def create_text_artifact(
                 filename: str,
                 content: str,
@@ -379,6 +733,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_exec" in allowed_tools:
             exec_fn = create_sandbox_exec_fn(sandbox)
 
+            @_cap("sandbox_exec")
             async def sandbox_exec_wrapper(command: str):
                 return await self._await_or_cancel(
                     exec_fn(command),
@@ -397,6 +752,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_read_file" in allowed_tools:
             read_fn = create_sandbox_read_file_fn(sandbox)
 
+            @_cap("sandbox_read_file")
             async def sandbox_read_file_wrapper(path: str):
                 return await self._await_or_cancel(
                     read_fn(path),
@@ -415,6 +771,7 @@ class GraphExecutor:
         if sandbox is not None and "sandbox_write_file" in allowed_tools:
             write_fn = create_sandbox_write_file_fn(sandbox)
 
+            @_cap("sandbox_write_file")
             async def sandbox_write_file_wrapper(path: str, content: str):
                 return await self._await_or_cancel(
                     write_fn(path, content),
@@ -439,6 +796,7 @@ class GraphExecutor:
                 tenant_id=tenant_id,
             )
 
+            @_cap("export_sandbox_file")
             async def export_sandbox_file_wrapper(path: str, filename: str | None = None):
                 return await self._await_or_cancel(
                     export_fn(path, filename),
@@ -471,6 +829,7 @@ class GraphExecutor:
         memory_decision: MemoryDecision | None = None,
         task_input: str | None = None,
         checkpointer: PostgresDurableCheckpointer | None = None,
+        model_context_window: int = 128_000,
     ) -> StateGraph:
         """Assembles the LangGraph state machine and binds MCP tools."""
         provider = agent_config.get("provider", "anthropic")
@@ -496,6 +855,7 @@ class GraphExecutor:
             cancel_event=cancel_event,
             task_id=task_id,
             tenant_id=tenant_id,
+            agent_id=agent_id,
             sandbox=sandbox,
             s3_client=s3_client,
         )
@@ -527,15 +887,55 @@ class GraphExecutor:
             await_or_cancel_fn=self._await_or_cancel,
             checkpointer=checkpointer,
         )
-        tools = tools + build_memory_tools(
+        # Track 7 Tier 0: helper to cap any StructuredTool whose coroutine is
+        # not yet wrapped.  Used below for memory tools and MCP tools, which
+        # are built outside _get_tools.
+        def _wrap_tool_with_cap(structured_tool: StructuredTool) -> StructuredTool:
+            """Return a copy of *structured_tool* whose coroutine is capped."""
+            tool_nm = structured_tool.name
+            original_coro = structured_tool.coroutine
+            if original_coro is None:
+                # Sync tool — wrap its func instead.
+                original_func = structured_tool.func
+
+                @_apply_result_cap(
+                    tool_nm,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+                async def _capped_sync(*args, **kwargs):
+                    return original_func(*args, **kwargs)
+
+                return StructuredTool.from_function(
+                    coroutine=_capped_sync,
+                    name=structured_tool.name,
+                    description=structured_tool.description or "",
+                    args_schema=structured_tool.args_schema,
+                )
+            wrapped_coro = _apply_result_cap(
+                tool_nm,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )(original_coro)
+            return StructuredTool.from_function(
+                coroutine=wrapped_coro,
+                name=structured_tool.name,
+                description=structured_tool.description or "",
+                args_schema=structured_tool.args_schema,
+            )
+
+        raw_memory_tools = build_memory_tools(
             memory_tool_ctx,
             stack_enabled=decision.stack_enabled,
             auto_write=decision.auto_write,
         )
+        tools = tools + [_wrap_tool_with_cap(t) for t in raw_memory_tools]
 
-        # Merge custom tools from MCP servers
+        # Merge custom tools from MCP servers — cap each one.
         if custom_tools:
-            tools = tools + custom_tools
+            tools = tools + [_wrap_tool_with_cap(t) for t in custom_tools]
 
         # Enforce tool count limit
         if len(tools) > MAX_TOOLS_PER_AGENT:
@@ -549,7 +949,76 @@ class GraphExecutor:
         else:
             llm_with_tools = llm
 
-        async def agent_node(state: MessagesState, config: RunnableConfig):
+        # Pool-backed adapter so the Tier-3 summariser can write a cost-ledger
+        # row without knowing about asyncpg connection management.  Without
+        # this, `task_context["cost_ledger"]` was None and the first Tier 3
+        # firing raised AttributeError inside `summarize_slice`, which the
+        # summariser treats as a fatal skip — permanently short-circuiting
+        # Tier 3 for the rest of the task and forcing hard-floor dead-letters.
+        _graph_pool = self.pool
+
+        class _PoolBackedCostLedger:
+            async def insert(
+                self,
+                *,
+                tenant_id: str,
+                agent_id: str,
+                task_id: str,
+                checkpoint_id: str | None,
+                cost_microdollars: int,
+                operation: str,
+                model_id: str | None = None,
+                tokens_in: int = 0,
+                tokens_out: int = 0,
+                summarized_through_turn_index_after: int | None = None,
+            ) -> None:
+                # The ledger column is TEXT NOT NULL. When LangGraph has not
+                # yet assigned a checkpoint id (first super-step, or certain
+                # retry paths), use a deterministic placeholder per firing so
+                # the partial unique index on
+                # (tenant_id, task_id, checkpoint_id, operation, summarized_through_turn_index_after)
+                # still dedups crash-retries correctly.
+                effective_ckpt = checkpoint_id or (
+                    f"compaction:{summarized_through_turn_index_after}"
+                    if summarized_through_turn_index_after is not None
+                    else "compaction:unknown"
+                )
+                async with _graph_pool.acquire() as conn:
+                    await insert_cost_row(
+                        conn,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        checkpoint_id=effective_ckpt,
+                        cost_microdollars=cost_microdollars,
+                        operation=operation,
+                        model_id=model_id,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        summarized_through_turn_index_after=summarized_through_turn_index_after,
+                    )
+
+        _compaction_cost_ledger = _PoolBackedCostLedger()
+
+        # `checkpoint_id` is resolved per-invocation from the RunnableConfig
+        # inside agent_node, not captured here — see line below where
+        # task_context is shallow-copied with the live value.
+        task_context = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "task_id": task_id,
+            "checkpoint_id": None,
+            "cost_ledger": _compaction_cost_ledger,
+            "callbacks": [],
+        }
+
+        # Track 7 Task 13 — user-facing conversation-log repo.  Appends are
+        # best-effort; all DB errors are swallowed inside the repo so a log
+        # failure never fails the task.
+        conversation_log_repo = ConversationLogRepository(self.pool)
+        self._last_conversation_log_repo = conversation_log_repo
+
+        async def agent_node(state: RuntimeState, config: RunnableConfig):
             messages = state["messages"]
             if not any(isinstance(m, SystemMessage) for m in messages):
                 sys_messages = []
@@ -559,18 +1028,166 @@ class GraphExecutor:
                     sys_messages.append(SystemMessage(content=platform_system_msg))
                 messages = sys_messages + messages
 
+            # Track 7 Task 13 — dual-write BEFORE compact_for_llm fires so
+            # the conversation log holds the raw view of the super-step's
+            # new turns (not the compacted model view).  Slice is computed
+            # against ``state["messages"]`` (which excludes any transient
+            # SystemMessage prepended to the local ``messages`` variable).
+            _raw_state_messages = state["messages"]
+            _last_count = state.get("last_super_step_message_count", 0) or 0
+            # Attempt to read a LangGraph-assigned checkpoint id off the
+            # runnable config.  When absent (first turn / pre-Task-10),
+            # append_entry substitutes the literal "init" via the shared
+            # idempotency-key formula.
+            _convlog_ckpt_id = None
+            try:
+                _convlog_ckpt_id = (
+                    (config.get("configurable") or {}).get("checkpoint_id")
+                    if isinstance(config, dict)
+                    else None
+                )
+            except Exception:
+                _convlog_ckpt_id = None
+
+            await _convlog_append_pre_llm_turns(
+                conversation_log_repo,
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=_convlog_ckpt_id,
+                messages=_raw_state_messages,
+                last_super_step_message_count=_last_count,
+            )
+
+            # Capture watermark values BEFORE compaction so we can compute
+            # the compaction_boundary delta after the pipeline returns.
+            _summary_marker_before = state.get("summary_marker") or ""
+            _summarized_through_before = int(
+                state.get("summarized_through_turn_index", 0) or 0
+            )
+
+            # Shallow-copy the shared task_context with the live checkpoint_id
+            # so the Tier 3 summariser writes a cost-ledger row tagged to the
+            # right checkpoint.  Falls back to None (adapter substitutes a
+            # deterministic placeholder so the INSERT still dedups correctly).
+            _per_call_task_context = {**task_context, "checkpoint_id": _convlog_ckpt_id}
+
+            # Track 7 Task 8 — run compaction pipeline before every LLM call.
+            # The pipeline is pure: it returns the compacted message view, a
+            # state_updates dict (watermarks, summary_marker, etc.), and a list
+            # of structured-log events.  We emit those events here so the
+            # pipeline module itself has zero logger coupling.
+            pass_result = await compact_for_llm(
+                raw_messages=messages,
+                state=state,
+                agent_config=agent_config,
+                model_context_window=model_context_window,
+                task_context=_per_call_task_context,
+                summarizer=summarize_slice,
+                estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+            )
+            messages_for_llm = pass_result.messages
+            compaction_state_updates = pass_result.state_updates
+
+            # Emit structured-log events from the pipeline and raise immediately
+            # on HardFloorEvent — single pass avoids re-iterating the list.
+            for ev in pass_result.events:
+                if isinstance(ev, HardFloorEvent):
+                    _compaction_logger.warning(
+                        "compaction.hard_floor",
+                        est_tokens=ev.est_tokens,
+                        model_context_window=ev.model_context_window,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                    # Raise a sentinel exception so the astream loop can catch it
+                    # and invoke _handle_dead_letter.
+                    raise _ContextExceededIrrecoverableError(
+                        f"Context window exceeded irrecoverably: "
+                        f"{ev.est_tokens} tokens > {ev.model_context_window} window"
+                    )
+                elif isinstance(ev, Tier1AppliedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier1_applied",
+                        messages_cleared=ev.messages_cleared,
+                        est_tokens_saved=ev.est_tokens_saved,
+                        new_watermark=ev.new_watermark,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier15AppliedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier15_applied",
+                        args_truncated=ev.args_truncated,
+                        bytes_saved=ev.bytes_saved,
+                        new_watermark=ev.new_watermark,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier3FiredEvent):
+                    _compaction_logger.info(
+                        "compaction.tier3_fired",
+                        summarizer_model_id=ev.summarizer_model_id,
+                        tokens_in=ev.tokens_in,
+                        tokens_out=ev.tokens_out,
+                        new_summarized_through=ev.new_summarized_through,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+                elif isinstance(ev, Tier3SkippedEvent):
+                    _compaction_logger.info(
+                        "compaction.tier3_skipped",
+                        reason=ev.reason,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                    )
+
+            # Track 7 Task 13 — mirror Tier3Fired / MemoryFlushFired events
+            # into the user-facing conversation log.  Tier 1 / Tier 1.5 are
+            # intentionally invisible (see task-13 spec §Design principle).
+            _summary_marker_after = (
+                compaction_state_updates.get("summary_marker")
+                or _summary_marker_before
+            )
+            await _convlog_append_compaction_events(
+                conversation_log_repo,
+                task_id=task_id,
+                tenant_id=tenant_id,
+                checkpoint_id=_convlog_ckpt_id,
+                events=pass_result.events,
+                summarized_through_before=_summarized_through_before,
+                summary_marker_before=_summary_marker_before,
+                summary_marker_after=_summary_marker_after,
+            )
+
             # Retry on rate limits inside the execution loop instead of
             # crashing and burning a task-level retry.
             max_rate_limit_retries = 5
             for attempt in range(max_rate_limit_retries + 1):
                 try:
                     response = await self._await_or_cancel(
-                        llm_with_tools.ainvoke(messages, config),
+                        llm_with_tools.ainvoke(messages_for_llm, config),
                         cancel_event,
                         task_id=task_id,
                         operation="agent",
                     )
-                    return {"messages": [response]}
+                    # Track 7 Task 13 — append the agent's response and any
+                    # tool-call requests to the user-facing conversation log
+                    # BEFORE returning (and therefore before LangGraph
+                    # commits the super-step's checkpoint).  Idempotency-key
+                    # dedup handles retry-after-crash correctly.
+                    await _convlog_append_llm_response(
+                        conversation_log_repo,
+                        task_id=task_id,
+                        tenant_id=tenant_id,
+                        checkpoint_id=_convlog_ckpt_id,
+                        response=response,
+                    )
+                    return {"messages": [response], **compaction_state_updates}
                 except Exception as e:
                     if self._is_rate_limit_error(e) and attempt < max_rate_limit_retries:
                         backoff = self._get_retry_after(e) or min(30, 5 * (2 ** attempt))
@@ -588,15 +1205,14 @@ class GraphExecutor:
                     raise
 
         # Define the Graph layout.
-        # When the stack is enabled (``agent.memory.enabled`` AND
-        # ``memory_mode ∈ {always, agent_decides}``), we register a custom
-        # state schema (MemoryEnabledState) which adds ``observations``,
-        # ``pending_memory``, and ``memory_opt_in`` fields. Memory-disabled
-        # tasks (including ``memory_mode='skip'``) keep using the stock
-        # ``MessagesState`` — identical to pre-Track-5 behaviour.
+        # All tasks — memory-enabled and memory-disabled alike — use the
+        # unified ``RuntimeState`` schema (Track 7 Task 2 refactor). The
+        # ``stack_enabled`` flag still gates *topology* (whether the
+        # ``memory_write`` node is wired and memory tools are registered);
+        # only the *schema* is now unconditionally ``RuntimeState``.
         stack_enabled = decision.stack_enabled
         auto_write = decision.auto_write
-        state_type = MemoryEnabledState if stack_enabled else MessagesState
+        state_type = RuntimeState
         workflow = StateGraph(state_type)
         workflow.add_node("agent", agent_node, input_schema=state_type)
 
@@ -724,6 +1340,46 @@ class GraphExecutor:
 
         self._cost_rate_cache[model_name] = rates
         return rates
+
+    async def _get_model_context_window(self, model_name: str) -> int:
+        """Fetch the context window token count for a model from the models table.
+
+        Returns the model's ``context_window`` column value, or the
+        platform floor (128_000) when the model is unknown.  Logs a
+        structured warning when the default fires so operators can act.
+
+        This value is resolved once at graph-build time (``execute_task``)
+        and passed into ``_build_graph`` so ``compact_for_llm`` always has
+        a known-good value without an extra DB round-trip per LLM call.
+        """
+        try:
+            row = await self.pool.fetchrow(
+                "SELECT context_window FROM models WHERE model_id = $1",
+                model_name,
+            )
+            if row is None or row["context_window"] is None:
+                # WARN (not INFO): a fallback means the model isn't in the
+                # ``models`` table or its ``context_window`` is NULL.
+                # Discovery should populate this; if it doesn't, the model-
+                # discovery service's CONTEXT_WINDOW_DEFAULTS / FALLBACKS
+                # (services/model-discovery/main.py) need an entry, or the
+                # agent is pointing at a model_id discovery never saw. A
+                # config hole operators should fix — not a routine event.
+                _compaction_logger.warning(
+                    "compaction.model_context_window_unknown",
+                    model=model_name,
+                    fallback=self._DEFAULT_MODEL_CONTEXT_WINDOW,
+                )
+                return self._DEFAULT_MODEL_CONTEXT_WINDOW
+            return int(row["context_window"])
+        except Exception:
+            logger.warning(
+                "Failed to fetch context_window for model %s; using default %d",
+                model_name,
+                self._DEFAULT_MODEL_CONTEXT_WINDOW,
+                exc_info=True,
+            )
+            return self._DEFAULT_MODEL_CONTEXT_WINDOW
 
     @staticmethod
     def _extract_tokens(metadata: dict) -> tuple[int, int]:
@@ -1594,6 +2250,13 @@ class GraphExecutor:
                 tenant_id=tenant_id
             )
 
+            # Track 7 Task 8 — resolve model context window once at graph-build
+            # time (not per LLM call) and cache it for the lifetime of this
+            # execute_task invocation.  Passed through to compact_for_llm via
+            # _build_graph so agent_node always has the right value.
+            _model_name_for_ctx = agent_config.get("model", "claude-3-5-sonnet-latest")
+            _model_context_window = await self._get_model_context_window(_model_name_for_ctx)
+
             # 3. Build & Compile graph
             graph = await self._build_graph(
                 agent_config,
@@ -1608,6 +2271,7 @@ class GraphExecutor:
                 memory_decision=memory_decision,
                 task_input=task_input,
                 checkpointer=checkpointer,
+                model_context_window=_model_context_window,
             )
             compiled_graph = graph.compile(checkpointer=checkpointer)
 
@@ -1734,15 +2398,41 @@ class GraphExecutor:
 
                 initial_input: Any
                 if first_execution:
-                    _payload: dict[str, Any] = {"messages": initial_messages}
-                    if memory_enabled_for_task and seeded_observations:
-                        _payload["observations"] = list(seeded_observations)
-                    # Phase 2 Track 5 Task 12 — per-run reset of the
-                    # ``agent_decides`` opt-in flag. The field has no reducer
-                    # (last-write-wins), so seeding ``False`` here guarantees
-                    # the agent must re-earn the opt-in on each run.
-                    if memory_enabled_for_task:
-                        _payload["memory_opt_in"] = False
+                    # Track 7 Task 2 — seed ALL RuntimeState fields with
+                    # reducer-safe defaults so every task graph starts from a
+                    # known-good state regardless of memory stack enablement.
+                    # LangGraph tolerates extra keys; memory-disabled tasks
+                    # simply never overwrite these fields.
+                    _observations: list[str] = (
+                        list(seeded_observations)
+                        if memory_enabled_for_task and seeded_observations
+                        else []
+                    )
+                    _payload: dict[str, Any] = {
+                        "messages": initial_messages,
+                        "observations": _observations,
+                        "pending_memory": {},
+                        # Phase 2 Track 5 Task 12 — per-run reset of the
+                        # ``agent_decides`` opt-in flag. The field has no
+                        # reducer (last-write-wins), so seeding ``False`` here
+                        # guarantees the agent must re-earn the opt-in on each
+                        # run.
+                        "memory_opt_in": False,
+                        # Track 7 Task 8 — seed ALL compaction watermarks at
+                        # reducer-safe defaults so every task graph starts from
+                        # a known-good state.  Reducer-annotated fields use the
+                        # seed only on the FIRST write; subsequent node returns
+                        # go through the reducer (max / any / strict-append).
+                        # MUST be 0 / "" / False — NEVER None.
+                        "cleared_through_turn_index": 0,
+                        "truncated_args_through_turn_index": 0,
+                        "summarized_through_turn_index": 0,
+                        "summary_marker": "",
+                        "memory_flush_fired_this_task": False,
+                        "last_super_step_message_count": 0,
+                        "tier3_firings_count": 0,
+                        "tier3_fatal_short_circuited": False,
+                    }
                     initial_input = _payload
                 else:
                     initial_input = None
@@ -1754,23 +2444,71 @@ class GraphExecutor:
                     )
                     if human_response:
                         payload = json.loads(human_response)
+                        # Track 7 Task 13 — append hitl_resume to the
+                        # user-facing conversation log.  One append per
+                        # resume per checkpoint (idempotency-key scoped).
+                        try:
+                            convlog_repo = ConversationLogRepository(self.pool)
+                            checkpoint_id_for_resume = (
+                                await fetch_latest_checkpoint_id(self.pool, task_id)
+                            )
+                            payload_kind = payload.get("kind", "input")
+                            if payload_kind == "approval":
+                                resolution = (
+                                    "approved"
+                                    if bool(payload.get("approved"))
+                                    else "rejected"
+                                )
+                            elif payload_kind == "follow_up":
+                                resolution = "follow_up"
+                            else:
+                                resolution = "modified" if payload.get("message") else "cancelled"
+                            user_note = payload.get("message") if isinstance(payload.get("message"), str) else None
+                            origin_ref = f"hitl_resume:{checkpoint_id_for_resume or 'init'}"
+                            resume_key = _convlog_key(
+                                task_id=task_id,
+                                checkpoint_id=checkpoint_id_for_resume,
+                                origin_ref=origin_ref,
+                            )
+                            await convlog_repo.append_entry(
+                                task_id=task_id,
+                                tenant_id=tenant_id,
+                                checkpoint_id=checkpoint_id_for_resume,
+                                idempotency_key=resume_key,
+                                kind="hitl_resume",
+                                role="system",
+                                content={
+                                    "resolution": resolution,
+                                    "user_note": user_note,
+                                },
+                                metadata={
+                                    "resolved_by": "user",
+                                    "resolved_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                        except Exception:
+                            logger.warning(
+                                "conversation_log hitl_resume append skipped",
+                                exc_info=True,
+                            )
                         # Decode the documented HITL resume payload
                         # {"kind":"follow_up","message":"..."} -> inject new HumanMessage
                         # {"kind":"input","message":"blue"} -> resume value is the message
                         # {"kind":"approval","approved":true} -> resume value is the payload itself
                         if payload.get("kind") == "follow_up":
-                            # Follow-up: inject new HumanMessage into existing conversation
-                            # Reset the opt-in flag so follow-up runs must
-                            # re-earn it (Task 12 per-run reset invariant).
+                            # Follow-up: inject new HumanMessage into existing
+                            # conversation. Reset the opt-in flag so follow-up
+                            # runs must re-earn it (Task 12 per-run reset
+                            # invariant). Track 7 Task 2: always include the
+                            # field — memory-disabled tasks simply hold False.
                             follow_up_payload: dict[str, Any] = {
                                 "messages": [
                                     HumanMessage(
                                         content=payload.get("message", "")
                                     )
-                                ]
+                                ],
+                                "memory_opt_in": False,
                             }
-                            if memory_enabled_for_task:
-                                follow_up_payload["memory_opt_in"] = False
                             initial_input = follow_up_payload
                         elif payload.get("kind") == "input":
                             resume_value = payload.get("message", "")
@@ -1814,7 +2552,16 @@ class GraphExecutor:
                     # explicit check provides defense in depth in case the
                     # pause enforcement ever widens to fire on non-agent
                     # nodes.
+                    # Track 7 Task 8: same carve-out for ``compaction.tier3``
+                    # — the Tier 3 summarizer LLM cost is written directly to
+                    # the cost ledger by ``summarize_slice`` (Task 7); it must
+                    # NOT also trip the per-task budget pause here.  The
+                    # "compaction.tier3" key is used as the operation tag in
+                    # the cost-ledger row and appears as the event key in
+                    # the astream update dict when the summarizer runs.
                     if MEMORY_WRITE_NODE_NAME in event:
+                        continue
+                    if "compaction.tier3" in event:
                         continue
 
                     # Per-checkpoint incremental cost tracking
@@ -2180,6 +2927,22 @@ class GraphExecutor:
             )
         except GraphInterrupt as gi:
             await self._handle_interrupt(task_data, gi, worker_id)
+        except _ContextExceededIrrecoverableError as e:
+            # Track 7 Task 8: compaction hard-floor — context window exceeded
+            # irrecoverably after all tiers.  Dead-letter with the dedicated
+            # reason code so operators can distinguish this from general errors.
+            await self._handle_dead_letter(
+                task_id, tenant_id, agent_id,
+                DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
+                str(e),
+                error_code=DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
+                memory_enabled=memory_enabled_for_task,
+                memory_mode=memory_mode,
+                agent_config=agent_config,
+                task_input=task_input,
+                retry_count=task_data.get("retry_count", 0),
+                checkpointer=checkpointer,
+            )
         except LeaseRevokedException:
             # Lease was explicitly stripped before a checkpoint write
             logger.warning("Task %s raised LeaseRevokedException, stopping gracefully.", task_id)
@@ -2371,10 +3134,23 @@ class GraphExecutor:
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
         # Check exception type first (most reliable signal)
-        if isinstance(e, ToolTransportError):
+        if isinstance(e, (ToolTransportError, McpToolCallError)):
             return True
         if isinstance(e, (ConnectionError, TimeoutError)):
             return True
+        # botocore timeouts: botocore.exceptions.ReadTimeoutError /
+        # ConnectTimeoutError do NOT inherit from Python's builtin
+        # TimeoutError (urllib3 defines its own same-named base). Import
+        # lazily to avoid coupling the generic classifier to a specific
+        # provider SDK at module-load time.
+        try:
+            from botocore.exceptions import ReadTimeoutError as _BotoReadTimeoutError
+            from botocore.exceptions import ConnectTimeoutError as _BotoConnectTimeoutError
+
+            if isinstance(e, (_BotoReadTimeoutError, _BotoConnectTimeoutError)):
+                return True
+        except ImportError:
+            pass
 
         # Use HTTP status code from the provider exception if available
         status = self._extract_status_code(e)
@@ -2387,6 +3163,12 @@ class GraphExecutor:
         if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
             return True
         if re.search(r'\b50[0234]\b', error_str):
+            return True
+        # Network-timeout phrasing produced by botocore / httpx / urllib3
+        # when no HTTP status was received. Matches the exact prefixes
+        # "Read timeout" and "Connect timeout" to avoid overmatching
+        # unrelated error strings that happen to contain the word "timeout".
+        if "read timeout" in error_str or "connect timeout" in error_str:
             return True
         if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
             return False
@@ -2607,6 +3389,56 @@ class GraphExecutor:
             logger.warning("Task %s interrupt handling skipped: lease no longer owned by this worker.", task_id)
         else:
             logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
+            # Track 7 Task 13 — append hitl_pause to the user-facing
+            # conversation log.  Idempotency key is scoped to the
+            # checkpoint id (pause per checkpoint fires exactly once).
+            try:
+                convlog_repo = ConversationLogRepository(self.pool)
+                checkpoint_id = await fetch_latest_checkpoint_id(self.pool, task_id)
+                prompt_for_log = (
+                    original_tool_prompt
+                    if original_tool_prompt is not None
+                    else interrupt_data.get("prompt", "") or ""
+                )
+                reason_for_log = (
+                    "tool_requires_approval"
+                    if interrupt_type == "approval"
+                    else interrupt_data.get("reason", "agent_requested")
+                )
+                tool_name_for_log = None
+                if isinstance(interrupt_data, dict):
+                    tool_name_for_log = (
+                        interrupt_data.get("tool_name")
+                        or (interrupt_data.get("action") or {}).get("tool_name")
+                    )
+                origin_ref = f"hitl_pause:{checkpoint_id or 'init'}"
+                key = _convlog_key(
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    origin_ref=origin_ref,
+                )
+                await convlog_repo.append_entry(
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    checkpoint_id=checkpoint_id,
+                    idempotency_key=key,
+                    kind="hitl_pause",
+                    role="system",
+                    content={
+                        "reason": reason_for_log,
+                        "prompt_to_user": prompt_for_log if prompt_for_log else None,
+                    },
+                    metadata={
+                        "checkpoint_id": checkpoint_id or "",
+                        "tool_name": tool_name_for_log,
+                    },
+                )
+            except Exception:
+                # Best-effort — never fail the pause path.
+                logger.warning(
+                    "conversation_log hitl_pause append skipped",
+                    exc_info=True,
+                )
 
     async def _handle_retryable_error(
         self,
