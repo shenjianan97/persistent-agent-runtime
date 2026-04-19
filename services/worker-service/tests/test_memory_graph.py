@@ -2,7 +2,7 @@
 
 Covers the ``memory_write`` LangGraph node and its fallback helper:
 
-- ``MemoryEnabledState`` carries ``observations`` and ``pending_memory`` fields,
+- ``RuntimeState`` carries ``observations`` and ``pending_memory`` fields,
   with ``operator.add`` as the reducer on ``observations`` — appending a single
   note via ``Command(update=...)`` preserves prior notes.
 - ``memory_write_node`` on the happy path calls the injected summarizer
@@ -28,10 +28,10 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
+from executor.compaction.state import RuntimeState
 from executor.embeddings import EmbeddingResult
 from executor.memory_graph import (
     MemoryDecision,
-    MemoryEnabledState,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     build_pending_memory_template_fallback,
     effective_memory_decision,
@@ -178,7 +178,12 @@ class TestTemplateFallback:
         assert pm["summary"]
 
 
-class TestMemoryEnabledState:
+class TestRuntimeState:
+    """Track 7 Task 2 — exercises the ``RuntimeState`` unified schema
+    (``executor.compaction.state``).  The AC-5 manifest in
+    ``test_track5_ac_mapping.py`` references this class.
+    """
+
     def test_observations_reducer_is_operator_add(self) -> None:
         # LangGraph inspects the annotated metadata on the TypedDict key.
         # We verify the ``observations`` field was wired with ``operator.add``
@@ -186,7 +191,7 @@ class TestMemoryEnabledState:
         # ``Command(update={"observations": [note]})``.
         from typing import get_type_hints
 
-        hints = get_type_hints(MemoryEnabledState, include_extras=True)
+        hints = get_type_hints(RuntimeState, include_extras=True)
         obs_annotation = hints["observations"]
         # ``Annotated[list[str], operator.add]`` — the metadata tuple holds
         # operator.add as the reducer.
@@ -201,7 +206,7 @@ class TestMemoryEnabledState:
         """
         from typing import get_type_hints
 
-        hints = get_type_hints(MemoryEnabledState, include_extras=True)
+        hints = get_type_hints(RuntimeState, include_extras=True)
         assert "memory_opt_in" in hints
         opt_in_annotation = hints["memory_opt_in"]
         # Bare ``bool`` — no ``Annotated[..., reducer]`` metadata attached.

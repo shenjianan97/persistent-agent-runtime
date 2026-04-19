@@ -5,7 +5,7 @@ bound from the worker's **immutable** task context at registration time:
 
 1. ``memory_note(text)`` — state-mutating. Returns
    ``Command(update={"observations": [text]})`` so LangGraph's ``operator.add``
-   reducer on :class:`executor.memory_graph.MemoryEnabledState` merges the
+   reducer on :class:`executor.compaction.state.RuntimeState` merges the
    append. Zero cost (no LLM, no network).
 2. ``memory_search(query, mode='hybrid', limit=5)`` — delegates to the Memory
    REST API (Task 3) using the worker's HTTP client. The ``agent_id`` in the

@@ -3,7 +3,7 @@
 | Task | Component | Status | Description |
 |------|-----------|--------|-------------|
 | Task 1 | Agent Config Extension | Not started | `agent_config.context_management` sub-object (3 fields, no `enabled`): Jackson, validation, canonicalisation |
-| Task 2 | State Schema Unification | Not started | **Pure refactor.** Unified `RuntimeState` TypedDict replaces Track 5's binary `MemoryEnabledState if stack_enabled else MessagesState`. All existing Track 5 tests pass. Blocks every subsequent worker-side task. |
+| Task 2 | State Schema Unification | Done | **Pure refactor.** Unified `RuntimeState` TypedDict in `executor/compaction/state.py`. `MemoryEnabledState` deleted. All existing Track 5 tests pass (561 passed). `grep MemoryEnabledState services/worker-service` → zero hits. |
 | Task 3 | Compaction Constants + Thresholds | Not started | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()`; `PLATFORM_EXCLUDE_TOOLS` includes memory_search + task_history_get |
 | Task 4 | Per-Tool-Result Cap | Not started | `compaction/caps.py` head+tail byte cap; tool-wrapper integration |
 | Task 5 | Tier 1 Transform | Not started | `clear_tool_results()` pure function with monotone `cleared_through_turn_index` |

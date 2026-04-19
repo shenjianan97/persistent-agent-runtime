@@ -3,7 +3,7 @@
 Covers :func:`core.memory_repository.read_memory_observations_by_task_id`,
 the single source of truth for "what observations did the prior execution
 produce?". The worker reads this at the top of ``execute_task`` and seeds
-``MemoryEnabledState.observations`` via the graph's initial state argument
+``RuntimeState.observations`` via the graph's initial state argument
 so the ``operator.add`` reducer preserves prior observations across
 follow-up / redrive.
 
