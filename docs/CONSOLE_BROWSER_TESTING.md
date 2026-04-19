@@ -241,6 +241,26 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 5. Select `agent-memory-off`. Assert the dropdown snaps to "Don't save memory", is disabled, and the helper text reads "This agent has memory disabled". Submission succeeds and persists `memory_mode = skip`.
 6. Craft a `POST /v1/tasks` (via devtools / `browser_evaluate`) for `agent-memory-off` with `memory_mode: "always"`. Assert the API responds 400 with a validation error referencing the memory-enabled invariant.
 
+### Scenario 17: User-Facing Conversation Log
+
+Covers Phase 2 Track 7 Task 13 — the user-facing "Conversation" tab on task detail. The tab renders the rendered entry stream from `GET /v1/tasks/:taskId/conversation` (what the user sees), separately from the existing Timeline tab (infrastructure events, operator audience). Verifies that long-context runs surface a `compaction_boundary` divider with an operator-visible provenance fold, and that the Timeline tab continues to render unchanged.
+
+Preconditions:
+
+- `make start` stack running with the API at `:8080` and the Console at `:5173`.
+- One agent configured with `agent_config.context_management.tier3_trigger_fraction = 0.1` (low trigger fraction forces Tier 3 summarisation to fire quickly so the scenario can observe a `compaction_boundary`). If the console doesn't expose `tier3_trigger_fraction` directly, seed the config via the API.
+- Fixture file on disk at `/tmp/large_log.txt` — at least ~200 KB of plain text. Create with any deterministic generator (e.g. `yes 'x' | head -c 200000 > /tmp/large_log.txt`) so the task's tool calls produce oversized outputs and trigger compaction.
+- One in-flight task with at least one `hitl_pause` / `hitl_resume` cycle if available; otherwise skip those assertions but still run the rest.
+
+Steps:
+
+1. Submit a task against the configured agent whose prompt instructs it to `read_file` the `/tmp/large_log.txt` fixture several times (enough to exceed the 10% Tier-3 trigger). Navigate to `/tasks/:taskId`.
+2. **Default tab is Conversation.** Without any query string, confirm `[data-testid="tab-conversation"]` carries `aria-selected="true"` and `[data-testid="conversation-pane"]` is present. The subtitle reads "What the agent did". `browser_snapshot` shows entry rows with kind-specific testids (`conversation-entry-user_turn`, `conversation-entry-agent_turn`, `conversation-entry-tool_call`, `conversation-entry-tool_result` at minimum).
+3. **Compaction divider appears once Tier 3 fires.** Wait for the task to accumulate enough context to trigger compaction (poll task detail until checkpoints > ~10, or watch Langfuse for `compaction.tier3_fired`). Assert `[data-testid="conversation-compaction-divider"]` is present and its text matches `/Context summarized \(turns \d+–\d+, \d+ turns\)/`.
+4. **Operator fold reveals provenance.** Click the compaction divider to expand. Assert the summary text is visible (primary reveal). Then click `[data-testid="conversation-operator-fold"]` to expand the secondary fold and confirm the four operator-only fields render: `summarizer_model`, `summary_bytes`, `cost_microdollars`, `tier3_firing_index`.
+5. **Capped tool_result explicit copy.** Expand any `[data-testid="conversation-entry-tool_result"]` whose entry carries `metadata.capped=true` (reading `/tmp/large_log.txt` should trigger the per-result 25KB cap). Confirm the explicit copy renders: "Tool returned {orig_bytes} bytes; showing head+tail capped at 25KB (same view the model had)."
+6. **Timeline-tab regression check.** Navigate to `/tasks/:taskId?tab=timeline`. Confirm `[data-testid="tab-timeline"]` is now `aria-selected="true"`, the checkpoint timeline renders exactly as before (`Execution Timeline` heading, step cards, HITL markers, cost/duration footer), and the Conversation pane is unmounted. Switch back to the Conversation tab via the tab button; confirm the URL drops the `?tab=timeline` parameter. `browser_console_messages` shows zero uncaught exceptions across the tab switches.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -251,6 +271,7 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 | Task submission file attachment feature | 1, 3, 10 |
 | Task submission memory attach feature | 1, 3, 12 |
 | Task detail / timeline feature | 1, 4 |
+| Task detail conversation log feature | 1, 17 |
 | Task list feature | 1, 5 |
 | Budget / pause feature | 1, 4, 6 |
 | Dead letter feature | 1, 7 |

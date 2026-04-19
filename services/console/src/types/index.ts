@@ -414,3 +414,57 @@ export interface ArtifactMetadata {
     sizeBytes: number;
     createdAt: string;
 }
+
+// ──────────────────────────────────────────────────────────────────
+// User-facing Conversation log (Phase 2 Track 7 Task 13)
+// ──────────────────────────────────────────────────────────────────
+
+export type ConversationEntryKind =
+    | 'user_turn'
+    | 'agent_turn'
+    | 'tool_call'
+    | 'tool_result'
+    | 'compaction_boundary'
+    | 'memory_flush'
+    | 'hitl_pause'
+    | 'hitl_resume'
+    | 'system_note';
+
+/**
+ * Metadata attached to a conversation entry. Shape is intentionally permissive:
+ * the pane renders only fields it recognises for a given `kind`, and falls back
+ * to a debug-fold banner when a field is missing or `content_version > 1`.
+ */
+export interface ConversationEntryMetadata {
+    capped?: boolean;
+    orig_bytes?: number;
+    turns_summarized?: number;
+    summarizer_model?: string;
+    summary_bytes?: number;
+    cost_microdollars?: number;
+    tier3_firing_index?: number;
+    first_turn_index?: number;
+    last_turn_index?: number;
+    [key: string]: unknown;
+}
+
+export interface ConversationEntry {
+    /** Stable monotonically-increasing sequence within a task. */
+    sequence: number;
+    /** One of the 9 public kinds; clients must handle unknown values gracefully. */
+    kind: ConversationEntryKind | string;
+    /** Schema version; clients fall back to a debug-fold banner when > 1. */
+    content_version: number;
+    /** Free-form content object keyed by `kind`; see the task spec §Content schema. */
+    content: Record<string, unknown>;
+    /** Render hints (capping info, compaction provenance, etc.). */
+    metadata?: ConversationEntryMetadata;
+    /** ISO timestamp the entry was produced. */
+    created_at: string;
+}
+
+export interface ConversationListResponse {
+    entries: ConversationEntry[];
+    /** Present when more entries exist past the requested window. */
+    next_after_sequence?: number;
+}
