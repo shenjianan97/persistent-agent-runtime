@@ -945,15 +945,66 @@ class GraphExecutor:
         else:
             llm_with_tools = llm
 
-        # Built once per graph — captured by agent_node closure so it is not
-        # re-allocated on every LLM call.  cost_ledger and checkpoint_id are
-        # None here; Task 9/10 will wire the real objects when they land.
+        # Pool-backed adapter so the Tier-3 summariser can write a cost-ledger
+        # row without knowing about asyncpg connection management.  Without
+        # this, `task_context["cost_ledger"]` was None and the first Tier 3
+        # firing raised AttributeError inside `summarize_slice`, which the
+        # summariser treats as a fatal skip — permanently short-circuiting
+        # Tier 3 for the rest of the task and forcing hard-floor dead-letters.
+        _graph_pool = self.pool
+
+        class _PoolBackedCostLedger:
+            async def insert(
+                self,
+                *,
+                tenant_id: str,
+                agent_id: str,
+                task_id: str,
+                checkpoint_id: str | None,
+                cost_microdollars: int,
+                operation: str,
+                model_id: str | None = None,
+                tokens_in: int = 0,
+                tokens_out: int = 0,
+                summarized_through_turn_index_after: int | None = None,
+            ) -> None:
+                # The ledger column is TEXT NOT NULL. When LangGraph has not
+                # yet assigned a checkpoint id (first super-step, or certain
+                # retry paths), use a deterministic placeholder per firing so
+                # the partial unique index on
+                # (tenant_id, task_id, checkpoint_id, operation, summarized_through_turn_index_after)
+                # still dedups crash-retries correctly.
+                effective_ckpt = checkpoint_id or (
+                    f"compaction:{summarized_through_turn_index_after}"
+                    if summarized_through_turn_index_after is not None
+                    else "compaction:unknown"
+                )
+                async with _graph_pool.acquire() as conn:
+                    await insert_cost_row(
+                        conn,
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        checkpoint_id=effective_ckpt,
+                        cost_microdollars=cost_microdollars,
+                        operation=operation,
+                        model_id=model_id,
+                        tokens_in=tokens_in,
+                        tokens_out=tokens_out,
+                        summarized_through_turn_index_after=summarized_through_turn_index_after,
+                    )
+
+        _compaction_cost_ledger = _PoolBackedCostLedger()
+
+        # `checkpoint_id` is resolved per-invocation from the RunnableConfig
+        # inside agent_node, not captured here — see line below where
+        # task_context is shallow-copied with the live value.
         task_context = {
             "tenant_id": tenant_id,
             "agent_id": agent_id,
             "task_id": task_id,
             "checkpoint_id": None,
-            "cost_ledger": None,
+            "cost_ledger": _compaction_cost_ledger,
             "callbacks": [],
         }
 
@@ -1010,6 +1061,12 @@ class GraphExecutor:
                 state.get("summarized_through_turn_index", 0) or 0
             )
 
+            # Shallow-copy the shared task_context with the live checkpoint_id
+            # so the Tier 3 summariser writes a cost-ledger row tagged to the
+            # right checkpoint.  Falls back to None (adapter substitutes a
+            # deterministic placeholder so the INSERT still dedups correctly).
+            _per_call_task_context = {**task_context, "checkpoint_id": _convlog_ckpt_id}
+
             # Track 7 Task 8 — run compaction pipeline before every LLM call.
             # The pipeline is pure: it returns the compacted message view, a
             # state_updates dict (watermarks, summary_marker, etc.), and a list
@@ -1020,7 +1077,7 @@ class GraphExecutor:
                 state=state,
                 agent_config=agent_config,
                 model_context_window=model_context_window,
-                task_context=task_context,
+                task_context=_per_call_task_context,
                 summarizer=summarize_slice,
                 estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
             )

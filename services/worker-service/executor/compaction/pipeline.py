@@ -285,9 +285,18 @@ async def compact_for_llm(
         exclude_tools_extra
     )
 
-    # State updates dict — we'll accumulate updates here
+    # State updates dict — we'll accumulate updates here.
+    # Watermark tracks the count of PERSISTED messages (state["messages"])
+    # NOT the possibly system-prompt-prepended `raw_messages` passed in.  If
+    # the caller injected transient SystemMessages before calling us, they
+    # do not live in state["messages"] and using len(raw_messages) here would
+    # cause the next super-step's conversation-log slice to start too far
+    # ahead and silently drop newly-added user/tool entries.
+    _persisted_messages = state.get("messages")
+    if _persisted_messages is None:
+        _persisted_messages = raw_messages
     state_updates: dict[str, Any] = {
-        "last_super_step_message_count": len(raw_messages),
+        "last_super_step_message_count": len(_persisted_messages),
     }
     events: list[CompactionEvent] = []
     tier3_skipped = False
@@ -429,17 +438,24 @@ async def compact_for_llm(
                     tenant_id=tenant_id,
                     agent_id=agent_id,
                 ))
-                # Hard floor check before returning
-                if est_tokens > model_context_window:
+                # Recompute tokens with the flush message appended — it adds
+                # non-trivial text and can push us over the hard floor.  If
+                # the pre-flush `est_tokens` was already close to the limit,
+                # skipping this check would have the next LLM call fail with
+                # a provider context-limit error instead of taking the
+                # explicit dead-letter path.
+                flush_view = [*messages, flush_message]
+                est_tokens_with_flush = estimate_tokens_fn(flush_view)
+                if est_tokens_with_flush > model_context_window:
                     events.append(HardFloorEvent(
-                        est_tokens=est_tokens,
+                        est_tokens=est_tokens_with_flush,
                         model_context_window=model_context_window,
                         task_id=task_id,
                         tenant_id=tenant_id,
                         agent_id=agent_id,
                     ))
                 return CompactionPassResult(
-                    messages=[*messages, flush_message],
+                    messages=flush_view,
                     state_updates=state_updates,
                     events=events,
                     tier3_skipped=False,
