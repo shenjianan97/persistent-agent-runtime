@@ -1,0 +1,163 @@
+<!-- AGENT_TASK_START: task-10-dead-letter-reason.md -->
+
+# Task 10 — Dead-Letter Reason: `context_exceeded_irrecoverable`
+
+## Agent Instructions
+
+**CRITICAL PRE-WORK:**
+1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Hard floor and dead-letter path".
+2. `docs/design-docs/phase-2/design.md §5 Execution Audit History` — where `dead_letter_reason` values live.
+3. `docs/exec-plans/completed/phase-2/track-2/` — how Track 2 added enum values (look for migrations and enum-update patterns).
+4. `infrastructure/database/migrations/` — latest migration number to choose `0014_*`.
+5. `services/api-service/src/main/java/com/persistentagent/api/enums/` (or wherever `DeadLetterReason` lives) — current enum shape.
+6. `services/worker-service/core/worker.py` — `_handle_dead_letter` path; how existing reasons are plumbed.
+7. `services/worker-service/executor/compaction/pipeline.py` (from Task 8) — `HardFloorEvent` definition and the caller site in `agent_node`.
+
+**CRITICAL POST-WORK:**
+1. Run `make test` AND `make e2e-test`. The enum addition affects API response serialisation; confirm existing Track 2 dead-letter tests still pass.
+2. Update Task 10 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+
+## Context
+
+When Tier 1 + 1.5 + 3 together cannot bring estimated input below the model's context window (and the protection-window shrink has also run), the task transitions to dead-letter with reason `context_exceeded_irrecoverable`. This is a safety-net event, expected to be rare in practice with the 25KB per-tool-result cap.
+
+The reason must be plumbed through:
+
+1. PostgreSQL enum (or enforced values set) for `dead_letter_reason` — additive migration.
+2. Java `DeadLetterReason` enum on the API side.
+3. Python constant on the worker side.
+4. Pipeline hard-floor path invokes the worker's existing dead-letter transition with the new reason.
+
+## Task-Specific Shared Contract
+
+- New reason value (string, snake_case): `context_exceeded_irrecoverable`.
+- Migration file: `infrastructure/database/migrations/0014_context_exceeded_dead_letter_reason.sql` (use the next available four-digit prefix — verify no `0014_*.sql` already exists; if it does, bump).
+- The migration is additive and non-breaking: adds the value to the enum (`ALTER TYPE ... ADD VALUE IF NOT EXISTS`) or extends the CHECK constraint — match whatever approach Track 2 took.
+- Java API surface: `DeadLetterReason.CONTEXT_EXCEEDED_IRRECOVERABLE` with JSON serialisation to `"context_exceeded_irrecoverable"`.
+- Worker constant: Python string `DeadLetterReason.CONTEXT_EXCEEDED_IRRECOVERABLE = "context_exceeded_irrecoverable"` (or the existing constant module pattern).
+- The hard-floor transition uses the worker's existing `_handle_dead_letter` path with `reason=DeadLetterReason.CONTEXT_EXCEEDED_IRRECOVERABLE`. No new transition code.
+
+## Affected Component
+
+- **Service/Module:** Database schema + API + Worker
+- **File paths:**
+  - `infrastructure/database/migrations/0014_context_exceeded_dead_letter_reason.sql` (new)
+  - `services/api-service/src/main/java/com/persistentagent/api/enums/DeadLetterReason.java` (modify — or wherever the Java enum lives)
+  - `services/api-service/src/test/java/.../DeadLetterReasonSerializationTest.java` (new or extend)
+  - `services/worker-service/core/worker.py` or `core/constants.py` (modify — add Python constant)
+  - `services/worker-service/executor/graph.py` (modify — `agent_node` handles `HardFloorEvent` from pipeline and invokes `_handle_dead_letter`)
+  - `services/worker-service/tests/test_compaction_hard_floor.py` (new)
+  - `tests/backend-integration/test_dead_letter_reasons.py` (modify if a reason-exhaustiveness test exists)
+- **Change type:** migration + enum additions + hard-floor integration
+
+## Dependencies
+
+- **Must complete first:**
+  - **Migration + enum plumbing** (the SQL file, Java `DeadLetterReason`, Python constant): independent — no prerequisite tasks. This part MUST land (merge + deploy) BEFORE any worker code that emits `context_exceeded_irrecoverable` (see "Deploy-order hard constraint" below). In practice this means merging Task 10's migration before Task 8's worker changes reach production, not before Task 8's code review.
+  - **`agent_node` wiring** (handling `HardFloorEvent` → invoking the dead-letter transition): needs Task 8's `HardFloorEvent` dataclass to exist. This is a build-time dependency on Task 8's contract only.
+- **Parallel-safe with:** Tasks 2–6 (different files). Task 11 (Console — different area entirely). The migration can be authored and merged in parallel with Tasks 3–8 since it touches no worker Python.
+- **Provides output to:** Task 12 (E2E test verifies the dead-letter transition).
+
+## Implementation Specification
+
+### Migration `0014_context_exceeded_dead_letter_reason.sql`
+
+`dead_letter_reason` is a **TEXT column with a CHECK constraint** (confirmed — see `infrastructure/database/migrations/0001_phase1_durable_execution.sql`, `0006_runtime_state_model.sql`, `0010_sandbox_support.sql`). The canonical pattern is **DROP CONSTRAINT + re-ADD with the expanded allowed-values list**. `0010_sandbox_support.sql` is the template to copy.
+
+Exact shape:
+
+```sql
+-- 0014: Add context_exceeded_irrecoverable to dead_letter_reason CHECK constraint.
+-- Track 7 — Context Window Management hard-floor safety net.
+
+ALTER TABLE tasks DROP CONSTRAINT tasks_dead_letter_reason_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_dead_letter_reason_check
+    CHECK (dead_letter_reason IS NULL OR dead_letter_reason IN (
+        'cancelled_by_user',
+        'retries_exhausted',
+        'task_timeout',
+        'non_retryable_error',
+        'max_steps_exceeded',
+        'human_input_timeout',
+        'rejected_by_user',
+        'sandbox_lost',
+        'sandbox_provision_failed',
+        'context_exceeded_irrecoverable'
+    ));
+```
+
+**Verify the current allowed-values list.** The list above is the cumulative state as of `0010_sandbox_support.sql`. If any migration between `0010` and `0014` added or removed a reason, copy the full current list from the latest migration and add `context_exceeded_irrecoverable` to it. Run `grep -r tasks_dead_letter_reason_check infrastructure/database/migrations/` to find the latest.
+
+**Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 8 and later tasks depend on this migration being applied first.
+
+**`task_events` column — MANDATORY inspection step (mechanically enforced).** Run `grep -rn task_events_dead_letter_reason_check infrastructure/database/migrations/` before writing the migration. If a CHECK constraint exists on `task_events.dead_letter_reason`, the migration MUST extend it identically (DROP + re-ADD with the same allowed-values list). If no constraint exists, document that explicitly in the migration comment so future maintainers know.
+
+This is a deploy blocker, not a reviewer note — the `tasks` row flips successfully but the audit event insert fails, leaving the worker stuck mid-transition and the reaper unable to re-claim. Two mechanical gates enforce it:
+
+1. **Integration test** (`tests/backend-integration/test_dead_letter_reasons.py`): a parameterised test invokes the dead-letter path for EVERY value in the `tasks.dead_letter_reason` CHECK constraint and asserts both the `tasks` row update AND the `task_events` row insert succeed within the same transaction. The new `context_exceeded_irrecoverable` value is added to the test's parameter list in this task. If a second CHECK constraint exists on `task_events` and was not extended, this test fails on the new reason.
+2. **Migration inspection assertion** (in the same integration test file or a new `test_dead_letter_check_constraints.py`): query `information_schema.check_constraints` for every constraint matching `%dead_letter_reason%` and assert the `context_exceeded_irrecoverable` string appears in each constraint's `check_clause`. This catches the "forgot one CHECK" failure mode even without exercising the write path.
+
+### Java enum
+
+Add `CONTEXT_EXCEEDED_IRRECOVERABLE("context_exceeded_irrecoverable")` to the existing enum. Keep the `@JsonValue` / `@JsonCreator` pattern already in place.
+
+### Python constant
+
+Add the constant in the same module Track 2 used (likely `services/worker-service/core/constants.py` or inline `worker.py`). Follow the existing style (either a plain module-level `str` or a `StrEnum`).
+
+### Hard-floor handling in `agent_node`
+
+After `pass_result = await compact_for_llm(...)`:
+
+```python
+hard_floor_event = next((ev for ev in pass_result.events if isinstance(ev, HardFloorEvent)), None)
+if hard_floor_event is not None:
+    await self._handle_dead_letter(
+        task_data=task_data,
+        reason=DeadLetterReason.CONTEXT_EXCEEDED_IRRECOVERABLE,
+        details={
+            "est_input_tokens": hard_floor_event.est_input_tokens,
+            "model_context_window": hard_floor_event.model_context_window,
+            "floor_reason": hard_floor_event.floor_reason,
+        },
+        ...
+    )
+    raise _DeadLetterRaised  # existing marker exception, if any
+```
+
+The existing `_handle_dead_letter` path persists the row to `task_events`, transitions the task status, releases the lease, etc. No new transition code is needed.
+
+## Acceptance Criteria
+
+- [ ] Migration `0014_*.sql` applies cleanly on a fresh Postgres (verified via `make db-reset` or equivalent).
+- [ ] Applying the migration on an existing dev DB with pre-existing task rows does not mutate any existing row's `dead_letter_reason`.
+- [ ] `POST /v1/tasks` existing dead-letter paths (`budget_exceeded`, `tool_failure`, `cancelled_by_user`, etc. — whatever Track 2 defined) continue to work; `make e2e-test` existing dead-letter tests pass.
+- [ ] A synthetic task that forces Tier 3 to fail AND the hard floor to hit transitions to `status='dead_letter'` with `dead_letter_reason='context_exceeded_irrecoverable'`.
+- [ ] The corresponding `task_events` row shows `event_type='task_dead_lettered'` with `details.floor_reason` populated.
+- [ ] `GET /v1/tasks/{id}` returns `dead_letter_reason='context_exceeded_irrecoverable'` in the response payload.
+- [ ] Console renders the new reason cleanly (Task 11 covers the UI mapping; Task 10 just needs to confirm no serialization errors).
+- [ ] `make test` and `make e2e-test` green.
+
+## Testing Requirements
+
+- **Migration test:** `make e2e-test` already includes a fresh-DB migration step — confirm the new migration is picked up.
+- **API serialization test:** `DeadLetterReason` enum serializes to `"context_exceeded_irrecoverable"` — test under the Java unit suite.
+- **Worker unit test (`test_compaction_hard_floor.py`):** mock the pipeline to emit a `HardFloorEvent`; verify `agent_node` calls `_handle_dead_letter` with the correct reason.
+- **E2E test:** synthesize a task + agent where Tier 3 is forced to fail (summarizer mocked to raise, or `summarizer_model` pointed at a non-existent model) AND the model context window is small enough that Tier 1/1.5 cannot hold the line; assert dead-letter transition + correct reason + event row.
+
+## Constraints and Guardrails
+
+- Do not remove any existing `dead_letter_reason` value. Migration is additive.
+- Do not introduce new dead-letter reasons beyond `context_exceeded_irrecoverable` in this task. Stay focused.
+- Do not change `_handle_dead_letter` logic beyond passing the new reason through — reuse the existing implementation.
+- Do not wire the hard-floor event transition inside `compact_for_llm` itself — keep that function pure. `agent_node` handles the transition.
+- Do not raise a bare `Exception` from the hard-floor path — use whatever marker exception Track 2's dead-letter path already uses.
+
+## Assumptions
+
+- Track 2's dead-letter flow is live and uses either a Postgres enum or a CHECK-constrained text column. If it's neither (e.g., free-text), align the migration with that shape.
+- The Java `DeadLetterReason` enum is the canonical Java-side representation; the worker uses string constants directly.
+- `task_events.dead_letter_reason` is the source of truth for the audit timeline; `tasks.dead_letter_reason` is the summary field.
+- `make db-reset` is the standard way to verify migrations in local dev.
+
+<!-- AGENT_TASK_END: task-10-dead-letter-reason.md -->

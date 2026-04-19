@@ -1,0 +1,312 @@
+<!-- AGENT_TASK_START: task-7-tier-3-summarizer.md -->
+
+# Task 7 — Tier 3 Summarizer
+
+## Agent Instructions
+
+**CRITICAL PRE-WORK:**
+1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Tier 3: retrospective LLM summarization", plus "Budget interaction (Track 3)" and "Summarizer outage" sub-sections.
+2. `services/worker-service/executor/graph.py` — `_build_summarizer_callable` from Track 5, which already wraps a cheap-model LLM call. Reuse the cost-ledger attribution, Langfuse callback, and retry-friendly shape.
+3. `services/worker-service/core/cost_ledger_repository.py` — the insert path for `agent_cost_ledger` rows.
+4. `services/worker-service/core/heartbeat.py` or similar — how the worker surfaces transient retries vs terminal failures.
+5. Track 5 Task 6 (`task-6-worker-memory-write.md`) — precedent for cheap-summarizer LLM calls with cost-ledger attribution.
+
+**CRITICAL POST-WORK:**
+1. Run `make worker-test`. Integration-level tests from this task require a mocked LLM client; do not require real provider credentials.
+2. Update Task 7 status in `docs/exec-plans/active/phase-2/track-7/progress.md`.
+
+## Context
+
+Tier 3 is the last-resort LLM summarization. When Tier 1 + 1.5 have run and the estimated input is still above the Tier 3 threshold, this module takes the slice `messages[summarized_through_turn_index : protect_from_index]` and produces a factual summary that replaces that prefix.
+
+The output is **appended** to `state.summary_marker`, preserving the KV-cache prefix on the marker region across subsequent Tier 3 firings within the same task.
+
+The summarizer runs with retries (`SUMMARIZER_MAX_RETRIES = 2`). After exhaustion, the function returns a `SummarizeResult` with `skipped=True` — callers do NOT treat this as a terminal error; the next agent-node call will re-attempt.
+
+## Task-Specific Shared Contract
+
+Function signature:
+
+```python
+async def summarize_slice(
+    slice_messages: list[BaseMessage],
+    summarizer_model_id: str,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    checkpoint_id: str | None,
+    cost_ledger: CostLedgerRepository,
+    callbacks: list[BaseCallbackHandler] | None = None,
+) -> SummarizeResult
+```
+
+`SummarizeResult`:
+
+```python
+@dataclass(frozen=True)
+class SummarizeResult:
+    summary_text: str | None        # None iff skipped
+    skipped: bool                   # True iff summarizer did not produce text
+    skipped_reason: str | None      # None iff skipped=False; "empty_slice",
+                                    # "retryable" (retries exhausted), or
+                                    # "fatal" (non-retryable error). Task 8
+                                    # pipeline branches on this value.
+    summarizer_model_id: str        # echoed back for event emission
+    tokens_in: int                  # prompt token count
+    tokens_out: int                 # completion token count
+    cost_microdollars: int          # rolled-up cost
+    latency_ms: int
+```
+
+Semantics:
+
+- If `slice_messages` has < 2 entries, returns `SummarizeResult(summary_text=None, skipped=True, ...)` (not enough to summarize).
+- Builds the summarizer prompt per the design doc's §Tier 3 spec:
+  - `SystemMessage` with the fixed `SUMMARIZER_PROMPT` string (see below).
+  - `HumanMessage` with a formatted serialisation of `slice_messages` (see below).
+- Calls the summarizer model via `langchain.chat_models.init_chat_model` (or the worker's existing model-init helper — reuse Track 5's pattern).
+- Retries up to `SUMMARIZER_MAX_RETRIES` on transient errors (use the worker's existing `_is_retryable_error` classification from `graph.py`).
+- **Fatal vs retryable distinction.** On a non-retryable error (bad API key, model removed, 4xx with invalid model, auth failure), `SummarizeResult.skipped=True` with `skipped_reason="fatal"` is returned AND a `compaction.tier3_fatal` structured log is emitted (distinct from `compaction.tier3_skipped` which is the retryable-exhausted path). The pipeline (Task 8) reads `skipped_reason` and — on `fatal` — applies a per-task short-circuit so the threshold check does NOT re-fire Tier 3 on every subsequent agent-node call (which would burn the minimum per-call cost forever). Short-circuit resets on a new task only. On retryable exhaustion (`skipped_reason="retryable"`), Tier 3 is re-attempted on the next call as before.
+- On success: writes one row to `agent_cost_ledger` with `operation='compaction.tier3'`, `model_id=summarizer_model_id`, tokens/cost from the response metadata. Uses the repository pattern.
+- Langfuse: if a Langfuse callback is passed in, the LLM call is automatically traced; no extra work beyond passing the callbacks list through to `ainvoke`.
+- Cost lookup: use `_get_model_cost_rates(summarizer_model_id)` (already in `graph.py`) or an equivalent lookup helper. If the model has zero cost rates (dev-mode), still write the ledger row with `cost_microdollars=0`.
+- Deterministic replay is best-effort. The caller is responsible for checkpointing the returned `summary_text`; crash mid-summarizer produces a retry that may return different text — accepted per design.
+
+### `SUMMARIZER_PROMPT`
+
+Defined as a module-level string constant:
+
+```
+You are compressing a portion of an autonomous agent's tool-use history so the
+agent can continue the task within its context window. Produce a compact
+factual summary (at most 400 words) that preserves:
+- Files the agent has created, read, or modified (full paths)
+- External URLs or API responses whose contents matter for the rest of the task
+- Decisions the agent has committed to and their reasoning
+- Errors encountered and whether they were resolved
+- Parameters or identifiers the agent will need later (IDs, keys, names)
+
+Do NOT:
+- Address the agent in the second person.
+- Invent next steps or give instructions.
+- Comment on the compression itself.
+Return the summary only.
+```
+
+### Slice serialisation helper
+
+`format_messages_for_summary(slice_messages: list[BaseMessage]) -> str` — produces a deterministic textual representation:
+
+- `SystemMessage` → `"SYSTEM: <content>"`
+- `HumanMessage` → `"USER: <content>"`
+- `AIMessage` → `"ASSISTANT (step N): <content>\n  tool_calls: [<name>(...), ...]"` where the args dict is rendered via `json.dumps(sort_keys=True)`.
+- `ToolMessage` → `"TOOL_RESULT (call_id=..., name=...): <content>"`.
+- Indexes are the positions in the input `slice_messages`, 0-based, so the summary can reference them.
+
+Determinism is load-bearing — sort keys in JSON dumps, use a fixed step-index naming scheme. If two callers with the same slice produce different serialisations, the KV-cache on the summary invocation itself drops.
+
+## Affected Component
+
+- **Service/Module:** Worker Service — Compaction + DB schema
+- **File paths:**
+  - `infrastructure/database/migrations/0015_agent_cost_ledger_compaction.sql` (new — extends `agent_cost_ledger` with the columns this task writes)
+  - `services/worker-service/core/cost_ledger_repository.py` (modify — extend `insert_cost_row` signature with the new columns; keep the existing callers working by defaulting `operation='model_token_spend'`, `tokens_in=0`, `tokens_out=0`, `model_id=agent_config.model` at the call site)
+  - `services/worker-service/executor/compaction/summarizer.py` (new)
+  - **Do NOT edit `compaction/__init__.py`** — Task 8 owns its final shape. Import `summarize_slice`, `SummarizeResult` directly from `executor.compaction.summarizer`.
+  - `services/worker-service/tests/test_compaction_summarizer.py` (new)
+  - `tests/backend-integration/test_cost_ledger_schema.py` (new or extend — asserts the new columns + unique constraint exist)
+- **Change type:** migration + repository extension + new module + unit tests + integration test
+
+### Migration `0015_agent_cost_ledger_compaction.sql`
+
+The current `agent_cost_ledger` table (see `infrastructure/database/migrations/0007_scheduler_and_budgets.sql`) has only `tenant_id, agent_id, task_id, checkpoint_id, cost_microdollars, created_at`. Track 7's ledger writes require additional attribution + idempotency. Exact shape:
+
+```sql
+-- 0015: Extend agent_cost_ledger for Track 7 compaction attribution.
+-- Adds: operation (what spent the money), model_id (which model), tokens_in/out
+-- (for reconciliation), and a unique key so crash-after-insert-before-state
+-- replay is swallowed by ON CONFLICT DO NOTHING rather than double-charging.
+
+ALTER TABLE agent_cost_ledger
+    ADD COLUMN operation TEXT NOT NULL DEFAULT 'model_token_spend'
+        CHECK (operation IN (
+            'model_token_spend',
+            'sandbox_runtime',
+            'memory_write',
+            'compaction.tier3'
+        )),
+    ADD COLUMN model_id TEXT,
+    ADD COLUMN tokens_in BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN tokens_out BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN summarized_through_turn_index_after INT;
+
+-- Partial unique index — idempotency key for compaction.tier3 only.
+-- The existing model_token_spend / sandbox paths already rely on application-
+-- level dedup and must NOT be constrained here (would break backfill of
+-- in-flight rows). Index is partial to keep it scoped to Track 7.
+CREATE UNIQUE INDEX idx_agent_cost_ledger_tier3_idempotency
+    ON agent_cost_ledger (tenant_id, task_id, checkpoint_id,
+                          operation, summarized_through_turn_index_after)
+    WHERE operation = 'compaction.tier3';
+```
+
+Verify before writing: `grep -rn agent_cost_ledger infrastructure/database/migrations/` to confirm no intervening migration has already added any of these columns. If it has, update this migration to be additive-only against the current state.
+
+### `cost_ledger_repository.insert_cost_row` extension
+
+Extend the existing function to accept the new columns as keyword args with sensible defaults so existing callers don't break:
+
+```python
+async def insert_cost_row(
+    conn: asyncpg.Connection,
+    *,
+    tenant_id: str,
+    agent_id: str,
+    task_id: str,
+    checkpoint_id: str,
+    cost_microdollars: int,
+    operation: str = "model_token_spend",
+    model_id: str | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    summarized_through_turn_index_after: int | None = None,
+) -> None:
+    ...  # INSERT ... ON CONFLICT DO NOTHING using the partial unique index.
+```
+
+Existing callers (`model_token_spend`, `sandbox_runtime` from Tracks 1–3) keep working unchanged — they pass only the original args. Task 7's summarizer passes the full set.
+
+## Dependencies
+
+- **Must complete first:** Task 3 (`SUMMARIZER_MAX_RETRIES`, `PLATFORM_DEFAULT_SUMMARIZER_MODEL`, `get_platform_default_summarizer_model`).
+- **Provides output to:** Task 8 (pipeline orchestrator calls `summarize_slice` as the Tier 3 step, branches on `skipped`).
+- **Shared interfaces/contracts:** The `SummarizeResult` type + `summarize_slice` function.
+
+## Implementation Specification
+
+Follow Track 5's `_build_summarizer_callable` shape closely — it already handles the cheap-model-via-init_chat_model pattern, extracts token metadata, and understands the worker's retry landscape. The main differences:
+
+- Cost ledger tag is `'compaction.tier3'` instead of `'memory.write'`.
+- Prompt is Track 7's `SUMMARIZER_PROMPT`, not Track 5's memory-entry prompt.
+- Output is a single string (the summary), not a structured title+summary+tags tuple.
+
+Pseudocode for the retry loop:
+
+```python
+async def summarize_slice(...):
+    if len(slice_messages) < 2:
+        return SummarizeResult(summary_text=None, skipped=True, summarizer_model_id=summarizer_model_id, tokens_in=0, tokens_out=0, cost_microdollars=0, latency_ms=0)
+
+    serialized = format_messages_for_summary(slice_messages)
+    prompt = [
+        SystemMessage(content=SUMMARIZER_PROMPT),
+        HumanMessage(content=serialized),
+    ]
+    llm = init_chat_model(summarizer_model_id, ...)
+
+    last_error = None
+    for attempt in range(SUMMARIZER_MAX_RETRIES + 1):
+        try:
+            started = time.monotonic()
+            response = await llm.ainvoke(prompt, config={"callbacks": callbacks or []})
+            latency_ms = int((time.monotonic() - started) * 1000)
+            tokens_in, tokens_out = _extract_tokens(response.response_metadata or {})
+            cost_microdollars = _rollup_cost(
+                tokens_in, tokens_out, summarizer_model_id
+            )
+            _write_cost_ledger_row(
+                cost_ledger, tenant_id, agent_id, task_id, checkpoint_id,
+                summarizer_model_id, tokens_in, tokens_out,
+                cost_microdollars, operation='compaction.tier3',
+            )
+            return SummarizeResult(
+                summary_text=response.content,
+                skipped=False,
+                summarizer_model_id=summarizer_model_id,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_microdollars=cost_microdollars,
+                latency_ms=latency_ms,
+            )
+        except Exception as e:
+            last_error = e
+            if not _is_retryable_error(e):
+                # Fatal — bad API key, model removed, auth failure.
+                # Short-circuit: caller (Task 8 pipeline) must set
+                # tier3_fatal_short_circuited=True on observing this.
+                _logger.info(
+                    "compaction.tier3_fatal",
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    summarizer_model=summarizer_model_id,
+                    error=str(e)[:200],
+                )
+                return SummarizeResult(
+                    summary_text=None,
+                    skipped=True,
+                    skipped_reason="fatal",
+                    summarizer_model_id=summarizer_model_id,
+                    tokens_in=0, tokens_out=0, cost_microdollars=0, latency_ms=0,
+                )
+            backoff = _get_retry_after(e) or min(30, 2 ** attempt)
+            await asyncio.sleep(backoff)
+
+    _logger.info(
+        "compaction.tier3_skipped",
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        summarizer_model=summarizer_model_id,
+        retries_exhausted=SUMMARIZER_MAX_RETRIES,
+        last_error=str(last_error)[:200] if last_error else None,
+    )
+    return SummarizeResult(
+        summary_text=None,
+        skipped=True,
+        skipped_reason="retryable",
+        summarizer_model_id=summarizer_model_id,
+        tokens_in=0, tokens_out=0, cost_microdollars=0, latency_ms=0,
+    )
+```
+
+`_logger` is a module-level `core.logging.get_logger(worker_id=WORKER_ID)` — see Task 4's note on structured logging for the pattern.
+
+Reuse `_extract_tokens`, `_is_retryable_error`, `_get_retry_after` from `graph.py` (or move them into a shared `worker_util.py` in this task if they're private helpers on `GraphExecutor`).
+
+## Acceptance Criteria
+
+- [ ] Migration `0015_agent_cost_ledger_compaction.sql` applies cleanly. `agent_cost_ledger` has `operation`, `model_id`, `tokens_in`, `tokens_out`, `summarized_through_turn_index_after` columns plus the partial unique index `idx_agent_cost_ledger_tier3_idempotency`. Integration test asserts columns + index exist (read `information_schema`).
+- [ ] `cost_ledger_repository.insert_cost_row` accepts the new kwargs with defaults; existing callers (model token spend, sandbox runtime) continue to write rows with `operation='model_token_spend'` / `'sandbox_runtime'` and zero-valued token columns without schema errors. Regression test covers both paths.
+- [ ] `summarize_slice` returns a non-None `summary_text` on a happy-path mocked LLM call and writes one `agent_cost_ledger` row with `operation='compaction.tier3'`, non-NULL `model_id`, `tokens_in`, `tokens_out`, and `summarized_through_turn_index_after`.
+- [ ] Slice of < 2 messages returns `skipped=True`, `skipped_reason='empty_slice'` with no LLM call and no ledger write.
+- [ ] On a retryable error followed by success, the function succeeds and records one ledger row (not three).
+- [ ] On exhaustion of retries, the function returns `skipped=True`, `skipped_reason='retryable'`, emits `compaction.tier3_skipped` log, and writes NO ledger row.
+- [ ] On a non-retryable error, the function returns `skipped=True`, `skipped_reason='fatal'`, emits `compaction.tier3_fatal` log, and writes NO ledger row. The pipeline (Task 8) is expected to set `tier3_fatal_short_circuited=True` on observing this result.
+- [ ] **Cost-ledger idempotency.** The ledger insert uses a natural key of `(task_id, checkpoint_id, operation='compaction.tier3', summarized_through_turn_index_after)` — duplicate writes (e.g., crash-after-ledger-before-state-commit followed by retry) are swallowed by a unique constraint or `ON CONFLICT DO NOTHING`. Verified by test: invoke `summarize_slice` twice for the same target watermark and assert only one ledger row exists. Rationale: the summarizer LLM call + ledger insert + state.summary_marker advance are not one transactional unit; a crash between them can replay the summarizer on restart.
+- [ ] `format_messages_for_summary` is deterministic: two calls on the same slice produce byte-identical output (assert via unit test).
+- [ ] Cost ledger row fields match the existing schema — `tenant_id`, `agent_id`, `task_id`, `checkpoint_id`, `model_id`, `tokens_in`, `tokens_out`, `cost_microdollars`, `operation`.
+- [ ] Langfuse callbacks passed in propagate into the `ainvoke` call.
+- [ ] `make worker-test` — unit tests pass with a mocked LangChain `init_chat_model`.
+
+## Testing Requirements
+
+- **Unit tests:** mock `init_chat_model` via `unittest.mock.patch` or equivalent; cover happy path, empty-slice, retry-then-success, retry-exhausted, cost-ledger row shape, callback propagation.
+- **Determinism test:** call `format_messages_for_summary` twice on the same slice; assert byte-equal.
+- **No live LLM call in CI.** The tests must run offline without any provider credentials.
+
+## Constraints and Guardrails
+
+- Do not call the summarizer from this module at import time. No top-level network.
+- Do not hard-code the summarizer model — always read it from the caller's argument. The caller (Task 8 pipeline) resolves the effective model from agent config + platform default.
+- Do not use `budget_max_per_task` gating here — the Track 3 per-step budget carve-out that skips Tier 3's pause check lives in Task 8 (at the pipeline or worker post-astream layer).
+- Do not silently swallow non-retryable errors — raise them, and let the caller surface the failure through the existing error path.
+- Do not write the summary to any state field — that is Task 8's job (pipeline merges the result into `summary_marker`).
+
+## Assumptions
+
+- The worker already has `init_chat_model` resolution and provider-credential plumbing from Phase 1 + Track 1.
+- Token extraction helpers (`_extract_tokens`) exist in `graph.py` from Track 5 — reuse them rather than re-implementing.
+- Retryable-error classification (`_is_retryable_error`) likewise exists.
+
+<!-- AGENT_TASK_END: task-7-tier-3-summarizer.md -->
