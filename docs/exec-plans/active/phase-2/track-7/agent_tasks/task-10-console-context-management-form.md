@@ -123,6 +123,7 @@ Add **Scenario 14: Context Management section**. Covers:
   - Tooltip appears when `memoryEnabled=false`.
   - Chip-input cap at 50.
   - Valid submission payload shape.
+  - **Don't-send-defaults-on-save:** loading an existing agent without `context_management` on its config, opening the form, and saving without any field change MUST produce a PUT payload that omits `context_management` entirely. Verify via a spy/mock on the API client.
 - **No live Playwright run in this task** — the subagent produces the scenario manifest; the orchestrator executes the Playwright run per AGENTS.md §Browser Verification.
 
 ## Constraints and Guardrails

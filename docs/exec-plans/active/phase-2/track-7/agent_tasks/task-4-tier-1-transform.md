@@ -67,7 +67,7 @@ Semantics:
 - **Service/Module:** Worker Service — Compaction transforms
 - **File paths:**
   - `services/worker-service/executor/compaction/transforms.py` (new — Task 4 adds `clear_tool_results`; Task 5 adds `truncate_tool_call_args` alongside)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — re-export `clear_tool_results`, `ClearResult`)
+  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `clear_tool_results`, `ClearResult` directly from `executor.compaction.transforms`.
   - `services/worker-service/tests/test_compaction_transforms_clear.py` (new)
 - **Change type:** new module + new function + unit tests
 
@@ -95,12 +95,20 @@ def clear_tool_results(messages, cleared_through_turn_index, keep, exclude_tools
         return ClearResult(messages, cleared_through_turn_index, 0, 0)
 
     # Build tool_call_id → tool_name map from preceding AIMessages so we can
-    # recover the tool name even if ToolMessage.name is None.
+    # recover the tool name even if ToolMessage.name is None. Note:
+    # LangChain 0.2+ represents tool_calls as a list of dicts with string
+    # keys (id, name, args, type) — not attribute access. Task 5 uses the
+    # same shape; keep them consistent.
     tool_name_by_call_id = {}
     for m in messages:
         if isinstance(m, AIMessage) and m.tool_calls:
             for call in m.tool_calls:
-                tool_name_by_call_id[call.id] = call.name
+                # Support both dict shape (LangChain >= 0.2) and the
+                # occasional TypedDict variant. Never attribute access.
+                call_id = call["id"] if isinstance(call, dict) else getattr(call, "id", None)
+                call_name = call["name"] if isinstance(call, dict) else getattr(call, "name", None)
+                if call_id is not None:
+                    tool_name_by_call_id[call_id] = call_name
 
     compacted = list(messages)
     cleared_count = 0

@@ -36,19 +36,21 @@ class CompactionEnabledState(TypedDict):
     cleared_through_turn_index: Annotated[int, _max_reducer]
     truncated_args_through_turn_index: Annotated[int, _max_reducer]
     summarized_through_turn_index: Annotated[int, _max_reducer]
-    summary_marker: Annotated[str | None, _summary_marker_reducer]
+    summary_marker: Annotated[str | None, _summary_marker_strict_append_reducer]
     memory_flush_fired_this_task: Annotated[bool, _any_reducer]
+    last_super_step_message_count: Annotated[int, _max_reducer]
 ```
 
 Where:
 
 - `_max_reducer(a: int, b: int) -> int` returns `max(a, b)`. Monotonicity — a stale super-step that returns a lower value cannot regress the watermark.
 - `_any_reducer(a: bool, b: bool) -> bool` returns `a or b`. One-shot monotonicity for the memory-flush flag.
-- `_summary_marker_reducer(a: str | None, b: str | None) -> str | None`:
-  - If `b is None`, return `a`.
-  - If `a is None`, return `b`.
-  - If `b.startswith(a)`: return `b` (append case — normal second-Tier-3 path).
-  - Else return `b` (replace case — e.g., redrive rollback). Log `compaction.summary_marker_replaced` when this branch fires for observability.
+- `_summary_marker_strict_append_reducer(a: str | None, b: str | None) -> str | None`:
+  - If `b is None`, return `a` (no update).
+  - If `a is None`, return `b` (first write).
+  - If `b.startswith(a)`: return `b` (append — normal second-Tier-3 path).
+  - Else: emit `compaction.summary_marker_non_append` structured log AND return `a` (REJECT the non-append write). Non-append rewrites invalidate KV-cache on every subsequent call and violate Design §Core design rule 1. There is no legitimate replace path in v1; regenerating the marker requires explicit state clearing, which is not in scope.
+  - Rollback via `rollback_last_checkpoint` restores the state snapshot wholesale outside the reducer, so rollback is not constrained by this rule.
 
 ### State selection in `_build_graph`
 
@@ -155,25 +157,33 @@ async def agent_node(state, config: RunnableConfig):
 
 Locate the Track 3 per-step budget enforcement (`_check_budget_and_pause` in `graph.py` or equivalent). Add `"compaction.tier3"` to the named-node carve-out list alongside `memory_write`. Match whatever mechanism Track 5 used (name-based skip for per-task pause check; hourly-spend accounting still applies).
 
-### Token estimation
+### Token estimation (`compaction/tokens.py`)
 
-Add `estimate_tokens(messages: list[BaseMessage]) -> int` in `compaction/pipeline.py`:
+Real-tokenizer-preferred. Per Design §Tokens vs bytes — heuristic-only is unacceptable for Anthropic and OpenAI because code/JSON-heavy history is exactly where `len/3.5` under-counts by 30–50%, pushing Tier 3 past the provider's hard ceiling.
 
 ```python
-def estimate_tokens(messages: list[BaseMessage]) -> int:
-    total_chars = 0
-    for m in messages:
-        if isinstance(m.content, str):
-            total_chars += len(m.content)
-        elif isinstance(m.content, list):  # structured content blocks
-            for block in m.content:
-                total_chars += len(str(block))
-        if isinstance(m, AIMessage) and m.tool_calls:
-            total_chars += sum(len(json.dumps(c, sort_keys=True)) for c in m.tool_calls)
-    return total_chars // 3  # ~3 chars/token heuristic, within ±25% for all supported models
+def estimate_tokens(messages: list[BaseMessage], provider: str) -> int:
+    serialized = _serialize_for_token_count(messages)  # deterministic, content+tool_calls
+    if provider == "anthropic":
+        import anthropic  # lazy to avoid import at startup
+        return anthropic.Anthropic().count_tokens(serialized)
+    if provider == "openai":
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(serialized))
+    # Gemini / Google / BYOT / unknown: fall back to char-count heuristic.
+    # Tolerates ±30%. If a specific provider proves persistently inaccurate,
+    # add its real tokenizer above.
+    return len(serialized) // 3
 ```
 
-Use a cheap heuristic; the true tokenizer is model-specific and not worth importing for a threshold comparison.
+`_serialize_for_token_count` must be deterministic (sort JSON keys, consistent message formatting) so two calls with the same messages produce the same token count — otherwise Tier 1 fires at different thresholds across retries. Both `tiktoken` and `anthropic.count_tokens` already exist in the worker's dependency tree (Track 1 / Track 5 added them).
+
+`provider` comes from the agent config (`agent_config.provider`).
+
+### Model context window lookup
+
+Read from the `models` table row for `agent_config.model` at graph-build time. Cache on the `GraphExecutor` for the lifetime of the `execute_task` invocation. For BYOT / custom models not in `models`, default to **32_000** tokens (conservative) and emit a `compaction.model_context_window_unknown` structured log at graph build so operators can notice. Never guess upward.
 
 ## Affected Component
 
@@ -181,7 +191,8 @@ Use a cheap heuristic; the true tokenizer is model-specific and not worth import
 - **File paths:**
   - `services/worker-service/executor/compaction/state.py` (new — `CompactionEnabledState`, `RuntimeState`, reducers)
   - `services/worker-service/executor/compaction/pipeline.py` (new — `compact_for_llm`, `CompactionPassResult`, event types, `estimate_tokens`)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — re-export public types)
+  - `services/worker-service/executor/compaction/tokens.py` (new — real-tokenizer-preferred token estimation for Anthropic/OpenAI; heuristic for Gemini/BYOT)
+  - `services/worker-service/executor/compaction/__init__.py` (modify — **SOLE OWNER** of the final public-API surface; consolidate all `compaction.*` re-exports here. Tasks 2–6 leave `__init__.py` empty-minus-docstring so the package can be imported; Task 7 fills it in. No other task edits this file.)
   - `services/worker-service/executor/graph.py` (modify — state selection, `agent_node` pipeline call, budget carve-out)
   - `services/worker-service/tests/test_compaction_pipeline.py` (new)
   - `services/worker-service/tests/test_compaction_state_reducers.py` (new)
@@ -217,6 +228,9 @@ Follow the Task-Specific Shared Contract above. Additional notes:
 - [ ] When both Track 5 and Track 7 are enabled, the graph uses the merged `RuntimeState` — all of memory's fields AND all of compaction's fields are present in the state.
 - [ ] When only Track 5 is enabled, the graph uses `MemoryEnabledState` (pre-Track-7 behavior).
 - [ ] When neither is enabled, the graph uses `MessagesState` (pre-Phase-2 behavior).
+- [ ] Pipeline updates `last_super_step_message_count = len(raw_messages)` in every `CompactionPassResult.state_updates` so heartbeat detection in Task 8 has the watermark it needs.
+- [ ] `__init__.py` after Task 7 re-exports the full public API: `KEEP_TOOL_USES`, `resolve_thresholds`, `cap_tool_result`, `clear_tool_results`, `truncate_tool_call_args`, `summarize_slice`, `compact_for_llm`, `CompactionEnabledState`, `RuntimeState`, plus all referenced result/event types. Callers import from the package root after this task lands.
+- [ ] Summary marker strict-append reducer rejects non-append writes — unit test asserts a non-append second write returns the ORIGINAL marker value, and `compaction.summary_marker_non_append` is logged.
 - [ ] Watermark reducers are `max` — a synthetic stale super-step returning `{cleared_through_turn_index: 0}` while state is at 10 does NOT regress the value.
 - [ ] `summary_marker` reducer appends when the new value has the old as a prefix; logs `compaction.summary_marker_replaced` when it replaces.
 - [ ] `make worker-test` and `make e2e-test` green.

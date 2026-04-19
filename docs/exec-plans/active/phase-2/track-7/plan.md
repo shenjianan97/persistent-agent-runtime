@@ -78,8 +78,8 @@ Task 1 ──► Task 10 (Console Edit Form) ───────────�
 **Parallelisation opportunities:**
 
 - **Task 1 and Task 2 can run in parallel** — Task 1 is Java API surface, Task 2 is Python worker constants; zero file overlap.
-- **Tasks 3, 4, 5, 6 can run in parallel** after Task 2 completes — they all add distinct new files under `services/worker-service/executor/compaction/`. No shared file edits.
-- **Task 7 is the integration step** — must wait for Tasks 2–6. Touches `services/worker-service/executor/graph.py`.
+- **Tasks 3, 4, 5, 6 can run in parallel** after Task 2 completes — they all add distinct new files under `services/worker-service/executor/compaction/`. **`compaction/__init__.py` is owned by Task 7** — Tasks 2–6 leave it as a minimal docstring-only file; Task 7 fills in the full public API. This avoids the shared-file conflict that would otherwise require worktree isolation for every parallel task.
+- **Task 7 is the integration step** — must wait for Tasks 2–6. Touches `services/worker-service/executor/graph.py` *and* `executor/compaction/__init__.py`. Adds `state.py`, `pipeline.py`, `tokens.py`. Task 7 is the largest task in this track (~1.5 engineer-days); consider splitting into 7a (state + tokens) and 7b (pipeline + graph integration) if the orchestrator prefers smaller units — the state schema and token estimator have no dependency on pipeline internals.
 - **Task 8 must serialize after Task 7** — extends the pipeline added in Task 7.
 - **Task 9 can run in parallel with Tasks 2–8** — it is a migration + enum addition in a different area, no overlap with compaction module.
 - **Task 10 can run in parallel with Tasks 2–9** — Console TypeScript, no overlap with worker Python or migration.
@@ -117,7 +117,7 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 4 and 5 both add to `c
 | Task 4 | `compaction/transforms.py::clear_tool_results` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 5 | `compaction/transforms.py::truncate_tool_call_args` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 6 | `compaction/summarizer.py::summarize_slice` — retry + cost ledger + Langfuse span; handles summarizer outage with structured retries |
-| Task 7 | `compaction/state.py::CompactionEnabledState`; `compaction/pipeline.py::compact_for_llm`; `agent_node` invokes pipeline before every LLM call; state class merges cleanly with `MemoryEnabledState` when Track 5 also enabled; `compaction.tier3` added to the Track 3 named-node budget carve-out |
+| Task 7 | `compaction/state.py::CompactionEnabledState` (with strict-append summary_marker reducer + `last_super_step_message_count` watermark); `compaction/pipeline.py::compact_for_llm`; `compaction/tokens.py::estimate_tokens` (real tokenizer for Anthropic/OpenAI, heuristic for others); `compaction/__init__.py` final public-API surface; `agent_node` invokes pipeline before every LLM call; state class merges cleanly with `MemoryEnabledState` when Track 5 also enabled; `compaction.tier3` added to the Track 3 named-node budget carve-out |
 | Task 8 | Pipeline extension: one-shot pre-Tier-3 memory flush; respects `memory.enabled`, `pre_tier3_memory_flush`, heartbeat/recovery detection, `memory_flush_fired_this_task` one-shot flag |
 | Task 9 | Migration `0014_context_exceeded_dead_letter_reason.sql`; enum value plumbed through Java + Python; pipeline hard-floor path transitions tasks via the existing dead-letter API |
 | Task 10 | Console Agent edit form "Context management" section with `enabled`, `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`; Playwright scenario added |
@@ -147,12 +147,16 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 4 and 5 both add to `c
 
 Same single-deployment pattern as Tracks 1–5. Key sequencing:
 
-1. **Migration `0014_context_exceeded_dead_letter_reason.sql`** ships with Task 9. Picked up by the existing migration glob (`[0-9][0-9][0-9][0-9]_*.sql`). Non-breaking additive enum change.
-2. **Default `enabled=true` on rollout.** New and existing agents get compaction behavior by default. Agents with an absent `context_management` sub-object are treated identically to those with `context_management.enabled=true` (platform defaults).
-3. **Opt-out path documented.** Customers who need verbatim history can `PUT /v1/agents/{id}` with `context_management.enabled=false`. Console edit form exposes the toggle (Task 10).
-4. **Rollout watch.** Track two Langfuse metrics for the first two weeks post-deploy:
-   - `tier3_fire_rate` across all active tasks (target: < 1 per 100 LLM calls).
-   - `cache_hit_rate_ratio` = post-Track-7 cached-token-fraction / pre-Track-7 cached-token-fraction on the same agents (target: within 5%).
+1. **Migration `0014_context_exceeded_dead_letter_reason.sql`** ships with Task 9. CHECK-constraint DROP+re-ADD pattern (see Task 9 for exact shape — `dead_letter_reason` is a TEXT+CHECK column, not a Postgres enum). **Must land before Task 7 code** — otherwise a hard-floor transition produces a CHECK-violation and the reaper can't dead-letter a stuck task.
+2. **Phased rollout — NOT default-on-everything.**
+   - **Week 1:** Deploy with `CONTEXT_MGMT_DEFAULT_ENABLED=true` for *new* agents only. Pre-existing agents continue with Track 7 disabled (worker reads `context_management.enabled` with `false` fallback for agents whose config predates the deploy).
+   - **Week 2:** If Week 1 metrics are clean, flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true` and run a background job to default pre-existing agents to enabled. Agents that explicitly set `enabled=false` keep that setting.
+   - **Kill switch:** Worker-process env var `CONTEXT_MGMT_KILL_SWITCH=true` forces every agent to `enabled=false`. Flipping requires only a worker restart (no DB change, no deploy). Runbook-documented escape hatch.
+3. **Opt-out path.** Customers can `PUT /v1/agents/{id}` with `context_management.enabled=false` at any time. Console edit form exposes the toggle (Task 10). Expected < 5% of agents.
+4. **Rollout watch.** Langfuse metrics tracked continuously:
+   - `tier3_fire_rate` — target < 1 per 100 LLM calls. Exceeds → lower `TIER_1_TRIGGER_FRACTION` platform default.
+   - `cache_hit_rate_ratio` = post-Track-7 cached-token-fraction / pre-Track-7 cached-token-fraction on the same agents — target within 5%. A drop signals a KV-cache-stability regression (the monotonicity or strict-append invariants have been violated).
+   - `compaction.summary_marker_non_append` log count — must be zero in production; non-zero means a reducer regression slipped through.
 5. **Regression test gate in CI.** Every compaction unit test runs twice (enabled + disabled) to guard the "disabled = pre-Track-7 behavior" invariant. Break that invariant and CI fails.
 
 ---
@@ -231,6 +235,9 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 10. **Budget carve-out for `compaction.tier3`.** Matches Track 5's `memory_write` pattern — per-task pause check skipped for the named node; hourly-spend accounting still applies.
 11. **Track 5 interaction scoped to one field + one SystemMessage.** `pre_tier3_memory_flush` gates a one-shot agentic turn inserted before Tier 3's first firing per task. Skipped on heartbeat turns; skipped entirely when memory is off.
 12. **Server-side Anthropic primitives deferred to Phase 3+.** Client-side compaction for provider portability in v1; layering `clear_tool_uses_20250919` / `compact_20260112` on Anthropic agents is a follow-up optimization.
+13. **Phased rollout with worker-level kill switch.** New agents get compaction on in Week 1; existing agents get it in Week 2 conditional on clean Week 1 metrics; `CONTEXT_MGMT_KILL_SWITCH` env var forces global off without a deploy. This replaces the original "default-on for everyone at rollout" plan after reviewer feedback: blast radius of a regression across every active task is too large to absorb in a single step.
+14. **Real tokenizer preferred for Anthropic / OpenAI.** Heuristic-only estimation under-counts by 30–50% on code/JSON-heavy history (exactly the case Track 7 exists to address), so `tiktoken` / `anthropic.count_tokens` is mandatory on those providers; Gemini / BYOT use the cheap char-count heuristic until a specific provider proves persistently inaccurate.
+15. **`__init__.py` owned by Task 7.** Tasks 2–6 don't touch it, avoiding the parallel-task merge conflict that would otherwise require worktree isolation on every preceding task.
 
 ---
 

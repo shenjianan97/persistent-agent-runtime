@@ -144,7 +144,13 @@ New sub-object on `agent_config`:
 
 **`enabled=false` semantics:** full opt-out. No tier fires, no per-result cap, no state mutation. The task runs with the pre-Track-7 behavior exactly. This exists for workloads that genuinely need verbatim history (e.g., legal/audit agents) and is expected to be rare.
 
-**`exclude_tools`:** tools whose *results* must never be masked. Use case: `request_human_input`'s response is load-bearing even after dozens of follow-up turns; if it is masked to `[tool output not retained]` the agent forgets what the human said. Platform seeds the list with `memory_note`, `request_human_input`, `save_memory`, and any other small-output flow-control tools. Agents can add custom tool names.
+**`exclude_tools`:** tools whose *results* must never be masked. Use case: `request_human_input`'s response is load-bearing even after dozens of follow-up turns; if it is masked to `[tool output not retained]` the agent forgets what the human said. Platform seeds the list with:
+
+- `memory_note`, `save_memory` — small, durable agent statements the agent may reference indefinitely.
+- `request_human_input` — the human response is the pivot for the entire task; masking it erases the reason the agent paused.
+- `memory_search`, `task_history_get` — the agent explicitly retrieved these to inform the current task. Masking what the agent *just chose to fetch* defeats the fetch.
+
+Any other small, semantically-dense tool should also go here; agents can extend via `context_management.exclude_tools`.
 
 **Platform-owned (not per-agent) in v1:**
 
@@ -189,9 +195,18 @@ Thresholds are a pure function of the model's context window. No absolute token 
 
 **Cost-sensitive customers can opt into tighter compaction** in a future Track 7 follow-up via `context_management.aggressive_compaction=true`, which halves both fractions. Deliberately deferred from v1 — no production telemetry yet shows a threshold tightening is needed, and a half-fraction knob is cleaner than any platform-wide absolute cap.
 
-**Tokens vs bytes.** Thresholds are measured in **tokens** (approximate — use a cheap `len(text) / 3.5` heuristic per the model, with ±20% accuracy tolerable). The per-tool-result cap is measured in **bytes** because it runs at tool-execution time, before any tokenization. Byte-level cap is cache-stable (tokenizer-agnostic) and matches what every HTTP client / tool runtime already has.
+**Tokens vs bytes.** Thresholds are measured in **tokens**. Estimation strategy:
 
-**Recomputed per LLM call, not cached.** The model context window is known from the agent's config; `resolve_thresholds` is pure and called once per agent-node call. No state required.
+- **Anthropic and OpenAI:** use the provider's real tokenizer (`anthropic.count_tokens`, `tiktoken`). Cheap, local, avoids the "real tokens are 30% more than our heuristic" failure mode on code/JSON-heavy history.
+- **Gemini / other providers / BYOT:** fall back to `len(serialized_text) / 3` character-count heuristic. Documented as ±30% accuracy; if a Gemini task is persistently firing Tier 3 late, we add Google's tokenizer.
+
+Heuristic-only implementations are forbidden for Anthropic and OpenAI — the code/JSON-heavy agent histories Track 7 exists to compact are exactly where the heuristic is least accurate (real tokens can be 30–50% higher than `len/3.5` for dense JSON). Using the real tokenizer is the difference between Tier 3 firing with a reasonable margin vs firing past the model's hard context limit.
+
+The per-tool-result cap is measured in **bytes** because it runs at tool-execution time, before any tokenization. Byte-level cap is cache-stable (tokenizer-agnostic) and matches what every HTTP client / tool runtime already has.
+
+**Model context window source.** Read from the `models` table row for the agent's primary model at graph-build time; cache for the lifetime of the `execute_task` invocation. For BYOT / custom models not in `models`, default to **32K tokens** (conservative) and emit a structured `compaction.model_context_window_unknown` warning log at graph build so operators can notice. Never guess upward — a 32K fallback for a model that actually has 200K just means we compact earlier than optimal; a 200K fallback for a model that actually has 32K causes hard-floor dead-letters.
+
+**Recomputed per LLM call, not cached.** `resolve_thresholds` is pure and called once per agent-node call. No state required.
 
 **Validation rules** (mirror Track 5's pattern):
 
@@ -236,6 +251,8 @@ def cap_tool_result(raw: str, tool_name: str) -> tuple[str, CapEvent | None]:
 - Track 4 BYOT MCP tool results
 - Memory tools (`memory_search`, `task_history_get`) — though their outputs are normally small
 - Human input (`request_human_input`) — typically small; capped same as everything else
+
+**Track 8 coordination.** Track 8 (proposed) adds tool-specific per-call caps (`sandbox_exec.max_output_bytes`, `sandbox_grep.head_limit`). Those are *semantic* caps — the tool decides how to truncate (e.g., keep all regex match lines, drop overflow). They must be **strictly less than or equal to** Track 7's 25KB ceiling; if a Track 8 tool returns more than 25KB it will be head+tail re-capped, destroying the semantic slicing. Task specs for Track 8 tools must assert their per-tool caps satisfy `tool_cap_bytes ≤ PER_TOOL_RESULT_CAP_BYTES`.
 
 **When the cap fires, emit** `compaction.per_result_capped` structured log + Langfuse span annotation with `{tool, orig_bytes, capped_bytes}`.
 
@@ -397,7 +414,11 @@ SystemMessage(
 
 **Fires at most once per task.** Runbooks matter less than stability — a second flush risks the agent flooding memory with duplicates.
 
-**Skipped on heartbeat / recovery turns.** If the current agent-node call is a LangGraph resume from checkpoint with no new user input and no new tool result since the last call, the flush is skipped. Detection: the last two messages in raw history are both `AIMessage` (no `ToolMessage` or `HumanMessage` in between). This prevents the flush from firing spuriously on dead-lettered-and-redriven tasks.
+**Skipped on heartbeat / recovery turns.** If the current agent-node call is entered without any new `ToolMessage` or `HumanMessage` having been appended since the last agent super-step, the flush is skipped. The detection rule is **positional, not message-pair-based**: compare the current message list length (or a persisted `last_flush_check_position` watermark on state) against the state snapshot at the end of the previous agent super-step. If nothing new was added, it's a heartbeat/recovery turn.
+
+This is the same rule used in §Validation #8, stated once here and once there. The "last two messages are both `AIMessage`" heuristic is NOT correct — it misfires on rate-limit retry loops (the previous call produced an AIMessage but the retry is a legitimate new super-step) and on pure-reasoning turns (two consecutive AIMessages can be valid).
+
+Implementation: track `last_super_step_message_count` as part of `CompactionEnabledState`. Before each compaction pass, compare `len(messages) > last_super_step_message_count` — true means new input arrived and the flush is eligible; false means heartbeat and the flush is skipped. Watermark is `max`-reduced.
 
 **Follow-up / redrive interaction.** The `memory_flush_fired_this_task` flag lives in graph state, which is checkpointed and survives crash/resume. A follow-up or redrive that resumes from a pre-flush checkpoint continues to treat the flush as unfired; a follow-up / redrive that resumes after the flush already fired does not re-fire it.
 
@@ -407,16 +428,22 @@ SystemMessage(
 - `context_management.pre_tier3_memory_flush = false` → flush never fires on this agent regardless of memory state
 - `context_management.enabled = false` → entire Track 7 off, flush moot
 
+**Edge case: flush turn pushes input past the model's hard context limit.** The flush inserts one SystemMessage and skips Tier 3 *for this call only*. If the Tier 1 + 1.5 output plus the flush prompt exceeds the model's hard context window (rare — requires history to be within ~200 bytes of the ceiling before the flush adds its ~500-byte message), the LLM call will error with provider-side context-limit. This surfaces through the worker's existing rate-limit / retryable-error path — the agent-node retry re-enters `compact_for_llm`, the `memory_flush_fired_this_task` flag is now True (already written by the flush turn), so Tier 3 proceeds normally on the retry. The flush is not re-inserted. No special handling is needed; the existing retry path covers it.
+
+**SystemMessage injection shape.** The flush message is appended as a new `SystemMessage` at the END of the compacted list. This is an in-memory-only mutation for the single LLM call — the flush message is **NOT** returned in `state_updates["messages"]`, so it is not persisted to checkpoint history. Only the `memory_flush_fired_this_task=True` flag is persisted. The next agent-node call rebuilds the compacted view without the flush message.
+
+**Provider compatibility note.** Some providers constrain SystemMessage placement (OpenAI requires exactly one at index 0; Gemini shims system messages through LangChain). The pipeline handles this by always *prepending to or appending a new line within* the existing first SystemMessage when a second SystemMessage would be disallowed. The detection for this is per-provider and lives in the pipeline alongside existing provider-specific message shaping.
+
 ## Hard floor and dead-letter path
 
 Minimum viable LLM input: most recent `ToolMessage` + most recent `AIMessage` + system prompts + the current turn's input. These are never truncated.
 
-If, after Tier 1 + 1.5 + 3 + protection-window shrink, the estimated input still exceeds the model's context window, the task transitions to dead-letter with reason `context_exceeded_irrecoverable` (new reason added to the Phase 2 Track 2 enum). This is a signaling event, not an expected code path — with `PER_TOOL_RESULT_CAP_BYTES=25000` and a 200K-context model, the hard floor is > 50 tool uses of capped content, which would require the agent's protection window itself to exceed 150K. In practice, this path catches either:
+If, after Tier 1 + 1.5 + 3 + protection-window shrink, the estimated input still exceeds the model's context window, the task transitions to dead-letter with reason `context_exceeded_irrecoverable`. This is a signaling event, not an expected code path — with `PER_TOOL_RESULT_CAP_BYTES=25000` and a 200K-context model, the hard floor is > 50 tool uses of capped content, which would require the agent's protection window itself to exceed 150K. In practice, this path catches either:
 
 - A misconfigured model with an unusually small context window (say, 8K).
 - A severely misbehaving summarizer (e.g., the summary marker itself exceeds 150K — never observed in testing).
 
-The reason enum update requires a Track 2 enum extension; Task 9 (see exec plan) picks that up.
+**Migration shape.** `dead_letter_reason` is a `TEXT` column with a `CHECK` constraint (see `infrastructure/database/migrations/0010_sandbox_support.sql`), not a Postgres enum. Adding a new reason requires `ALTER TABLE tasks DROP CONSTRAINT tasks_dead_letter_reason_check` + re-add with the expanded allowed-values list. Task 9's migration uses the pattern in `0010_sandbox_support.sql` verbatim. **Deploy order is a hard constraint** — the migration must land *before* worker code that can produce the new reason, or the `UPDATE tasks` transition will fail the CHECK and the reaper will be unable to dead-letter a stuck task.
 
 ## State schema extensions
 
@@ -430,6 +457,7 @@ class CompactionEnabledState(TypedDict):
     summarized_through_turn_index: int       # Tier 3 watermark, default 0
     summary_marker: str | None               # Tier 3 output, default None
     memory_flush_fired_this_task: bool       # pre-Tier-3 flush one-shot, default False
+    last_super_step_message_count: int       # heartbeat-detection watermark, default 0
 
     # if Track 5 also enabled, MemoryEnabledState fields are added on top:
     # observations: Annotated[list[str], operator.add]
@@ -439,7 +467,13 @@ class CompactionEnabledState(TypedDict):
 
 Both Track 5 and Track 7 state extensions merge cleanly into a single `RuntimeState` type that the worker picks based on which tracks are enabled for the agent. When **neither** Track 5 nor Track 7 is enabled, stock `MessagesState` is used (pre-Phase-2 behavior preserved).
 
-**Reducers:** watermark fields use a `max` reducer (not stock `operator.add`), expressing monotonicity at the schema level. A stale LangGraph super-step that returns `{cleared_through_turn_index: 5}` when the current value is `10` will be ignored by the reducer rather than silently regressing the watermark. The `summary_marker` uses a custom append-or-replace reducer: append when the new value has the old value as a prefix, replace when not (e.g., on a repair path).
+**Reducers:** watermark fields use a `max` reducer (not stock `operator.add`), expressing monotonicity at the schema level. A stale LangGraph super-step that returns `{cleared_through_turn_index: 5}` when the current value is `10` will be ignored by the reducer rather than silently regressing the watermark.
+
+The `summary_marker` uses a **strict-append reducer**: the new value MUST start with the old value (prefix check). Any other input raises a structured error (`compaction.summary_marker_non_append`) and the reducer returns the *old* value — the non-append write is rejected. This is a hard invariant, not a soft "log and fallback." Rationale: any non-append rewrite changes byte 0 of the compacted prefix, which invalidates the KV-cache for every subsequent LLM call in the task. Silently accepting a replace would make cache-stability (§Core design rule 1) unenforceable.
+
+`memory_flush_fired_this_task` uses an `or` reducer (monotone one-shot — once True, stays True).
+
+Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the reducer: the checkpointer restores a prior state snapshot wholesale, including a prior `summary_marker`. Rollback is the legitimate way to "move backward" on the marker; reducers never execute that path.
 
 ## Checkpoint interaction
 
@@ -483,14 +517,17 @@ Both Track 5 and Track 7 state extensions merge cleanly into a single `RuntimeSt
 
 ## Validation and consistency rules
 
-1. **Monotonicity invariant.** Every watermark field reducer is `max`. A bug that tried to regress a watermark would be silently ignored; regressions must be detected at the state-schema level, not in the reducer.
-2. **Cache stability invariant.** For any two LLM calls C1 < C2 within a task, the compacted prefix up to `min(watermark_at(C1), watermark_at(C2))` MUST be byte-identical. This is enforceable by unit test: run the compaction transform twice on the same input state; assert `output == output`.
-3. **`exclude_tools` is intersection-safe.** Platform exclude list + agent exclude list is a union; no override semantics needed.
-4. **Summary marker content is not replayed to the summarizer.** When Tier 3 fires a second time in the same task, the summarizer sees only the new slice being summarized, not the existing marker. This prevents summary-of-summary drift.
-5. **Per-tool-result cap is indivisible from ingestion.** Tool wrapper MUST apply the cap before returning the `ToolMessage`. Uncapped tool results must never enter state.
-6. **Compaction-disabled agents behave identically to pre-Track-7.** No state extension, no pipeline call, no structured logs, no cost ledger rows tagged `compaction.*`. This is the opt-out correctness gate.
-7. **Memory-disabled agents never fire the pre-Tier-3 flush.** Regardless of `context_management.pre_tier3_memory_flush` value.
-8. **Heartbeat / recovery turns never fire the pre-Tier-3 flush.** Even if all three gating flags are on. Detection rule: no `ToolMessage` or `HumanMessage` has been added since the last agent super-step.
+1. **Monotonicity invariant.** Every watermark field reducer is `max` (or strict-append for `summary_marker`). A bug that tried to regress a watermark is rejected at the schema level.
+2. **Cache stability invariant.** For any two LLM calls C1 < C2 within a task, the compacted prefix up to `min(watermark_at(C1), watermark_at(C2))` MUST be byte-identical. Enforceable by unit test: run the compaction transform twice on the same input state; assert `output == output`.
+3. **Rollback byte-identity.** After Phase 2 Track 2's `rollback_last_checkpoint` restores a prior checkpoint, the compacted prefix generated on the subsequent agent-node call MUST be byte-identical to the compacted prefix generated from that same checkpoint when it was originally written. Enforceable by integration test — compact, checkpoint, advance, rollback, compact, assert equality.
+4. **`exclude_tools` is intersection-safe.** Platform exclude list + agent exclude list is a union; no override semantics needed.
+5. **Summary marker content is not replayed to the summarizer.** When Tier 3 fires a second time in the same task, the summarizer sees only the new slice being summarized, not the existing marker. This prevents summary-of-summary drift.
+6. **Summary marker is strict-append.** The reducer rejects any write where the new value does not start with the old value. Replace is not a valid path; regenerating the marker requires explicitly clearing it (not in scope for v1).
+7. **Per-tool-result cap is indivisible from ingestion.** Tool wrapper MUST apply the cap before returning the `ToolMessage`. Uncapped tool results must never enter state.
+8. **Compaction-disabled agents behave identically to pre-Track-7.** No state extension, no pipeline call, no structured logs, no cost ledger rows tagged `compaction.*`. This is the opt-out correctness gate.
+9. **Memory-disabled agents never fire the pre-Tier-3 flush.** Regardless of `context_management.pre_tier3_memory_flush` value.
+10. **Heartbeat / recovery turns never fire the pre-Tier-3 flush.** Detection rule: `len(messages) == last_super_step_message_count` (no `ToolMessage` or `HumanMessage` added since the last agent super-step).
+11. **Transforms never mutate input messages or their nested objects.** All `AIMessage.tool_calls`, `ToolMessage.content`, and `args` dict modifications MUST produce new objects via LangChain's `model_copy(update=...)` or equivalent. Mutation has caused cache-invalidation bugs in other tracks.
 
 ## Scale and operational plan
 
@@ -498,12 +535,13 @@ Both Track 5 and Track 7 state extensions merge cleanly into a single `RuntimeSt
 
 **Target cache hit rate:** the compaction transform is deterministic and monotone, so cache-hit rate should approach the pre-Track-7 baseline within 5% for any task whose watermarks advance linearly. Measurement: compare cached-token-fraction from Langfuse before and after enabling Track 7 on the same agent.
 
-**Rollout:**
+**Rollout (phased):**
 
-- Track 7 lands with `enabled` default `true` on all agents (new and existing). No migration needed — agent_config is JSONB; missing `context_management` sub-object is treated as platform defaults.
-- Pre-existing agents keep working because the per-result cap is universally applied; Tier 1/1.5 fire silently when they'd otherwise have to, preserving cost and not breaking correctness.
-- Customers who need verbatim history set `context_management.enabled=false`. Expected to be < 5% of agents.
-- Metrics (tier3_fire_rate, cache_hit_rate_ratio) are watched for the first two weeks post-rollout. If Tier 3 fires more than 1 call in 100 on average, the platform default `TIER_1_TRIGGER_FRACTION` is lowered (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
+1. **Week 1 — New agents only.** Track 7 code ships; a deploy-time env var (`CONTEXT_MGMT_DEFAULT_ENABLED=true`) governs the default for agents created *after* the deploy. Pre-existing agents continue with Track 7 disabled (the worker reads `context_management.enabled` with a *false* default for pre-existing agents, distinguishing "not present on config" from "explicitly false"). New agents get compaction immediately; operators watch Langfuse metrics.
+2. **Week 2 — Canary sweep.** If Week 1 metrics are clean (tier3_fire_rate < 1 per 100, cache_hit_rate_ratio within 5%), flip `CONTEXT_MGMT_EXISTING_AGENT_DEFAULT=true` and run a background job that marks pre-existing agents' effective default as `enabled=true`. Agents that explicitly set `enabled=false` before the sweep keep that setting.
+3. **Kill switch.** A worker-process-level env var `CONTEXT_MGMT_KILL_SWITCH=true` forces `enabled=false` for *every* agent regardless of config. This is the global-regression escape hatch — flipping it requires only a worker restart, no DB change. Documented runbook: "flip kill switch, inspect Langfuse, fix, reverse."
+4. **Customer opt-out.** `context_management.enabled=false` on an agent is the permanent, per-agent override. Expected < 5% of agents.
+5. **Metrics** (tier3_fire_rate, cache_hit_rate_ratio) are watched continuously. If Tier 3 fires more than 1 call in 100 on average, the platform default `TIER_1_TRIGGER_FRACTION` is lowered (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
 
 **Regression test gate:** every agent-node unit test suite in `services/worker-service/tests/` runs twice — once with compaction enabled, once with it disabled — to guard the "disabled = pre-Track-7 behavior" invariant.
 

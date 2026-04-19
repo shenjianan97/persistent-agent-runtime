@@ -21,7 +21,7 @@ Before Tier 3 summarization would otherwise fire for the first time in a task, t
 
 - Fires at most once per task (`memory_flush_fired_this_task`).
 - Fires only when `agent.memory.enabled AND context_management.pre_tier3_memory_flush`.
-- Is skipped on heartbeat/recovery turns (detection: last two messages in raw history are both `AIMessage`).
+- Is skipped on heartbeat/recovery turns (detection: `len(raw_messages) <= state.last_super_step_message_count` — no new `ToolMessage` or `HumanMessage` since the last super-step; this is positional, NOT the "last two messages are both AIMessage" heuristic which misfires on rate-limit retries and pure-reasoning turns).
 - Does not fire when `context_management.enabled=false` (Track 7 off entirely).
 - Does not fire when `memory.enabled=false` even if `pre_tier3_memory_flush=true` in config.
 
@@ -29,7 +29,7 @@ Control flow when the flush fires:
 
 1. Pipeline detects Tier 3 would fire AND pre-flush conditions hold.
 2. Pipeline sets `state_updates["memory_flush_fired_this_task"] = True`.
-3. Pipeline inserts the one-shot `SystemMessage` at the END of the compacted messages list and **skips Tier 3 this call**.
+3. Pipeline inserts the one-shot `SystemMessage` at the END of the compacted messages list (in-memory only, NOT returned in `state_updates["messages"]`) and **skips Tier 3 this call**.
 4. The main agent LLM call proceeds on this turn; the agent may call `memory_note` (Track 5's tool).
 5. On the next agent-node call, the flag is already True; Tier 3 proceeds normally if threshold still exceeded.
 
@@ -45,18 +45,24 @@ Function: extend `compact_for_llm` in Task 7's pipeline with a new helper `shoul
   - Not a heartbeat turn (see detection below)
 - When it returns True, the pipeline inserts the flush SystemMessage, skips Tier 3 on this call, and returns `state_updates = {"memory_flush_fired_this_task": True, ...watermarks from tier 1/1.5}`.
 
-Heartbeat detection:
+Heartbeat detection (positional, NOT message-pair-based):
 
 ```python
-def _is_heartbeat_turn(raw_messages: list[BaseMessage]) -> bool:
-    """A heartbeat turn has no new user input and no new tool result since the
-    last agent super-step. Detect by looking at the last two messages.
+def _is_heartbeat_turn(
+    raw_messages: list[BaseMessage],
+    last_super_step_message_count: int,
+) -> bool:
+    """A heartbeat/recovery turn has no new ToolMessage or HumanMessage since
+    the last agent super-step. Detect by comparing the current message-list
+    length against the watermark persisted at the end of the previous
+    super-step.
     """
-    if len(raw_messages) < 2:
-        return False
-    last, prev = raw_messages[-1], raw_messages[-2]
-    return isinstance(last, AIMessage) and isinstance(prev, AIMessage)
+    return len(raw_messages) <= last_super_step_message_count
 ```
+
+This matches Design §Validation rule 10. The earlier "last two messages are both `AIMessage`" heuristic was wrong — it misfires on rate-limit retry loops (the previous call succeeded and wrote an AIMessage, the retry is legitimate new work) and on pure-reasoning turns (consecutive AIMessages can be valid). The positional comparison is unambiguous: new work = new message appended; no new work = no new message.
+
+`last_super_step_message_count` is a new state field introduced in Task 7 (see `CompactionEnabledState`). At the end of every agent super-step, the pipeline writes `last_super_step_message_count = len(raw_messages)` so the next call's heartbeat detection is accurate.
 
 Flush system-message shape (exact string):
 
@@ -130,7 +136,8 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 - [ ] Heartbeat detection: two consecutive `AIMessage`s at the end of `raw_messages` → `_is_heartbeat_turn` returns True → flush is skipped even if other conditions hold. `compaction.memory_flush_fired` is NOT emitted.
 - [ ] The flush `SystemMessage` is appended at the END of the compacted messages list (so it's the most recent system-context before the agent acts).
 - [ ] The flush message byte content exactly matches `_PRE_TIER3_FLUSH_PROMPT`.
-- [ ] The flush is one-shot across the task — even on redrive / follow-up that resumes from a post-flush checkpoint, the flag remains True and the flush does NOT re-fire.
+- [ ] The flush is one-shot across the task — even on redrive / follow-up that resumes from a post-flush checkpoint, the flag remains True and the flush does NOT re-fire. Explicit test: construct a state with `memory_flush_fired_this_task=True`, trigger checkpoint save, trigger redrive from that checkpoint, verify the flag is restored to True and the flush does not re-insert.
+- [ ] The flush SystemMessage is NOT persisted to graph state — it appears only in the compacted view for the one LLM call it was inserted for. Verified by: inspecting `state["messages"]` after `agent_node` returns and asserting no `SystemMessage` with `additional_kwargs["compaction_event"] == "pre_tier3_memory_flush"` is present.
 - [ ] `make worker-test` — all unit tests pass.
 
 ## Testing Requirements

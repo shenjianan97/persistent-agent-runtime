@@ -40,6 +40,8 @@ Track 7's acceptance criteria span worker, API, Console, DB, observability. Task
   - `services/worker-service/tests/test_compaction_cost_ledger.py` (new — AC 10)
   - `services/worker-service/tests/test_compaction_budget_carve_out.py` (new — AC 11)
   - `services/worker-service/tests/test_compaction_memory_disabled_no_flush.py` (new — AC 14)
+  - `services/worker-service/tests/test_compaction_observability.py` (new — AC 15 automated log-event assertions)
+  - `services/worker-service/tests/test_compaction_pre_tier3_flush_redrive.py` (new — AC 8 redrive-safety)
   - `tests/backend-integration/test_context_management_validation.py` (new — AC 13)
   - `docs/CONSOLE_BROWSER_TESTING.md` (modify — add Scenario 15)
   - `docs/exec-plans/active/phase-2/track-7/progress.md` (modify — mark Task 11 done; update STATUS.md; move directory)
@@ -65,14 +67,14 @@ Track 7 design doc lists 15 ACs; Task 11 ensures each is covered:
 | 5 — cache-stability invariant | **NEW** `test_compaction_cache_stability.py` (this task) |
 | 6 — enabled=false parity with pre-Track-7 | **NEW** `test_compaction_enabled_false_parity.py` (this task) |
 | 7 — exclude_tools never masked | **NEW** `test_compaction_exclude_tools.py` (this task) |
-| 8 — pre-Tier-3 flush once per task + heartbeat skip | `test_compaction_pre_tier3_flush.py` (Task 8) |
+| 8 — pre-Tier-3 flush once per task + heartbeat skip + survives redrive | `test_compaction_pre_tier3_flush.py` (Task 8) plus a new redrive-safety E2E test in `test_compaction_pre_tier3_flush_redrive.py` (this task) that saves a post-flush checkpoint, redrives, and asserts the flag is restored (no second flush) |
 | 9 — summary_marker append-only | **NEW** `test_compaction_summary_marker_append.py` (this task) |
 | 10 — Tier 3 cost ledger attribution | **NEW** `test_compaction_cost_ledger.py` (this task) |
 | 11 — budget carve-out for compaction.tier3 | **NEW** `test_compaction_budget_carve_out.py` (this task) |
 | 12 — context_exceeded_irrecoverable dead-letter | `test_compaction_hard_floor.py` (Task 9) |
 | 13 — API validation of context_management fields | **NEW** `test_context_management_validation.py` (this task, REST E2E) |
 | 14 — memory-disabled never fires flush | **NEW** `test_compaction_memory_disabled_no_flush.py` (this task) |
-| 15 — Langfuse spans present | Orchestrator Playwright Scenario 15 (manual trace verification) |
+| 15 — Langfuse spans present | **Automated:** `test_compaction_observability.py` asserts `compaction.inline` / `compaction.tier3` / `compaction.per_result_capped` / `compaction.memory_flush_fired` structured-log events fire at the expected points (mocked LLM + log-capture fixture). **Manual:** Orchestrator Playwright Scenario 15 confirms the Langfuse UI shows the spans (visual verification that the log events translate to trace spans correctly). |
 
 ### `test_track7_ac_mapping.py`
 
@@ -154,7 +156,7 @@ Covers: Orchestrator runs a task long enough to cross Tier 1 threshold → inspe
 - [ ] `make test`, `make worker-test`, `make e2e-test` — all green.
 - [ ] `docs/exec-plans/active/phase-2/track-7/progress.md` shows all 11 tasks as Done.
 - [ ] `STATUS.md` row for Track 7 flipped from "Not started" to "Complete" with links to plan + progress.
-- [ ] The `docs/exec-plans/active/phase-2/track-7/` directory has been moved to `docs/exec-plans/completed/phase-2/track-7/`.
+- [ ] The `docs/exec-plans/active/phase-2/track-7/` directory has been moved to `docs/exec-plans/completed/phase-2/track-7/`. **The orchestrator (not this subagent) performs the move** after Playwright verification passes — see AGENTS.md §Browser Verification and Task 11 CRITICAL POST-WORK. The subagent marks Task 11 internal status Done but does NOT move the directory.
 
 ## Testing Requirements
 

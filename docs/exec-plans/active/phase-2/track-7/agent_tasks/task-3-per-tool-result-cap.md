@@ -41,8 +41,8 @@ The cap applies universally: built-in tools (`sandbox_*`, `web_search`), BYOT MC
 - **Service/Module:** Worker Service — Compaction + tool wrappers
 - **File paths:**
   - `services/worker-service/executor/compaction/caps.py` (new)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — re-export `cap_tool_result`, `CapEvent`)
   - `services/worker-service/executor/graph.py` (modify — wrap every tool's return value through `cap_tool_result`)
+  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `cap_tool_result`, `CapEvent` directly from `executor.compaction.caps`.
   - `services/worker-service/tests/test_compaction_caps.py` (new)
   - `services/worker-service/tests/test_graph_tool_cap_integration.py` (new or extend an existing graph-test file)
 - **Change type:** new module + modification of `graph.py` tool wrappers
@@ -65,9 +65,7 @@ cap at ingestion.
 """
 from dataclasses import dataclass
 
-from services.worker_service.executor.compaction.defaults import (
-    PER_TOOL_RESULT_CAP_BYTES,
-)
+from executor.compaction.defaults import PER_TOOL_RESULT_CAP_BYTES
 
 
 @dataclass(frozen=True)
@@ -109,8 +107,8 @@ def cap_tool_result(raw: str, tool_name: str) -> tuple[str, CapEvent | None]:
 For every tool registered via the `_get_tools` path (both built-in and MCP-proxied), wrap the tool's return to apply the cap. The cleanest pattern is a helper decorator:
 
 ```python
-from services.worker_service.executor.compaction import cap_tool_result
-from services.worker_service.core.logging import log_structured
+from executor.compaction.caps import cap_tool_result
+from core.logging import log_structured
 
 def _apply_result_cap(tool_name: str):
     def decorator(fn):

@@ -105,7 +105,7 @@ Determinism is load-bearing — sort keys in JSON dumps, use a fixed step-index 
 - **Service/Module:** Worker Service — Compaction
 - **File paths:**
   - `services/worker-service/executor/compaction/summarizer.py` (new)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — re-export `summarize_slice`, `SummarizeResult`)
+  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `summarize_slice`, `SummarizeResult` directly from `executor.compaction.summarizer`.
   - `services/worker-service/tests/test_compaction_summarizer.py` (new)
 - **Change type:** new module + unit tests (with mocked LLM client)
 

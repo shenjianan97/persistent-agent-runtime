@@ -159,7 +159,7 @@ extension for the threshold shape and model-size behavior.
 """
 from typing import NamedTuple
 
-from services.worker_service.executor.compaction.defaults import (
+from executor.compaction.defaults import (
     MIN_TIER_SEPARATION_TOKENS,
     OUTPUT_BUDGET_RESERVE_TOKENS,
     TIER_1_TRIGGER_FRACTION,
@@ -195,61 +195,36 @@ def resolve_thresholds(model_context_window: int) -> Thresholds:
 
 ### `__init__.py`
 
-Export the public API:
+Create a **minimal** `__init__.py` with only the package docstring — NO re-exports:
 
 ```python
 """Track 7 — Context Window Management.
 
 See docs/design-docs/phase-2/track-7-context-window-management.md.
-"""
-from services.worker_service.executor.compaction.defaults import (
-    ARG_TRUNCATION_CAP_BYTES,
-    KEEP_TOOL_USES,
-    MIN_TIER_SEPARATION_TOKENS,
-    OUTPUT_BUDGET_RESERVE_TOKENS,
-    PER_TOOL_RESULT_CAP_BYTES,
-    PLATFORM_DEFAULT_SUMMARIZER_MODEL,
-    PLATFORM_EXCLUDE_TOOLS,
-    SUMMARIZER_MAX_RETRIES,
-    TIER_1_TRIGGER_FRACTION,
-    TIER_3_TRIGGER_FRACTION,
-    TRUNCATABLE_TOOL_ARG_KEYS,
-    get_platform_default_summarizer_model,
-)
-from services.worker_service.executor.compaction.thresholds import (
-    Thresholds,
-    resolve_thresholds,
-)
 
-__all__ = [
-    # defaults
-    "ARG_TRUNCATION_CAP_BYTES",
-    "KEEP_TOOL_USES",
-    "MIN_TIER_SEPARATION_TOKENS",
-    "OUTPUT_BUDGET_RESERVE_TOKENS",
-    "PER_TOOL_RESULT_CAP_BYTES",
-    "PLATFORM_DEFAULT_SUMMARIZER_MODEL",
-    "PLATFORM_EXCLUDE_TOOLS",
-    "SUMMARIZER_MAX_RETRIES",
-    "TIER_1_TRIGGER_FRACTION",
-    "TIER_3_TRIGGER_FRACTION",
-    "TRUNCATABLE_TOOL_ARG_KEYS",
-    "get_platform_default_summarizer_model",
-    # thresholds
-    "Thresholds",
-    "resolve_thresholds",
-]
+Public API is re-exported from this package in Task 7 (pipeline integration).
+Earlier tasks (2–6) import directly from submodules:
+
+    from executor.compaction.defaults import KEEP_TOOL_USES
+    from executor.compaction.thresholds import resolve_thresholds, Thresholds
+    from executor.compaction.caps import cap_tool_result, CapEvent
+    from executor.compaction.transforms import clear_tool_results, ClearResult
+    from executor.compaction.transforms import truncate_tool_call_args, TruncateResult
+    from executor.compaction.summarizer import summarize_slice, SummarizeResult
+"""
 ```
+
+**Why no re-exports here:** Tasks 2–6 each create separate modules; consolidating all re-exports into `__init__.py` would require every downstream task to edit the same file, creating merge conflicts when Tasks 3–6 run in parallel. Task 7 owns the final `__init__.py` shape as part of its integration work. Downstream tasks import from submodules directly.
 
 ## Acceptance Criteria
 
-- [ ] `from services.worker_service.executor.compaction import resolve_thresholds, KEEP_TOOL_USES` (and the full `__all__` list) succeeds.
+- [ ] `from executor.compaction import resolve_thresholds, KEEP_TOOL_USES` (and the full `__all__` list) succeeds. (Worker-service cwd-based import root — same pattern as `from executor.graph import GraphExecutor` used elsewhere.)
 - [ ] `resolve_thresholds(200_000)` returns `Thresholds(tier1≈95_000, tier3≈142_500)` — exact values depend on `OUTPUT_BUDGET_RESERVE_TOKENS`, assert within tolerance.
 - [ ] `resolve_thresholds(1_000_000)` returns `Thresholds(tier1≈495_000, tier3≈742_500)`.
 - [ ] `resolve_thresholds(8_000)` returns a Thresholds value where `tier3 - tier1 >= MIN_TIER_SEPARATION_TOKENS`.
 - [ ] `resolve_thresholds(0)` raises `ValueError`.
 - [ ] `resolve_thresholds(-1)` raises `ValueError`.
-- [ ] Running the module with `python -m services.worker_service.executor.compaction.defaults` produces no output and no errors (import-time assertions pass).
+- [ ] Running the module (via `services/worker-service/.venv/bin/python -c "import executor.compaction.defaults"` with cwd set to `services/worker-service`) produces no output and no errors (import-time assertions pass).
 - [ ] `get_platform_default_summarizer_model()` returns `"claude-haiku-4-5"` with no env override; returns the override value when `CONTEXT_MGMT_DEFAULT_SUMMARIZER_MODEL=xyz` is set in `os.environ`.
 - [ ] No import of LangChain / LangGraph / asyncpg / langfuse from `defaults.py` or `thresholds.py` — unit test asserts these modules are absent from the imported module object's graph.
 - [ ] `make worker-test` — full worker unit suite passes.

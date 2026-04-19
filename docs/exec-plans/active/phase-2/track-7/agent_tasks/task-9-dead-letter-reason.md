@@ -60,16 +60,35 @@ The reason must be plumbed through:
 
 ### Migration `0014_context_exceeded_dead_letter_reason.sql`
 
-Match Track 2's migration style. Example shape:
+`dead_letter_reason` is a **TEXT column with a CHECK constraint** (confirmed — see `infrastructure/database/migrations/0001_phase1_durable_execution.sql`, `0006_runtime_state_model.sql`, `0010_sandbox_support.sql`). The canonical pattern is **DROP CONSTRAINT + re-ADD with the expanded allowed-values list**. `0010_sandbox_support.sql` is the template to copy.
+
+Exact shape:
 
 ```sql
--- 0014: Add context_exceeded_irrecoverable to dead_letter_reason enum.
+-- 0014: Add context_exceeded_irrecoverable to dead_letter_reason CHECK constraint.
 -- Track 7 — Context Window Management hard-floor safety net.
 
-ALTER TYPE dead_letter_reason ADD VALUE IF NOT EXISTS 'context_exceeded_irrecoverable';
+ALTER TABLE tasks DROP CONSTRAINT tasks_dead_letter_reason_check;
+ALTER TABLE tasks ADD CONSTRAINT tasks_dead_letter_reason_check
+    CHECK (dead_letter_reason IS NULL OR dead_letter_reason IN (
+        'cancelled_by_user',
+        'retries_exhausted',
+        'task_timeout',
+        'non_retryable_error',
+        'max_steps_exceeded',
+        'human_input_timeout',
+        'rejected_by_user',
+        'sandbox_lost',
+        'sandbox_provision_failed',
+        'context_exceeded_irrecoverable'
+    ));
 ```
 
-If Track 2 used a CHECK constraint on a text column instead of a Postgres enum, match that approach. Inspect the current state of the `tasks` or `task_events` column `dead_letter_reason`.
+**Verify the current allowed-values list.** The list above is the cumulative state as of `0010_sandbox_support.sql`. If any migration between `0010` and `0014` added or removed a reason, copy the full current list from the latest migration and add `context_exceeded_irrecoverable` to it. Run `grep -r tasks_dead_letter_reason_check infrastructure/database/migrations/` to find the latest.
+
+**Deploy-order hard constraint.** The migration MUST land in production **before** any worker code that can produce the new reason. Otherwise the `UPDATE tasks SET dead_letter_reason='context_exceeded_irrecoverable'` call will violate the CHECK constraint and throw, and the reaper will fail to dead-letter the stuck task. Task 7 and later tasks depend on this migration being applied first.
+
+**`task_events` column.** If `task_events.dead_letter_reason` has its own CHECK constraint, extend that too. Otherwise the audit event insert will fail while the `tasks` update succeeds.
 
 ### Java enum
 

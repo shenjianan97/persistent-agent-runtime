@@ -67,7 +67,7 @@ Semantics:
 - **Service/Module:** Worker Service — Compaction transforms
 - **File paths:**
   - `services/worker-service/executor/compaction/transforms.py` (modify — add `truncate_tool_call_args` alongside Task 4's `clear_tool_results`)
-  - `services/worker-service/executor/compaction/__init__.py` (modify — re-export `truncate_tool_call_args`, `TruncateResult`)
+  - **Do NOT edit `compaction/__init__.py`** — Task 7 owns its final shape. Import `truncate_tool_call_args`, `TruncateResult` directly from `executor.compaction.transforms`.
   - `services/worker-service/tests/test_compaction_transforms_truncate.py` (new)
 - **Change type:** function addition + unit tests
 
