@@ -66,9 +66,16 @@ SUMMARIZER_TEMPLATE_FALLBACK = "template:fallback"
 # dead-letter with observations.
 SUMMARIZER_TEMPLATE_DEAD_LETTER = "template:dead_letter"
 
-# Dead-letter reason constant reused across worker code. Keeps the string
-# from drifting across hook sites.
+# Dead-letter reason constants reused across worker code. Keep these strings
+# in sync with ValidationConstants.ALLOWED_DEAD_LETTER_REASONS (Java) and the
+# latest dead_letter_reason migration in infrastructure/database/migrations/.
 DEAD_LETTER_REASON_CANCELLED_BY_USER = "cancelled_by_user"
+
+# Track 7 — Context Window Management hard-floor safety net.
+# Emitted when Tier 1 + 1.5 + 3 compaction together cannot reduce estimated
+# input tokens below the model's context window.
+# Migration: 0015_context_exceeded_dead_letter_reason.sql
+DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE = "context_exceeded_irrecoverable"
 
 # Attached-memory prompt-prefix caps (Task 8). Observations and summary
 # are injected into the initial prompt; we cap per-block byte sizes so a
