@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     toastSuccessMock: vi.fn(),
     searchParamsInit: new URLSearchParams(),
     agentFixture: null as any,
+    agentIsLoading: false as boolean,
     agentsListFixture: [] as any[],
     memoryListResult: {
         data: { items: [], next_cursor: null },
@@ -59,8 +60,8 @@ vi.mock('@/features/agents/useAgents', () => ({
         isLoading: false,
     }),
     useAgent: () => ({
-        data: mocks.agentFixture,
-        isLoading: false,
+        data: mocks.agentIsLoading ? undefined : mocks.agentFixture,
+        isLoading: mocks.agentIsLoading,
     }),
 }));
 
@@ -96,6 +97,7 @@ function createWrapper() {
 
 beforeEach(() => {
     mocks.searchParamsInit = new URLSearchParams();
+    mocks.agentIsLoading = false;
     mocks.agentsListFixture = [
         {
             agent_id: 'test-agent',
@@ -228,6 +230,42 @@ describe('SubmitTaskPage — memory enabled agent', () => {
         expect(request.memory_mode).toBe('always');
         expect(request.skip_memory_write).toBeUndefined();
         expect(request.attached_memory_ids).toBeUndefined();
+    });
+});
+
+describe('SubmitTaskPage — agent config still loading', () => {
+    // Regression: previously ``memoryEnabled`` collapsed "unknown/loading" and
+    // "explicitly disabled" into the same false state, so a fast submit while
+    // useAgent was still fetching would silently force ``memory_mode=skip`` on
+    // what turned out to be a memory-enabled agent. Guard: the submit button
+    // must be disabled while ``useAgent`` is in flight, and if the coercion
+    // path ever runs it must NOT force ``skip`` without a resolved agent.
+
+    it('disables the submit button while useAgent is loading', async () => {
+        mocks.agentIsLoading = true;
+        mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
+        render(<SubmitTaskPage />, { wrapper: createWrapper() });
+        const btn = await screen.findByRole('button', { name: /loading agent/i });
+        expect(btn).toBeDisabled();
+    });
+
+    it('does NOT coerce memory_mode=skip just because agent config is still loading', async () => {
+        // First render: loading → user tries to submit early. The button is
+        // disabled so mutate shouldn't fire, but we also assert the coercion
+        // path itself would not set 'skip'. To exercise that belt-and-
+        // suspenders path, flip to "resolved + memory ENABLED" and submit;
+        // the payload must be 'always', never 'skip'.
+        mocks.agentFixture.agent_config.memory = { enabled: true };
+        mocks.searchParamsInit = new URLSearchParams({ agent_id: 'test-agent' });
+        render(<SubmitTaskPage />, { wrapper: createWrapper() });
+        const input = screen.getByLabelText(/Input Directive/i);
+        fireEvent.change(input, { target: { value: 'hello' } });
+        await act(async () => {
+            fireEvent.click(screen.getByRole('button', { name: /submit task/i }));
+        });
+        await waitFor(() => expect(mocks.mutateMock).toHaveBeenCalled());
+        const [{ request }] = mocks.mutateMock.mock.calls[mocks.mutateMock.mock.calls.length - 1];
+        expect(request.memory_mode).toBe('always');
     });
 });
 

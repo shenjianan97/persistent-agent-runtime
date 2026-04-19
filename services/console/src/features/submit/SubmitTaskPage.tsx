@@ -67,6 +67,14 @@ export function SubmitTaskPage() {
 
     const sandboxEnabled = selectedAgent?.agent_config?.sandbox?.enabled === true;
     const memoryEnabled = selectedAgent?.agent_config?.memory?.enabled === true;
+    // Tri-state: the agent's memory-enabled flag has three resolved states —
+    // {enabled, disabled, still-loading/unknown}. ``memoryEnabled`` collapses
+    // unknown to false, which is right for hiding UI but wrong for forcing a
+    // submit payload, because it would coerce ``memory_mode='skip'`` onto a
+    // memory-enabled agent whose detail query is still in flight. Only coerce
+    // to ``skip`` when we have the agent detail AND it says memory is off.
+    const agentConfigResolved = !!selectedAgent && !isLoadingAgent;
+    const memoryExplicitlyDisabled = agentConfigResolved && !memoryEnabled;
 
     // Cache of resolved memory entries keyed by id, used to render the "Selected"
     // panel and to feed the token-footprint indicator. Entries arrive lazily as
@@ -237,10 +245,15 @@ export function SubmitTaskPage() {
                 memoryEnabled && data.attached_memory_ids && data.attached_memory_ids.length > 0
                     ? data.attached_memory_ids
                     : undefined,
-            // When the agent has memory disabled, the only legal mode is `skip`
-            // (API enforces this invariant). Otherwise honour the form value,
-            // defaulting to `always`.
-            memory_mode: memoryEnabled ? (data.memory_mode ?? 'always') : 'skip',
+            // When the agent has memory CONFIRMED disabled, the only legal mode
+            // is `skip` (API enforces this invariant). Unknown / still-loading
+            // is NOT the same as disabled — the submit button below is gated on
+            // ``agentConfigResolved`` so this branch only runs for a resolved
+            // agent, but defend here too: never coerce to `skip` without a
+            // loaded agent_config.
+            memory_mode: memoryExplicitlyDisabled
+                ? 'skip'
+                : (data.memory_mode ?? 'always'),
         };
 
         mutation.mutate(
@@ -654,10 +667,18 @@ export function SubmitTaskPage() {
                         <div className="flex justify-end pt-4 pb-12">
                             <Button
                                 type="submit"
-                                disabled={mutation.isPending || !selectedAgentId}
+                                disabled={
+                                    mutation.isPending ||
+                                    !selectedAgentId ||
+                                    !agentConfigResolved
+                                }
                                 className="rounded-none font-bold uppercase tracking-widest px-8 hover:saturate-150 transition-all border border-primary text-black"
                             >
-                                {mutation.isPending ? "INITIALIZING..." : "SUBMIT TASK"}
+                                {mutation.isPending
+                                    ? "INITIALIZING..."
+                                    : isLoadingAgent
+                                        ? "LOADING AGENT..."
+                                        : "SUBMIT TASK"}
                             </Button>
                         </div>
                     </form>
