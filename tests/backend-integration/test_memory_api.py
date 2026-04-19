@@ -7,7 +7,7 @@ Exercises the live api-service against the dedicated test DB, verifying:
     unit tests only; integration-level vector testing lands with Task 5)
   - websearch_to_tsquery parse-safety against tricky user input
   - agent_storage_stats appears only on the first page
-  - skip_memory_write column default has not broken the path
+  - memory_mode column default has not broken the path
 """
 from __future__ import annotations
 

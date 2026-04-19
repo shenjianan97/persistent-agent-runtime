@@ -1,7 +1,9 @@
 package com.persistentagent.api.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
+import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -13,6 +15,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -27,11 +30,15 @@ class ConfigValidationHelperTest {
     @Mock
     private ToolServerRepository toolServerRepository;
 
+    @Mock
+    private AgentRepository agentRepository;
+
     private ConfigValidationHelper helper;
 
     @BeforeEach
     void setUp() {
-        helper = new ConfigValidationHelper(modelRepository, toolServerRepository, false);
+        helper = new ConfigValidationHelper(
+                modelRepository, toolServerRepository, agentRepository, new ObjectMapper(), false);
     }
 
     // --- validateToolServers tests ---

@@ -106,7 +106,20 @@ public class TaskService {
         //    resolver error. The 404-not-403 rule still applies to the resolver step
         //    once we get there.
         List<UUID> attachedMemoryIds = validateAttachedMemoryIdShape(request.attachedMemoryIds());
-        boolean skipMemoryWrite = Boolean.TRUE.equals(request.skipMemoryWrite());
+        // Phase 2 Track 5 Task 12: normalise memory_mode; default is 'always' when
+        // absent. Pattern validation on the request DTO already rejected any other
+        // string value with a 400.
+        String memoryMode = normalizeMemoryMode(request.memoryMode());
+
+        // Cross-field invariant: the worker will refuse to engage the memory stack
+        // when the agent's config says memory.enabled=false. Surface that as a 4xx
+        // here rather than silently accepting a mode the worker will ignore. Mode
+        // 'skip' is always legal, even for memory-disabled agents, because it
+        // matches the worker's actual behaviour.
+        if (!"skip".equals(memoryMode)) {
+            configValidationHelper.validateMemoryModeAgainstAgent(
+                    tenantId, request.agentId(), memoryMode);
+        }
 
         // 3. Apply task-level defaults
         int maxRetries = request.maxRetries() != null ? request.maxRetries() : ValidationConstants.DEFAULT_MAX_RETRIES;
@@ -123,7 +136,7 @@ public class TaskService {
         Optional<Map<String, Object>> result = taskRepository.insertTaskFromAgent(
                 tenantId, request.agentId(), workerPoolId,
                 request.input(), maxRetries, maxSteps, taskTimeoutSeconds,
-                request.langfuseEndpointId(), skipMemoryWrite);
+                request.langfuseEndpointId(), memoryMode);
 
         if (result.isEmpty()) {
             // Atomic INSERT returned empty — determine why for the error response.
@@ -299,7 +312,21 @@ public class TaskService {
                 DateTimeUtil.toOffsetDateTime(task.get("resume_eligible_at")),
                 artifacts,
                 attachedMemoryIds,
-                attachedMemoriesPreview);
+                attachedMemoriesPreview,
+                memoryModeOrDefault(task.get("memory_mode")));
+    }
+
+    /**
+     * Reads the task row's {@code memory_mode} column, defaulting to
+     * {@code "always"} when null (e.g. an in-flight row created by a
+     * pre-migration test fixture, although the migration's NOT NULL
+     * guarantees this cannot persist).
+     */
+    private String memoryModeOrDefault(Object raw) {
+        if (raw instanceof String s && !s.isBlank()) {
+            return s;
+        }
+        return "always";
     }
 
     public CheckpointListResponse getCheckpoints(UUID taskId) {
@@ -784,6 +811,18 @@ public class TaskService {
     }
 
     // --- Validation helpers ---
+
+    /**
+     * Normalises the optional {@code memory_mode} submission field. Null / blank
+     * defaults to {@code "always"}. Pattern validation on the request DTO already
+     * rejected any other string with a 400, so this method trusts its input.
+     */
+    private String normalizeMemoryMode(String memoryMode) {
+        if (memoryMode == null || memoryMode.isBlank()) {
+            return "always";
+        }
+        return memoryMode;
+    }
 
     private void validateTaskTimeoutSeconds(Integer taskTimeoutSeconds) {
         if (taskTimeoutSeconds == null) {
