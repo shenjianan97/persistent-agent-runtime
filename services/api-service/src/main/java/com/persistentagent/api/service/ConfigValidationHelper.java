@@ -6,6 +6,7 @@ import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
+import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
@@ -211,12 +212,99 @@ public class ConfigValidationHelper {
         }
     }
 
+    /**
+     * Validates the optional {@code context_management} sub-object on
+     * {@link AgentConfigRequest}. Absence is always valid; platform defaults
+     * apply at read time in the worker (Task 3), not at write time.
+     *
+     * <ul>
+     *   <li>{@code summarizerModel}, when non-blank, must resolve against the
+     *       {@code models} table for the agent's provider (same lookup as
+     *       {@link #validateModel(String, String)}). Additionally, when the DB
+     *       exposes {@code context_window} for both the summarizer and the primary
+     *       model, the summarizer's context window must be ≥ the primary model's
+     *       Tier 3 trigger. Tier 3 trigger formula mirrors
+     *       {@code compaction/thresholds.py#resolve_thresholds} (Task 3):
+     *       {@code tier3_trigger = int((context_window - OUTPUT_BUDGET_RESERVE) * TIER_3_FRACTION)}.
+     *       When either window is absent from the DB the check is skipped
+     *       (graceful degradation — older seeds lack context_window).</li>
+     *   <li>{@code excludeTools}, when non-null, must have ≤ 50 entries
+     *       (matches {@code tool_servers} cap). Tool-name existence is NOT
+     *       validated — customers may add custom tools before wiring.</li>
+     *   <li>{@code preTier3MemoryFlush} bool-typed; no coercion or cross-field
+     *       validation — runtime gating (memory.enabled check) is the worker's
+     *       job (Task 9).</li>
+     * </ul>
+     *
+     * @param cm       context-management sub-object (may be {@code null})
+     * @param provider agent's provider (e.g. "anthropic")
+     * @param model    agent's primary model ID (used for context-window comparison)
+     */
+    public void validateContextManagementConfig(
+            ContextManagementConfigRequest cm, String provider, String model) {
+        if (cm == null) {
+            return; // Absent context_management sub-object is valid.
+        }
+
+        // summarizer_model: optional; when present and non-blank, must be active
+        // for the agent's provider. Reject blank strings — ambiguous with absence.
+        if (cm.summarizerModel() != null && !cm.summarizerModel().isBlank()) {
+            if (!modelRepository.isModelActive(provider, cm.summarizerModel())) {
+                throw new ValidationException(
+                        "Unsupported context_management.summarizer_model or provider: "
+                                + provider + "/" + cm.summarizerModel()
+                                + ". Check GET /v1/models for supported ones.");
+            }
+
+            // Context-window check: summarizer must be able to hold the primary model's
+            // Tier 3 trigger. Formula mirrors compaction/thresholds.py#resolve_thresholds
+            // (Task 3 — inlined here until Task 3 ships a shared helper):
+            //   effective_budget = context_window - OUTPUT_BUDGET_RESERVE_TOKENS  (10_000)
+            //   tier3_trigger    = int(effective_budget * TIER_3_TRIGGER_FRACTION) (0.75)
+            // When either window is NULL / missing from DB, we skip the check (graceful
+            // degradation: older model seeds do not carry context_window yet; the
+            // migration 0014_model_context_window.sql adds the column with DEFAULT NULL).
+            modelRepository.getContextWindow(provider, cm.summarizerModel())
+                    .ifPresent(summarizerWindow -> {
+                        modelRepository.getContextWindow(provider, model).ifPresent(primaryWindow -> {
+                            // Mirror Task 3 resolve_thresholds formula.
+                            int outputBudgetReserve = 10_000;
+                            double tier3TriggerFraction = 0.75;
+                            int effectiveBudget = primaryWindow - outputBudgetReserve;
+                            int tier3Trigger = (int) (effectiveBudget * tier3TriggerFraction);
+                            if (summarizerWindow < tier3Trigger) {
+                                throw new ValidationException(
+                                        "context_management.summarizer_model " + cm.summarizerModel()
+                                                + " has context_window " + summarizerWindow
+                                                + " but primary model " + model
+                                                + " triggers Tier 3 at " + tier3Trigger
+                                                + " tokens — select a summarizer with context_window >= "
+                                                + tier3Trigger);
+                            }
+                        });
+                    });
+        }
+
+        // exclude_tools: optional; when present, must not exceed 50 entries.
+        // Tool-name existence is NOT validated — unknown names are allowed.
+        if (cm.excludeTools() != null && cm.excludeTools().size() > 50) {
+            throw new ValidationException(
+                    "context_management.exclude_tools must not exceed 50 entries "
+                            + "(got " + cm.excludeTools().size() + ")");
+        }
+
+        // pre_tier3_memory_flush: pure boolean toggle — no further validation.
+        // No cross-field check against memory.enabled; runtime gating is the worker's
+        // job (Task 9).
+    }
+
     public void validateAgentConfig(AgentConfigRequest config) {
         validateModel(config.provider(), config.model());
         validateAllowedTools(config.allowedTools());
         validateToolServers(config.toolServers());
         validateSandboxConfig(config.sandbox());
         validateMemoryConfig(config.memory(), config.provider());
+        validateContextManagementConfig(config.contextManagement(), config.provider(), config.model());
     }
 
     /**
