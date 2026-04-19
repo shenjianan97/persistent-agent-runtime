@@ -411,10 +411,12 @@ class TaskServiceTest {
     }
 
     @Test
-    void submitTask_withMemoryModeAbsent_defaultsToAlways() {
+    void submitTask_withMemoryModeAbsent_memoryEnabledAgent_defaultsToAlways() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", "input", null, null, null, null, null, null);
 
+        when(configValidationHelper.isAgentMemoryEnabled("default", "agent1"))
+                .thenReturn(Optional.of(true));
         UUID taskId = UUID.randomUUID();
         stubSuccessfulInsertExpectingMemoryMode(taskId, "always");
 
@@ -423,9 +425,29 @@ class TaskServiceTest {
         verify(taskRepository).insertTaskFromAgent(
                 eq("default"), eq("agent1"), eq("shared"),
                 eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("always"));
-        // always triggers the cross-field invariant against the selected agent.
-        verify(configValidationHelper)
-                .validateMemoryModeAgainstAgent("default", "agent1", "always");
+        // Implicit defaults skip the strict cross-field validator — the service
+        // already consulted the agent to pick the default.
+        verify(configValidationHelper, never())
+                .validateMemoryModeAgainstAgent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void submitTask_withMemoryModeAbsent_memoryDisabledAgent_defaultsToSkip() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        when(configValidationHelper.isAgentMemoryEnabled("default", "agent1"))
+                .thenReturn(Optional.of(false));
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsertExpectingMemoryMode(taskId, "skip");
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(
+                eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("skip"));
+        verify(configValidationHelper, never())
+                .validateMemoryModeAgainstAgent(anyString(), anyString(), anyString());
     }
 
     @Test

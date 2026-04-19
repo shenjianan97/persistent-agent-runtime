@@ -106,19 +106,26 @@ public class TaskService {
         //    resolver error. The 404-not-403 rule still applies to the resolver step
         //    once we get there.
         List<UUID> attachedMemoryIds = validateAttachedMemoryIdShape(request.attachedMemoryIds());
-        // Phase 2 Track 5 Task 12: normalise memory_mode; default is 'always' when
-        // absent. Pattern validation on the request DTO already rejected any other
-        // string value with a 400.
-        String memoryMode = normalizeMemoryMode(request.memoryMode());
-
-        // Cross-field invariant: the worker will refuse to engage the memory stack
-        // when the agent's config says memory.enabled=false. Surface that as a 4xx
-        // here rather than silently accepting a mode the worker will ignore. Mode
-        // 'skip' is always legal, even for memory-disabled agents, because it
-        // matches the worker's actual behaviour.
-        if (!"skip".equals(memoryMode)) {
-            configValidationHelper.validateMemoryModeAgainstAgent(
-                    tenantId, request.agentId(), memoryMode);
+        // Phase 2 Track 5 Task 12: normalise memory_mode.
+        //  - Explicit value → validated strictly; "always"/"agent_decides" against a
+        //    memory-disabled agent is rejected with a 4xx.
+        //  - Absent → resolve default based on the agent's memory.enabled flag so
+        //    Phase-1/2 callers that never set the field keep working ("skip" for
+        //    memory-disabled agents, "always" for memory-enabled ones).
+        boolean memoryModeExplicit =
+                request.memoryMode() != null && !request.memoryMode().isBlank();
+        String memoryMode;
+        if (memoryModeExplicit) {
+            memoryMode = request.memoryMode();
+            if (!"skip".equals(memoryMode)) {
+                configValidationHelper.validateMemoryModeAgainstAgent(
+                        tenantId, request.agentId(), memoryMode);
+            }
+        } else {
+            boolean memoryEnabled = configValidationHelper
+                    .isAgentMemoryEnabled(tenantId, request.agentId())
+                    .orElse(true);
+            memoryMode = memoryEnabled ? "always" : "skip";
         }
 
         // 3. Apply task-level defaults
@@ -817,13 +824,6 @@ public class TaskService {
      * defaults to {@code "always"}. Pattern validation on the request DTO already
      * rejected any other string with a 400, so this method trusts its input.
      */
-    private String normalizeMemoryMode(String memoryMode) {
-        if (memoryMode == null || memoryMode.isBlank()) {
-            return "always";
-        }
-        return memoryMode;
-    }
-
     private void validateTaskTimeoutSeconds(Integer taskTimeoutSeconds) {
         if (taskTimeoutSeconds == null) {
             return;

@@ -11,6 +11,7 @@ import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
+import org.postgresql.util.PGobject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -240,23 +241,47 @@ public class ConfigValidationHelper {
      *                    — callers must gate out {@code "skip"} before invoking
      */
     public void validateMemoryModeAgainstAgent(String tenantId, String agentId, String memoryMode) {
-        Optional<Map<String, Object>> agentRow = agentRepository.findByIdAndTenant(tenantId, agentId);
-        if (agentRow.isEmpty()) {
-            // Let the caller fall through to its own unknown-agent handling; the
-            // atomic insert step will also miss and raise AgentNotFoundException
-            // with the richer error path. Stay silent here rather than double-reporting.
-            return;
-        }
-        String agentConfigJson = (String) agentRow.get().get("agent_config");
-        if (agentConfigJson == null || agentConfigJson.isBlank()) {
-            return;
-        }
-        boolean memoryEnabled = readMemoryEnabled(agentConfigJson);
-        if (!memoryEnabled) {
+        if (!isAgentMemoryEnabled(tenantId, agentId).orElse(true)) {
             throw new ValidationException(
                     "memory_mode cannot be '" + memoryMode
                             + "' because this agent does not have memory enabled");
         }
+    }
+
+    /**
+     * Looks up {@code agent_config.memory.enabled} for the agent. Returns
+     * {@link Optional#empty()} when the agent cannot be resolved — callers that
+     * want to defer the unknown-agent error to the atomic-insert path should
+     * treat empty as "unknown, fall through" rather than "memory off". Used by
+     * {@link com.persistentagent.api.service.TaskService} to pick a sensible
+     * per-task {@code memory_mode} default when the submitter did not specify
+     * one: memory-disabled agents default to {@code "skip"} so Phase-1/2
+     * callers that never set the field keep working; memory-enabled agents
+     * default to {@code "always"} per the Track 5 spec.
+     */
+    public Optional<Boolean> isAgentMemoryEnabled(String tenantId, String agentId) {
+        Optional<Map<String, Object>> agentRow = agentRepository.findByIdAndTenant(tenantId, agentId);
+        if (agentRow.isEmpty()) {
+            return Optional.empty();
+        }
+        String agentConfigJson = extractAgentConfigJson(agentRow.get().get("agent_config"));
+        if (agentConfigJson == null || agentConfigJson.isBlank()) {
+            return Optional.of(false);
+        }
+        return Optional.of(readMemoryEnabled(agentConfigJson));
+    }
+
+    private static String extractAgentConfigJson(Object rawAgentConfig) {
+        if (rawAgentConfig == null) {
+            return null;
+        }
+        if (rawAgentConfig instanceof String s) {
+            return s;
+        }
+        if (rawAgentConfig instanceof PGobject pg) {
+            return pg.getValue();
+        }
+        return rawAgentConfig.toString();
     }
 
     /**
