@@ -6,6 +6,7 @@ import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.response.AttachedMemoryPreview;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.service.ConversationLogService;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,9 @@ class TaskControllerTest {
 
         @MockitoBean
         private TaskEventService taskEventService;
+
+        @MockitoBean
+        private ConversationLogService conversationLogService;
 
         // --- POST /v1/tasks ---
 
@@ -564,5 +568,41 @@ class TaskControllerTest {
                                 .contentType(MediaType.APPLICATION_JSON_VALUE)
                                 .content(body))
                                 .andExpect(status().isNotFound());
+        }
+
+        // --- GET /v1/tasks/{id}/conversation (Phase 2 Track 7 Task 13) ---
+
+        @Test
+        void getConversation_existingTask_returns200AndPage() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                ConversationEntryResponse.Page empty =
+                                new ConversationEntryResponse.Page(List.of(), null);
+                when(conversationLogService.getConversation(eq(taskId), any(), any()))
+                                .thenReturn(empty);
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/conversation"))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.entries").isArray())
+                                .andExpect(jsonPath("$.next_sequence").doesNotExist());
+        }
+
+        @Test
+        void getConversation_unknownTask_returns404() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                when(conversationLogService.getConversation(eq(taskId), any(), any()))
+                                .thenThrow(new TaskNotFoundException(taskId));
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/conversation"))
+                                .andExpect(status().isNotFound());
+        }
+
+        @Test
+        void getConversation_limitTooLarge_returns400() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                when(conversationLogService.getConversation(eq(taskId), any(), eq(5000)))
+                                .thenThrow(new ValidationException("limit must be <= 1000"));
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/conversation?limit=5000"))
+                                .andExpect(status().isBadRequest());
         }
 }
