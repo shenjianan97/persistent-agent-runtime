@@ -2,6 +2,7 @@ package com.persistentagent.api.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.exception.ValidationException;
+import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
@@ -337,5 +338,200 @@ class ConfigValidationHelperTest {
 
         assertThrows(ValidationException.class,
                 () -> helper.validateMemoryModeAgainstAgent("tenant", "agent-x", "always"));
+    }
+
+    // --- validateContextManagementConfig tests ---
+
+    @Test
+    void testValidateContextManagementConfig_null_ok() {
+        // Absent context_management sub-object is always valid.
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(null, "openai", "gpt-4o"));
+        verifyNoInteractions(modelRepository);
+    }
+
+    @Test
+    void testValidateContextManagementConfig_allFieldsNull_ok() {
+        // All fields null — no checks needed.
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        verifyNoInteractions(modelRepository);
+    }
+
+    @Test
+    void testValidateContextManagementConfig_summarizerModelValid_ok() {
+        // Known-active summarizer model resolves for the agent's provider.
+        when(modelRepository.isModelActive("anthropic", "claude-haiku-4-5")).thenReturn(true);
+        // No context window available (returns empty) — check is skipped.
+        when(modelRepository.getContextWindow("anthropic", "claude-haiku-4-5")).thenReturn(Optional.empty());
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
+        verify(modelRepository).isModelActive("anthropic", "claude-haiku-4-5");
+    }
+
+    @Test
+    void testValidateContextManagementConfig_summarizerModelBlankString_skipped() {
+        // Empty or whitespace-only summarizer_model behaves like absence — no lookup.
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("   ", null, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        verifyNoInteractions(modelRepository);
+    }
+
+    @Test
+    void testValidateContextManagementConfig_summarizerModelUnknown_throws() {
+        // Unknown summarizer_model — rejected with the same shape as validateModel.
+        when(modelRepository.isModelActive("openai", "nonexistent-model")).thenReturn(false);
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("nonexistent-model", null, null);
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        assertTrue(ex.getMessage().contains("nonexistent-model"),
+                "error message should name the offending model: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("openai"),
+                "error message should name the provider: " + ex.getMessage());
+    }
+
+    @Test
+    void testValidateContextManagementConfig_summarizerModelDisabled_throws() {
+        // Model exists but is inactive — same 400 path.
+        when(modelRepository.isModelActive("openai", "retired-model")).thenReturn(false);
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("retired-model", null, null);
+        assertThrows(ValidationException.class,
+                () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_contextWindowCheck_summarizerTooSmall_throws() {
+        // Summarizer has 32K context window; primary model triggers Tier 3 at ~142K.
+        // The summarizer context_window (32K) < primary tier3_trigger (~142K) → 400.
+        when(modelRepository.isModelActive("anthropic", "small-model")).thenReturn(true);
+        when(modelRepository.getContextWindow("anthropic", "small-model"))
+                .thenReturn(Optional.of(32_000));
+        when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
+                .thenReturn(Optional.of(200_000));
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("small-model", null, null);
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
+        assertTrue(ex.getMessage().contains("small-model"),
+                "error message should name the offending summarizer: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("context_window"),
+                "error message should mention context_window: " + ex.getMessage());
+    }
+
+    @Test
+    void testValidateContextManagementConfig_contextWindowCheck_summarizerSufficient_ok() {
+        // Summarizer has 200K context window; primary triggers Tier 3 at ~142K.
+        // The summarizer context_window (200K) >= primary tier3_trigger (~142K) → accepted.
+        when(modelRepository.isModelActive("anthropic", "claude-haiku-4-5")).thenReturn(true);
+        when(modelRepository.getContextWindow("anthropic", "claude-haiku-4-5"))
+                .thenReturn(Optional.of(200_000));
+        when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
+                .thenReturn(Optional.of(200_000));
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_contextWindowCheck_primaryWindowUnknown_skipsCheck() {
+        // Primary model context window not in DB — check is skipped (graceful degradation).
+        when(modelRepository.isModelActive("anthropic", "claude-haiku-4-5")).thenReturn(true);
+        when(modelRepository.getContextWindow("anthropic", "claude-haiku-4-5"))
+                .thenReturn(Optional.of(32_000));
+        when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
+                .thenReturn(Optional.empty()); // primary window unknown
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        // Skips the check when primary window is unknown — no 400.
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_excludeTools_exactly50_ok() {
+        // 50 entries is at the cap — must accept.
+        List<String> tools = new java.util.ArrayList<>();
+        for (int i = 0; i < 50; i++) {
+            tools.add("tool_" + i);
+        }
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_excludeTools_51entries_throws() {
+        // 51 entries exceeds the 50-entry cap — must reject with a message naming the cap.
+        List<String> tools = new java.util.ArrayList<>();
+        for (int i = 0; i < 51; i++) {
+            tools.add("tool_" + i);
+        }
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        assertTrue(ex.getMessage().contains("50"),
+                "error message must name the 50-entry cap: " + ex.getMessage());
+    }
+
+    @Test
+    void testValidateContextManagementConfig_excludeTools_unknownToolNames_ok() {
+        // Unknown tool names are allowed — customers can add custom tools before wiring.
+        List<String> tools = List.of("memory_note", "unknown_tool_xyz");
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_excludeTools_empty_ok() {
+        // Empty exclude_tools list is valid.
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of(), null);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+    }
+
+    @Test
+    void testValidateContextManagementConfig_preTier3MemoryFlush_true_ok() {
+        // pre_tier3_memory_flush=true is valid regardless of memory.enabled state.
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, true);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        verifyNoInteractions(modelRepository);
+    }
+
+    @Test
+    void testValidateContextManagementConfig_preTier3MemoryFlush_false_ok() {
+        // pre_tier3_memory_flush=false is also valid.
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, false);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
+        verifyNoInteractions(modelRepository);
+    }
+
+    @Test
+    void testValidateContextManagementConfig_allFieldsValid_ok() {
+        // Combination of all fields present and valid — accepted.
+        when(modelRepository.isModelActive("anthropic", "claude-haiku-4-5")).thenReturn(true);
+        when(modelRepository.getContextWindow("anthropic", "claude-haiku-4-5"))
+                .thenReturn(Optional.of(200_000));
+        when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
+                .thenReturn(Optional.of(200_000));
+
+        List<String> tools = List.of("memory_note", "custom_tool");
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(
+                "claude-haiku-4-5", tools, true);
+        assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
+    }
+
+    @Test
+    void testValidateAgentConfig_withContextManagement_invokesNestedValidation() {
+        // validateAgentConfig must call validateContextManagementConfig when the sub-object is present.
+        // We verify this by checking that an invalid summarizer_model produces a 400 via the top-level call.
+        when(modelRepository.isModelActive("openai", "gpt-4o")).thenReturn(true);
+        when(modelRepository.isModelActive("openai", "bad-cm-model")).thenReturn(false);
+
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("bad-cm-model", null, null);
+        com.persistentagent.api.model.request.AgentConfigRequest config =
+                new com.persistentagent.api.model.request.AgentConfigRequest(
+                        "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
+
+        assertThrows(ValidationException.class, () -> helper.validateAgentConfig(config),
+                "validateAgentConfig must propagate context_management validation errors");
     }
 }

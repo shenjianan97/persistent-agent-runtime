@@ -27,5 +27,12 @@ public record AgentConfigRequest(
                 // When absent on the request, the persisted canonical JSON
                 // omits the key entirely (per Track 5 design: no silent
                 // defaults written to the row).
-                @JsonInclude(JsonInclude.Include.NON_NULL) MemoryConfigRequest memory) {
+                @JsonInclude(JsonInclude.Include.NON_NULL) MemoryConfigRequest memory,
+
+                // Track 7: Context Window Management. When absent on the request,
+                // the persisted canonical JSON omits the key entirely (no silent
+                // defaults written to the row — same pattern as memory above).
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("context_management")
+                ContextManagementConfigRequest contextManagement) {
 }
