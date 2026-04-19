@@ -20,7 +20,7 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from langfuse import Langfuse
 from langfuse.langchain import CallbackHandler
-from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError, GraphInterrupt
 from langgraph.types import Command
@@ -549,7 +549,7 @@ class GraphExecutor:
         else:
             llm_with_tools = llm
 
-        async def agent_node(state: MessagesState, config: RunnableConfig):
+        async def agent_node(state: RuntimeState, config: RunnableConfig):
             messages = state["messages"]
             if not any(isinstance(m, SystemMessage) for m in messages):
                 sys_messages = []
