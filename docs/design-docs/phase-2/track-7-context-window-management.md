@@ -75,7 +75,7 @@ Track 7 follows the same rule. Tool-result placeholders use neutral language ("t
 
 ### 4. Platform-owned defaults with narrow per-agent tuning knobs
 
-Per the "managed runtime, not a personal agent" positioning: customers do not need to tune knobs to get a working agent. Platform defaults (25KB per-result cap, keep=3 tool uses, 50% / 75% trigger fractions) apply to every agent. The per-agent tuning surface is **narrow on purpose** — `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`. None of these are kill switches; they're tuning for agents with unusual tool surfaces. Thresholds (`trigger_fraction_*`, `keep`, `per_result_cap_bytes`) are platform-owned and are promoted to per-agent only if production metrics show a clear use case. Context management itself is not toggleable per agent — see §Scope for why.
+Per the "managed runtime, not a personal agent" positioning: customers do not need to tune knobs to get a working agent. Platform defaults (25KB per-result cap, keep=3 tool uses, 50% / 75% trigger fractions) apply to every agent. The per-agent tuning surface is **narrow on purpose** — `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush`. None of these are feature toggles; they're tuning for agents with unusual tool surfaces. Thresholds (`trigger_fraction_*`, `keep`, `per_result_cap_bytes`) are platform-owned and are promoted to per-agent only if production metrics show a clear use case. Context management itself is not toggleable per agent — see §Scope for why.
 
 ## Architecture overview
 
@@ -141,8 +141,6 @@ New sub-object on `agent_config`:
 | `pre_tier3_memory_flush` | bool | `true` | per-agent, no-ops when `memory.enabled=false` |
 
 **No per-agent opt-out.** Context management is platform infrastructure, not a feature. An agent that hits the provider's context-window ceiling without compaction simply fails — there is no graceful "verbatim history" mode, because the per-tool-result cap already makes "verbatim history" impossible the moment compaction exists at all. Every agent gets all three tiers + the per-result cap.
-
-**Global kill switch** — `CONTEXT_MGMT_KILL_SWITCH=true` on a worker process forces Track 7 off for every task that worker runs. This is an **operator-only incident escape hatch**, not customer-facing. Flipping requires a worker restart, no DB change, no deploy. In-flight tasks that were using Track 7 state lose it on resume (their checkpointed `summary_marker` and watermarks are dropped from the schema), which triggers a fresh Tier 3 firing at extra cost — acceptable cost for an emergency revert.
 
 **`exclude_tools`:** tools whose *results* must never be masked. Use case: `request_human_input`'s response is load-bearing even after dozens of follow-up turns; if it is masked to `[tool output not retained]` the agent forgets what the human said. Platform seeds the list with:
 
@@ -426,7 +424,6 @@ Implementation: track `last_super_step_message_count` as part of `CompactionEnab
 
 - `agent.memory.enabled = false` → flush never fires (no memory system to note into)
 - `context_management.pre_tier3_memory_flush = false` → flush never fires on this agent regardless of memory state
-- `CONTEXT_MGMT_KILL_SWITCH=true` on the worker process → entire Track 7 off for that worker, flush moot
 
 **Edge case: flush turn pushes input past the model's hard context limit.** The flush inserts one SystemMessage and skips Tier 3 *for this call only*. If the Tier 1 + 1.5 output plus the flush prompt exceeds the model's hard context window (rare — requires history to be within ~200 bytes of the ceiling before the flush adds its ~500-byte message), the LLM call will error with provider-side context-limit. This surfaces through the worker's existing rate-limit / retryable-error path — the agent-node retry re-enters `compact_for_llm`, the `memory_flush_fired_this_task` flag is now True (already written by the flush turn), so Tier 3 proceeds normally on the retry. The flush is not re-inserted. No special handling is needed; the existing retry path covers it.
 
@@ -462,8 +459,7 @@ class RuntimeState(TypedDict):
     memory_opt_in: bool                                 # default False
 
     # Track 7 (Context Management) fields — populated by the compaction
-    # pipeline. Kill-switch runs mean the pipeline is a no-op; fields stay
-    # at defaults.
+    # pipeline on every task.
     cleared_through_turn_index: Annotated[int, _max_reducer]             # default 0
     truncated_args_through_turn_index: Annotated[int, _max_reducer]      # default 0
     summarized_through_turn_index: Annotated[int, _max_reducer]          # default 0
@@ -491,14 +487,13 @@ Rollback (Phase 2 Track 2's `rollback_last_checkpoint`) is handled outside the r
 
 1. **Checkpoint shape is stable.** A task checkpointed today and resumed next month after the agent's config has been edited (memory flipped on/off, exclude_tools changed) deserialises cleanly into the same schema. No silent field drops.
 2. **One test matrix.** Every state test covers one TypedDict. No N×M combinatorics across enabled/disabled feature pairs.
-3. **The kill switch becomes trivial.** It doesn't change the schema; it just causes the compaction pipeline to be a no-op. State fields stay at whatever they were; in-flight tasks are unaffected *structurally*, just temporarily uncompacted.
-4. **Future features add fields, not branches.** Track 9 (planning primitive), Track 10 (deep research), etc., each extend `RuntimeState` additively. No per-feature schema class.
-5. **Cost is negligible.** LangGraph reducers on unused fields are O(1) calls with empty updates; the checkpointer serializes `None` / `[]` / `0` in a few bytes.
+3. **Future features add fields, not branches.** Track 9 (planning primitive), Track 10 (deep research), etc., each extend `RuntimeState` additively. No per-feature schema class.
+4. **Cost is negligible.** LangGraph reducers on unused fields are O(1) calls with empty updates; the checkpointer serializes `None` / `[]` / `0` in a few bytes.
 
 **Features still branch on topology**, not state:
 
 - Track 5 `memory_write` node is registered iff `agent.memory.enabled`. Memory-disabled agents have no `memory_write` node; the `agent → END` edge is used.
-- Track 7 compaction pipeline runs inside `agent_node` iff `CONTEXT_MGMT_KILL_SWITCH != true`. Kill-switched workers skip the pipeline; `agent_node` sends raw `state["messages"]` to the LLM.
+- Track 7 compaction pipeline runs inside `agent_node` for every task; there is no per-worker or per-agent toggle.
 - Track 5 memory tools (`memory_note`, `memory_search`, `task_history_get`) are registered on the LLM iff memory is enabled — same as today.
 
 This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState if stack_enabled else MessagesState`). The plan rolls that migration into Task 7 so both tracks end up consistent.
@@ -552,10 +547,9 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 5. **Summary marker content is not replayed to the summarizer.** When Tier 3 fires a second time in the same task, the summarizer sees only the new slice being summarized, not the existing marker. This prevents summary-of-summary drift.
 6. **Summary marker is strict-append.** The reducer rejects any write where the new value does not start with the old value. Replace is not a valid path; regenerating the marker requires explicitly clearing it (not in scope for v1).
 7. **Per-tool-result cap is indivisible from ingestion.** Tool wrapper MUST apply the cap before returning the `ToolMessage`. Uncapped tool results must never enter state.
-8. **Compaction-disabled agents behave identically to pre-Track-7.** No state extension, no pipeline call, no structured logs, no cost ledger rows tagged `compaction.*`. This is the opt-out correctness gate.
-9. **Memory-disabled agents never fire the pre-Tier-3 flush.** Regardless of `context_management.pre_tier3_memory_flush` value.
-10. **Heartbeat / recovery turns never fire the pre-Tier-3 flush.** Detection rule: `len(messages) == last_super_step_message_count` (no `ToolMessage` or `HumanMessage` added since the last agent super-step).
-11. **Transforms never mutate input messages or their nested objects.** All `AIMessage.tool_calls`, `ToolMessage.content`, and `args` dict modifications MUST produce new objects via LangChain's `model_copy(update=...)` or equivalent. Mutation has caused cache-invalidation bugs in other tracks.
+8. **Memory-disabled agents never fire the pre-Tier-3 flush.** Regardless of `context_management.pre_tier3_memory_flush` value.
+9. **Heartbeat / recovery turns never fire the pre-Tier-3 flush.** Detection rule: `len(messages) == last_super_step_message_count` (no `ToolMessage` or `HumanMessage` added since the last agent super-step).
+10. **Transforms never mutate input messages or their nested objects.** All `AIMessage.tool_calls`, `ToolMessage.content`, and `args` dict modifications MUST produce new objects via LangChain's `model_copy(update=...)` or equivalent. Mutation has caused cache-invalidation bugs in other tracks.
 
 ## Scale and operational plan
 
@@ -563,14 +557,13 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 
 **Target cache hit rate:** the compaction transform is deterministic and monotone, so cache-hit rate should approach the pre-Track-7 baseline within 5% for any task whose watermarks advance linearly. Measurement: compare cached-token-fraction from Langfuse before and after enabling Track 7 on the same agent.
 
-**Rollout is a traditional deploy + watch.** Track 7 is always-on for all agents from the moment the worker ships; there is no per-agent config toggle and no phased config-driven canary. The kill switch (`CONTEXT_MGMT_KILL_SWITCH` env var) is the incident escape hatch.
+**Rollout is a traditional deploy + watch.** Track 7 is always-on for all agents from the moment the worker ships; there is no per-agent config toggle and no phased config-driven canary. If metrics show a regression, roll back the deploy — the same pattern as every other Phase 2 track.
 
 1. **Staging.** Deploy to staging. Run synthetic long-running tasks that cross the Tier 1 threshold. Verify metrics: `tier3_fire_rate` < 1 per 100 LLM calls on the synthetic load; `cache_hit_rate_ratio` within 5% of pre-Track-7 baseline; `compaction.summary_marker_non_append` count is zero.
 2. **Production.** Deploy to prod. Track 7 activates for every new and in-flight task on the next `_build_graph` call. Continue watching the same metrics.
-3. **Kill switch.** `CONTEXT_MGMT_KILL_SWITCH=true` on a worker process forces Track 7 off for that worker's task runs. Flipping requires a worker restart only — no DB change, no deploy. Runbook-documented: "flip kill switch, inspect Langfuse, fix, revert." In-flight tasks using Track 7 state lose it when the worker re-builds the graph for their resume: the schema downgrades to `MessagesState` and the `summary_marker`/watermark fields are dropped. Tier 3 will re-fire on that task at extra cost — acceptable for an emergency revert.
-4. **Metrics** watched continuously. If Tier 3 fires more than 1 per 100 calls on average, lower `TIER_1_TRIGGER_FRACTION` (clear earlier) before considering the deferred `aggressive_compaction` per-agent override.
+3. **Metrics** watched continuously. If Tier 3 fires more than 1 per 100 calls on average, lower `TIER_1_TRIGGER_FRACTION` (clear earlier) before considering the deferred `aggressive_compaction` per-agent override. If any of the rollout metrics regresses materially, roll back the deploy.
 
-**Regression test gate:** every agent-node unit test suite in `services/worker-service/tests/` runs twice — once with compaction enabled, once with it disabled — to guard the "disabled = pre-Track-7 behavior" invariant.
+**Regression test gate:** the cache-stability invariant (running the pipeline twice on the same state produces byte-identical output — AC 5) is the primary correctness gate for the compaction transforms. Every compaction unit test runs once; no doubled matrix.
 
 ## Cross-track coordination
 
@@ -588,16 +581,15 @@ This is a migration of the pattern Track 5 currently uses (`MemoryEnabledState i
 3. Tier 3 fires only when Tier 1 + 1.5 together cannot bring input below `TIER_3_TRIGGER_FRACTION`. Verifiable by test that constructs a synthetic history and confirms the tier ordering.
 4. Watermark fields on graph state only advance — a unit test that feeds back a regressing watermark confirms the reducer ignores it.
 5. Cache-stability invariant: running the same compaction pipeline on the same state twice produces byte-identical output.
-6. `CONTEXT_MGMT_KILL_SWITCH=true` on a worker yields zero pipeline invocations, zero new structured log lines, zero new cost ledger rows, and byte-identical tool output pass-through. Worker unit tests run twice (kill switch off + on) as a regression gate.
-7. `exclude_tools` entries are never masked. Given a task with `memory_note` results scattered through history, after Tier 1 runs, every `memory_note` `ToolMessage` retains its original content.
-8. Pre-Tier-3 memory flush fires at most once per task. Fires for agents with `memory.enabled=true AND pre_tier3_memory_flush=true`. Does not fire on heartbeat / recovery turns.
-9. `summary_marker` is append-only. A second Tier 3 firing within the same task appends a new summary rather than rewriting the existing one; cache-hit rate on the marker region stays high.
-10. Tier 3 cost lands in `agent_cost_ledger` tagged `compaction.tier3`, attributed to the current task and checkpoint.
-11. Budget carve-out: tasks with `budget_max_per_task` close to Tier 3 cost do not pause mid-summarization. Verifiable by integration test.
-12. Dead-letter with reason `context_exceeded_irrecoverable` transitions the task cleanly, including emitting `task_dead_lettered` event with the new reason.
-13. `POST/PUT /v1/agents` validates `context_management` fields per the rules in §Agent config extension. `summarizer_model` pointing at an inactive / wrong-provider model returns 400.
-14. Memory-disabled agents never fire the pre-Tier-3 flush, even if `pre_tier3_memory_flush=true` in their config.
-15. A Langfuse trace of a task that exercised all three tiers shows one `compaction.tier3` span per firing, one `compaction.inline` span per call that fires tier 1/1.5, and per-result cap annotations on affected tool spans.
+6. `exclude_tools` entries are never masked. Given a task with `memory_note` results scattered through history, after Tier 1 runs, every `memory_note` `ToolMessage` retains its original content.
+7. Pre-Tier-3 memory flush fires at most once per task. Fires for agents with `memory.enabled=true AND pre_tier3_memory_flush=true`. Does not fire on heartbeat / recovery turns.
+8. `summary_marker` is append-only. A second Tier 3 firing within the same task appends a new summary rather than rewriting the existing one; cache-hit rate on the marker region stays high.
+9. Tier 3 cost lands in `agent_cost_ledger` tagged `compaction.tier3`, attributed to the current task and checkpoint.
+10. Budget carve-out: tasks with `budget_max_per_task` close to Tier 3 cost do not pause mid-summarization. Verifiable by integration test.
+11. Dead-letter with reason `context_exceeded_irrecoverable` transitions the task cleanly, including emitting `task_dead_lettered` event with the new reason.
+12. `POST/PUT /v1/agents` validates `context_management` fields per the rules in §Agent config extension. `summarizer_model` pointing at an inactive / wrong-provider model returns 400.
+13. Memory-disabled agents never fire the pre-Tier-3 flush, even if `pre_tier3_memory_flush=true` in their config.
+14. A Langfuse trace of a task that exercised all three tiers shows one `compaction.tier3` span per firing, one `compaction.inline` span per call that fires tier 1/1.5, and per-result cap annotations on affected tool spans.
 
 ## References
 

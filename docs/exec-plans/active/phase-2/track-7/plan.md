@@ -4,7 +4,7 @@
 
 **Goal:** Keep long-running tasks viable by bounding the in-task message-history growth that otherwise pushes tasks into context-limit or cost-limit failure. Deliver a three-tier compaction pipeline (tool-result masking, tool-call argument truncation, retrospective summarization) that runs inside the LangGraph executor loop on a deterministic, cache-stable, monotone transform, plus a per-tool-result byte cap at ingestion and a narrow per-agent opt-out.
 
-**Architecture:** A worker-local `compaction` module (`services/worker-service/executor/compaction/`) exposes pure-function transforms plus an orchestrator that runs before every LLM call inside `agent_node`. A single unified `RuntimeState` TypedDict holds fields from both Track 5 (memory) and Track 7 (compaction); graph topology branches per feature, not state schema (matches LangGraph best practice and avoids the unsupported "swap schema per task" path). State extensions (`cleared_through_turn_index`, `truncated_args_through_turn_index`, `summarized_through_turn_index`, `summary_marker`, `memory_flush_fired_this_task`, `last_super_step_message_count`) use monotone reducers so watermarks only advance — preserving the KV-cache prefix across LLM calls. Per-tool-result byte cap (25KB) lives in the tool-execution wrapper so no oversized ToolMessage ever enters state. Thresholds scale with the model's context window (50% Tier 1, 75% Tier 3, fraction-only — no absolute caps). Track 7 is **always-on** for every agent — no per-agent opt-out; an operator kill switch (`CONTEXT_MGMT_KILL_SWITCH` env var) is the incident escape hatch. Pre-Tier-3 memory flush (one-shot agentic turn to `memory_note`) fires only when `agent.memory.enabled` is also on.
+**Architecture:** A worker-local `compaction` module (`services/worker-service/executor/compaction/`) exposes pure-function transforms plus an orchestrator that runs before every LLM call inside `agent_node`. A single unified `RuntimeState` TypedDict holds fields from both Track 5 (memory) and Track 7 (compaction); graph topology branches per feature, not state schema (matches LangGraph best practice and avoids the unsupported "swap schema per task" path). State extensions (`cleared_through_turn_index`, `truncated_args_through_turn_index`, `summarized_through_turn_index`, `summary_marker`, `memory_flush_fired_this_task`, `last_super_step_message_count`) use monotone reducers so watermarks only advance — preserving the KV-cache prefix across LLM calls. Per-tool-result byte cap (25KB) lives in the tool-execution wrapper so no oversized ToolMessage ever enters state. Thresholds scale with the model's context window (50% Tier 1, 75% Tier 3, fraction-only — no absolute caps). Track 7 is **always-on** for every agent — no per-agent opt-out and no runtime toggle; if metrics regress, roll back the deploy. Pre-Tier-3 memory flush (one-shot agentic turn to `memory_note`) fires only when `agent.memory.enabled` is also on.
 
 **Tech Stack:** Python + LangGraph + LangChain (worker); Spring Boot / Jackson (API agent config extension); React/TypeScript (Console agent edit form); PostgreSQL enum extension (Track 2 `dead_letter_reason` enum); Langfuse spans (observability).
 
@@ -24,7 +24,7 @@ Track 7 extends the Phase 2 worker runtime with:
 8. **Pre-Tier-3 memory flush** — before the first Tier 3 firing per task, when `agent.memory.enabled AND context_management.pre_tier3_memory_flush AND NOT memory_flush_fired_this_task`, the pipeline inserts a one-shot `SystemMessage` asking the agent to call `memory_note`. Heartbeat/recovery turns skip the flush.
 9. **Dead-letter reason + budget carve-out** — adds `context_exceeded_irrecoverable` to the Track 2 `dead_letter_reason` enum (schema migration) and wires it from the pipeline's hard-floor path. Adds `compaction.tier3` to the Track 3 named-node budget carve-out list (alongside `memory_write`).
 10. **Console UI** — extension to the Agent edit form adding a "Context management" section with the four narrow override fields. Mirrors Track 5 Memory tab's edit patterns. Browser-verified.
-11. **Integration + browser tests** — E2E acceptance-criteria coverage, cache-stability regression tests, kill-switch pass-through parity tests, Playwright scenarios for Console + Langfuse event emission.
+11. **Integration + browser tests** — E2E acceptance-criteria coverage, cache-stability regression tests, Playwright scenarios for Console + Langfuse event emission.
 
 **Canonical design contract:** `docs/design-docs/phase-2/track-7-context-window-management.md` — the spec agents must read before implementing any task.
 
@@ -47,7 +47,7 @@ Track 7 extends the Phase 2 worker runtime with:
 | Dead-letter reason | `infrastructure/database/migrations/0014_context_exceeded_dead_letter_reason.sql`, `services/api-service/.../enums/DeadLetterReason.java`, `services/worker-service/core/worker.py` | new migration + modification | Enum addition for `context_exceeded_irrecoverable`; pipeline hard-floor path transitions via the existing dead-letter API |
 | Budget carve-out | `services/worker-service/executor/graph.py` or wherever the Track 3 named-node carve-out list lives | modification | Add `compaction.tier3` to the named-node carve-out alongside `memory_write` |
 | Console edit form | `services/console/src/features/agents/ContextManagementSection.tsx`, `features/agents/AgentConfigForm.tsx` | new + modification | Section with the four override fields; summarizer_model dropdown sourced from `models`; exclude_tools chip-input; Playwright scenario addition |
-| Integration / E2E tests | `services/worker-service/tests/test_compaction_*.py`, `tests/backend-integration/test_context_management_*.py`, Playwright scenarios in `CONSOLE_BROWSER_TESTING.md` | new + modification | 15-AC coverage + cache-stability regression + parity tests + browser verification |
+| Integration / E2E tests | `services/worker-service/tests/test_compaction_*.py`, `tests/backend-integration/test_context_management_*.py`, Playwright scenarios in `CONSOLE_BROWSER_TESTING.md` | new + modification | 14-AC coverage + cache-stability regression + browser verification |
 
 ---
 
@@ -119,15 +119,15 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 5 and 6 both add to `c
 | Task 1 | `agent_config.context_management` accepted (three fields — no `enabled`), validated, canonicalised verbatim; `summarizer_model` cross-checked against `models`; Jackson round-trips the sub-object; requests with `enabled` key rejected 400 |
 | Task 2 | **Pure refactor, zero behavior change.** Worker's graph state unified to a single `RuntimeState` TypedDict (Track 5 fields only at this stage). `MemoryEnabledState if stack_enabled else MessagesState` branching in `_build_graph` replaced with `state_type = RuntimeState`. All existing Track 5 tests pass. |
 | Task 3 | `compaction/defaults.py` + `compaction/thresholds.py` — pure, unit-tested, no dependencies on LangGraph internals. `PLATFORM_EXCLUDE_TOOLS` includes all five: `memory_note`, `save_memory`, `request_human_input`, `memory_search`, `task_history_get`. |
-| Task 4 | `compaction/caps.py` with `cap_tool_result()`; tool wrappers always apply the cap unless `CONTEXT_MGMT_KILL_SWITCH=true` (operator-only escape hatch); `compaction.per_result_capped` emitted when the cap fires |
+| Task 4 | `compaction/caps.py` with `cap_tool_result()`; tool wrappers always apply the cap; `compaction.per_result_capped` emitted when the cap fires |
 | Task 5 | `compaction/transforms.py::clear_tool_results` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 6 | `compaction/transforms.py::truncate_tool_call_args` — pure, deterministic, monotone; cache-stability unit test passes |
 | Task 7 | `compaction/summarizer.py::summarize_slice` — retry + cost ledger + Langfuse span; handles summarizer outage with structured retries |
-| Task 8 | Track 7 fields added to `RuntimeState` (already unified in Task 2) — watermarks, summary marker with strict-append reducer, `last_super_step_message_count`. `compaction/pipeline.py::compact_for_llm`; `compaction/tokens.py::estimate_tokens` (real tokenizer for Anthropic/OpenAI, heuristic for others); `compaction/__init__.py` final public-API surface; `agent_node` invokes pipeline before every LLM call (skip if kill switch on); `compaction.tier3` added to the Track 3 named-node budget carve-out |
+| Task 8 | Track 7 fields added to `RuntimeState` (already unified in Task 2) — watermarks, summary marker with strict-append reducer, `last_super_step_message_count`. `compaction/pipeline.py::compact_for_llm`; `compaction/tokens.py::estimate_tokens` (real tokenizer for Anthropic/OpenAI, heuristic for others); `compaction/__init__.py` final public-API surface; `agent_node` invokes pipeline before every LLM call; `compaction.tier3` added to the Track 3 named-node budget carve-out |
 | Task 9 | Pipeline extension: one-shot pre-Tier-3 memory flush; respects `memory.enabled`, `pre_tier3_memory_flush`, heartbeat/recovery detection, `memory_flush_fired_this_task` one-shot flag |
 | Task 10 | Migration `0014_context_exceeded_dead_letter_reason.sql` (DROP+ADD CHECK constraint pattern per `0010_sandbox_support.sql`); enum value plumbed through Java + Python; pipeline hard-floor path transitions tasks via the existing dead-letter API |
 | Task 11 | Console Agent edit form "Context management" section with `summarizer_model`, `exclude_tools`, `pre_tier3_memory_flush` (no `enabled` toggle); Playwright scenario added |
-| Task 12 | 15-AC E2E coverage manifest + cache-stability regression tests + kill-switch pass-through tests + Playwright scenarios for Console + observability event emission |
+| Task 12 | 14-AC E2E coverage manifest + cache-stability regression tests + Playwright scenarios for Console + observability event emission |
 
 ---
 
@@ -154,13 +154,12 @@ Follow **AGENTS.md §Parallel Subagent Safety** — Tasks 5 and 6 both add to `c
 Same single-deployment pattern as Tracks 1–5. Key sequencing:
 
 1. **Migration `0014_context_exceeded_dead_letter_reason.sql`** ships with Task 9. CHECK-constraint DROP+re-ADD pattern (see Task 9 for exact shape — `dead_letter_reason` is a TEXT+CHECK column, not a Postgres enum). **Must land before Task 7 code** — otherwise a hard-floor transition produces a CHECK-violation and the reaper can't dead-letter a stuck task.
-2. **Traditional deploy + watch (not a canary-via-config rollout).** Track 7 is always-on for all agents; there is no per-agent toggle. Ship to staging, verify metrics, ship to prod. No Week-1/Week-2 config flips.
-3. **Kill switch.** `CONTEXT_MGMT_KILL_SWITCH=true` on a worker process forces Track 7 off for that worker's task runs. Worker-restart only; no DB change, no deploy. Runbook-documented escape hatch. In-flight tasks using Track 7 state lose it when the worker re-builds the graph on resume (compaction fields stay at last-persisted values but pipeline is a no-op); Tier 3 re-fires on their next run at extra cost — acceptable for an emergency revert.
-4. **Rollout watch.** Langfuse metrics tracked continuously:
+2. **Traditional deploy + watch (not a canary-via-config rollout).** Track 7 is always-on for all agents; there is no per-agent toggle. Ship to staging, verify metrics, ship to prod. No Week-1/Week-2 config flips. If metrics regress after prod rollout, roll back the deploy — same pattern as Tracks 3/4/5.
+3. **Rollout watch.** Langfuse metrics tracked continuously:
    - `tier3_fire_rate` — target < 1 per 100 LLM calls. Exceeds → lower `TIER_1_TRIGGER_FRACTION` platform default.
    - `cache_hit_rate_ratio` = post-Track-7 cached-token-fraction / pre-Track-7 cached-token-fraction on the same agents — target within 5%. A drop signals a KV-cache-stability regression (the monotonicity or strict-append invariants have been violated).
    - `compaction.summary_marker_non_append` log count — must be zero in production; non-zero means a reducer regression slipped through.
-5. **Regression test gate in CI.** Every compaction unit test runs twice (enabled + disabled) to guard the "disabled = pre-Track-7 behavior" invariant. Break that invariant and CI fails.
+4. **Regression test gate in CI.** Every compaction unit test runs — the cache-stability invariant (run the pipeline twice on the same state, assert byte-identical output) is the correctness gate. Break the invariant and CI fails.
 
 ---
 
@@ -197,7 +196,7 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 | Summarizer outage leaves task above Tier 3 threshold | Tier 1/1.5 continue to fire on every call and usually keep input under the model context limit even without Tier 3. Only when Tier 1/1.5 together cannot does the task hit the hard floor — expected to be rare. |
 | `exclude_tools` list grows unbounded and memory usage balloons | Cap at 50 entries (matches `tool_servers`). Validation rejects over-50 at `POST/PUT /v1/agents`. |
 | Cache-stability invariant silently broken by future refactor | Unit test runs the compaction pipeline twice on the same state and asserts `output == output`. CI gate. |
-| Customer workloads silently regress after Track 7 ships | Metrics watch in staging (synthetic long tasks) and prod (Langfuse dashboards). Worker-process kill switch (`CONTEXT_MGMT_KILL_SWITCH`) is the escape hatch for the platform operator; customers have no opt-out because an agent without compaction fails at the context ceiling anyway. |
+| Customer workloads silently regress after Track 7 ships | Metrics watch in staging (synthetic long tasks) and prod (Langfuse dashboards). If metrics show a regression, roll back the deploy — same pattern as Tracks 3/4/5. Customers have no opt-out because an agent without compaction fails at the context ceiling anyway. |
 | Pre-Tier-3 memory flush fires on heartbeat turn, wasting a memory_note cycle | Detection rule: last two messages both `AIMessage` → heartbeat. Skip flush. Unit tested. |
 | Budget carve-out omitted for `compaction.tier3` → Tier 3 pauses mid-compaction | Task 7 explicitly adds `compaction.tier3` to the Track 3 named-node carve-out list alongside `memory_write`. Regression test verifies carve-out by constructing a task with a tight per-task budget + forced Tier 3. |
 | Dead-letter reason enum migration ordering races with existing in-flight tasks | Enum additions are additive + non-breaking; in-flight tasks keep working with pre-existing reasons. Migration runs during normal deploy. |
@@ -210,7 +209,6 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 ## A9. Orchestrator Guidance
 
 - Use `docs/design-docs/phase-2/track-7-context-window-management.md` as the canonical design contract. Every task spec must reference the relevant section of that document.
-- `CONTEXT_MGMT_KILL_SWITCH=true` on a worker MUST yield zero pipeline invocations, zero new structured log lines, zero new cost ledger rows, and tool-wrapper pass-through (byte-identical). Regression gate: worker unit tests run twice (kill switch off + on) in CI.
 - Watermark reducers MUST be `max` (not stock `operator.add` and not raw assignment). Enforce in `state.py` unit tests.
 - `summary_marker` MUST NOT be replayed to the summarizer when Tier 3 fires a second time — the summarizer receives only the newly-old slice, and the new summary appends to the existing marker.
 - Pipeline transforms MUST be deterministic and monotone. Cache-stability unit test (`output == output` on repeat runs of the same input state) is mandatory in Task 7.
@@ -238,7 +236,7 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 10. **Budget carve-out for `compaction.tier3`.** Matches Track 5's `memory_write` pattern — per-task pause check skipped for the named node; hourly-spend accounting still applies.
 11. **Track 5 interaction scoped to one field + one SystemMessage.** `pre_tier3_memory_flush` gates a one-shot agentic turn inserted before Tier 3's first firing per task. Skipped on heartbeat turns; skipped entirely when memory is off.
 12. **Server-side Anthropic primitives deferred to Phase 3+.** Client-side compaction for provider portability in v1; layering `clear_tool_uses_20250919` / `compact_20260112` on Anthropic agents is a follow-up optimization.
-13. **Phased rollout with worker-level kill switch.** New agents get compaction on in Week 1; existing agents get it in Week 2 conditional on clean Week 1 metrics; `CONTEXT_MGMT_KILL_SWITCH` env var forces global off without a deploy. This replaces the original "default-on for everyone at rollout" plan after reviewer feedback: blast radius of a regression across every active task is too large to absorb in a single step.
+13. **Traditional deploy-and-watch rollout.** Track 7 activates for all agents at worker ship. If rollout metrics regress, roll back the deploy — the same incident-response path as every other Phase 2 track. No Track-7-specific env-var escape hatch.
 14. **Real tokenizer preferred for Anthropic / OpenAI.** Heuristic-only estimation under-counts by 30–50% on code/JSON-heavy history (exactly the case Track 7 exists to address), so `tiktoken` / `anthropic.count_tokens` is mandatory on those providers; Gemini / BYOT use the cheap char-count heuristic until a specific provider proves persistently inaccurate.
 15. **`__init__.py` owned by Task 7.** Tasks 2–6 don't touch it, avoiding the parallel-task merge conflict that would otherwise require worktree isolation on every preceding task.
 
@@ -251,7 +249,7 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 | Task 1 | [task-1-agent-config-extension.md](agent_tasks/task-1-agent-config-extension.md) | `agent_config.context_management` sub-object: Jackson, validation, canonicalisation (API) |
 | Task 2 | [task-2-state-schema-unification.md](agent_tasks/task-2-state-schema-unification.md) | **Refactor.** Unified `RuntimeState` TypedDict replaces Track 5's binary schema selection. All existing Track 5 tests pass; zero behavior change. Blocks every subsequent worker-side task. |
 | Task 3 | [task-3-compaction-constants-and-thresholds.md](agent_tasks/task-3-compaction-constants-and-thresholds.md) | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()` |
-| Task 4 | [task-4-per-tool-result-cap.md](agent_tasks/task-4-per-tool-result-cap.md) | `compaction/caps.py` head+tail cap; integration into tool wrappers; kill-switch pass-through |
+| Task 4 | [task-4-per-tool-result-cap.md](agent_tasks/task-4-per-tool-result-cap.md) | `compaction/caps.py` head+tail cap; integration into tool wrappers |
 | Task 5 | [task-5-tier-1-transform.md](agent_tasks/task-5-tier-1-transform.md) | `compaction/transforms.py::clear_tool_results` — pure, deterministic, monotone |
 | Task 6 | [task-6-tier-1-5-transform.md](agent_tasks/task-6-tier-1-5-transform.md) | `compaction/transforms.py::truncate_tool_call_args` — pure, deterministic, monotone |
 | Task 7 | [task-7-tier-3-summarizer.md](agent_tasks/task-7-tier-3-summarizer.md) | `compaction/summarizer.py::summarize_slice` with retry, cost ledger, Langfuse span |
@@ -259,4 +257,4 @@ Same single-deployment pattern as Tracks 1–5. Key sequencing:
 | Task 9 | [task-9-pre-tier3-memory-flush.md](agent_tasks/task-9-pre-tier3-memory-flush.md) | Pipeline extension: one-shot pre-Tier-3 memory flush with positional heartbeat skip |
 | Task 10 | [task-10-dead-letter-reason.md](agent_tasks/task-10-dead-letter-reason.md) | Migration + Java enum + Python constant for `context_exceeded_irrecoverable` |
 | Task 11 | [task-11-console-context-management-form.md](agent_tasks/task-11-console-context-management-form.md) | Console Agent edit form "Context management" section + Playwright scenario |
-| Task 12 | [task-12-integration-and-browser-tests.md](agent_tasks/task-12-integration-and-browser-tests.md) | 15-AC E2E + cache-stability regression + kill-switch pass-through tests + Playwright scenarios |
+| Task 12 | [task-12-integration-and-browser-tests.md](agent_tasks/task-12-integration-and-browser-tests.md) | 14-AC E2E + cache-stability regression + Playwright scenarios |

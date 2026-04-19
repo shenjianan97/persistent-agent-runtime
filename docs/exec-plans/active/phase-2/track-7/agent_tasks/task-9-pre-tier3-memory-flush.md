@@ -22,7 +22,6 @@ Before Tier 3 summarization would otherwise fire for the first time in a task, t
 - Fires at most once per task (`memory_flush_fired_this_task`).
 - Fires only when `agent.memory.enabled AND context_management.pre_tier3_memory_flush`.
 - Is skipped on heartbeat/recovery turns (detection: `len(raw_messages) <= state.last_super_step_message_count` — no new `ToolMessage` or `HumanMessage` since the last super-step; this is positional, NOT the "last two messages are both AIMessage" heuristic which misfires on rate-limit retries and pure-reasoning turns).
-- Does not fire when `CONTEXT_MGMT_KILL_SWITCH=true` on the worker process (Track 7 off for that worker entirely).
 - Does not fire when `memory.enabled=false` even if `pre_tier3_memory_flush=true` in config.
 
 Control flow when the flush fires:
@@ -131,7 +130,6 @@ Define module-level constant `_PRE_TIER3_FLUSH_PROMPT` with the exact string abo
 - [ ] On the NEXT call with the same threshold situation, the flush does NOT re-fire (flag is True); Tier 3 proceeds.
 - [ ] With `memory.enabled=false`, the flush never fires regardless of `pre_tier3_memory_flush` value; Tier 3 proceeds normally if threshold met.
 - [ ] With `pre_tier3_memory_flush=false`, the flush never fires; Tier 3 proceeds normally.
-- [ ] With `CONTEXT_MGMT_KILL_SWITCH=true` on the worker, compaction is disabled entirely — flush impossible.
 - [ ] Heartbeat detection (positional): when `len(raw_messages) <= state.last_super_step_message_count` (no new `ToolMessage` or `HumanMessage` since the last agent super-step), `_is_heartbeat_turn` returns True → flush is skipped even if all other conditions hold. `compaction.memory_flush_fired` is NOT emitted. This deliberately does NOT use the "last two messages are both AIMessage" heuristic, which misfires on rate-limit retries and pure-reasoning turns.
 - [ ] The flush `SystemMessage` is appended at the END of the compacted messages list (so it's the most recent system-context before the agent acts).
 - [ ] The flush message byte content exactly matches `_PRE_TIER3_FLUSH_PROMPT`.

@@ -5,7 +5,7 @@
 ## Agent Instructions
 
 **CRITICAL PRE-WORK:**
-1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Acceptance criteria" (15 ACs); every AC must be covered by a test or have a documented reason it isn't.
+1. `docs/design-docs/phase-2/track-7-context-window-management.md` — section "Acceptance criteria" (14 ACs); every AC must be covered by a test or have a documented reason it isn't.
 2. `services/worker-service/tests/test_track5_ac_mapping.py` — precedent for an AC-to-test mapping manifest (Track 5 Task 11).
 3. `docs/CONSOLE_BROWSER_TESTING.md` — scenario format + orchestrator verification workflow.
 4. `tests/backend-integration/` — existing REST E2E helpers, especially `helpers/api_client.py`.
@@ -19,13 +19,13 @@
 
 ## Context
 
-Track 7's acceptance criteria span worker, API, Console, DB, observability. Task 12 is the verification + manifest task — wires the 15 ACs to concrete tests, adds missing coverage, and lands the Playwright scenarios the orchestrator needs.
+Track 7's acceptance criteria span worker, API, Console, DB, observability. Task 12 is the verification + manifest task — wires the 14 ACs to concrete tests, adds missing coverage, and lands the Playwright scenarios the orchestrator needs.
 
 ## Task-Specific Shared Contract
 
 - **AC mapping manifest** at `services/worker-service/tests/test_track7_ac_mapping.py` — one failing-when-missing test per AC, matching Track 5's `test_track5_ac_mapping.py` pattern. Each test asserts the existence of the concrete test file + test function covering the AC; fails with a descriptive error if the target moves.
-- **New worker tests** under `services/worker-service/tests/test_compaction_*.py` for ACs 1–12 (see AC list below).
-- **New REST E2E tests** under `tests/backend-integration/test_context_management_*.py` for ACs 13 (validation).
+- **New worker tests** under `services/worker-service/tests/test_compaction_*.py` for ACs 1–11 (see AC list below).
+- **New REST E2E tests** under `tests/backend-integration/test_context_management_*.py` for AC 12 (validation).
 - **New Playwright scenarios** in `docs/CONSOLE_BROWSER_TESTING.md` (Scenario 14 from Task 11 covers the edit form; a new Scenario 15 covers the Langfuse trace verification for a compaction task — orchestrator executes).
 
 ## Affected Component
@@ -34,15 +34,14 @@ Track 7's acceptance criteria span worker, API, Console, DB, observability. Task
 - **File paths:**
   - `services/worker-service/tests/test_track7_ac_mapping.py` (new)
   - `services/worker-service/tests/test_compaction_cache_stability.py` (new — AC 5)
-  - `services/worker-service/tests/test_compaction_kill_switch_parity.py` (new — AC 6)
-  - `services/worker-service/tests/test_compaction_exclude_tools.py` (new — AC 7)
-  - `services/worker-service/tests/test_compaction_summary_marker_append.py` (new — AC 9)
-  - `services/worker-service/tests/test_compaction_cost_ledger.py` (new — AC 10)
-  - `services/worker-service/tests/test_compaction_budget_carve_out.py` (new — AC 11)
-  - `services/worker-service/tests/test_compaction_memory_disabled_no_flush.py` (new — AC 14)
-  - `services/worker-service/tests/test_compaction_observability.py` (new — AC 15 automated log-event assertions)
-  - `services/worker-service/tests/test_compaction_pre_tier3_flush_redrive.py` (new — AC 8 redrive-safety)
-  - `tests/backend-integration/test_context_management_validation.py` (new — AC 13)
+  - `services/worker-service/tests/test_compaction_exclude_tools.py` (new — AC 6)
+  - `services/worker-service/tests/test_compaction_summary_marker_append.py` (new — AC 8)
+  - `services/worker-service/tests/test_compaction_cost_ledger.py` (new — AC 9)
+  - `services/worker-service/tests/test_compaction_budget_carve_out.py` (new — AC 10)
+  - `services/worker-service/tests/test_compaction_memory_disabled_no_flush.py` (new — AC 13)
+  - `services/worker-service/tests/test_compaction_observability.py` (new — AC 14 automated log-event assertions)
+  - `services/worker-service/tests/test_compaction_pre_tier3_flush_redrive.py` (new — AC 7 redrive-safety)
+  - `tests/backend-integration/test_context_management_validation.py` (new — AC 12)
   - `docs/CONSOLE_BROWSER_TESTING.md` (modify — add Scenario 15)
   - `docs/exec-plans/active/phase-2/track-7/progress.md` (modify — mark Task 12 done; update STATUS.md; move directory)
 - **Change type:** new tests + manifest + scenario addition + completion bookkeeping
@@ -56,7 +55,7 @@ Track 7's acceptance criteria span worker, API, Console, DB, observability. Task
 
 ### AC ↔ Test coverage
 
-Track 7 design doc lists 15 ACs; Task 12 ensures each is covered:
+Track 7 design doc lists 14 ACs; Task 12 ensures each is covered:
 
 | AC # | Covered by |
 |------|-----------|
@@ -65,20 +64,19 @@ Track 7 design doc lists 15 ACs; Task 12 ensures each is covered:
 | 3 — tier ordering (Tier 3 only after Tier 1/1.5) | `test_compaction_pipeline.py::test_tier3_only_when_tier1_insufficient` (Task 8) |
 | 4 — watermark reducer rejects regressions | `test_compaction_state_reducers.py::test_max_reducer_rejects_regression` (Task 8) |
 | 5 — cache-stability invariant | **NEW** `test_compaction_cache_stability.py` (this task) |
-| 6 — kill-switch pass-through parity with pre-Track-7 | **NEW** `test_compaction_kill_switch_parity.py` (this task) |
-| 7 — exclude_tools never masked | **NEW** `test_compaction_exclude_tools.py` (this task) |
-| 8 — pre-Tier-3 flush once per task + heartbeat skip + survives redrive | `test_compaction_pre_tier3_flush.py` (Task 9) plus a new redrive-safety E2E test in `test_compaction_pre_tier3_flush_redrive.py` (this task) that saves a post-flush checkpoint, redrives, and asserts the flag is restored (no second flush) |
-| 9 — summary_marker append-only | **NEW** `test_compaction_summary_marker_append.py` (this task) |
-| 10 — Tier 3 cost ledger attribution | **NEW** `test_compaction_cost_ledger.py` (this task) |
-| 11 — budget carve-out for compaction.tier3 | **NEW** `test_compaction_budget_carve_out.py` (this task) |
-| 12 — context_exceeded_irrecoverable dead-letter | `test_compaction_hard_floor.py` (Task 10) |
-| 13 — API validation of context_management fields | **NEW** `test_context_management_validation.py` (this task, REST E2E) |
-| 14 — memory-disabled never fires flush | **NEW** `test_compaction_memory_disabled_no_flush.py` (this task) |
-| 15 — Langfuse spans present | **Automated:** `test_compaction_observability.py` asserts `compaction.inline` / `compaction.tier3` / `compaction.per_result_capped` / `compaction.memory_flush_fired` structured-log events fire at the expected points (mocked LLM + log-capture fixture). **Manual:** Orchestrator Playwright Scenario 15 confirms the Langfuse UI shows the spans (visual verification that the log events translate to trace spans correctly). |
+| 6 — exclude_tools never masked | **NEW** `test_compaction_exclude_tools.py` (this task) |
+| 7 — pre-Tier-3 flush once per task + heartbeat skip + survives redrive | `test_compaction_pre_tier3_flush.py` (Task 9) plus a new redrive-safety E2E test in `test_compaction_pre_tier3_flush_redrive.py` (this task) that saves a post-flush checkpoint, redrives, and asserts the flag is restored (no second flush) |
+| 8 — summary_marker append-only | **NEW** `test_compaction_summary_marker_append.py` (this task) |
+| 9 — Tier 3 cost ledger attribution | **NEW** `test_compaction_cost_ledger.py` (this task) |
+| 10 — budget carve-out for compaction.tier3 | **NEW** `test_compaction_budget_carve_out.py` (this task) |
+| 11 — context_exceeded_irrecoverable dead-letter | `test_compaction_hard_floor.py` (Task 10) |
+| 12 — API validation of context_management fields | **NEW** `test_context_management_validation.py` (this task, REST E2E) |
+| 13 — memory-disabled never fires flush | **NEW** `test_compaction_memory_disabled_no_flush.py` (this task) |
+| 14 — Langfuse spans present | **Automated:** `test_compaction_observability.py` asserts `compaction.inline` / `compaction.tier3` / `compaction.per_result_capped` / `compaction.memory_flush_fired` structured-log events fire at the expected points (mocked LLM + log-capture fixture). **Manual:** Orchestrator Playwright Scenario 15 confirms the Langfuse UI shows the spans (visual verification that the log events translate to trace spans correctly). |
 
 ### `test_track7_ac_mapping.py`
 
-Mirror `test_track5_ac_mapping.py`. Each of the 15 ACs gets one meta-test that asserts the concrete test file + function exists. Failing this test tells future maintainers which AC has drifted from its coverage.
+Mirror `test_track5_ac_mapping.py`. Each of the 14 ACs gets one meta-test that asserts the concrete test file + function exists. Failing this test tells future maintainers which AC has drifted from its coverage.
 
 ### `test_compaction_cache_stability.py` (AC 5)
 
@@ -88,26 +86,11 @@ Construct a realistic state with a long messages history and non-None summary_ma
 - `result_a.state_updates == result_b.state_updates`
 - Byte-level identical placeholder strings
 
-### `test_compaction_kill_switch_parity.py` (AC 6)
-
-Build a minimal LangGraph task runner. Run the same 10-tool task twice:
-
-- Run 1: worker with `CONTEXT_MGMT_KILL_SWITCH=false` (default) — compaction active.
-- Run 2: worker with `CONTEXT_MGMT_KILL_SWITCH=true` — kill switch flipped.
-
-For Run 2, assert:
-
-- No `compaction.*` structured logs emitted.
-- No `agent_cost_ledger` rows with `operation='compaction.tier3'`.
-- Graph state compaction fields stay at reducer-safe defaults (`cleared_through_turn_index=0`, `summary_marker=""`, etc.) throughout the task.
-- Message history fed to the LLM matches pre-Track-7 behavior exactly — no masking, no truncation, no summarization.
-- `ToolMessage.content` on a tool that returns > 25KB is byte-identical to the tool's original return — the per-result cap is a pass-through when kill switch is on.
-
-### `test_compaction_exclude_tools.py` (AC 7)
+### `test_compaction_exclude_tools.py` (AC 6)
 
 Construct a task history with 20 tool calls interleaved between `memory_note` and `web_search`. Force Tier 1 to fire. Assert every `memory_note` `ToolMessage.content` is unchanged; every old `web_search` `ToolMessage.content` is replaced with the placeholder.
 
-### `test_compaction_summary_marker_append.py` (AC 9)
+### `test_compaction_summary_marker_append.py` (AC 8)
 
 Mock summarizer returning distinct text on each call. Force Tier 3 to fire twice in the same task. Assert:
 
@@ -115,11 +98,11 @@ Mock summarizer returning distinct text on each call. Force Tier 3 to fire twice
 - `state.summary_marker` after second call = summary_1 + "\n\n..." + summary_2 (the append shape)
 - `summarized_through_turn_index` advanced on both calls
 
-### `test_compaction_cost_ledger.py` (AC 10)
+### `test_compaction_cost_ledger.py` (AC 9)
 
 Force one Tier 3 firing with a mocked summarizer returning a real response (with mocked response_metadata for token counts). Read back from `agent_cost_ledger`. Assert exactly one row with `operation='compaction.tier3'`, correct `task_id`, `agent_id`, `tenant_id`, non-zero `tokens_in` and `tokens_out`, `cost_microdollars` matching the formula against the summarizer model's pricing.
 
-### `test_compaction_budget_carve_out.py` (AC 11)
+### `test_compaction_budget_carve_out.py` (AC 10)
 
 Construct an agent with `budget_max_per_task = 100_000_000` microdollars (tight). Force a single Tier 3 firing whose summarizer cost would push the task over the per-task budget. Assert:
 
@@ -127,7 +110,7 @@ Construct an agent with `budget_max_per_task = 100_000_000` microdollars (tight)
 - The task continues normally after the compaction call.
 - The hourly-spend rollup still reflects the Tier 3 cost.
 
-### `test_compaction_memory_disabled_no_flush.py` (AC 14)
+### `test_compaction_memory_disabled_no_flush.py` (AC 13)
 
 Agent with `memory.enabled=false` and `context_management.pre_tier3_memory_flush=true`. Force Tier 3. Assert:
 
@@ -135,7 +118,7 @@ Agent with `memory.enabled=false` and `context_management.pre_tier3_memory_flush
 - No SystemMessage with `additional_kwargs.compaction_event == "pre_tier3_memory_flush"` in the compacted messages.
 - Tier 3 fires normally.
 
-### `test_context_management_validation.py` (AC 13, REST E2E)
+### `test_context_management_validation.py` (AC 12, REST E2E)
 
 Using the live API against the E2E DB (per `CLAUDE.md` — port 55433):
 
@@ -163,7 +146,7 @@ Covers: Orchestrator runs a task long enough to cross Tier 1 threshold → inspe
 
 - Every test listed above is new in this task unless marked as owned by an earlier task.
 - Tests must not require live LLM credentials. Mock all summarizer calls.
-- Tests must not require live Langfuse credentials. For the one Langfuse-span test (AC 15), the assertion is Playwright-inspection by the orchestrator, not automated.
+- Tests must not require live Langfuse credentials. For the one Langfuse-span test (AC 14), the assertion is Playwright-inspection by the orchestrator, not automated.
 - REST E2E tests use the `par-e2e-postgres` DB on port 55433 per `CLAUDE.md`.
 
 ## Constraints and Guardrails

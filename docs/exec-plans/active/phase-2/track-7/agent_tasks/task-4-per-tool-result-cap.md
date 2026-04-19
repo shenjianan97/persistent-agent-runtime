@@ -25,8 +25,6 @@ Every `ToolMessage` entering graph state is capped at `PER_TOOL_RESULT_CAP_BYTES
 
 The cap applies universally across: built-in tools (`sandbox_*`, `web_search`), BYOT MCP tools, memory tools (`memory_search`, `task_history_get`), human-input responses — every tool.
 
-**Kill-switch interaction.** When `CONTEXT_MGMT_KILL_SWITCH=true` is set on the worker process, the wrapper becomes a byte-identical pass-through — no cap, no log, nothing. This is the operator-only incident escape hatch; no customer-facing surface.
-
 ## Task-Specific Shared Contract
 
 - `cap_tool_result(raw: str, tool_name: str) -> tuple[str, CapEvent | None]`:
@@ -139,18 +137,13 @@ For every tool registered via the `_get_tools` path (both built-in and MCP-proxi
 from executor.compaction.caps import cap_tool_result
 from core.logging import log_structured
 
-def _apply_result_cap(tool_name: str, *, kill_switch: bool):
+def _apply_result_cap(tool_name: str):
     """Wraps a tool so its return value is head+tail capped to
     PER_TOOL_RESULT_CAP_BYTES before being handed to the ToolNode.
-
-    Pass-through (no cap, no log) iff the worker-process kill switch is on
-    — the operator-only incident escape hatch. Otherwise always cap.
     """
     def decorator(fn):
         async def wrapper(*args, **kwargs):
             result = await fn(*args, **kwargs)
-            if kill_switch:
-                return result
             result_str = result if isinstance(result, str) else str(result)
             capped, event = cap_tool_result(result_str, tool_name)
             if event is not None:
@@ -167,7 +160,7 @@ def _apply_result_cap(tool_name: str, *, kill_switch: bool):
     return decorator
 ```
 
-Apply this decorator to every tool returned by `_get_tools`, passing `kill_switch=worker_config.context_mgmt_kill_switch` (a boolean read from the `CONTEXT_MGMT_KILL_SWITCH` env var once at worker startup — not per-call). For MCP tools (Track 4), wrap the existing MCP-call wrapper the same way. The cap happens before the `ToolNode` constructs the `ToolMessage`.
+Apply this decorator to every tool returned by `_get_tools`. For MCP tools (Track 4), wrap the existing MCP-call wrapper the same way. The cap happens before the `ToolNode` constructs the `ToolMessage`.
 
 **Do NOT** apply the cap inside `_handle_tool_error` — errors are small and should not be truncated.
 
@@ -186,15 +179,14 @@ When `cap_tool_result` fires, in addition to the structured log, emit an annotat
 - [ ] Middle marker contains the byte counts (`orig_bytes` and `dropped`).
 - [ ] `cap_tool_result` handles UTF-8 multi-byte boundaries without raising (assert on a payload with `"日"` characters near the cut points).
 - [ ] Every tool registered in `_get_tools` applies the cap decorator — grep-test that asserts `@_apply_result_cap` or equivalent wraps each tool function.
-- [ ] Integration test (normal worker): a built-in tool returning a 500KB string produces a `ToolMessage` with `len(content) ≤ PER_TOOL_RESULT_CAP_BYTES` after the full execution path; `compaction.per_result_capped` is logged once.
-- [ ] **Integration test (kill-switch worker)**: same 500KB tool result on a worker with `CONTEXT_MGMT_KILL_SWITCH=true` lands in the `ToolMessage.content` VERBATIM (byte-identical to the original). No `compaction.per_result_capped` log emitted. This is the operator escape-hatch verification.
+- [ ] Integration test: a built-in tool returning a 500KB string produces a `ToolMessage` with `len(content) ≤ PER_TOOL_RESULT_CAP_BYTES` after the full execution path; `compaction.per_result_capped` is logged once.
 - [ ] Integration test: an error path (`_handle_tool_error`) is NOT affected by the cap.
 - [ ] Unit tests pass on `make worker-test`.
 
 ## Testing Requirements
 
 - **Unit tests for `caps.py`:** under-cap passes through; over-cap head+tail structure; byte-exact sizes; UTF-8 boundary safety; tool_name is echoed in `CapEvent`.
-- **Integration tests:** build a synthetic tool that returns > 25KB; run it through the `_get_tools` wrapping path on a normal worker (`CONTEXT_MGMT_KILL_SWITCH=false`) and assert the `ToolMessage` content is capped and the log line fired. Run the same synthetic tool on a kill-switch worker (`CONTEXT_MGMT_KILL_SWITCH=true`) and assert the content is pass-through byte-identical with no log line.
+- **Integration tests:** build a synthetic tool that returns > 25KB; run it through the `_get_tools` wrapping path and assert the `ToolMessage` content is capped and the log line fired.
 - **MCP tool integration (if Track 4 code paths are touched):** one integration test where a mock MCP server returns 500KB confirms the cap fires.
 - **No regression on short results:** confirm a 1KB `sandbox_read_file` result is unchanged.
 
