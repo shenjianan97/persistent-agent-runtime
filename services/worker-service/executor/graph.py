@@ -38,6 +38,7 @@ from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_P
 from executor import url_safety
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
+    MemoryDecision,
     MemoryEnabledState,
     MEMORY_WRITE_NODE_NAME,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
@@ -45,7 +46,7 @@ from executor.memory_graph import (
     build_attached_memories_preamble,
     build_pending_memory_dead_letter_template,
     checkpoint_tuple_has_prior_history,
-    effective_memory_enabled,
+    effective_memory_decision,
     memory_write_node,
 )
 from executor.embeddings import compute_embedding as _default_compute_embedding
@@ -467,7 +468,7 @@ class GraphExecutor:
         sandbox=None,
         s3_client=None,
         injected_files: list[str] | None = None,
-        memory_enabled: bool = False,
+        memory_decision: MemoryDecision | None = None,
         task_input: str | None = None,
         checkpointer: PostgresDurableCheckpointer | None = None,
     ) -> StateGraph:
@@ -484,6 +485,7 @@ class GraphExecutor:
             allowed_tools,
             injected_files=injected_files,
             sandbox_template=sandbox_template,
+            memory_decision=memory_decision,
         )
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
@@ -498,15 +500,22 @@ class GraphExecutor:
             s3_client=s3_client,
         )
 
-        # Phase 2 Track 5 Task 7 — memory tools are registered per-task with
-        # (tenant_id, agent_id) bound from the worker's task context. Scope
-        # is captured by closure; the LLM cannot override it via arguments.
+        # Phase 2 Track 5 Task 7 + Task 12 — memory tools are registered per-
+        # task with (tenant_id, agent_id) bound from the worker's task context.
+        # Scope is captured by closure; the LLM cannot override it via
+        # arguments.
         #
         # - ``memory_note`` and ``memory_search`` are gated on
-        #   ``effective_memory_enabled`` (agent.memory.enabled AND NOT
-        #   task.skip_memory_write).
+        #   ``decision.stack_enabled`` (agent.memory.enabled AND memory_mode
+        #   ∈ {always, agent_decides}).
+        # - ``save_memory`` (Task 12) is registered only in
+        #   ``agent_decides`` mode (``stack_enabled=True AND auto_write=False``)
+        #   — the agent's lever to opt this run in to writing a memory.
         # - ``task_history_get`` is always registered — diagnostic drill-down
         #   that is still safe cross-scope because of the bound predicate.
+        decision = memory_decision or MemoryDecision(
+            stack_enabled=False, auto_write=False
+        )
         memory_tool_ctx = MemoryToolContext(
             tenant_id=tenant_id,
             agent_id=agent_id,
@@ -520,7 +529,8 @@ class GraphExecutor:
         )
         tools = tools + build_memory_tools(
             memory_tool_ctx,
-            effective_memory_enabled=memory_enabled,
+            stack_enabled=decision.stack_enabled,
+            auto_write=decision.auto_write,
         )
 
         # Merge custom tools from MCP servers
@@ -578,23 +588,24 @@ class GraphExecutor:
                     raise
 
         # Define the Graph layout.
-        # When ``memory.enabled`` AND NOT ``skip_memory_write``, we register a
-        # custom state schema (MemoryEnabledState) which adds the
-        # ``observations`` + ``pending_memory`` fields and attaches the
-        # ``operator.add`` reducer on ``observations`` so the Task 7
-        # ``memory_note`` tool can append durably. Memory-disabled agents
-        # keep using the stock ``MessagesState`` — identical to pre-Track-5
-        # behaviour.
-        state_type = MemoryEnabledState if memory_enabled else MessagesState
+        # When the stack is enabled (``agent.memory.enabled`` AND
+        # ``memory_mode ∈ {always, agent_decides}``), we register a custom
+        # state schema (MemoryEnabledState) which adds ``observations``,
+        # ``pending_memory``, and ``memory_opt_in`` fields. Memory-disabled
+        # tasks (including ``memory_mode='skip'``) keep using the stock
+        # ``MessagesState`` — identical to pre-Track-5 behaviour.
+        stack_enabled = decision.stack_enabled
+        auto_write = decision.auto_write
+        state_type = MemoryEnabledState if stack_enabled else MessagesState
         workflow = StateGraph(state_type)
-        workflow.add_node("agent", agent_node)
+        workflow.add_node("agent", agent_node, input_schema=state_type)
 
-        # Wire the ``memory_write`` node when memory is enabled. Placed on
-        # the "no pending tool calls" branch so the terminal path becomes
-        # ``agent → memory_write → END`` — HITL pauses, budget pauses, and
-        # dead-letters exit the graph via different paths and therefore
-        # never traverse this node.
-        if memory_enabled:
+        # Wire the ``memory_write`` node whenever the stack is enabled.
+        # Terminal path out of the agent runs through this node on the
+        # branch selected by ``route_after_agent`` (below). HITL pauses,
+        # budget pauses, and dead-letters exit the graph via different paths
+        # and therefore never traverse this node.
+        if stack_enabled:
             summarizer_model_id = (
                 (agent_config.get("memory") or {}).get("summarizer_model")
                 or PLATFORM_DEFAULT_SUMMARIZER_MODEL
@@ -620,26 +631,68 @@ class GraphExecutor:
             workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
             workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
 
+        # Phase 2 Track 5 Task 12 — unified routing function out of the
+        # agent node. Replaces the pre-Task-12 ``tools_condition``-based
+        # wiring so the decision tree is explicit:
+        #
+        # 1. Pending tool calls on the last AIMessage → ``tools`` (same as
+        #    stock ``tools_condition``).
+        # 2. ``auto_write`` OR the ``memory_opt_in`` state flag is True →
+        #    ``memory_write`` (terminal memory branch).
+        # 3. Otherwise → ``END`` (silent no-op in agent_decides-no-opt).
+        def route_after_agent(state: Any) -> str:
+            messages = state.get("messages") if isinstance(state, dict) else None
+            if not messages:
+                messages = getattr(state, "messages", None)
+            last = messages[-1] if messages else None
+            pending = bool(getattr(last, "tool_calls", None)) if last else False
+            opt_in = bool(
+                state.get("memory_opt_in", False)
+                if isinstance(state, dict)
+                else getattr(state, "memory_opt_in", False)
+            )
+            if pending:
+                decision = "tools"
+            elif stack_enabled and (auto_write or opt_in):
+                decision = MEMORY_WRITE_NODE_NAME
+            else:
+                decision = END
+            logger.info(
+                "memory.route_after_agent task_id=%s decision=%s "
+                "pending_tool_calls=%s stack_enabled=%s auto_write=%s opt_in=%s",
+                task_id, decision, pending, stack_enabled, auto_write, opt_in,
+            )
+            return decision
+
         if tools:
             tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
-            if memory_enabled:
-                # ``tools_condition`` routes to ``tools`` when the agent
-                # message has pending tool calls, else to the node we pass
-                # as the third argument. Replace the "no pending calls"
-                # target with ``memory_write`` so the single terminal path
-                # out of ``agent`` runs the memory write.
+            if stack_enabled:
                 workflow.add_conditional_edges(
                     "agent",
-                    tools_condition,
-                    {"tools": "tools", END: MEMORY_WRITE_NODE_NAME},
+                    route_after_agent,
+                    {
+                        "tools": "tools",
+                        MEMORY_WRITE_NODE_NAME: MEMORY_WRITE_NODE_NAME,
+                        END: END,
+                    },
                 )
             else:
                 workflow.add_conditional_edges("agent", tools_condition)
         else:
-            if memory_enabled:
-                workflow.add_edge("agent", MEMORY_WRITE_NODE_NAME)
+            if stack_enabled:
+                # No tools configured → same routing but without the
+                # ``tools`` branch. ``route_after_agent`` still decides
+                # between ``memory_write`` and ``END``.
+                workflow.add_conditional_edges(
+                    "agent",
+                    route_after_agent,
+                    {
+                        MEMORY_WRITE_NODE_NAME: MEMORY_WRITE_NODE_NAME,
+                        END: END,
+                    },
+                )
             else:
                 workflow.add_edge("agent", END)
 
@@ -1197,6 +1250,7 @@ class GraphExecutor:
         *,
         injected_files: list[str] | None = None,
         sandbox_template: str | None = None,
+        memory_decision: MemoryDecision | None = None,
     ) -> str:
         """Build platform-generated system message with tool instructions.
 
@@ -1250,6 +1304,32 @@ class GraphExecutor:
                 f"with sandbox_exec commands."
             )
 
+        # Phase 2 Track 5 Task 12 — memory-tool framing. Gated on what is
+        # actually registered: ``memory_note`` / ``memory_search`` whenever
+        # the stack is on; ``save_memory`` only in ``agent_decides``. Tool
+        # descriptions alone underspecify behavior — Anthropic / OpenAI /
+        # Bedrock LLMs reliably forget optional retrieval tools without a
+        # platform nudge, and ``save_memory`` in particular needs the
+        # opt-in framing to preserve ``agent_decides`` semantics (a MUST
+        # directive would collapse it into ``always`` mode).
+        if memory_decision is not None and memory_decision.stack_enabled:
+            sections.append(
+                "This agent has persistent memory. Before starting non-trivial "
+                "work, consider calling `memory_search` to recall relevant past "
+                "runs. During the run, use `memory_note` to capture salient "
+                "intermediate findings that should survive into the final "
+                "memory entry."
+            )
+            if not memory_decision.auto_write:
+                sections.append(
+                    "Memory writes are opt-in for this run: call "
+                    "`save_memory(reason=...)` exactly when the run has "
+                    "produced something worth remembering (non-trivial "
+                    "findings, customer decisions, recurring patterns). "
+                    "Skip the call for routine or trivial runs — the absence "
+                    "of a call means no memory entry is written."
+                )
+
         return "\n\n".join(sections)
 
     async def execute_task(self, task_data: dict[str, Any], cancel_event: asyncio.Event) -> None:
@@ -1263,15 +1343,21 @@ class GraphExecutor:
         worker_id = self.config.worker_id
         agent_id = task_data.get("agent_id") or "unknown"
 
-        # Phase 2 Track 5: single-source-of-truth memory gate — computed once
-        # and consulted by graph assembly, the commit path, and the budget
-        # carve-out. ``skip_memory_write`` lands as a typed column on the
-        # tasks row (see migration 0011); the router should forward it via
-        # ``task_data`` in Task 4's dispatch path.
-        memory_enabled_for_task = effective_memory_enabled(
+        # Phase 2 Track 5 Task 12: single-source-of-truth memory gate —
+        # computed once and consulted by graph assembly, the commit path,
+        # and the budget carve-out. ``memory_mode`` is the typed task column
+        # introduced in migration 0012 and replaces the legacy
+        # ``skip_memory_write`` boolean. Default is ``always`` (today's
+        # memory-enabled behaviour) so a payload without the field preserves
+        # the pre-Task-12 default for memory-enabled agents.
+        memory_mode = task_data.get("memory_mode", "always")
+        if not isinstance(memory_mode, str):
+            memory_mode = "always"
+        memory_decision = effective_memory_decision(
             agent_config=agent_config,
-            skip_memory_write=bool(task_data.get("skip_memory_write", False)),
+            memory_mode=memory_mode,
         )
+        memory_enabled_for_task = memory_decision.stack_enabled
 
         # Reset per-task cost rate cache
         self._cost_rate_cache = {}
@@ -1519,7 +1605,7 @@ class GraphExecutor:
                 sandbox=sandbox,
                 s3_client=self.s3_client,
                 injected_files=injected_files if sandbox_enabled else None,
-                memory_enabled=memory_enabled_for_task,
+                memory_decision=memory_decision,
                 task_input=task_input,
                 checkpointer=checkpointer,
             )
@@ -1633,6 +1719,7 @@ class GraphExecutor:
                             injected_files if sandbox_enabled else None
                         ),
                         sandbox_template=sandbox_template_for_sys,
+                        memory_decision=memory_decision,
                     )
                     if agent_system_prompt:
                         initial_messages.append(
@@ -1650,6 +1737,12 @@ class GraphExecutor:
                     _payload: dict[str, Any] = {"messages": initial_messages}
                     if memory_enabled_for_task and seeded_observations:
                         _payload["observations"] = list(seeded_observations)
+                    # Phase 2 Track 5 Task 12 — per-run reset of the
+                    # ``agent_decides`` opt-in flag. The field has no reducer
+                    # (last-write-wins), so seeding ``False`` here guarantees
+                    # the agent must re-earn the opt-in on each run.
+                    if memory_enabled_for_task:
+                        _payload["memory_opt_in"] = False
                     initial_input = _payload
                 else:
                     initial_input = None
@@ -1667,7 +1760,18 @@ class GraphExecutor:
                         # {"kind":"approval","approved":true} -> resume value is the payload itself
                         if payload.get("kind") == "follow_up":
                             # Follow-up: inject new HumanMessage into existing conversation
-                            initial_input = {"messages": [HumanMessage(content=payload.get("message", ""))]}
+                            # Reset the opt-in flag so follow-up runs must
+                            # re-earn it (Task 12 per-run reset invariant).
+                            follow_up_payload: dict[str, Any] = {
+                                "messages": [
+                                    HumanMessage(
+                                        content=payload.get("message", "")
+                                    )
+                                ]
+                            }
+                            if memory_enabled_for_task:
+                                follow_up_payload["memory_opt_in"] = False
+                            initial_input = follow_up_payload
                         elif payload.get("kind") == "input":
                             resume_value = payload.get("message", "")
                             initial_input = Command(resume=resume_value)
@@ -1972,12 +2076,23 @@ class GraphExecutor:
                 if langfuse_endpoint_id:
                     output_data["langfuse_status"] = langfuse_status
 
-                if memory_enabled_for_task:
-                    # Phase 2 Track 5: co-commit the memory UPSERT + FIFO
-                    # trim + lease-validated task completion in one
-                    # transaction. Read ``pending_memory`` from the final
-                    # state values — the ``memory_write`` node just set it
-                    # on the terminal branch.
+                # Phase 2 Track 5 Task 12 — post-commit gate. The stack-
+                # enabled branch splits again on whether the run earned a
+                # memory write: ``auto_write=True`` (always mode) or the
+                # in-state ``memory_opt_in`` flag set by ``save_memory``
+                # (agent_decides mode). When neither is true we fall through
+                # to the memory-disabled branch below and complete the task
+                # without a memory row.
+                opt_in = bool(final_state.values.get("memory_opt_in", False)) \
+                    if isinstance(final_state.values, dict) else False
+                if memory_decision.stack_enabled and (
+                    memory_decision.auto_write or opt_in
+                ):
+                    # Co-commit the memory UPSERT + FIFO trim + lease-
+                    # validated task completion in one transaction. Read
+                    # ``pending_memory`` from the final state values — the
+                    # ``memory_write`` node just set it on the terminal
+                    # branch.
                     pending_memory = read_pending_memory_from_state_values(
                         final_state.values
                     )
@@ -1992,8 +2107,9 @@ class GraphExecutor:
                             worker_id=worker_id,
                         )
                         logger.info(
-                            "Task %s completed with memory (cost: %d microdollars, langfuse: %s).",
+                            "Task %s completed with memory (cost: %d microdollars, langfuse: %s, mode=%s, opt_in=%s).",
                             task_id, cumulative_task_cost, langfuse_status,
+                            memory_mode, opt_in,
                         )
                     except LeaseRevokedException:
                         logger.warning(
@@ -2044,6 +2160,7 @@ class GraphExecutor:
                 task_id, tenant_id, agent_id,
                 "task_timeout", "Execution exceeded task logic timeout",
                 memory_enabled=memory_enabled_for_task,
+                memory_mode=memory_mode,
                 agent_config=agent_config,
                 task_input=task_input,
                 retry_count=task_data.get("retry_count", 0),
@@ -2055,6 +2172,7 @@ class GraphExecutor:
                 "max_steps_exceeded",
                 f"Execution exceeded max_steps ({max_steps})",
                 memory_enabled=memory_enabled_for_task,
+                memory_mode=memory_mode,
                 agent_config=agent_config,
                 task_input=task_input,
                 retry_count=task_data.get("retry_count", 0),
@@ -2073,6 +2191,7 @@ class GraphExecutor:
                     task_data,
                     e,
                     memory_enabled=memory_enabled_for_task,
+                    memory_mode=memory_mode,
                     agent_config=agent_config,
                     task_input=task_input,
                     checkpointer=checkpointer,
@@ -2083,6 +2202,7 @@ class GraphExecutor:
                     "non_retryable_error", str(e),
                     error_code="fatal_error",
                     memory_enabled=memory_enabled_for_task,
+                    memory_mode=memory_mode,
                     agent_config=agent_config,
                     task_input=task_input,
                     retry_count=task_data.get("retry_count", 0),
@@ -2494,6 +2614,7 @@ class GraphExecutor:
         e: Exception,
         *,
         memory_enabled: bool = False,
+        memory_mode: str = "always",
         agent_config: dict[str, Any] | None = None,
         task_input: str | None = None,
         checkpointer: PostgresDurableCheckpointer | None = None,
@@ -2511,6 +2632,7 @@ class GraphExecutor:
                 "retries_exhausted",
                 f"Max retries reached. Last error: {e}",
                 memory_enabled=memory_enabled,
+                memory_mode=memory_mode,
                 agent_config=agent_config,
                 task_input=task_input,
                 retry_count=retry_count,
@@ -2574,6 +2696,7 @@ class GraphExecutor:
         error_code: str | None = None,
         *,
         memory_enabled: bool = False,
+        memory_mode: str = "always",
         agent_config: dict[str, Any] | None = None,
         task_input: str | None = None,
         retry_count: int | None = None,
@@ -2585,10 +2708,16 @@ class GraphExecutor:
         the same transaction** as the task UPDATE. Gating rules (all must
         hold to write a row):
 
-        * ``memory_enabled`` is True (agent.memory.enabled AND NOT
-          tasks.skip_memory_write — caller's pre-computed decision).
+        * ``memory_enabled`` is True (``decision.stack_enabled`` — agent.
+          memory.enabled AND ``tasks.memory_mode ∈ {always, agent_decides}``
+          — caller's pre-computed decision).
         * ``reason != 'cancelled_by_user'`` — cancellation writes nothing.
         * At least one observation recorded in the most recent checkpoint.
+        * Task 12 additional gate for ``memory_mode='agent_decides'`` — the
+          agent must have called ``save_memory`` (``memory_opt_in=True`` in
+          the latest checkpoint) before the failure. Without opt-in the
+          dead-letter template is suppressed so the customer's
+          "only-remember-when-worth-remembering" intent survives crashes.
 
         The row is template-only (``summarizer_model_id='template:dead_letter'``,
         ``outcome='failed'``) — no LLM call. Embedding is still attempted when
@@ -2618,7 +2747,21 @@ class GraphExecutor:
             observations = await self._read_observations_from_checkpoint(
                 checkpointer, task_id
             )
-            if observations:
+            # Phase 2 Track 5 Task 12 — ``agent_decides`` mode additionally
+            # requires that the agent opted in (via ``save_memory``) before
+            # the failure. Read the last-checkpointed value of
+            # ``memory_opt_in`` so a crash that occurred BEFORE the opt-in
+            # suppresses the dead-letter template, preserving the customer's
+            # "only remember when worth remembering" intent.
+            opt_in_required = memory_mode == "agent_decides"
+            opt_in_confirmed = False
+            if opt_in_required:
+                opt_in_confirmed = (
+                    await self._read_memory_opt_in_from_checkpoint(
+                        checkpointer, task_id
+                    )
+                )
+            if observations and (not opt_in_required or opt_in_confirmed):
                 memory_write_attempted = True
                 pending_memory = build_pending_memory_dead_letter_template(
                     task_input=task_input,
@@ -2836,6 +2979,39 @@ class GraphExecutor:
                 exc_info=True,
             )
             return []
+
+    async def _read_memory_opt_in_from_checkpoint(
+        self,
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+    ) -> bool:
+        """Read ``memory_opt_in`` from the latest checkpoint's state.
+
+        Task 12 — used by the dead-letter hook to decide whether an
+        ``agent_decides`` run had opted in before the failure. Missing /
+        corrupt / absent → ``False`` (degrade to "not opted in") so a
+        checkpoint read failure never silently upgrades a dead-letter into
+        a memory write.
+        """
+        try:
+            config: dict[str, Any] = {"configurable": {"thread_id": task_id}}
+            tup = await checkpointer.aget_tuple(config)
+            if tup is None:
+                return False
+            checkpoint = getattr(tup, "checkpoint", None) or {}
+            if not isinstance(checkpoint, dict):
+                return False
+            values = checkpoint.get("channel_values")
+            if not isinstance(values, dict):
+                return False
+            return bool(values.get("memory_opt_in", False))
+        except Exception:
+            logger.warning(
+                "memory.deadletter.opt_in_read_failed task_id=%s",
+                task_id,
+                exc_info=True,
+            )
+            return False
 
 
 def _build_dead_letter_embedding_text(pending_memory: dict[str, Any]) -> str:

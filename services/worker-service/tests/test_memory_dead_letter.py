@@ -127,10 +127,11 @@ async def _seed_checkpoint_with_observations(
     *,
     task_id: str,
     observations: list[str],
+    memory_opt_in: bool = False,
 ) -> None:
-    """Insert a checkpoint row with the given ``observations`` in
-    ``channel_values``. The dead-letter hook uses ``aget_tuple`` to read
-    this value.
+    """Insert a checkpoint row with the given ``observations`` (and
+    optionally ``memory_opt_in``) in ``channel_values``. The dead-letter
+    hook uses ``aget_tuple`` to read these values.
     """
     import time as _time
     checkpoint_id = f"1{_time.monotonic_ns()}"
@@ -142,6 +143,7 @@ async def _seed_checkpoint_with_observations(
             "messages": [],
             "observations": list(observations),
             "pending_memory": None,
+            "memory_opt_in": memory_opt_in,
         },
         "channel_versions": {},
         "versions_seen": {},
@@ -477,4 +479,114 @@ class TestMemoryDisabledSkipsWrite:
                 "SELECT status FROM tasks WHERE task_id = $1::uuid", task_id,
             )
         assert count == 0
+        assert status == "dead_letter"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Track 5 Task 12 — ``agent_decides`` opt-in gate on dead-letter
+# ---------------------------------------------------------------------------
+
+
+class TestAgentDecidesModeDeadLetterGate:
+    """Dead-letter template suppression under ``memory_mode='agent_decides'``.
+
+    * No opt-in → no row (even when observations exist).
+    * Opt-in → row written (the same behaviour as ``always`` mode).
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_decides_no_opt_in_writes_no_row(
+        self, integration_pool: asyncpg.Pool, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        async def _boom(*args, **kwargs):
+            raise AssertionError(
+                "embedding must not be called when agent_decides + no-opt "
+                "suppresses the dead-letter memory write"
+            )
+        monkeypatch.setattr(graph_module, "_default_compute_embedding", _boom)
+
+        task_id = str(uuid.uuid4())
+        await _seed_running_task(integration_pool, task_id=task_id)
+        await _seed_checkpoint_with_observations(
+            integration_pool,
+            task_id=task_id,
+            observations=["step-a", "step-b"],
+            memory_opt_in=False,
+        )
+
+        executor = _make_executor(integration_pool)
+        checkpointer = _make_checkpointer(integration_pool)
+        agent_config = {"memory": {"enabled": True, "max_entries": 10_000}}
+
+        await executor._handle_dead_letter(
+            task_id, TENANT_ID, AGENT_ID,
+            "non_retryable_error", "oh no",
+            error_code="fatal_error",
+            memory_enabled=True,
+            memory_mode="agent_decides",
+            agent_config=agent_config,
+            task_input="Investigate X",
+            retry_count=0,
+            checkpointer=checkpointer,
+        )
+
+        async with integration_pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM agent_memory_entries "
+                "WHERE task_id = $1::uuid", task_id,
+            )
+            status = await conn.fetchval(
+                "SELECT status FROM tasks WHERE task_id = $1::uuid", task_id,
+            )
+        assert count == 0, (
+            "agent_decides + no-opt must suppress the dead-letter memory row "
+            "even when observations exist"
+        )
+        assert status == "dead_letter"
+
+    @pytest.mark.asyncio
+    async def test_agent_decides_with_opt_in_writes_template_row(
+        self, integration_pool: asyncpg.Pool,
+    ) -> None:
+        task_id = str(uuid.uuid4())
+        await _seed_running_task(integration_pool, task_id=task_id)
+        await _seed_checkpoint_with_observations(
+            integration_pool,
+            task_id=task_id,
+            observations=["step-a", "[save_memory] worth remembering"],
+            memory_opt_in=True,
+        )
+
+        executor = _make_executor(integration_pool)
+        checkpointer = _make_checkpointer(integration_pool)
+        agent_config = {"memory": {"enabled": True, "max_entries": 10_000}}
+
+        await executor._handle_dead_letter(
+            task_id, TENANT_ID, AGENT_ID,
+            "non_retryable_error", "oh no",
+            error_code="fatal_error",
+            memory_enabled=True,
+            memory_mode="agent_decides",
+            agent_config=agent_config,
+            task_input="Investigate X",
+            retry_count=0,
+            checkpointer=checkpointer,
+        )
+
+        async with integration_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT outcome, summarizer_model_id, observations "
+                "FROM agent_memory_entries WHERE task_id = $1::uuid",
+                task_id,
+            )
+            status = await conn.fetchval(
+                "SELECT status FROM tasks WHERE task_id = $1::uuid", task_id,
+            )
+        assert row is not None, (
+            "agent_decides + opt-in should write the dead-letter template"
+        )
+        assert row["outcome"] == "failed"
+        assert row["summarizer_model_id"] == "template:dead_letter"
+        # Observations preserved verbatim, including the save_memory marker.
+        assert "[save_memory] worth remembering" in list(row["observations"])
         assert status == "dead_letter"

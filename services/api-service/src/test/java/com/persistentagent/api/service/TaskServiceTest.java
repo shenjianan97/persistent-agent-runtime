@@ -108,7 +108,7 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("do something"), eq(3), eq(100), eq(3600), isNull(), anyBoolean()))
+                eq("do something"), eq(3), eq(100), eq(3600), isNull(), anyString()))
                 .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
@@ -138,7 +138,7 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("do something"), eq(3), eq(100), eq(3600), eq(endpointId), anyBoolean()))
+                eq("do something"), eq(3), eq(100), eq(3600), eq(endpointId), anyString()))
                 .thenReturn(Optional.of(inserted));
 
         TaskSubmissionResponse response = taskService.submitTask(request);
@@ -165,7 +165,7 @@ class TaskServiceTest {
                 null, "agent-unknown", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-unknown"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyString()))
                 .thenReturn(Optional.empty());
         when(agentRepository.findByIdAndTenant("default", "agent-unknown"))
                 .thenReturn(Optional.empty());
@@ -179,7 +179,7 @@ class TaskServiceTest {
                 null, "agent-disabled", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent-disabled"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyString()))
                 .thenReturn(Optional.empty());
         Map<String, Object> agentRow = new LinkedHashMap<>();
         agentRow.put("agent_id", "agent-disabled");
@@ -197,7 +197,7 @@ class TaskServiceTest {
                 null, "agent1", "input", null, null, null, null, null, null);
 
         when(taskRepository.insertTaskFromAgent(anyString(), eq("agent1"), anyString(),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyBoolean()))
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), anyString()))
                 .thenReturn(Optional.empty());
         Map<String, Object> agentRow = new LinkedHashMap<>();
         agentRow.put("agent_id", "agent1");
@@ -229,16 +229,16 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "Agent One");
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyBoolean()))
+                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyString()))
                 .thenReturn(Optional.of(inserted));
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyBoolean());
+                eq("input"), eq(3), eq(100), eq(3600), isNull(), anyString());
     }
 
-    // --- submitTask: attached_memory_ids + skip_memory_write ---
+    // --- submitTask: attached_memory_ids + memory_mode ---
 
     @Test
     void submitTask_withNullAttachedMemoryIds_insertsNoAttachmentRows() {
@@ -246,7 +246,7 @@ class TaskServiceTest {
                 null, "agent1", "input", null, null, null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsert(taskId, false);
+        stubSuccessfulInsert(taskId);
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
@@ -267,7 +267,7 @@ class TaskServiceTest {
                 null, "agent1", "input", null, null, null, null, List.of(), null);
 
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsert(taskId, false);
+        stubSuccessfulInsert(taskId);
 
         TaskSubmissionResponse response = taskService.submitTask(request);
 
@@ -285,7 +285,7 @@ class TaskServiceTest {
                 null, "agent1", "input", null, null, null, null, inputIds, null);
 
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsert(taskId, false);
+        stubSuccessfulInsert(taskId);
         when(taskAttachedMemoryRepository.resolveScopedMemoryIds("default", "agent1", inputIds))
                 .thenReturn(List.of(m1, m2, m3));
 
@@ -325,7 +325,7 @@ class TaskServiceTest {
         inserted.put("agent_display_name_snapshot", "agent1");
         inserted.put("created_at", OffsetDateTime.now());
         when(taskRepository.insertTaskFromAgent(anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean()))
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyString()))
                 .thenReturn(Optional.of(inserted));
         when(taskAttachedMemoryRepository.resolveScopedMemoryIds("default", "agent1", inputIds))
                 .thenReturn(List.of(ok)); // count mismatch — one missed scope
@@ -355,7 +355,7 @@ class TaskServiceTest {
         assertTrue(ex.getMessage().toLowerCase().contains("duplicate"),
                 "Duplicate-id rejection should say 'duplicate'; got: " + ex.getMessage());
         verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean());
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyString());
     }
 
     @Test
@@ -372,7 +372,7 @@ class TaskServiceTest {
         assertTrue(ex.getMessage().contains("50"),
                 "Cap-exceeded rejection should mention 50; got: " + ex.getMessage());
         verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean());
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyString());
     }
 
     @Test
@@ -384,7 +384,7 @@ class TaskServiceTest {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", "input", null, null, null, null, ids, null);
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsert(taskId, false);
+        stubSuccessfulInsert(taskId);
         when(taskAttachedMemoryRepository.resolveScopedMemoryIds(eq("default"), eq("agent1"), eq(ids)))
                 .thenReturn(ids);
 
@@ -393,33 +393,95 @@ class TaskServiceTest {
     }
 
     @Test
-    void submitTask_withSkipMemoryWriteTrue_persistsOnTaskRow() {
+    void submitTask_withMemoryModeSkip_persistsOnTaskRow() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
-                null, "agent1", "input", null, null, null, null, null, true);
+                null, "agent1", "input", null, null, null, null, null, "skip");
 
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsertExpectingSkip(taskId, true);
+        stubSuccessfulInsertExpectingMemoryMode(taskId, "skip");
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTaskFromAgent(
                 eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq(true));
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("skip"));
+        // skip bypasses the cross-field invariant; agent config is not read.
+        verify(configValidationHelper, never())
+                .validateMemoryModeAgainstAgent(anyString(), anyString(), anyString());
     }
 
     @Test
-    void submitTask_withSkipMemoryWriteAbsent_defaultsToFalse() {
+    void submitTask_withMemoryModeAbsent_memoryEnabledAgent_defaultsToAlways() {
         TaskSubmissionRequest request = new TaskSubmissionRequest(
                 null, "agent1", "input", null, null, null, null, null, null);
 
+        when(configValidationHelper.isAgentMemoryEnabled("default", "agent1"))
+                .thenReturn(Optional.of(true));
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsertExpectingSkip(taskId, false);
+        stubSuccessfulInsertExpectingMemoryMode(taskId, "always");
 
         taskService.submitTask(request);
 
         verify(taskRepository).insertTaskFromAgent(
                 eq("default"), eq("agent1"), eq("shared"),
-                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq(false));
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("always"));
+        // Implicit defaults skip the strict cross-field validator — the service
+        // already consulted the agent to pick the default.
+        verify(configValidationHelper, never())
+                .validateMemoryModeAgainstAgent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void submitTask_withMemoryModeAbsent_memoryDisabledAgent_defaultsToSkip() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        when(configValidationHelper.isAgentMemoryEnabled("default", "agent1"))
+                .thenReturn(Optional.of(false));
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsertExpectingMemoryMode(taskId, "skip");
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(
+                eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("skip"));
+        verify(configValidationHelper, never())
+                .validateMemoryModeAgainstAgent(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void submitTask_withMemoryModeAgentDecides_persistsAndValidatesAgainstAgent() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, "agent_decides");
+
+        UUID taskId = UUID.randomUUID();
+        stubSuccessfulInsertExpectingMemoryMode(taskId, "agent_decides");
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(
+                eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), anyInt(), isNull(), eq("agent_decides"));
+        verify(configValidationHelper)
+                .validateMemoryModeAgainstAgent("default", "agent1", "agent_decides");
+    }
+
+    @Test
+    void submitTask_withMemoryModeAlwaysForMemoryDisabledAgent_throwsValidation() {
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, "always");
+
+        doThrow(new ValidationException(
+                "memory_mode cannot be 'always' because this agent does not have memory enabled"))
+                .when(configValidationHelper)
+                .validateMemoryModeAgainstAgent("default", "agent1", "always");
+
+        ValidationException ex = assertThrows(ValidationException.class,
+                () -> taskService.submitTask(request));
+        assertTrue(ex.getMessage().contains("memory_mode"));
+        verify(taskRepository, never()).insertTaskFromAgent(anyString(), anyString(), anyString(),
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyString());
     }
 
     @Test
@@ -428,7 +490,7 @@ class TaskServiceTest {
                 null, "agent1", "input", null, null, null, null, null, null);
 
         UUID taskId = UUID.randomUUID();
-        stubSuccessfulInsert(taskId, false);
+        stubSuccessfulInsert(taskId);
 
         taskService.submitTask(request);
 
@@ -444,8 +506,8 @@ class TaskServiceTest {
                 "Empty list should render as []; got: " + details);
     }
 
-    // Helper to stub a successful task insert without caring about skip_memory_write value.
-    private void stubSuccessfulInsert(UUID taskId, boolean skipMemoryWrite) {
+    // Helper to stub a successful task insert without caring about memory_mode value.
+    private void stubSuccessfulInsert(UUID taskId) {
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> inserted = new LinkedHashMap<>();
         inserted.put("task_id", taskId);
@@ -453,11 +515,11 @@ class TaskServiceTest {
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(
                 anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), anyBoolean()))
+                anyString(), anyInt(), anyInt(), anyInt(), any(), anyString()))
                 .thenReturn(Optional.of(inserted));
     }
 
-    private void stubSuccessfulInsertExpectingSkip(UUID taskId, boolean expectedSkip) {
+    private void stubSuccessfulInsertExpectingMemoryMode(UUID taskId, String expectedMode) {
         Timestamp now = Timestamp.from(Instant.now());
         Map<String, Object> inserted = new LinkedHashMap<>();
         inserted.put("task_id", taskId);
@@ -465,7 +527,7 @@ class TaskServiceTest {
         inserted.put("created_at", now);
         when(taskRepository.insertTaskFromAgent(
                 anyString(), anyString(), anyString(),
-                anyString(), anyInt(), anyInt(), anyInt(), any(), eq(expectedSkip)))
+                anyString(), anyInt(), anyInt(), anyInt(), any(), eq(expectedMode)))
                 .thenReturn(Optional.of(inserted));
     }
 
@@ -501,6 +563,7 @@ class TaskServiceTest {
         taskRow.put("pause_reason", null);
         taskRow.put("pause_details", null);
         taskRow.put("resume_eligible_at", null);
+        taskRow.put("memory_mode", "agent_decides");
 
         when(taskRepository.findByIdWithAggregates(taskId, "default")).thenReturn(Optional.of(taskRow));
         when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
@@ -520,6 +583,7 @@ class TaskServiceTest {
         assertNull(response.pauseReason());
         assertNull(response.pauseDetails());
         assertNull(response.resumeEligibleAt());
+        assertEquals("agent_decides", response.memoryMode());
     }
 
     @Test

@@ -1,12 +1,17 @@
 package com.persistentagent.api.service;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
+import com.persistentagent.api.exception.AgentNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
+import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
+import org.postgresql.util.PGobject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -14,6 +19,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -25,14 +31,20 @@ public class ConfigValidationHelper {
 
     private final ModelRepository modelRepository;
     private final ToolServerRepository toolServerRepository;
+    private final AgentRepository agentRepository;
+    private final ObjectMapper objectMapper;
     private final Set<String> allowedTools;
 
     public ConfigValidationHelper(
             ModelRepository modelRepository,
             ToolServerRepository toolServerRepository,
+            AgentRepository agentRepository,
+            ObjectMapper objectMapper,
             @Value("${app.dev-task-controls.enabled:false}") boolean devTaskControlsEnabled) {
         this.modelRepository = modelRepository;
         this.toolServerRepository = toolServerRepository;
+        this.agentRepository = agentRepository;
+        this.objectMapper = objectMapper;
 
         Set<String> tools = new LinkedHashSet<>(ValidationConstants.ALLOWED_TOOLS);
         if (devTaskControlsEnabled) {
@@ -205,5 +217,90 @@ public class ConfigValidationHelper {
         validateToolServers(config.toolServers());
         validateSandboxConfig(config.sandbox());
         validateMemoryConfig(config.memory(), config.provider());
+    }
+
+    /**
+     * Phase 2 Track 5 Task 12: cross-field invariant enforced at task submission.
+     *
+     * <p>The API rejects {@code memory_mode ∈ {always, agent_decides}} when the
+     * target agent has {@code memory.enabled=false}. The worker's master gate is
+     * the agent-level {@code memory.enabled} flag; asking for {@code always} or
+     * {@code agent_decides} against a memory-disabled agent is meaningless —
+     * surface that as a 400 rather than silently accepting a mode the worker
+     * will not honour. Mode {@code skip} is always legal, even for
+     * memory-disabled agents, because it matches the worker's actual behaviour.
+     *
+     * <p>Throws {@link AgentNotFoundException} if the agent cannot be resolved
+     * for the tenant — the caller (TaskService) already has its own not-found
+     * path for atomic insert misses; this check runs before that and fails
+     * fast when the agent is missing outright.
+     *
+     * @param tenantId    tenant scope
+     * @param agentId     agent to inspect
+     * @param memoryMode  normalised mode, one of {@code "always"} or {@code "agent_decides"}
+     *                    — callers must gate out {@code "skip"} before invoking
+     */
+    public void validateMemoryModeAgainstAgent(String tenantId, String agentId, String memoryMode) {
+        if (!isAgentMemoryEnabled(tenantId, agentId).orElse(true)) {
+            throw new ValidationException(
+                    "memory_mode cannot be '" + memoryMode
+                            + "' because this agent does not have memory enabled");
+        }
+    }
+
+    /**
+     * Looks up {@code agent_config.memory.enabled} for the agent. Returns
+     * {@link Optional#empty()} when the agent cannot be resolved — callers that
+     * want to defer the unknown-agent error to the atomic-insert path should
+     * treat empty as "unknown, fall through" rather than "memory off". Used by
+     * {@link com.persistentagent.api.service.TaskService} to pick a sensible
+     * per-task {@code memory_mode} default when the submitter did not specify
+     * one: memory-disabled agents default to {@code "skip"} so Phase-1/2
+     * callers that never set the field keep working; memory-enabled agents
+     * default to {@code "always"} per the Track 5 spec.
+     */
+    public Optional<Boolean> isAgentMemoryEnabled(String tenantId, String agentId) {
+        Optional<Map<String, Object>> agentRow = agentRepository.findByIdAndTenant(tenantId, agentId);
+        if (agentRow.isEmpty()) {
+            return Optional.empty();
+        }
+        String agentConfigJson = extractAgentConfigJson(agentRow.get().get("agent_config"));
+        if (agentConfigJson == null || agentConfigJson.isBlank()) {
+            return Optional.of(false);
+        }
+        return Optional.of(readMemoryEnabled(agentConfigJson));
+    }
+
+    private static String extractAgentConfigJson(Object rawAgentConfig) {
+        if (rawAgentConfig == null) {
+            return null;
+        }
+        if (rawAgentConfig instanceof String s) {
+            return s;
+        }
+        if (rawAgentConfig instanceof PGobject pg) {
+            return pg.getValue();
+        }
+        return rawAgentConfig.toString();
+    }
+
+    /**
+     * Parses {@code agent_config.memory.enabled} out of the stored JSON. Treats
+     * any malformed / missing / null-ish value as {@code false} — the mode
+     * check's purpose is to block meaningless combinations, so defaulting to
+     * memory-off on parse trouble is the conservative choice.
+     */
+    private boolean readMemoryEnabled(String agentConfigJson) {
+        try {
+            JsonNode root = objectMapper.readTree(agentConfigJson);
+            JsonNode memory = root == null ? null : root.get("memory");
+            if (memory == null || memory.isNull()) {
+                return false;
+            }
+            JsonNode enabled = memory.get("enabled");
+            return enabled != null && enabled.asBoolean(false);
+        } catch (Exception e) {
+            return false;
+        }
     }
 }

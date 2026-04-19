@@ -1,11 +1,14 @@
 package com.persistentagent.api.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
+import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.postgresql.util.PGobject;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -13,6 +16,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -27,11 +31,15 @@ class ConfigValidationHelperTest {
     @Mock
     private ToolServerRepository toolServerRepository;
 
+    @Mock
+    private AgentRepository agentRepository;
+
     private ConfigValidationHelper helper;
 
     @BeforeEach
     void setUp() {
-        helper = new ConfigValidationHelper(modelRepository, toolServerRepository, false);
+        helper = new ConfigValidationHelper(
+                modelRepository, toolServerRepository, agentRepository, new ObjectMapper(), false);
     }
 
     // --- validateToolServers tests ---
@@ -289,5 +297,45 @@ class ConfigValidationHelperTest {
 
         MemoryConfigRequest memory = new MemoryConfigRequest(true, "claude-haiku-4-5", 25_000);
         assertDoesNotThrow(() -> helper.validateMemoryConfig(memory, "anthropic"));
+    }
+
+    // --- validateMemoryModeAgainstAgent tests ---
+
+    @Test
+    void testValidateMemoryModeAgainstAgent_pgobjectConfig_memoryDisabled_throws() throws Exception {
+        // Regression: the JDBC driver hands jsonb columns back as PGobject, not String.
+        // An earlier version of this helper cast directly to String and produced a
+        // 500 for every task submission against the live DB.
+        PGobject pg = new PGobject();
+        pg.setType("jsonb");
+        pg.setValue("{\"memory\":{\"enabled\":false}}");
+
+        when(agentRepository.findByIdAndTenant("tenant", "agent-x"))
+                .thenReturn(Optional.of(Map.of("agent_config", pg)));
+
+        assertThrows(ValidationException.class,
+                () -> helper.validateMemoryModeAgainstAgent("tenant", "agent-x", "always"));
+    }
+
+    @Test
+    void testValidateMemoryModeAgainstAgent_pgobjectConfig_memoryEnabled_ok() throws Exception {
+        PGobject pg = new PGobject();
+        pg.setType("jsonb");
+        pg.setValue("{\"memory\":{\"enabled\":true}}");
+
+        when(agentRepository.findByIdAndTenant("tenant", "agent-x"))
+                .thenReturn(Optional.of(Map.of("agent_config", pg)));
+
+        assertDoesNotThrow(
+                () -> helper.validateMemoryModeAgainstAgent("tenant", "agent-x", "agent_decides"));
+    }
+
+    @Test
+    void testValidateMemoryModeAgainstAgent_stringConfig_memoryDisabled_throws() {
+        when(agentRepository.findByIdAndTenant("tenant", "agent-x"))
+                .thenReturn(Optional.of(Map.of("agent_config", "{\"memory\":{\"enabled\":false}}")));
+
+        assertThrows(ValidationException.class,
+                () -> helper.validateMemoryModeAgainstAgent("tenant", "agent-x", "always"));
     }
 }

@@ -60,6 +60,8 @@ export interface TaskStatusResponse {
     attached_memory_ids?: string[];
     /** Live preview (memory_id + title) for attachments that still resolve within scope. */
     attached_memories_preview?: AttachedMemoryPreview[];
+    /** Memory write mode for this task: 'always' | 'agent_decides' | 'skip'. */
+    memory_mode: string;
 }
 
 export interface AttachedMemoryPreview {
@@ -76,8 +78,8 @@ export interface TaskSubmissionRequest {
     langfuse_endpoint_id?: string;
     /** Optional list of memory entry ids to attach (ordered). Omitted when empty. */
     attached_memory_ids?: string[];
-    /** Per-task privacy override — when true, no memory entry is written for this task. */
-    skip_memory_write?: boolean;
+    /** Per-task memory-write mode. Optional; server default is 'always'. */
+    memory_mode?: 'always' | 'agent_decides' | 'skip';
 }
 
 export interface TaskSubmissionResponse {

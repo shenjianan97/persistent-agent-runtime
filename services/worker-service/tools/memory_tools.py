@@ -32,9 +32,11 @@ bound predicate to its SQL. See ``docs/design-docs/phase-2/track-5-memory.md``
 
 Registration gating
 -------------------
-``memory_note`` and ``memory_search`` are returned only when
-``effective_memory_enabled`` (from Task 6) is ``True`` — i.e.,
-``agent.memory.enabled`` AND NOT ``task.skip_memory_write``.
+``memory_note`` and ``memory_search`` are returned whenever the stack is
+enabled (``decision.stack_enabled=True``) — i.e., ``agent.memory.enabled`` AND
+``task.memory_mode ∈ {always, agent_decides}``. ``save_memory`` (Task 12) is
+returned only when the stack is enabled AND ``auto_write=False``
+(``agent_decides`` mode), so the agent has a lever to opt in per run.
 ``task_history_get`` is always returned — it is a diagnostic drill-down, not
 a memory tool, and the scope binding keeps it safe regardless of memory
 state.
@@ -50,7 +52,8 @@ from typing import Annotated, Any, Awaitable, Callable
 
 import asyncpg
 import httpx
-from langchain_core.tools import StructuredTool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, StructuredTool
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -89,6 +92,34 @@ class MemoryNoteArguments(BaseModel):
             ),
         ),
     ]
+    # Injected by ToolNode at runtime; hidden from the LLM schema so the model
+    # never tries to supply it. Required so the tool can return a matching
+    # ``ToolMessage`` paired to the agent's tool call — LangGraph's ``ToolNode``
+    # rejects a ``Command`` update that lacks the pairing.
+    tool_call_id: Annotated[str, InjectedToolCallId]
+
+
+# Phase 2 Track 5 Task 12 — ``save_memory`` mirror shape. Same 1..2048 char
+# bound as ``memory_note`` so a reason fits in the observations channel too.
+SAVE_MEMORY_REASON_MAX_LEN = 2048
+
+
+class SaveMemoryArguments(BaseModel):
+    reason: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=SAVE_MEMORY_REASON_MAX_LEN,
+            description=(
+                "Short justification for why this run is worth remembering. "
+                "Flows into the task timeline and the summarizer input as "
+                f"an observation. Max {SAVE_MEMORY_REASON_MAX_LEN} characters."
+            ),
+        ),
+    ]
+    # Injected by ToolNode at runtime; hidden from the LLM schema. See
+    # ``MemoryNoteArguments.tool_call_id`` for rationale.
+    tool_call_id: Annotated[str, InjectedToolCallId]
 
 
 class MemorySearchArguments(BaseModel):
@@ -260,21 +291,117 @@ def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
     bound_agent = ctx.agent_id
     bound_task = ctx.task_id
 
-    def memory_note(text: str) -> Command:
+    def memory_note(
+        text: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
         # Argument validation is enforced by ``MemoryNoteArguments`` — if we
         # reach here, ``text`` already satisfies length 1..MEMORY_NOTE_MAX_LEN.
+        # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
+        # Command's ``messages`` update — without it the next agent step
+        # rejects the orphan tool call as a fatal graph error.
         logger.debug(
             "memory.note.appended tenant_id=%s agent_id=%s task_id=%s "
             "note_chars=%d",
             bound_tenant, bound_agent, bound_task, len(text),
         )
-        return Command(update={"observations": [text]})
+        return Command(update={
+            "messages": [ToolMessage(content="ok", tool_call_id=tool_call_id)],
+            "observations": [text],
+        })
 
     return StructuredTool.from_function(
         func=memory_note,
         name="memory_note",
         description=MEMORY_NOTE_DESCRIPTION,
         args_schema=MemoryNoteArguments,
+    )
+
+
+# ---------------------------------------------------------------------------
+# save_memory (Phase 2 Track 5 Task 12)
+# ---------------------------------------------------------------------------
+
+
+SAVE_MEMORY_DESCRIPTION = (
+    "Opt this task in to writing a durable retrospective memory entry. "
+    "Call this exactly when the run has produced something worth "
+    "remembering (non-trivial findings, customer decisions, recurring "
+    "patterns). Silently no-ops when called more than once. Argument: "
+    "reason (1-2048 chars) — a short justification that will appear in "
+    "the task timeline and feed the summarizer. Zero cost; the write "
+    "itself happens once at the terminal branch."
+)
+
+
+def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Task 12 — agent-decides opt-in tool.
+
+    Returns a :class:`Command` that sets ``memory_opt_in=True`` on the state
+    (simple last-write-wins overwrite) AND appends the reason to
+    ``observations`` so the opt-in is visible in the task timeline as a
+    ``ToolMessage`` and feeds the summarizer alongside the rest of the
+    observations. The reason is ``strip()``-ed to normalize agent whitespace;
+    length bounds (1..2048 chars after stripping) are enforced by
+    :class:`SaveMemoryArguments` — the Pydantic schema reports an error
+    through LangGraph's ToolNode, keeping the graph in-loop.
+
+    The reason is NOT persisted into ``agent_memory_entries``. It lives only
+    in the observations snapshot — the summarizer may reference it freely
+    when composing the final memory body.
+    """
+
+    bound_tenant = ctx.tenant_id
+    bound_agent = ctx.agent_id
+    bound_task = ctx.task_id
+
+    def save_memory(
+        reason: str,
+        tool_call_id: Annotated[str, InjectedToolCallId],
+    ) -> Command:
+        stripped = reason.strip()
+        if not stripped:
+            # Schema already rejects empty strings; post-strip emptiness
+            # (e.g. reason="   ") lands here. Surface as a tool error so the
+            # agent can self-correct in-loop rather than silently opting in
+            # with a blank rationale.
+            raise MemoryToolError(
+                "save_memory requires a non-empty reason after whitespace is "
+                "stripped."
+            )
+        if len(stripped) > SAVE_MEMORY_REASON_MAX_LEN:
+            # Defense in depth — normally caught by the Pydantic max_length
+            # check, but stripping on our side can never lengthen so this
+            # branch is unreachable in practice. Keep the guard so the
+            # invariant is obvious.
+            raise MemoryToolError(
+                f"save_memory reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
+            )
+        logger.info(
+            "memory.save_memory.opt_in tenant_id=%s agent_id=%s task_id=%s "
+            "reason_chars=%d",
+            bound_tenant, bound_agent, bound_task, len(stripped),
+        )
+        # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
+        # Command's ``messages`` update — every LLM tool call needs a paired
+        # reply or the next agent step rejects the orphan as a fatal graph
+        # error (surfaced on the dead_letter task
+        # c385a4e4-e88c-4a2a-9796-f409ebec18cc).
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(content="ok", tool_call_id=tool_call_id),
+                ],
+                "memory_opt_in": True,
+                "observations": [f"[save_memory] {stripped}"],
+            }
+        )
+
+    return StructuredTool.from_function(
+        func=save_memory,
+        name="save_memory",
+        description=SAVE_MEMORY_DESCRIPTION,
+        args_schema=SaveMemoryArguments,
     )
 
 
@@ -578,25 +705,32 @@ async def _fetch_task_history_row(
 def build_memory_tools(
     ctx: MemoryToolContext,
     *,
-    effective_memory_enabled: bool,
+    stack_enabled: bool,
+    auto_write: bool,
 ) -> list[StructuredTool]:
-    """Assemble the per-task memory-tool list.
+    """Assemble the per-task memory-tool list (Task 12 gate semantics).
 
     Gating:
 
-    - ``memory_note`` and ``memory_search`` are returned only when
-      ``effective_memory_enabled`` is True.
-    - ``task_history_get`` is returned unconditionally — diagnostic drill-down,
-      scope-bound, safe even for memory-disabled agents.
+    - ``memory_note`` and ``memory_search`` are returned whenever
+      ``stack_enabled`` is True.
+    - ``save_memory`` (Task 12) is returned only when ``stack_enabled`` is
+      True AND ``auto_write`` is False — i.e., the ``agent_decides`` mode.
+      In ``always`` mode the run writes unconditionally so the tool would be
+      a no-op; in ``skip`` / memory-disabled mode the stack is off entirely.
+    - ``task_history_get`` is returned unconditionally — diagnostic drill-
+      down, scope-bound, safe even for memory-disabled agents.
 
     Returns a list of :class:`langchain_core.tools.StructuredTool` suitable for
     appending to the worker's built-in tool list before the BYOT merge in
     :func:`executor.graph.GraphExecutor._build_graph`.
     """
     tools: list[StructuredTool] = []
-    if effective_memory_enabled:
+    if stack_enabled:
         tools.append(_build_memory_note_tool(ctx))
         tools.append(_build_memory_search_tool(ctx))
+        if not auto_write:
+            tools.append(_build_save_memory_tool(ctx))
     tools.append(_build_task_history_get_tool(ctx))
     return tools
 
@@ -613,6 +747,9 @@ __all__ = [
     "MemoryToolContext",
     "MemoryToolError",
     "MemoryToolNotFoundError",
+    "SAVE_MEMORY_DESCRIPTION",
+    "SAVE_MEMORY_REASON_MAX_LEN",
+    "SaveMemoryArguments",
     "TASK_HISTORY_GET_DESCRIPTION",
     "TaskHistoryGetArguments",
     "build_memory_tools",

@@ -18,9 +18,11 @@ cover:
               deleted entries (soft-ref audit survives, live preview does not).
   AC-10 — Cross-tenant / cross-agent memory-touching endpoints return a uniform
           "not found" across list / detail / delete / search / submit-attach.
-  AC-11 — `skip_memory_write = true` round-trips through the API (stored on
-          `tasks.skip_memory_write` column) and leaves `agent_memory_entries`
-          untouched. Also confirms the field defaults to false when absent.
+  AC-11 — Task 12 `memory_mode` enum round-trips through the API (stored on
+          `tasks.memory_mode` column). Three modes (`always`, `agent_decides`,
+          `skip`) all persist verbatim. Default when absent is `always`.
+          Cross-field invariant: `always` / `agent_decides` are rejected for
+          agents whose `memory.enabled=false`.
 
 The worker-side half of AC-2 / AC-4 / AC-6 / AC-7 / AC-13 / AC-14 lives in
 `services/worker-service/tests/` — see the AC map in
@@ -78,6 +80,16 @@ def _memory_enabled_config() -> dict[str, Any]:
     }
 
 
+def _memory_disabled_config() -> dict[str, Any]:
+    return {
+        "system_prompt": "You are a test assistant.",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "temperature": 0.5,
+        "allowed_tools": [],
+    }
+
+
 # ---------- AC-1: agent config memory round-trip ----------------------------
 
 
@@ -103,13 +115,7 @@ async def test_ac1_agent_config_memory_absent_when_disabled(e2e):
     """AC-1 — Agents without `memory` on the config do not gain a memory sub-object."""
     resp = e2e.api.create_agent(
         display_name="Memory-Absent Agent",
-        agent_config={
-            "system_prompt": "You are a test assistant.",
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
-            "temperature": 0.5,
-            "allowed_tools": [],
-        },
+        agent_config=_memory_disabled_config(),
     )
     agent_id = resp["body"]["agent_id"]
     body = e2e.api.get_agent(agent_id)["body"]
@@ -137,7 +143,7 @@ async def test_ac8_attach_valid_persists_in_join_table_and_event(e2e):
         agent_id=agent_id,
         input="exercise attach",
         attached_memory_ids=[m1, m2],
-        skip_memory_write=True,  # keep this test API-only; no worker needed
+        memory_mode="skip",  # keep this test API-only; no worker needed
     )
     task_id = submit["body"]["task_id"]
 
@@ -186,7 +192,7 @@ async def test_ac8_attach_cross_agent_rejected_uniform(e2e):
         agent_id=b,
         input="try to attach foreign memory",
         attached_memory_ids=[foreign],
-        skip_memory_write=True,
+        memory_mode="skip",
         expected_status=(201, 400, 404),
         raise_for_status=False,
     )
@@ -209,7 +215,7 @@ async def test_ac8_attach_unknown_id_rejected_uniform(e2e):
         agent_id=agent,
         input="attach an unknown memory id",
         attached_memory_ids=[made_up],
-        skip_memory_write=True,
+        memory_mode="skip",
         expected_status=(201, 400, 404),
         raise_for_status=False,
     )
@@ -239,7 +245,7 @@ async def test_ac8_preview_omits_deleted_memory_entries(e2e):
         agent_id=agent,
         input="attach both",
         attached_memory_ids=[keep, drop],
-        skip_memory_write=True,
+        memory_mode="skip",
     )
     task_id = submit["body"]["task_id"]
 
@@ -321,36 +327,89 @@ async def test_ac10_cross_tenant_memory_is_invisible(e2e):
     assert count == 1
 
 
-# ---------- AC-11: skip_memory_write round-trips through the API ----------
+# ---------- AC-11 / Task 12: memory_mode round-trips + cross-agent validation
 
 
 @pytest.mark.asyncio
-async def test_ac11_skip_memory_write_persists_on_task(e2e):
-    """AC-11 — submitting with `skip_memory_write=true` stores the flag."""
+async def test_ac11_memory_mode_always_persists(e2e):
+    """Task 12 — `memory_mode='always'` stored verbatim and returned on detail."""
     agent = e2e.api.create_agent(
-        display_name="Skip Memory Write Agent",
+        display_name="Always Memory Mode Agent",
         agent_config=_memory_enabled_config(),
     )["body"]["agent_id"]
 
     submit = e2e.api.submit_task(
         agent_id=agent,
-        input="no memory write please",
-        skip_memory_write=True,
+        input="always remember",
+        memory_mode="always",
     )
     task_id = submit["body"]["task_id"]
 
     row = await e2e.db.fetchval(
-        "SELECT skip_memory_write FROM tasks WHERE task_id = $1::uuid",
+        "SELECT memory_mode FROM tasks WHERE task_id = $1::uuid",
         task_id,
     )
-    assert row is True
+    assert row == "always"
+
+    detail = e2e.api.get_task(task_id)["body"]
+    assert detail["memory_mode"] == "always"
 
 
 @pytest.mark.asyncio
-async def test_ac11_skip_memory_write_defaults_false(e2e):
-    """AC-11 — absent `skip_memory_write` defaults to false on the stored row."""
+async def test_ac11_memory_mode_agent_decides_persists(e2e):
+    """Task 12 — `memory_mode='agent_decides'` stored verbatim."""
     agent = e2e.api.create_agent(
-        display_name="Default Skip Memory Write",
+        display_name="Agent Decides Memory Mode Agent",
+        agent_config=_memory_enabled_config(),
+    )["body"]["agent_id"]
+
+    submit = e2e.api.submit_task(
+        agent_id=agent,
+        input="maybe remember",
+        memory_mode="agent_decides",
+    )
+    task_id = submit["body"]["task_id"]
+
+    row = await e2e.db.fetchval(
+        "SELECT memory_mode FROM tasks WHERE task_id = $1::uuid",
+        task_id,
+    )
+    assert row == "agent_decides"
+
+    detail = e2e.api.get_task(task_id)["body"]
+    assert detail["memory_mode"] == "agent_decides"
+
+
+@pytest.mark.asyncio
+async def test_ac11_memory_mode_skip_persists(e2e):
+    """Task 12 — `memory_mode='skip'` stored verbatim."""
+    agent = e2e.api.create_agent(
+        display_name="Skip Memory Mode Agent",
+        agent_config=_memory_enabled_config(),
+    )["body"]["agent_id"]
+
+    submit = e2e.api.submit_task(
+        agent_id=agent,
+        input="no memory please",
+        memory_mode="skip",
+    )
+    task_id = submit["body"]["task_id"]
+
+    row = await e2e.db.fetchval(
+        "SELECT memory_mode FROM tasks WHERE task_id = $1::uuid",
+        task_id,
+    )
+    assert row == "skip"
+
+    detail = e2e.api.get_task(task_id)["body"]
+    assert detail["memory_mode"] == "skip"
+
+
+@pytest.mark.asyncio
+async def test_ac11_memory_mode_absent_defaults_always(e2e):
+    """Task 12 — absent `memory_mode` defaults to `always` on the stored row."""
+    agent = e2e.api.create_agent(
+        display_name="Default Memory Mode Agent",
         agent_config=_memory_enabled_config(),
     )["body"]["agent_id"]
 
@@ -361,39 +420,84 @@ async def test_ac11_skip_memory_write_defaults_false(e2e):
     task_id = submit["body"]["task_id"]
 
     row = await e2e.db.fetchval(
-        "SELECT skip_memory_write FROM tasks WHERE task_id = $1::uuid",
+        "SELECT memory_mode FROM tasks WHERE task_id = $1::uuid",
         task_id,
     )
-    assert row is False
+    assert row == "always"
 
 
 @pytest.mark.asyncio
-async def test_ac11_skip_memory_write_on_disabled_agent_is_noop_but_persisted(e2e):
-    """AC-11 — `skip_memory_write` is a per-task override stored regardless of agent memory state.
-
-    When the agent already has memory disabled, the flag still persists; the
-    worker path stays behaviourally identical. This test pins the storage
-    behaviour so future worker changes cannot silently drop the flag.
-    """
+async def test_ac11_memory_mode_invalid_value_rejected(e2e):
+    """Task 12 — unknown `memory_mode` string rejects with 400."""
     agent = e2e.api.create_agent(
-        display_name="Memory-Off Agent With Skip",
-        agent_config={
-            "system_prompt": "You are a test assistant.",
-            "provider": "anthropic",
-            "model": "claude-sonnet-4-6",
-            "temperature": 0.5,
-            "allowed_tools": [],
-        },
+        display_name="Invalid Memory Mode Agent",
+        agent_config=_memory_enabled_config(),
     )["body"]["agent_id"]
 
-    task_id = e2e.api.submit_task(
+    resp = e2e.api.submit_task(
         agent_id=agent,
-        input="memory off plus skip",
-        skip_memory_write=True,
-    )["body"]["task_id"]
+        input="malformed mode",
+        memory_mode="bogus",
+        expected_status=(201, 400),
+        raise_for_status=False,
+    )
+    assert resp["status_code"] == 400, (
+        f"invalid memory_mode must return 400; got {resp['status_code']} {resp['body']!r}"
+    )
 
-    stored = await e2e.db.fetchval(
-        "SELECT skip_memory_write FROM tasks WHERE task_id = $1::uuid",
+
+@pytest.mark.asyncio
+async def test_ac11_memory_mode_always_rejected_for_memory_disabled_agent(e2e):
+    """Task 12 — cross-field invariant: `always` / `agent_decides` must reject
+    when the target agent has `memory.enabled=false`.
+
+    The worker's master gate is the agent-level `memory.enabled` flag; asking
+    for `always` or `agent_decides` against a memory-disabled agent is
+    meaningless and must surface as a 400 rather than silently passing.
+    """
+    agent = e2e.api.create_agent(
+        display_name="Memory Off Cross-field Agent",
+        agent_config=_memory_disabled_config(),
+    )["body"]["agent_id"]
+
+    for mode in ("always", "agent_decides"):
+        resp = e2e.api.submit_task(
+            agent_id=agent,
+            input="try to save",
+            memory_mode=mode,
+            expected_status=(201, 400),
+            raise_for_status=False,
+        )
+        assert resp["status_code"] == 400, (
+            f"memory_mode={mode!r} on memory-disabled agent must 400; "
+            f"got {resp['status_code']} {resp['body']!r}"
+        )
+        # Error references the field name; callers can differentiate.
+        body = resp["body"]
+        message = body.get("message") if isinstance(body, dict) else str(body)
+        assert "memory_mode" in (message or ""), (
+            f"error message must reference memory_mode; got {message!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ac11_memory_mode_skip_accepted_for_memory_disabled_agent(e2e):
+    """Task 12 — `memory_mode='skip'` is always legal, even for memory-disabled
+    agents, because it matches the worker's actual behaviour."""
+    agent = e2e.api.create_agent(
+        display_name="Memory Off Skip Still Works",
+        agent_config=_memory_disabled_config(),
+    )["body"]["agent_id"]
+
+    submit = e2e.api.submit_task(
+        agent_id=agent,
+        input="still legal",
+        memory_mode="skip",
+    )
+    task_id = submit["body"]["task_id"]
+
+    row = await e2e.db.fetchval(
+        "SELECT memory_mode FROM tasks WHERE task_id = $1::uuid",
         task_id,
     )
-    assert stored is True
+    assert row == "skip"

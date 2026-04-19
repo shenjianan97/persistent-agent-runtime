@@ -111,47 +111,88 @@ _EMPTY_TAGS: list[str] = []
 class MemoryEnabledState(MessagesState):
     """LangGraph state type for memory-enabled tasks.
 
-    Adds two fields to ``MessagesState``:
+    Adds three fields to ``MessagesState``:
 
     * ``observations`` — append-only list. Reducer is ``operator.add`` so any
       node that returns ``{"observations": [note]}`` is merged associatively.
     * ``pending_memory`` — populated once by the terminal ``memory_write``
       node; read once by the worker's post-astream commit.
+    * ``memory_opt_in`` — Task 12 ``agent_decides`` mode. Default ``False``;
+      the ``save_memory`` tool sets it to ``True`` via
+      ``Command(update={"memory_opt_in": True, ...})``. No reducer —
+      last-write-wins semantics; the initial-state seeding block in
+      :func:`executor.graph.GraphExecutor.execute_task` explicitly resets this
+      to ``False`` on every run (first execution AND follow-up/redrive) so the
+      opt-in must be re-earned per run.
 
     Memory-disabled tasks keep using plain ``MessagesState`` (see graph
     assembly in :mod:`executor.graph`). The effective-memory gate is
-    :func:`effective_memory_enabled`.
+    :func:`effective_memory_decision`.
     """
 
     observations: Annotated[list[str], operator.add]
     pending_memory: dict[str, Any] | None
+    memory_opt_in: bool
 
 
 # ---------------------------------------------------------------------------
-# Effective-memory gate
+# Effective-memory gate — Task 12 rewrite
 # ---------------------------------------------------------------------------
 
 
-def effective_memory_enabled(
+@dataclass(frozen=True)
+class MemoryDecision:
+    """Two-boolean result of :func:`effective_memory_decision`.
+
+    * ``stack_enabled`` — gates the memory stack as a whole: observations
+      channel, ``memory_note`` / ``save_memory`` tool registration, the
+      attached-memory preamble, and the ``memory_write`` node registration.
+      Identical to the pre-Task-12 ``effective_memory_enabled`` bool.
+    * ``auto_write`` — when ``True``, the terminal ``agent → memory_write``
+      edge fires unconditionally (today's ``always`` behaviour). When
+      ``False`` (``agent_decides`` mode), routing inspects ``memory_opt_in``
+      at runtime and only traverses ``memory_write`` if the agent opted in.
+    """
+
+    stack_enabled: bool
+    auto_write: bool
+
+
+def effective_memory_decision(
     *,
     agent_config: dict[str, Any],
-    skip_memory_write: bool,
-) -> bool:
-    """Single predicate used by every downstream memory branch.
+    memory_mode: str,
+) -> MemoryDecision:
+    """Single gate used by every downstream memory branch (Task 12).
 
-    ``effective_memory_enabled = agent.memory.enabled AND NOT
-    tasks.skip_memory_write``. Designed to be computed once per task at the
-    top of ``execute_task`` so every code site that branches on memory state
-    reads the same decision.
+    Mapping (see task spec "Shared Contract"):
+
+    * ``enabled=False OR mode=skip`` → ``MemoryDecision(False, False)`` —
+      identical to today's memory-disabled path.
+    * ``enabled=True AND mode=always`` → ``MemoryDecision(True, True)`` —
+      current memory-enabled behaviour.
+    * ``enabled=True AND mode=agent_decides`` →
+      ``MemoryDecision(True, False)`` — memory stack on, ``memory_write``
+      routing gated at runtime by ``memory_opt_in``.
+
+    An unrecognised ``memory_mode`` value is treated as ``skip`` so a mis-
+    serialized payload never silently writes a memory the customer didn't
+    ask for.
     """
 
     memory = agent_config.get("memory") if isinstance(agent_config, dict) else None
     if not isinstance(memory, dict):
-        return False
+        return MemoryDecision(stack_enabled=False, auto_write=False)
     enabled = memory.get("enabled", False)
-    if not isinstance(enabled, bool):
-        return False
-    return enabled and not bool(skip_memory_write)
+    if not isinstance(enabled, bool) or not enabled:
+        return MemoryDecision(stack_enabled=False, auto_write=False)
+    mode = memory_mode if isinstance(memory_mode, str) else ""
+    if mode == "always":
+        return MemoryDecision(stack_enabled=True, auto_write=True)
+    if mode == "agent_decides":
+        return MemoryDecision(stack_enabled=True, auto_write=False)
+    # "skip" and any other value collapse to the disabled-stack result.
+    return MemoryDecision(stack_enabled=False, auto_write=False)
 
 
 # ---------------------------------------------------------------------------

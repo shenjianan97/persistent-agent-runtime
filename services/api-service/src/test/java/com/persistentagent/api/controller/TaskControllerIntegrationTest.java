@@ -65,7 +65,7 @@ class TaskControllerIntegrationTest {
                 jdbcTemplate.execute("""
                         INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
                         VALUES ('default', 'integ-test-agent', 'Integration Test Agent',
-                                '{"system_prompt":"You are a test assistant.","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":["web_search","calculator"]}'::jsonb,
+                                '{"system_prompt":"You are a test assistant.","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":["web_search","calculator"],"memory":{"enabled":true}}'::jsonb,
                                 'active')
                         ON CONFLICT (tenant_id, agent_id) DO NOTHING
                         """);
@@ -240,7 +240,7 @@ class TaskControllerIntegrationTest {
                                 .andExpect(jsonPath("$.database").value("connected"));
         }
 
-        // --- Track 5: attached_memory_ids + skip_memory_write ---
+        // --- Track 5: attached_memory_ids + memory_mode ---
 
         @Test
         void submitTask_withValidAttachedMemoryIds_persistsJoinRowsInOrder() throws Exception {
@@ -354,12 +354,12 @@ class TaskControllerIntegrationTest {
         }
 
         @Test
-        void submitTask_withSkipMemoryWriteTrue_persistsOnTaskRow() throws Exception {
+        void submitTask_withMemoryModeSkip_persistsOnTaskRow() throws Exception {
                 String body = String.format("""
                                 {
                                   "agent_id": "%s",
                                   "input": "sensitive work",
-                                  "skip_memory_write": true
+                                  "memory_mode": "skip"
                                 }
                                 """, TEST_AGENT_ID);
 
@@ -371,14 +371,19 @@ class TaskControllerIntegrationTest {
                 String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
                                 .get("task_id").asText();
 
-                Boolean skip = jdbcTemplate.queryForObject(
-                                "SELECT skip_memory_write FROM tasks WHERE task_id = ?::uuid",
-                                Boolean.class, taskId);
-                org.junit.jupiter.api.Assertions.assertEquals(Boolean.TRUE, skip);
+                String mode = jdbcTemplate.queryForObject(
+                                "SELECT memory_mode FROM tasks WHERE task_id = ?::uuid",
+                                String.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals("skip", mode);
+
+                // Task detail response surfaces the mode
+                mockMvc.perform(get("/v1/tasks/" + taskId))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.memory_mode").value("skip"));
         }
 
         @Test
-        void submitTask_skipMemoryWriteAbsent_defaultsFalse() throws Exception {
+        void submitTask_memoryModeAbsent_defaultsAlways() throws Exception {
                 String body = String.format("""
                                 {
                                   "agent_id": "%s",
@@ -394,10 +399,92 @@ class TaskControllerIntegrationTest {
                 String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
                                 .get("task_id").asText();
 
-                Boolean skip = jdbcTemplate.queryForObject(
-                                "SELECT skip_memory_write FROM tasks WHERE task_id = ?::uuid",
-                                Boolean.class, taskId);
-                org.junit.jupiter.api.Assertions.assertEquals(Boolean.FALSE, skip);
+                String mode = jdbcTemplate.queryForObject(
+                                "SELECT memory_mode FROM tasks WHERE task_id = ?::uuid",
+                                String.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals("always", mode);
+        }
+
+        @Test
+        void submitTask_withMemoryModeAgentDecides_persistsOnTaskRow() throws Exception {
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "maybe remember",
+                                  "memory_mode": "agent_decides"
+                                }
+                                """, TEST_AGENT_ID);
+
+                MvcResult submitResult = mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isCreated())
+                                .andReturn();
+                String taskId = objectMapper.readTree(submitResult.getResponse().getContentAsString())
+                                .get("task_id").asText();
+
+                String mode = jdbcTemplate.queryForObject(
+                                "SELECT memory_mode FROM tasks WHERE task_id = ?::uuid",
+                                String.class, taskId);
+                org.junit.jupiter.api.Assertions.assertEquals("agent_decides", mode);
+        }
+
+        @Test
+        void submitTask_withInvalidMemoryMode_returns400() throws Exception {
+                String body = String.format("""
+                                {
+                                  "agent_id": "%s",
+                                  "input": "bad mode",
+                                  "memory_mode": "maybe"
+                                }
+                                """, TEST_AGENT_ID);
+
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(body))
+                                .andExpect(status().isBadRequest());
+        }
+
+        @Test
+        void submitTask_withAlwaysForMemoryDisabledAgent_returns400() throws Exception {
+                // Create an agent with memory explicitly disabled; the cross-field
+                // invariant must reject non-skip modes.
+                jdbcTemplate.execute("""
+                        INSERT INTO agents (tenant_id, agent_id, display_name, agent_config, status)
+                        VALUES ('default', 'memory-off-agent', 'Memory Off Agent',
+                                '{"system_prompt":"p","provider":"anthropic","model":"claude-sonnet-4-6","temperature":0.5,"allowed_tools":[],"memory":{"enabled":false}}'::jsonb,
+                                'active')
+                        ON CONFLICT (tenant_id, agent_id) DO NOTHING
+                        """);
+
+                for (String mode : new String[]{"always", "agent_decides"}) {
+                        String body = String.format("""
+                                        {
+                                          "agent_id": "memory-off-agent",
+                                          "input": "try to enable memory",
+                                          "memory_mode": "%s"
+                                        }
+                                        """, mode);
+                        mockMvc.perform(post("/v1/tasks")
+                                        .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                        .content(body))
+                                        .andExpect(status().isBadRequest())
+                                        .andExpect(jsonPath("$.message").value(
+                                                        org.hamcrest.Matchers.containsString("memory_mode")));
+                }
+
+                // skip mode is still accepted for memory-disabled agents
+                String skipBody = """
+                                {
+                                  "agent_id": "memory-off-agent",
+                                  "input": "skip still works",
+                                  "memory_mode": "skip"
+                                }
+                                """;
+                mockMvc.perform(post("/v1/tasks")
+                                .contentType(MediaType.APPLICATION_JSON_VALUE)
+                                .content(skipBody))
+                                .andExpect(status().isCreated());
         }
 
         @Test

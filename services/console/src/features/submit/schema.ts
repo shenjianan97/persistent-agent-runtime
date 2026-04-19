@@ -11,8 +11,14 @@ export const submitTaskSchema = z.object({
     langfuse_endpoint_id: z.string().optional(),
     /** Attached memory ids in selection order. Capped at 50 (server enforces the same). */
     attached_memory_ids: z.array(z.string()).max(50).optional().default([]),
-    /** Per-task privacy opt-out — skip writing a memory entry for this task. */
-    skip_memory_write: z.boolean().optional().default(false),
+    /**
+     * Per-task memory write mode.
+     *   - `always`        — every successful task writes a memory entry (default)
+     *   - `agent_decides` — the agent must call `save_memory(reason)` for a memory to be written
+     *   - `skip`          — never write a memory entry for this task
+     * Forced to `skip` when the selected agent has `memory.enabled=false`.
+     */
+    memory_mode: z.enum(['always', 'agent_decides', 'skip']).optional().default('always'),
 });
 
 export type SubmitTaskFormValues = z.infer<typeof submitTaskSchema>;

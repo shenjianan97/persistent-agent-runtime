@@ -47,6 +47,11 @@ public record TaskStatusResponse(
          * Always present — may be shorter than {@code attached_memory_ids} when
          * entries have been deleted.
          */
-        @JsonProperty("attached_memories_preview") List<AttachedMemoryPreview> attachedMemoriesPreview
+        @JsonProperty("attached_memories_preview") List<AttachedMemoryPreview> attachedMemoriesPreview,
+        /**
+         * Phase 2 Track 5 Task 12: the per-task memory mode this task ran under.
+         * One of {@code "always" | "agent_decides" | "skip"}. Always present.
+         */
+        @JsonProperty("memory_mode") String memoryMode
 ) {
 }

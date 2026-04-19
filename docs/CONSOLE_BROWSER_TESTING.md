@@ -200,7 +200,7 @@ What to verify:
 - Clicking an entry in the picker adds it to the `Selected` panel below, in position order; clicking the `X` removes it
 - The `Attached context:` indicator renders with a byte approximation and entry count. Selecting a large entry (≥10 KB combined summary + observations) turns the indicator amber and surfaces a tooltip on hover
 - The `(N/50)` counter on the picker reflects the current selection size; selecting a 51st entry no-ops and surfaces a capped-selection warning
-- Submitting the form with attached memories POSTs a JSON body that contains `attached_memory_ids: [...]` in selection order and (when the checkbox is ticked) `skip_memory_write: true`. Verify via `browser_network_requests` on the `/v1/tasks` POST
+- Submitting the form with attached memories POSTs a JSON body that contains `attached_memory_ids: [...]` in selection order and `memory_mode` set to the dropdown value (`always` | `agent_decides` | `skip`). Verify via `browser_network_requests` on the `/v1/tasks` POST
 - After a successful submit, navigate to `/tasks/:taskId` and confirm the `TaskStatusResponse` exposes `attached_memory_ids` and `attached_memories_preview` with the attached entries — inspect with `browser_evaluate` against the task detail endpoint
 - Deep link: navigating to `/tasks/new?agent_id=<memory-enabled-agent>&attachMemoryId=<valid-memory-id>` auto-selects that entry in the Selected panel
 - Deep link mismatch: navigating with `attachMemoryId` pointing at a memory-DISABLED agent surfaces a toast along the lines of `Attachment ignored — memory is disabled for this agent` and does NOT render the Memory card
@@ -210,7 +210,7 @@ What to verify:
 
 ### Scenario 13: Memory End-to-End Cross-Feature Flow
 
-Covers Task 11's "Memory Tab E2E" and "Submit Attach E2E" requirements in a single cross-feature session that exercises every Console-visible stop on the memory journey. Primarily validates design-doc acceptance criteria AC-2 (one entry per completed memory-enabled task), AC-8 (attachment persisted on the submitted task), AC-9 (customer-visible browse / search / read / delete), and AC-11 (`skip_memory_write` honoured end-to-end).
+Covers Task 11's "Memory Tab E2E" and "Submit Attach E2E" requirements in a single cross-feature session that exercises every Console-visible stop on the memory journey. Primarily validates design-doc acceptance criteria AC-2 (one entry per completed memory-enabled task), AC-8 (attachment persisted on the submitted task), AC-9 (customer-visible browse / search / read / delete), and AC-11 (`memory_mode=skip` honoured end-to-end).
 
 Preconditions:
 
@@ -221,12 +221,25 @@ Preconditions:
 What to verify, in order (a single browser session):
 
 1. **Memory Tab E2E**: navigate to `/agents/:memory_enabled_agent_id/memory`. Confirm the list renders with at least one entry, the storage-stats strip shows entry count + bytes, and filters / search behave per Scenario 11. Open a row (detail view), assert title, summary, observations, linked task, tags, summarizer model id render. Delete a row via the detail page's `Delete` button, confirm the toast and the entry disappearing from the list.
-2. **Submit Attach E2E**: from the detail page of a different (still-present) memory entry, click `Attach to new task`. Confirm routing to `/tasks/new?agent_id=<memory_enabled_agent_id>&attachMemoryId=<memory_id>` with that entry pre-selected. Open the picker, add a second entry, leave `skip_memory_write` unchecked, submit. Confirm the POST body carries `attached_memory_ids` in the correct order (via `browser_network_requests`).
+2. **Submit Attach E2E**: from the detail page of a different (still-present) memory entry, click `Attach to new task`. Confirm routing to `/tasks/new?agent_id=<memory_enabled_agent_id>&attachMemoryId=<memory_id>` with that entry pre-selected. Open the picker, add a second entry, leave the memory-mode dropdown at its default ("Always save memory"), submit. Confirm the POST body carries `attached_memory_ids` in the correct order and `memory_mode: "always"` (via `browser_network_requests`).
 3. **Task detail surfaces attachments**: navigate to `/tasks/:taskId`, confirm the Attachments / Memory section lists the two attached memory entries (preview titles). Use `browser_evaluate` against `/v1/tasks/:taskId` to assert the response has `attached_memory_ids: [...]` and `attached_memories_preview: [...]` with the same two ids.
 4. **Wait for completion**: poll until the task reaches `completed` (may take several seconds against a live worker). Once completed, re-open the Memory tab for the same agent — confirm a NEW entry appears for this task, with title / summary populated, and that it survives a page reload.
-5. **`skip_memory_write` variant**: submit a second task with `skip_memory_write` checked. After completion, re-open the Memory tab and assert **no** new entry was written for the task (AC-11).
-6. **Memory-disabled agent negative path**: navigate to the disabled agent's `/tasks/new`, confirm the Memory card does NOT render. Submitting a task there produces no memory row. Navigate to that agent's Memory tab and confirm the disabled notice + any historical entries render as read-only.
+5. **`memory_mode="skip"` variant**: submit a second task with the memory-mode dropdown set to "Don't save memory". After completion, re-open the Memory tab and assert **no** new entry was written for the task (AC-11).
+6. **Memory-disabled agent negative path**: navigate to the disabled agent's `/tasks/new`. The memory-mode dropdown (`memory-mode-select`) renders but is locked to "Don't save memory" and disabled with helper text "This agent has memory disabled"; the attach picker (`attach-memory-picker`) does NOT render. Submitting a task there produces no memory row. Navigate to that agent's Memory tab and confirm the disabled notice + any historical entries render as read-only.
 7. `browser_console_messages` shows zero uncaught exceptions across the full walkthrough.
+
+### Scenario 14: Task Memory Mode Dropdown
+
+Covers Track 5 Task 12 — the `memory_mode` submission field replaces the old `skip_memory_write` checkbox with a three-value dropdown whose options are `always`, `agent_decides`, and `skip`. Verifies the `agent_decides` end-to-end flow (with and without the agent calling `save_memory`), the disabled-when-memory-off branch, and the cross-field API validation.
+
+Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.enabled = true`) and `agent-memory-off` (`agent_config.memory.enabled = false`).
+
+1. Navigate to Submit Task. Select `agent-memory-on`. Assert the `memory-mode-select` trigger exists, defaults to "Always save memory", and is enabled.
+2. Change the dropdown to "Let agent decide". Submit a task whose prompt instructs the agent to call `save_memory(reason="test reason")`. After completion, navigate to the Memories page and assert a new row appears for this task. Open task detail; confirm the `memory_mode` metadata reads `agent_decides` and the timeline includes the `save_memory` tool call carrying the reason.
+3. Repeat with a prompt that does NOT call `save_memory`. Assert no memory row is created, no "Memory Saved" timeline marker appears, and task detail shows `memory_mode = agent_decides`.
+4. Change the dropdown to "Don't save memory". Submit a task. Assert no memory row is written, no memory-related timeline entries appear, and task detail shows `memory_mode = skip`.
+5. Select `agent-memory-off`. Assert the dropdown snaps to "Don't save memory", is disabled, and the helper text reads "This agent has memory disabled". Submission succeeds and persists `memory_mode = skip`.
+6. Craft a `POST /v1/tasks` (via devtools / `browser_evaluate`) for `agent-memory-off` with `memory_mode: "always"`. Assert the API responds 400 with a validation error referencing the memory-enabled invariant.
 
 ## When to Run Which Scenarios
 
@@ -244,7 +257,8 @@ What to verify, in order (a single browser session):
 | HITL / approval / input feature | 1, 4, 8 |
 | Settings / Langfuse feature | 1, 9 |
 | Agent Memory tab feature | 1, 11 |
-| Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13 |
+| Task submission memory-mode / `agent_decides` feature | 1, 3, 14 |
+| Cross-cutting memory feature / Track 5 verification | 1, 11, 12, 13, 14 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
