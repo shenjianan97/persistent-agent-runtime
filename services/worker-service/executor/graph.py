@@ -485,6 +485,7 @@ class GraphExecutor:
             allowed_tools,
             injected_files=injected_files,
             sandbox_template=sandbox_template,
+            memory_decision=memory_decision,
         )
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
@@ -1249,6 +1250,7 @@ class GraphExecutor:
         *,
         injected_files: list[str] | None = None,
         sandbox_template: str | None = None,
+        memory_decision: MemoryDecision | None = None,
     ) -> str:
         """Build platform-generated system message with tool instructions.
 
@@ -1301,6 +1303,32 @@ class GraphExecutor:
                 f"You can read these files using sandbox_read_file or process them "
                 f"with sandbox_exec commands."
             )
+
+        # Phase 2 Track 5 Task 12 — memory-tool framing. Gated on what is
+        # actually registered: ``memory_note`` / ``memory_search`` whenever
+        # the stack is on; ``save_memory`` only in ``agent_decides``. Tool
+        # descriptions alone underspecify behavior — Anthropic / OpenAI /
+        # Bedrock LLMs reliably forget optional retrieval tools without a
+        # platform nudge, and ``save_memory`` in particular needs the
+        # opt-in framing to preserve ``agent_decides`` semantics (a MUST
+        # directive would collapse it into ``always`` mode).
+        if memory_decision is not None and memory_decision.stack_enabled:
+            sections.append(
+                "This agent has persistent memory. Before starting non-trivial "
+                "work, consider calling `memory_search` to recall relevant past "
+                "runs. During the run, use `memory_note` to capture salient "
+                "intermediate findings that should survive into the final "
+                "memory entry."
+            )
+            if not memory_decision.auto_write:
+                sections.append(
+                    "Memory writes are opt-in for this run: call "
+                    "`save_memory(reason=...)` exactly when the run has "
+                    "produced something worth remembering (non-trivial "
+                    "findings, customer decisions, recurring patterns). "
+                    "Skip the call for routine or trivial runs — the absence "
+                    "of a call means no memory entry is written."
+                )
 
         return "\n\n".join(sections)
 
@@ -1691,6 +1719,7 @@ class GraphExecutor:
                             injected_files if sandbox_enabled else None
                         ),
                         sandbox_template=sandbox_template_for_sys,
+                        memory_decision=memory_decision,
                     )
                     if agent_system_prompt:
                         initial_messages.append(

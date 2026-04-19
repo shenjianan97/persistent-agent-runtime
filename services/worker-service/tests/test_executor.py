@@ -1344,6 +1344,51 @@ class TestInputFileInjection:
         assert "/home/user/data.csv" in msg
         assert "/home/user/readme.txt" in msg
 
+    # Phase 2 Track 5 Task 12 — memory-tool framing in the platform system
+    # message. Gated on the graph's effective memory decision so the prompt
+    # matches what tools are actually registered.
+
+    def test_platform_system_message_memory_disabled_no_memory_section(self):
+        """Memory stack off → no memory-tool framing leaks into the prompt."""
+        from executor.memory_graph import MemoryDecision
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(
+            ["web_search"],
+            memory_decision=MemoryDecision(stack_enabled=False, auto_write=False),
+        )
+        assert "memory_search" not in msg
+        assert "memory_note" not in msg
+        assert "save_memory" not in msg
+
+    def test_platform_system_message_memory_always_mode(self):
+        """``always`` mode → memory_search + memory_note framing, NO save_memory."""
+        from executor.memory_graph import MemoryDecision
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(
+            ["web_search"],
+            memory_decision=MemoryDecision(stack_enabled=True, auto_write=True),
+        )
+        assert "memory_search" in msg
+        assert "memory_note" in msg
+        assert "save_memory" not in msg
+
+    def test_platform_system_message_memory_agent_decides_mode(self):
+        """``agent_decides`` mode → full framing including save_memory opt-in."""
+        from executor.memory_graph import MemoryDecision
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(
+            ["web_search"],
+            memory_decision=MemoryDecision(stack_enabled=True, auto_write=False),
+        )
+        assert "memory_search" in msg
+        assert "memory_note" in msg
+        assert "save_memory" in msg
+        # The save_memory framing must preserve agent-decision semantics: the
+        # prompt should say writes are opt-in, not a MUST directive. A MUST
+        # would collapse ``agent_decides`` into ``always`` mode.
+        assert "opt-in" in msg.lower()
+        assert "MUST" not in msg  # no policy-level enforcement on save_memory
+
 
 # ---------------------------------------------------------------------------
 # Sandbox lifecycle tests (Task 7)
