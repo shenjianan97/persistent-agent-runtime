@@ -6,7 +6,7 @@
 | Task 2 | State Schema Unification | Done | **Pure refactor.** Unified `RuntimeState` TypedDict in `executor/compaction/state.py`. `MemoryEnabledState` deleted. All existing Track 5 tests pass (561 passed). `grep MemoryEnabledState services/worker-service` → zero hits. |
 | Task 3 | Compaction Constants + Thresholds | Done | `compaction/defaults.py` + `compaction/thresholds.py` — platform constants + `resolve_thresholds()`; `PLATFORM_EXCLUDE_TOOLS` includes memory_search + task_history_get |
 | Task 4 | Per-Tool-Result Cap | Not started | `compaction/caps.py` head+tail byte cap; tool-wrapper integration |
-| Task 5 | Tier 1 Transform | Not started | `clear_tool_results()` pure function with monotone `cleared_through_turn_index` |
+| Task 5 | Tier 1 Transform | Done | `clear_tool_results()` + `ClearResult` in `compaction/transforms.py`; 24 unit tests in `test_compaction_transforms_clear.py` (all pass) |
 | Task 6 | Tier 1.5 Transform | Not started | `truncate_tool_call_args()` pure function with monotone `truncated_args_through_turn_index` |
 | Task 7 | Tier 3 Summarizer | Not started | `summarize_slice()` + retry + cost ledger (`compaction.tier3`) + Langfuse span |
 | Task 8 | Pipeline + Graph Integration | Not started | Track 7 state fields added to `RuntimeState`; `compact_for_llm()`; `agent_node` wiring; budget carve-out for `compaction.tier3` |
