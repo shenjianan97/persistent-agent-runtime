@@ -48,7 +48,7 @@ Track 7's acceptance criteria span worker, API, Console, DB, observability. Task
 
 ## Dependencies
 
-- **Must complete first:** Tasks 1–10.
+- **Must complete first:** Tasks 1–11. Task 11 in particular is required because Task 12 extends `docs/CONSOLE_BROWSER_TESTING.md` (adding Scenario 15 alongside Task 11's Scenario 14) and performs track-completion bookkeeping that marks Track 7 done — running Task 12 before Task 11 would let the track flip to "complete" without Console coverage.
 - **Provides output to:** STATUS.md flip; orchestrator Playwright verification.
 
 ## Implementation Specification
