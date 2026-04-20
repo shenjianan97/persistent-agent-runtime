@@ -1,27 +1,28 @@
-"""Unit tests for Phase 2 Track 7 Follow-up Task 5 — Option C.
+"""Unit tests for :func:`shrink_summarized_recalls_to_pointers` — the
+recall-pointer rewrite.
 
-Option C is the ONE sanctioned mutation to ``state["messages"]`` under the
+This is the ONE sanctioned mutation to ``state["messages"]`` under the
 replace-and-rehydrate architecture: on a compaction firing that advances
 ``summarized_through`` past a recalled ``ToolMessage``'s position, the hook
-replaces its ``content`` with a short reference string pointing at the
+replaces its ``content`` with a short pointer string referencing the
 original ``tool_call_id``. The original content stays in S3 — a fresh
 ``recall_tool_result`` call still returns it byte-for-byte.
 
-Covers (see task-5 spec §6):
+Covers:
 
 * Replacement fires only on recalled ToolMessages inside
   ``[previous_summarized_through, new_summarized_through)``.
 * Replacement content matches the canonical placeholder string.
 * ``additional_kwargs["content_offloaded"] = True`` is set;
   ``original_tool_call_id`` is preserved.
-* Recovery path — after replacement, a direct ``recall_tool_result`` call
+* Recovery path — after the rewrite, a direct ``recall_tool_result`` call
   still returns the original content (the artefact store is the source of
-  truth; Option C is lossless).
+  truth; the rewrite is lossless).
 * Projection rule — recalled ToolMessages outside the keep window have
   their ``content`` stubbed in ``middle`` (envelope preserved so the
   tool_use / tool_result pair stays valid for Bedrock / Anthropic).
-* Idempotence — running Option C twice on the same range is a no-op (no
-  churn through the reducer).
+* Idempotence — running the rewrite twice on the same range is a no-op
+  (no churn through the reducer).
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from executor.compaction.pre_model_hook import (
     _is_recalled_tool_message,
     _reference_placeholder,
     compaction_pre_model_hook,
-    option_c_reference_replacement,
+    shrink_summarized_recalls_to_pointers,
 )
 from executor.compaction.tool_result_store import InMemoryToolResultStore
 
@@ -77,7 +78,7 @@ def _recalled_tool_message(
 
 
 # ---------------------------------------------------------------------------
-# option_c_reference_replacement — direct unit tests
+# shrink_summarized_recalls_to_pointers — direct unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -93,7 +94,7 @@ def test_replacement_fires_for_recalled_message_in_newly_summarized_range():
         AIMessage(content="ok", id="a1"),
     ]
 
-    replacements = option_c_reference_replacement(
+    replacements = shrink_summarized_recalls_to_pointers(
         raw,
         previous_summarized_through=0,
         new_summarized_through=3,
@@ -128,7 +129,7 @@ def test_replacement_does_not_fire_for_message_outside_range():
     ]
 
     # Only the first recalled message is inside [0, 2)
-    replacements = option_c_reference_replacement(
+    replacements = shrink_summarized_recalls_to_pointers(
         raw,
         previous_summarized_through=0,
         new_summarized_through=2,
@@ -139,7 +140,7 @@ def test_replacement_does_not_fire_for_message_outside_range():
 
 def test_replacement_idempotent_when_already_offloaded():
     # Simulate a second compaction pass that would cover an already-
-    # reference-replaced recalled message. Option C must no-op so the
+    # pointer-rewritten recalled message. The rewrite must no-op so the
     # reducer doesn't churn the id.
     already_replaced = ToolMessage(
         content=_reference_placeholder("tooluse_orig_1"),
@@ -153,7 +154,7 @@ def test_replacement_idempotent_when_already_offloaded():
         id="t1",
     )
     raw = [HumanMessage(content="seed", id="h1"), already_replaced]
-    replacements = option_c_reference_replacement(
+    replacements = shrink_summarized_recalls_to_pointers(
         raw,
         previous_summarized_through=0,
         new_summarized_through=2,
@@ -166,7 +167,7 @@ def test_replacement_ignores_non_recalled_tool_messages():
         AIMessage(content="", id="a1", tool_calls=[{"id": "c1", "name": "x", "args": {}}]),
         ToolMessage(content="normal result", tool_call_id="c1", name="x", id="t1"),
     ]
-    replacements = option_c_reference_replacement(
+    replacements = shrink_summarized_recalls_to_pointers(
         raw,
         previous_summarized_through=0,
         new_summarized_through=2,
@@ -183,21 +184,21 @@ def test_replacement_no_op_when_range_empty():
             content="payload",
         )
     ]
-    assert option_c_reference_replacement(
+    assert shrink_summarized_recalls_to_pointers(
         raw, previous_summarized_through=5, new_summarized_through=3
     ) == []
-    assert option_c_reference_replacement(
+    assert shrink_summarized_recalls_to_pointers(
         raw, previous_summarized_through=3, new_summarized_through=3
     ) == []
 
 
 # ---------------------------------------------------------------------------
-# Recovery: S3 still holds the original content after Option C fires
+# Recovery: S3 still holds the original content after the rewrite fires
 # ---------------------------------------------------------------------------
 
 
-async def test_option_c_is_lossless_s3_still_returns_original_content():
-    """The artefact store is the source of truth: even after Option C
+async def test_pointer_rewrite_is_lossless_s3_still_returns_original_content():
+    """The artefact store is the source of truth: even after the rewrite
     replaces the journal entry's ``content``, a fresh ``recall_tool_result``
     call still returns the original bytes from S3."""
     from executor.builtin_tools.recall_tool_result import _resolve_and_fetch
@@ -213,7 +214,7 @@ async def test_option_c_is_lossless_s3_still_returns_original_content():
         content=original_content,
     )
 
-    # Apply Option C — the journal entry's content is replaced with a
+    # Apply the rewrite — the journal entry's content is replaced with a
     # placeholder, but the S3 artefact is untouched.
     raw = [
         _recalled_tool_message(
@@ -223,7 +224,7 @@ async def test_option_c_is_lossless_s3_still_returns_original_content():
             content=original_content,
         )
     ]
-    replacements = option_c_reference_replacement(
+    replacements = shrink_summarized_recalls_to_pointers(
         raw, previous_summarized_through=0, new_summarized_through=1
     )
     assert len(replacements) == 1
@@ -434,7 +435,7 @@ async def _unused_summarizer(**kwargs: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: hook writes Option C replacements into state_updates["messages"]
+# End-to-end: hook writes the pointer-rewrite result into state_updates["messages"]
 # ---------------------------------------------------------------------------
 
 
@@ -448,7 +449,7 @@ class _FakeSummarizeResult:
         self.skipped_reason = None
 
 
-async def test_hook_emits_option_c_replacement_in_state_updates_messages():
+async def test_hook_emits_pointer_rewrite_in_state_updates_messages():
     """Full hook flow: when the trigger fires and the watermark advances
     past a recalled ToolMessage, ``state_updates["messages"]`` carries the
     replacement so LangGraph's ``add_messages`` reducer swaps it in place."""
@@ -506,7 +507,7 @@ async def test_hook_emits_option_c_replacement_in_state_updates_messages():
     new_through = result.state_updates["summarized_through_turn_index"]
     assert new_through >= 2  # past our recalled message at index 2
 
-    # Option C replacement is in the state update.
+    # The pointer-rewrite replacement is in the state update.
     assert "messages" in result.state_updates
     replacements = result.state_updates["messages"]
     assert len(replacements) == 1

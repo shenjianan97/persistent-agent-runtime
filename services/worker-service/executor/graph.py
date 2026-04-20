@@ -643,7 +643,7 @@ def _tag_recall_message(
     The tool surface itself returns a plain string (see
     ``executor.builtin_tools.recall_tool_result``); LangGraph's ToolNode
     wraps it into a ``ToolMessage`` with the call's id — we use THAT id as
-    ``original_tool_call_id`` so the Option C replacement can point readers
+    ``original_tool_call_id`` so the recall-pointer rewrite can point readers
     back at the right S3 artefact. The ToolMessage also carries a fresh id
     (assigned by LangGraph later) so add_messages replay semantics stay
     consistent.
@@ -1652,15 +1652,15 @@ class GraphExecutor:
                 loop that defeats the purpose. The recall output is tagged
                 with ``additional_kwargs={"recalled": True,
                 "original_tool_call_id": ...}`` so the compaction hook's
-                Option C replacement and the projection rule can recognise
-                it later.
+                recall-pointer rewrite and the projection stub rule can
+                recognise it later.
                 """
                 out = await _raw_tool_node.ainvoke(state, config)
                 if not _offload_enabled or _offload_store is None:
                     # When the flag is off, still tag recall-tool outputs so
-                    # the compaction hook's projection/Option-C logic can
-                    # find them. Re-offload is already disabled in this
-                    # branch.
+                    # the compaction hook's projection stub + recall-pointer
+                    # rewrite can find them. Re-offload is already disabled
+                    # in this branch.
                     out = _tag_recall_outputs_in_toolnode_output(
                         out, _raw_tool_node_input_messages(state)
                     )

@@ -28,7 +28,7 @@ Track 7 Follow-up: [Task 6 spec](../../../docs/exec-plans/active/phase-2/track-7
 |---|------|---------|
 | 1 | `test_research_task_large_context.py` | AWS-research-style task forcing ≥1 compaction firing; asserts task completes + summary stays under budget fraction. |
 | 2 | `test_tool_use_pairing_through_compaction.py` | Multi-tool-call turns; asserts `pre_model_hook` projection preserves tool_use/tool_result pairing through compaction. Real-provider replay of PR #80's unit coverage. |
-| 3 | `test_offload_recall_roundtrip.py` | Ingestion offload + `recall_tool_result` round-trip; asserts Option-C reference-replacement preserves recallability after summarization. **Depends on Tasks 4+5.** |
+| 3 | `test_offload_recall_roundtrip.py` | Ingestion offload + `recall_tool_result` round-trip; asserts the recall-pointer rewrite preserves recallability after summarization. **Depends on Tasks 4+5.** |
 | 4 | `test_memory_flush_and_dead_letter.py` | Memory-enabled agent: asserts `memory_flush_fired_this_task` runs once; asserts pathological input dead-letters with `context_exceeded_irrecoverable`. |
 | 5 | `test_multi_provider_smoke.py` | One cheap completion per provider (Bedrock / Anthropic / OpenAI) — credentials + adapter smoke check. |
 | 6 | `test_main_path_shape_through_compactions.py` | Captures `llm_input_messages` at first / second / third `pre_model_hook` firings; runs each through `LLMConversationShapeValidator`; asserts cleanliness. MAIN-path shape regression coverage. |

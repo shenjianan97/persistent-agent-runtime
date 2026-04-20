@@ -29,9 +29,11 @@ projection for the current turn with the fresh summary and an empty middle.
 
 Invariants preserved from Track 7:
 
-* ``state["messages"]`` is never mutated by this hook. Option C's recalled-
-  reference replacement (Task 5) is the single sanctioned write and is called
-  from Task 5's code path — we leave a documented hook-point here.
+* ``state["messages"]`` is never mutated by this hook directly. The sole
+  sanctioned write to the journal from compaction is the recall-pointer
+  rewrite (:func:`shrink_summarized_recalls_to_pointers`), which fires at the
+  end of a successful Tier-3 firing and swaps already-summarised recalled
+  ``ToolMessage`` content for a short S3 pointer string.
 * Tool-use / tool-result pairing is preserved by the orphan-alignment
   walkback. No ``ToolMessage`` ever appears as the first non-``SystemMessage``
   of the projection.
@@ -61,9 +63,14 @@ from executor.compaction.defaults import (
 
 
 # ---------------------------------------------------------------------------
-# Option C — reference-replacement for recalled ToolMessages absorbed into
-# ``summary``. Exported so Task 5's tests can exercise it directly without
-# running the full hook.
+# Recall-pointer rewrite: once a Tier-3 summarisation firing has absorbed the
+# full content of a ``recall_tool_result`` ``ToolMessage`` into ``summary``,
+# we swap that ``ToolMessage``'s ``.content`` for a short S3 pointer string.
+# The envelope (``tool_call_id``, ``name``, ``id``, ``additional_kwargs``) is
+# preserved verbatim so the provider still sees a valid tool_use/tool_result
+# pair; the full bytes remain in S3 and a fresh ``recall_tool_result`` call
+# returns them unchanged. Exported so the unit tests can exercise it directly
+# without running the full hook.
 # ---------------------------------------------------------------------------
 
 
@@ -76,10 +83,10 @@ def _is_recalled_tool_message(msg: BaseMessage) -> bool:
 
 
 def _reference_placeholder(original_tool_call_id: str) -> str:
-    """Return the canonical Option C reference string.
+    """Return the canonical post-summarisation pointer string.
 
-    Shared between :func:`option_c_reference_replacement` and tests so the
-    exact wording stays aligned. Keeping the original ``tool_call_id``
+    Shared between :func:`shrink_summarized_recalls_to_pointers` and tests so
+    the exact wording stays aligned. Keeping the original ``tool_call_id``
     inline lets the agent re-issue ``recall_tool_result`` to fetch the full
     content again if it still needs it post-summarisation.
     """
@@ -89,20 +96,61 @@ def _reference_placeholder(original_tool_call_id: str) -> str:
     )
 
 
-def option_c_reference_replacement(
+def shrink_summarized_recalls_to_pointers(
     raw_messages: list[BaseMessage],
     *,
     previous_summarized_through: int,
     new_summarized_through: int,
 ) -> list[BaseMessage]:
-    """Return replacement ``ToolMessage``s for any recalled messages
-    absorbed into the new summary window.
+    """Rewrite already-summarised recalled ``ToolMessage`` content to a short
+    S3-pointer string.
 
-    This is the ONE sanctioned mutation to ``state["messages"]`` under the
-    replace-and-rehydrate architecture — everywhere else the durable journal
-    is strictly append-only. The mutation is executed via LangGraph's
-    ``add_messages`` reducer: we return ``ToolMessage`` instances whose
-    ``id`` matches the original, and the reducer replaces them in place.
+    What this does
+    --------------
+    When a compaction pass advances the summary watermark past the index of a
+    ``ToolMessage`` that was produced by ``recall_tool_result`` (flagged via
+    ``additional_kwargs['recalled']``), this function returns a replacement
+    ``ToolMessage`` whose ``.content`` is a tiny pointer string
+    (``_reference_placeholder``) referencing the original ``tool_call_id``.
+    The envelope — ``tool_call_id``, ``name``, ``id``, and the rest of
+    ``additional_kwargs`` — is copied through unchanged; only ``.content``
+    shrinks. LangGraph's ``add_messages`` reducer matches the returned
+    instance's ``id`` against the existing entry in ``state["messages"]`` and
+    overwrites it in place.
+
+    Why we keep the envelope (not just drop the message)
+    ----------------------------------------------------
+    Anthropic and Bedrock reject requests where a ``tool_use`` block has no
+    matching ``tool_result``. If the keep-window boundary happens to sit
+    between the invoking ``AIMessage.tool_calls`` entry and its
+    ``ToolMessage`` response, dropping the message would produce an orphan
+    tool_use and the next turn would dead-letter. Shrinking the content while
+    leaving the envelope keeps pairing valid on every projection.
+
+    Why we mutate the journal here (and only here)
+    ----------------------------------------------
+    The durable journal (``state["messages"]``) is rehydrated from the
+    checkpoint on every worker restart; the compaction hook's in-memory
+    projection is NOT persisted. If we left the full recalled payload in the
+    journal, restart would faithfully bring it back and the summariser would
+    have to re-absorb it on the next compaction — an infinite re-read loop
+    (see the task 75f5a223 dead-letter for the historical symptom). Rewriting
+    the journal entry to a pointer makes the shrink durable.
+
+    The ONE sanctioned journal mutation
+    -----------------------------------
+    Under the replace-and-rehydrate architecture every other compaction
+    code path treats ``state["messages"]`` as append-only. This function is
+    the sole exception. The replacement is emitted as part of the same
+    state update as ``summary`` and ``summarized_through_turn_index``, so
+    no intermediate state is ever observed externally.
+
+    Idempotence
+    -----------
+    Each replacement carries ``additional_kwargs['content_offloaded'] =
+    True``. A subsequent compaction pass whose summary window covers the
+    same range sees the flag and skips the message, so we don't churn the
+    same id through the reducer twice.
 
     Parameters
     ----------
@@ -493,9 +541,10 @@ async def compaction_pre_model_hook(
     Parameters
     ----------
     raw_messages:
-        ``state["messages"]`` verbatim. Treated as immutable — this function
-        NEVER writes to the underlying list. Option C (Task 5) is the only
-        sanctioned mutation and happens elsewhere.
+        ``state["messages"]`` verbatim. Treated as immutable on read paths —
+        the hook only writes to the journal through the recall-pointer
+        rewrite (:func:`shrink_summarized_recalls_to_pointers`) emitted in
+        ``state_updates["messages"]`` on a successful Tier-3 firing.
     state:
         Read-only mapping view of the current graph state.
     agent_config:
@@ -578,14 +627,16 @@ async def compaction_pre_model_hook(
     middle = list(raw_messages[summarized_through:keep_window_start])
     keep_window = list(raw_messages[keep_window_start:])
 
-    # Task 5 §5 (revised) — projection rule for recalled ToolMessages: keep
-    # verbatim inside the keep window (the agent recalled them on purpose)
-    # but STUB them in ``middle``. Stubbing, not dropping, preserves the
-    # tool_use/tool_result pairing the provider requires; the short stub
-    # still prevents the re-offload / re-recall oscillation the original
-    # rule targeted because the bytes are replaced with a placeholder.
-    # Once absorbed into ``summary``, the Option C replacement below keeps
-    # the journal entry lossless (S3 still holds the original bytes).
+    # Projection rule for recalled ToolMessages: keep verbatim inside the
+    # keep window (the agent recalled them on purpose) but STUB their
+    # ``.content`` when they land in ``middle``. Stubbing — not dropping —
+    # preserves the tool_use / tool_result pairing the provider requires;
+    # the short stub still prevents a re-offload / re-recall oscillation
+    # because the bytes are replaced with a placeholder. Note this only
+    # shrinks the in-memory projection; once the recalled message is
+    # absorbed into ``summary``, ``shrink_summarized_recalls_to_pointers``
+    # below makes the shrink durable by rewriting the journal entry too
+    # (S3 still holds the original bytes, so recall stays lossless).
     middle = _stub_recalled_outside_keep_window(middle)
 
     # Build the initial projection and estimate tokens.
@@ -810,19 +861,19 @@ async def compaction_pre_model_hook(
     state_updates["summarized_through_turn_index"] = new_summarized_through
     state_updates["tier3_firings_count"] = tier3_firings_count + 1
 
-    # Task 5 §6 — Option C reference-replacement. This is the SOLE sanctioned
-    # mutation to ``state["messages"]`` under the replace-and-rehydrate
-    # architecture; every other code path treats the journal as append-only.
-    # Recalled ``ToolMessage`` instances whose indices fall within the newly-
-    # absorbed window get their content replaced with a short reference
-    # string pointing back at the original ``tool_call_id`` — the full bytes
-    # stay in S3 and a fresh ``recall_tool_result`` call still returns them.
-    # LangGraph's ``add_messages`` reducer performs the replacement by id;
-    # ``option_c_reference_replacement`` preserves the original message id on
-    # every returned instance. The mutation is part of the SAME state update
-    # as ``summary`` / ``summarized_through_turn_index`` so no intermediate
-    # state is ever observed externally.
-    _replacements = option_c_reference_replacement(
+    # Recall-pointer rewrite — the SOLE sanctioned mutation to
+    # ``state["messages"]`` under the replace-and-rehydrate architecture;
+    # every other code path treats the journal as append-only. Recalled
+    # ``ToolMessage`` instances whose indices fall within the newly-absorbed
+    # window get their ``.content`` rewritten to a short pointer string
+    # referencing the original ``tool_call_id`` — the full bytes stay in S3
+    # and a fresh ``recall_tool_result`` call still returns them. LangGraph's
+    # ``add_messages`` reducer performs the replacement by id; the function
+    # preserves the original message id on every returned instance. The
+    # mutation ships in the SAME state update as ``summary`` /
+    # ``summarized_through_turn_index`` so no intermediate state is ever
+    # observed externally.
+    _replacements = shrink_summarized_recalls_to_pointers(
         raw_messages,
         previous_summarized_through=summarized_through,
         new_summarized_through=new_summarized_through,

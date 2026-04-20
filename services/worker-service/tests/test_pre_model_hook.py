@@ -371,7 +371,7 @@ async def test_journal_append_only_across_turns():
         )
         assert "messages" not in result.state_updates, (
             "Task 3's hook must never write back to state['messages']; "
-            "that mutation belongs to Task 5's Option C path."
+            "that mutation belongs to the recall-pointer rewrite path."
         )
         # Append a turn to simulate further agent progress.
         msgs = msgs + _tool_pair(100 + turn)
