@@ -41,6 +41,7 @@ MUST propagate — Task 5's recall tool distinguishes these from retention GC.
 from __future__ import annotations
 
 import abc
+import asyncio
 import hashlib
 import re
 from dataclasses import dataclass
@@ -230,6 +231,23 @@ class ToolResultArtifactStore(abc.ABC):
                 errors. The caller MUST distinguish these from ``None``.
         """
 
+    async def list_keys(self, prefix: str) -> list[str]:
+        """Return every object key stored directly under ``prefix``.
+
+        Used by Task 5's ``recall_tool_result`` to find the
+        ``{content_hash}.txt`` file for a given ``(tenant_id, task_id,
+        tool_call_id[, args/{arg_key}])`` prefix. Returns an empty list when
+        the prefix has no objects. Transport / auth / backend errors
+        propagate so the caller can differentiate "no content" (missing)
+        from "storage down" (transient).
+
+        Default implementation returns ``[]``. Concrete stores that support
+        listing (``S3ToolResultStore``, ``InMemoryToolResultStore``)
+        override. Minimal test-double subclasses that only need put/get
+        inherit the no-op behaviour safely.
+        """
+        return []
+
 
 # ---------------------------------------------------------------------------
 # InMemory implementation (tests)
@@ -266,6 +284,21 @@ class InMemoryToolResultStore(ToolResultArtifactStore):
         # Parse first — exercises the shape gate.
         parse_tool_result_uri(uri)
         return self._data.get(uri)
+
+    async def list_keys(self, prefix: str) -> list[str]:
+        """Return keys whose URI begins with ``toolresult://{prefix}``.
+
+        The production store would call ``list_objects_v2`` on the bucket;
+        for the in-memory double we enumerate the dict's URI keys and strip
+        the ``toolresult://`` scheme so the returned values are bucket-
+        relative keys (same shape as the S3 implementation).
+        """
+        marker = f"{URI_SCHEME}{prefix}"
+        return [
+            uri[len(URI_SCHEME):]
+            for uri in self._data.keys()
+            if uri.startswith(marker)
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +371,30 @@ class S3ToolResultStore(ToolResultArtifactStore):
                 return None
             raise
         return data.decode("utf-8")
+
+    async def list_keys(self, prefix: str) -> list[str]:
+        """Return object keys directly under ``prefix`` via ``list_objects_v2``.
+
+        Uses the wrapped :class:`S3Client`'s boto3 client through
+        ``asyncio.to_thread`` so the rest of the worker remains async-pure.
+        Pagination is handled by the ``Paginator`` API — in practice a
+        single tool_call_id rarely exceeds one page, but we iterate all
+        pages defensively. Transport / auth errors propagate unchanged.
+        """
+        boto_client = self._s3._client  # type: ignore[attr-defined]
+        bucket = self._s3.bucket_name
+
+        def _list() -> list[str]:
+            paginator = boto_client.get_paginator("list_objects_v2")
+            out: list[str] = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for item in page.get("Contents", []) or []:
+                    key = item.get("Key")
+                    if isinstance(key, str):
+                        out.append(key)
+            return out
+
+        return await asyncio.to_thread(_list)
 
 
 __all__ = [

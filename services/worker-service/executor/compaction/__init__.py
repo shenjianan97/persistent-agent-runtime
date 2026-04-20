@@ -103,6 +103,7 @@ from executor.compaction.pre_model_hook import (
     Tier3SkippedEvent,
     compaction_pre_model_hook,
     find_keep_window_start,
+    option_c_reference_replacement,
     should_fire_pre_tier3_flush,
 )
 
@@ -156,6 +157,7 @@ __all__ = [
     "Tier3SkippedEvent",
     "compaction_pre_model_hook",
     "find_keep_window_start",
+    "option_c_reference_replacement",
     "should_fire_pre_tier3_flush",
     # Tokens
     "estimate_tokens",
