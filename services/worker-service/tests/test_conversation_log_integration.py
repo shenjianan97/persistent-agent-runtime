@@ -26,10 +26,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from core.conversation_log_repository import ConversationLogRepository
-from executor.compaction.pipeline import (
+from executor.compaction.pre_model_hook import (
     MemoryFlushFiredEvent,
-    Tier1AppliedEvent,
-    Tier15AppliedEvent,
     Tier3FiredEvent,
 )
 from executor.graph import (
@@ -349,8 +347,8 @@ async def test_tier3_fired_emits_compaction_boundary(
         checkpoint_id="ckpt-t3",
         events=[ev],
         summarized_through_before=5,
-        summary_marker_before="",
-        summary_marker_after="Earlier: agent explored /tmp.",
+        summary_before="",
+        summary_after="Earlier: agent explored /tmp.",
     )
 
     rows = await _fetch_entries(integration_pool, task_id)
@@ -367,10 +365,14 @@ async def test_tier3_fired_emits_compaction_boundary(
 
 
 @pytest.mark.asyncio
-async def test_tier3_second_fire_computes_append_delta(
+async def test_tier3_second_fire_logs_replaced_summary(
     integration_pool: asyncpg.Pool,
 ) -> None:
-    """Second Tier 3 firing within same task: summary_text is the appended delta."""
+    """Second Tier 3 firing within same task: summary_text is the NEW summary.
+
+    Track 7 Follow-up (Task 3) replaces ``summary`` each firing instead of
+    appending, so the conversation-log entry simply records the replacement.
+    """
     task_id = await _seed_task(integration_pool)
     repo = ConversationLogRepository(integration_pool)
 
@@ -387,36 +389,35 @@ async def test_tier3_second_fire_computes_append_delta(
         checkpoint_id="ckpt-t3b",
         events=[ev],
         summarized_through_before=12,
-        summary_marker_before="Earlier: A.",
-        summary_marker_after="Earlier: A.\nLater: B.",
+        summary_before="Earlier: A.",
+        summary_after="Rewritten: combined A + B.",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     import json as _json
     content = _json.loads(rows[0]["content"]) if isinstance(rows[0]["content"], str) else rows[0]["content"]
-    assert content["summary_text"] == "\nLater: B."
+    assert content["summary_text"] == "Rewritten: combined A + B."
 
 
 @pytest.mark.asyncio
-async def test_tier1_and_tier15_events_produce_no_log_entries(
+async def test_empty_events_list_produces_no_log_entries(
     integration_pool: asyncpg.Pool,
 ) -> None:
+    """Track 7 Follow-up (Task 3): with no Tier3Fired / MemoryFlush events
+    the compaction helper produces zero log entries. Tier 1 / Tier 1.5 event
+    types were removed by the replace-and-rehydrate rewrite.
+    """
     task_id = await _seed_task(integration_pool)
     repo = ConversationLogRepository(integration_pool)
-
-    events = [
-        Tier1AppliedEvent(messages_cleared=5, est_tokens_saved=1500, new_watermark=5),
-        Tier15AppliedEvent(args_truncated=3, bytes_saved=4200, new_watermark=5),
-    ]
 
     await _convlog_append_compaction_events(
         repo,
         task_id=task_id,
         tenant_id=TENANT_ID,
         checkpoint_id="ckpt-silent",
-        events=events,
+        events=[],
         summarized_through_before=0,
-        summary_marker_before="",
-        summary_marker_after="",
+        summary_before="",
+        summary_after="",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     assert rows == []
@@ -442,8 +443,8 @@ async def test_memory_flush_event_emits_memory_flush_entry(
         checkpoint_id="ckpt-mf",
         events=[ev],
         summarized_through_before=0,
-        summary_marker_before="",
-        summary_marker_after="",
+        summary_before="",
+        summary_after="",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     assert len(rows) == 1
@@ -470,8 +471,8 @@ async def test_memory_flush_event_dedups_within_task(
             checkpoint_id="ckpt-dup",
             events=[ev],
             summarized_through_before=0,
-            summary_marker_before="",
-            summary_marker_after="",
+            summary_before="",
+            summary_after="",
         )
     rows = await _fetch_entries(integration_pool, task_id)
     assert len(rows) == 1
