@@ -1524,7 +1524,20 @@ class GraphExecutor:
                         checkpoint_id=_convlog_ckpt_id,
                         response=response,
                     )
-                    return {"messages": [response], **compaction_state_updates}
+                    # Merge the new assistant ``response`` with any ``messages``
+                    # update from the compaction hook (the recall-pointer
+                    # rewrite returns ToolMessage replacements keyed by id).
+                    # A naive ``{"messages": [response], **compaction_state_updates}``
+                    # would let the hook's ``messages`` key overwrite ``[response]``
+                    # via dict-literal collision semantics, dropping the assistant
+                    # turn (including any pending tool_calls) on the recall-and-
+                    # summarize path. ``add_messages`` handles append + replace
+                    # in one list, so we combine both.
+                    _hook_messages = compaction_state_updates.get("messages", [])
+                    return {
+                        **compaction_state_updates,
+                        "messages": [*_hook_messages, response],
+                    }
                 except Exception as e:
                     if self._is_rate_limit_error(e) and attempt < max_rate_limit_retries:
                         backoff = self._get_retry_after(e) or min(30, 5 * (2 ** attempt))
@@ -2793,14 +2806,12 @@ class GraphExecutor:
                         )
 
                 # Build initial message list. Attachment preamble (when
-                # present) is prepended as a SystemMessage BEFORE the agent's
-                # own system prompt — the distinction between "agent rules"
-                # and "customer-attached memory" must be preserved. Because
-                # the ``agent_node`` only auto-synthesizes system prompts
-                # when NO SystemMessage is present in state, we explicitly
-                # include the agent's system prompt + platform system
-                # message here when we're also injecting the preamble, so
-                # those aren't silently dropped on the first super-step.
+                # present) is stored as a SystemMessage in state so it flows
+                # through the projection via ``middle`` / ``keep_window``.
+                # The agent system prompt and platform system message are
+                # NOT added here — the pre_model_hook prepends them on every
+                # turn (``_build_projection``), so adding them to state too
+                # would duplicate system directives and inflate token count.
                 initial_messages: list[Any] = []
                 if attached_preamble is not None:
                     initial_messages.append(
@@ -2813,46 +2824,6 @@ class GraphExecutor:
                             )
                         )
                     )
-                    # Reconstruct the agent's system prompts that
-                    # ``agent_node`` would normally synthesise on the first
-                    # super-step — see agent_node's "no SystemMessage"
-                    # branch in _build_graph.
-                    agent_system_prompt = agent_config.get("system_prompt", "")
-                    allowed_tools_for_sys = agent_config.get("allowed_tools", [])
-                    sandbox_template_for_sys = (
-                        agent_config.get("sandbox") or {}
-                    ).get("template")
-                    # Track 7 Follow-up Task 5 — mirror the graph-build-time
-                    # resolution so the initial platform SystemMessage shows
-                    # (or hides) the ``recall_tool_result`` hint consistently
-                    # with the tool registration gate in ``_build_graph``.
-                    _cm_cfg_for_sys = (
-                        agent_config.get("context_management") or {}
-                    )
-                    _offload_flag_for_sys = _cm_cfg_for_sys.get(
-                        "offload_tool_results"
-                    )
-                    _offload_enabled_for_sys = (
-                        True if _offload_flag_for_sys is None
-                        else bool(_offload_flag_for_sys)
-                    )
-                    platform_system_msg = self._build_platform_system_message(
-                        allowed_tools_for_sys,
-                        injected_files=(
-                            injected_files if sandbox_enabled else None
-                        ),
-                        sandbox_template=sandbox_template_for_sys,
-                        memory_decision=memory_decision,
-                        offload_tool_results_enabled=_offload_enabled_for_sys,
-                    )
-                    if agent_system_prompt:
-                        initial_messages.append(
-                            SystemMessage(content=agent_system_prompt)
-                        )
-                    if platform_system_msg:
-                        initial_messages.append(
-                            SystemMessage(content=platform_system_msg)
-                        )
                 if first_execution:
                     initial_messages.append(HumanMessage(content=task_input))
 
