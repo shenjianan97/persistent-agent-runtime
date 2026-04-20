@@ -75,6 +75,16 @@ SUMMARIZER_MAX_RETRIES: int = 2
 # 5% of firings post-Task 3.
 SUMMARIZER_MAX_OUTPUT_TOKENS: int = 1500
 
+# Input headroom (tokens) subtracted from the summarizer's context window when
+# deciding whether the `prior_summary + middle` payload needs to be chunked.
+# Accounts for the ~1K-token SUMMARIZER_PROMPT, the SUMMARIZER_MAX_OUTPUT_TOKENS
+# reservation, serialisation overhead from `format_messages_for_summary`
+# (~10% over raw tokens for JSON-dumped tool args), and a per-provider safety
+# margin. On a 200K summarizer, this leaves ~188K for `prior_summary +
+# serialised middle` — still massive. If the output cap rises, bump headroom
+# proportionally.
+SUMMARIZER_INPUT_HEADROOM_TOKENS: int = 12_000
+
 # Maximum number of Tier 3 firings allowed per task. Beyond this cap the
 # pipeline stops invoking the summarizer and falls through to the hard-floor
 # path if the input still exceeds the floor. Bounds worst-case cost for
@@ -102,6 +112,7 @@ assert PER_TOOL_RESULT_CAP_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
 assert SUMMARIZER_MAX_RETRIES >= 0
 assert SUMMARIZER_MAX_OUTPUT_TOKENS > 0
+assert SUMMARIZER_INPUT_HEADROOM_TOKENS > 0
 
 
 def get_platform_default_summarizer_model() -> str:
