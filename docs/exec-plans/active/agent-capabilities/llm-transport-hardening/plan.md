@@ -7,7 +7,7 @@
 **Goal:** Convert the worker's LLM call site from a silent blocking `ainvoke` with a non-functional 300 s timeout into a streamed call with a real per-chunk inactivity timeout, a hard `maxTokens` ceiling, live progress events surfaced into the conversation log, and a system-prompt nudge that prevents the agent from packing multi-thousand-token reports into a single tool argument.
 
 **Architecture:**
-1. **`executor/providers.py`** stops using `init_chat_model("bedrock_converse", …)` and constructs `ChatBedrockConverse` directly. The boto3 client is built with an explicit `botocore.Config(read_timeout=…, connect_timeout=…)` and passed in via the `client` field. `max_tokens` is set on the model. Both knobs come from a single `LLMTransportConfig` resolver that consults agent config first, then platform defaults.
+1. **`executor/providers.py`** stops using `init_chat_model(...)` for **all three providers** (Bedrock, OpenAI, Anthropic) and constructs each provider's chat-model class directly. Each provider's native timeout / retries / max-tokens fields are used (Bedrock: `botocore.Config(read_timeout, connect_timeout)` on a pre-built boto3 client; OpenAI: `request_timeout=`, `max_retries=`, `max_tokens=` on `ChatOpenAI`; Anthropic: `default_request_timeout=`, `max_retries=`, `max_tokens=` on `ChatAnthropic`). All three values come from a single `LLMTransportConfig` resolver that consults agent config first, then platform defaults.
 2. **`executor/graph.py`** replaces `llm_with_tools.ainvoke(messages_for_llm, config)` at line 1173 with `llm_with_tools.astream(...)`. Chunks are accumulated into a single `AIMessageChunk` (LangChain's chunk-merge protocol via `+`), then materialized into the same `AIMessage` shape the rest of the graph expects. Non-streaming behavior of downstream code (cost ledger, conversation log append, `Command` returns) does not change.
 3. **`core/conversation_log_repository.py`** gains a new `ConversationLogKind` for `llm_stream_progress` carrying `{chunks, chars, tool_call_chars, elapsed_s}`. The streaming loop in `agent_node` emits one progress entry every N seconds (default 10 s, configurable) and one terminal `llm_stream_complete` entry. Idempotency keys are deterministic per checkpoint + sequence so retries don't double-count.
 4. **`services/console/`** renders these progress entries on the task page (live tail). Existing `useTaskEvents` / SSE paths are unchanged; only the new entry kind needs a render branch.
@@ -21,7 +21,7 @@
 
 The five fixes track the five layers identified in #85's root cause analysis:
 
-1. **Real boto3 timeout config.** `init_chat_model` silently moves unknown kwargs (`timeout`, `max_retries`) into `model_kwargs`, where they end up as Bedrock *inference* parameters, not boto3 client config (proven by langchain's startup warning). Switching to direct `ChatBedrockConverse` construction with an explicit `botocore.Config` makes the read timeout an actually-enforced contract.
+1. **Real client-level timeout config — all providers.** `init_chat_model` silently moves *unknown* kwargs into `model_kwargs`. Bedrock's failure mode was the loudest (langchain's startup warning proved `timeout=` and `max_retries=` were dropped) but **the same hazard exists for OpenAI and Anthropic**: their native field names are `request_timeout` and `default_request_timeout` respectively, not `timeout`. Anyone passing the wrong name silently gets default behavior. Direct per-provider construction with each provider's native field names guarantees the timeout we configure is the one that actually applies.
 2. **`maxTokens` safety belt.** Without `inferenceConfig.maxTokens` Bedrock generates until the model says `end_turn`. Slow models (e.g., `zai.glm-5` at ~35 tok/s) can run for minutes. Setting a per-agent cap (default 16 384) with a structured warning when `stopReason=max_tokens` keeps a misbehaving model bounded.
 3. **Streaming.** `ainvoke` blocks until the entire response is buffered; the worker has no mid-call signal. `astream` resets the per-read timeout each chunk, so a 4-min generation succeeds; partial state is observable; cancellation becomes meaningful.
 4. **Per-task progress events.** Streaming alone is invisible to operators unless we surface the chunks. A small repeating `llm_stream_progress` entry on the conversation log lets the Console show "agent generating, 12 s, 1834 chars" instead of a frozen page.
@@ -43,7 +43,7 @@ The five fixes track the five layers identified in #85's root cause analysis:
 
 | Component | Path | Change Type | Description |
 |-----------|------|-------------|-------------|
-| LLM transport config | `services/worker-service/executor/providers.py` | rewrite | Drop `init_chat_model("bedrock_converse")`; construct `ChatBedrockConverse` directly with an explicit boto3 client + `botocore.Config(read_timeout, connect_timeout)`; pass `max_tokens`. OpenAI/Anthropic paths keep `init_chat_model` but stop passing `timeout=` / `max_retries=` since those are also silently dropped — switch to provider-native client kwargs or accept defaults documented per-provider. |
+| LLM transport config | `services/worker-service/executor/providers.py` | rewrite | Drop `init_chat_model(...)` for **all three providers** and construct each provider's chat-model class directly with provider-native transport fields. Bedrock: `ChatBedrockConverse(client=boto3.client("bedrock-runtime", config=botocore.Config(read_timeout, connect_timeout, retries={"max_attempts": 0})), max_tokens=...)`. OpenAI: `ChatOpenAI(request_timeout=read_timeout_s, max_retries=0, max_tokens=...)`. Anthropic: `ChatAnthropic(default_request_timeout=read_timeout_s, max_retries=0, max_tokens=...)`. All three consume the same `LLMTransportConfig` from `transport.py`. |
 | Transport defaults + resolver | `services/worker-service/executor/transport.py` (new) | new | `LLMTransportConfig` dataclass + `resolve_transport(agent_config, model)` returning `(connect_timeout, read_timeout, max_tokens)`. Platform defaults: `connect=10`, `read=120`, `max_tokens=16_384`. Per-agent overrides via `agent_config.llm_transport.{connect_timeout_s, read_timeout_s, max_output_tokens}` (all optional). |
 | Agent config (API) | `services/api-service/.../request/LlmTransportConfigRequest.java` (new) + `AgentConfigRequest.java` (modify) + `ConfigValidationHelper.java` (modify) + `AgentService.java` (modify) | new + modification | Add nested `llm_transport` sub-object with the three optional override fields; canonicalisation round-trip; validation: `connect_timeout_s ∈ [1, 60]`, `read_timeout_s ∈ [10, 900]`, `max_output_tokens ∈ [256, 200_000]`. |
 | LLM call streaming | `services/worker-service/executor/graph.py:1170-1210` | rewrite | Replace `ainvoke` with `astream`; accumulate chunks; emit progress events via the conversation log every N seconds. Preserve current rate-limit retry loop, cost ledger attribution, conversation-log final append, and `Command` return shape. |
@@ -92,8 +92,11 @@ Tasks 1, 7, 8 can start in parallel. Task 7 must merge before Task 1 can consume
 
 ## A4. Acceptance Criteria (mirrors #85)
 
-- [ ] Worker startup logs no longer emit langchain's `"timeout was transferred to model_kwargs"` / `"max_retries was transferred to model_kwargs"` warnings.
-- [ ] Unit test asserts the Bedrock boto3 client's `_endpoint.http_session._read_timeout` (or equivalent) equals the configured `read_timeout`.
+- [ ] Worker startup logs no longer emit any langchain `"... was transferred to model_kwargs"` warning for **any** of the three providers (Bedrock, OpenAI, Anthropic).
+- [ ] Unit tests assert the configured `read_timeout` is actually applied:
+  - Bedrock: boto3 client's `meta.config.read_timeout` (or equivalent — verify the stable read path interactively first) equals the configured value.
+  - OpenAI: constructed `ChatOpenAI.request_timeout` equals the configured value.
+  - Anthropic: constructed `ChatAnthropic.default_request_timeout` equals the configured value.
 - [ ] Worker emits a structured `llm_stream_progress` entry on the **first chunk arrival** (typically <1 s) so operators see liveness immediately. Subsequent progress entries are throttled to one every 10 s wall time. A successful call always emits exactly one terminal `llm_stream_complete`. (For very fast calls that complete in <10 s, this means: 1 progress entry on first chunk + 1 complete entry — never zero progress entries.)
 - [ ] `inferenceConfig.maxTokens` is present in the Bedrock request payload (verify via stub or recorded fixture). When the model would exceed it, the worker emits a structured warning `llm.max_tokens_reached` with `model`, `max_tokens`, and the resulting `AIMessage`'s `response_metadata.stopReason`.
 - [ ] Console task page shows live progress during a generation ≥ 30 s (browser-verified per `docs/CONSOLE_TASK_CHECKLIST.md`).
@@ -109,7 +112,7 @@ Tasks 1, 7, 8 can start in parallel. Task 7 must merge before Task 1 can consume
 - **Adding a task-level retry-cap exemption** for `ReadTimeoutError` specifically — once the streaming + maxTokens fixes land, this error class is rare and the existing retry budget is appropriate.
 - **Per-tool-argument size enforcement** — tempting (cap tool arguments mid-stream and abort) but the right place to bound this is `maxTokens` (Task 3) plus prompt guidance (Task 8), not custom interception logic.
 - **Streaming partial tool calls back to the agent's tool executor** — out of scope. We materialize the full `AIMessage` before the tool-execution node runs, exactly as today.
-- **Provider-native streaming for OpenAI / Anthropic** — Task 4 implements streaming on the Bedrock path first. OpenAI / Anthropic paths can adopt the same pattern in a follow-up; both already support `astream` with comparable semantics.
+- *(removed — streaming and transport configuration are now provider-agnostic; see Task 4 and Task 2+3 respectively)*
 
 ---
 
