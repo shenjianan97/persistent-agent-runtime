@@ -261,50 +261,11 @@ async def test_tier1_fires_when_over_threshold():
 
 # ---------------------------------------------------------------------------
 # 3. Tier 1.5 fires after Tier 1 when still above threshold
+#    REMOVED in Track 7 Follow-up Task 4 — Tier 1.5 (``truncate_tool_call_args``)
+#    no longer runs in the pipeline. Oversized tool-call args are now offloaded
+#    to S3 at AIMessage-append time; see ``test_compaction_ingestion_offload.py``
+#    for coverage of the replacement behaviour.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_tier15_fires_after_tier1():
-    """When Tier 1 alone is insufficient, Tier 1.5 (arg truncation) should fire."""
-    # Create messages with large args that are truncatable
-    msgs = [HumanMessage(content="task")]
-    for i in range(10):
-        call_id = f"call_{i}"
-        msgs.extend([
-            AIMessage(
-                content=f"Step {i}",
-                tool_calls=[{
-                    "id": call_id,
-                    "name": f"tool_{i}",
-                    "args": {"content": "x" * 5000},  # large truncatable arg
-                    "type": "tool_call",
-                }],
-            ),
-            ToolMessage(
-                content="r" * 100,
-                tool_call_id=call_id,
-                name=f"tool_{i}",
-            ),
-        ])
-
-    model_context_window = 10_000
-    thresholds = resolve_thresholds(model_context_window)
-    token_count = thresholds.tier1 + 100
-
-    result = await compact_for_llm(
-        raw_messages=msgs,
-        state=_base_state(),
-        agent_config=_agent_config(),
-        model_context_window=model_context_window,
-        task_context=_task_context(),
-        summarizer=_make_successful_summarizer(),
-        estimate_tokens_fn=_fixed_token_estimate(token_count),
-    )
-
-    tier15_events = [e for e in result.events if isinstance(e, Tier15AppliedEvent)]
-    assert tier15_events, "Tier15AppliedEvent must be emitted"
-    assert result.state_updates.get("truncated_args_through_turn_index", 0) > 0
 
 
 # ---------------------------------------------------------------------------

@@ -115,10 +115,10 @@ class TestCompactForLLMImport:
         import executor.compaction as pkg
         required = [
             "KEEP_TOOL_USES",
+            "OFFLOAD_THRESHOLD_BYTES",
+            "TRUNCATABLE_ARG_KEYS",
             "resolve_thresholds",
-            "cap_tool_result",
             "clear_tool_results",
-            "truncate_tool_call_args",
             "summarize_slice",
             "compact_for_llm",
             "RuntimeState",
@@ -130,9 +130,15 @@ class TestCompactForLLMImport:
             "Tier3SkippedEvent",
             "estimate_tokens",
             "ClearResult",
-            "TruncateResult",
             "SummarizeResult",
             "Thresholds",
+            # Track 7 Follow-up Task 4 ingestion offload surface
+            "offload_tool_message",
+            "offload_ai_message_args",
+            "ToolResultArtifactStore",
+            "InMemoryToolResultStore",
+            "S3ToolResultStore",
+            "parse_tool_result_uri",
         ]
         for name in required:
             assert hasattr(pkg, name), f"executor.compaction must export {name!r}"

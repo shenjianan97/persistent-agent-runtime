@@ -39,12 +39,14 @@ AC_TO_TESTS: dict[int, list[str]] = {
         "services/worker-service/tests/test_graph_compaction_integration.py",
         "services/worker-service/tests/test_compaction_pipeline.py::test_tier1_fires_when_over_threshold",
     ],
-    # AC-2 — Per-tool-result cap applied before ToolMessage enters state; structured
-    # log compaction.per_result_capped emitted.
+    # AC-2 — Per-tool-result byte bounding applied before ToolMessage enters state.
+    # Track 7 Follow-up (Task 4) replaced the head+tail 25KB trim with S3-backed
+    # ingestion offload. The acceptance criterion shifts meaning slightly
+    # (offload + placeholder instead of hard cap) but the observable invariant —
+    # oversized tool-result bytes do NOT land in state — is unchanged.
     2: [
-        "services/worker-service/tests/test_graph_tool_cap_integration.py",
-        "services/worker-service/tests/test_compaction_caps.py",
-        "services/worker-service/tests/test_compaction_observability.py::test_per_result_capped_event_fires_above_cap",
+        "services/worker-service/tests/test_tool_result_store.py",
+        "services/worker-service/tests/test_compaction_ingestion_offload.py",
     ],
     # AC-3 — Tier 3 fires only when Tier 1+1.5 together cannot bring input below
     # TIER_3_TRIGGER_FRACTION.

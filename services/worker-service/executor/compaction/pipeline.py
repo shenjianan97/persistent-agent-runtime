@@ -41,7 +41,13 @@ from executor.compaction.defaults import (
     get_platform_default_summarizer_model,
 )
 from executor.compaction.thresholds import resolve_thresholds
-from executor.compaction.transforms import clear_tool_results, truncate_tool_call_args
+from executor.compaction.transforms import clear_tool_results
+
+# Tier 1.5 (``truncate_tool_call_args``) was removed in the Track 7 Follow-up
+# (Task 4). Oversized truncatable arg values are now offloaded to S3 at
+# ingestion time — see :func:`executor.compaction.ingestion.offload_ai_message_args`.
+# Task 3 will delete the surrounding Tier 1.5 pipeline step entirely; this
+# stub preserves the import graph in the meantime.
 
 
 # ---------------------------------------------------------------------------
@@ -362,31 +368,11 @@ async def compact_for_llm(
     # ------------------------------------------------------------------
     # Step 3: Tier 1.5 — tool-call argument truncation
     # ------------------------------------------------------------------
-    if est_tokens > thresholds.tier1:
-        trunc_result = truncate_tool_call_args(
-            messages=messages,
-            truncated_args_through_turn_index=truncated_through,
-            keep=KEEP_TOOL_USES,
-            truncatable_keys=TRUNCATABLE_TOOL_ARG_KEYS,
-            cap_bytes=ARG_TRUNCATION_CAP_BYTES,
-        )
-        if trunc_result.new_truncated_args_through_turn_index > truncated_through:
-            events.append(Tier15AppliedEvent(
-                args_truncated=trunc_result.args_truncated,
-                bytes_saved=trunc_result.bytes_saved,
-                new_watermark=trunc_result.new_truncated_args_through_turn_index,
-                task_id=task_id,
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-            ))
-            state_updates["truncated_args_through_turn_index"] = (
-                trunc_result.new_truncated_args_through_turn_index
-            )
-            truncated_through = trunc_result.new_truncated_args_through_turn_index
-        messages = trunc_result.messages
-
-        # Re-estimate after Tier 1.5
-        est_tokens = estimate_tokens_fn(messages)
+    # REMOVED in Track 7 Follow-up (Task 4). Oversized truncatable arg values
+    # are now offloaded to S3 at ingestion time; see
+    # :func:`executor.compaction.ingestion.offload_ai_message_args`.
+    # Task 3 will delete the surrounding ``Tier15AppliedEvent`` /
+    # ``truncated_args_through_turn_index`` state entirely.
 
     # ------------------------------------------------------------------
     # Step 4: Tier 3 — LLM summarization (last resort)

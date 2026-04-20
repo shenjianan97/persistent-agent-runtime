@@ -7,7 +7,6 @@ AC 14 has two parts:
 This file asserts that the following events fire and have correct shape when
 the corresponding tiers are triggered:
 
-  - ``compaction.per_result_capped`` — via ``cap_tool_result``
   - ``compaction.tier1_applied`` — via Tier1AppliedEvent emitted by pipeline
   - ``compaction.tier15_applied`` — via Tier15AppliedEvent
   - ``compaction.tier3_fired`` — via Tier3FiredEvent
@@ -34,7 +33,6 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from executor.compaction.caps import cap_tool_result
 from executor.compaction.pipeline import (
     HardFloorEvent,
     MemoryFlushFiredEvent,
@@ -154,36 +152,10 @@ def _make_successful_summarizer(summary_text: str = "SUMMARY") -> AsyncMock:
 
 
 # ---------------------------------------------------------------------------
-# Test: compaction.per_result_capped fires when tool result exceeds cap
+# NOTE: ``compaction.per_result_capped`` / ``cap_tool_result`` were removed
+# in Track 7 Follow-up Task 4. The replacement is ingestion offload — see
+# ``test_compaction_ingestion_offload.py`` and ``test_tool_result_store.py``.
 # ---------------------------------------------------------------------------
-
-
-def test_per_result_capped_event_fires_above_cap():
-    """cap_tool_result emits a CapEvent when the raw result exceeds PER_TOOL_RESULT_CAP_BYTES."""
-    from executor.compaction.defaults import PER_TOOL_RESULT_CAP_BYTES
-
-    large_content = "x" * (PER_TOOL_RESULT_CAP_BYTES + 1000)
-    capped, event = cap_tool_result(large_content, "my_tool")
-
-    assert event is not None, (
-        "cap_tool_result must return a CapEvent when result exceeds the cap"
-    )
-    assert event.tool == "my_tool"
-    assert event.orig_bytes > PER_TOOL_RESULT_CAP_BYTES
-    assert event.capped_bytes <= PER_TOOL_RESULT_CAP_BYTES + 200  # head+tail plus separator
-
-
-def test_per_result_capped_event_not_fired_below_cap():
-    """cap_tool_result returns None event when content is within the cap."""
-    from executor.compaction.defaults import PER_TOOL_RESULT_CAP_BYTES
-
-    small_content = "x" * (PER_TOOL_RESULT_CAP_BYTES - 1)
-    capped, event = cap_tool_result(small_content, "my_tool")
-
-    assert event is None, (
-        "cap_tool_result must NOT emit a CapEvent when content is within the cap"
-    )
-    assert capped == small_content
 
 
 # ---------------------------------------------------------------------------
@@ -227,59 +199,12 @@ async def test_tier1_applied_event_emitted_when_threshold_crossed():
 
 
 # ---------------------------------------------------------------------------
-# Test: Tier15AppliedEvent fires at correct points
+# NOTE: Tier 1.5 (``truncate_tool_call_args``) was removed in Track 7 Follow-up
+# Task 4. Oversized tool-call args are now offloaded to S3 at AIMessage-append
+# time (see ``test_compaction_ingestion_offload.py``). The Tier15AppliedEvent
+# class still exists for Task 3 to clean up, but the pipeline no longer fires
+# the event.
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_tier15_applied_event_emitted_when_args_truncated():
-    """Tier15AppliedEvent must be emitted when Tier 1.5 truncates arguments."""
-    msgs: list[BaseMessage] = [HumanMessage(content="task")]
-    for i in range(10):
-        call_id = f"call_{i}"
-        msgs.extend([
-            AIMessage(
-                content=f"Step {i}",
-                tool_calls=[{
-                    "id": call_id,
-                    "name": f"tool_{i}",
-                    "args": {"content": "x" * 5000},  # large truncatable arg
-                    "type": "tool_call",
-                }],
-            ),
-            ToolMessage(
-                content="r" * 100,
-                tool_call_id=call_id,
-                name=f"tool_{i}",
-            ),
-        ])
-
-    model_context_window = 10_000
-    thresholds = resolve_thresholds(model_context_window)
-
-    call_count = [0]
-    def estimator(messages: list[BaseMessage]) -> int:
-        call_count[0] += 1
-        if call_count[0] <= 2:
-            return thresholds.tier1 + 200
-        return thresholds.tier3 - 100
-
-    result = await compact_for_llm(
-        raw_messages=msgs,
-        state=_base_state(),
-        agent_config=_agent_config(),
-        model_context_window=model_context_window,
-        task_context=_task_context(),
-        summarizer=_make_successful_summarizer(),
-        estimate_tokens_fn=estimator,
-    )
-
-    tier15_events = [e for e in result.events if isinstance(e, Tier15AppliedEvent)]
-    assert tier15_events, "Tier15AppliedEvent must be emitted when Tier 1.5 fires"
-
-    ev = tier15_events[0]
-    assert ev.args_truncated > 0, "Tier15AppliedEvent.args_truncated must be > 0"
-    assert ev.task_id == "task-1"
 
 
 # ---------------------------------------------------------------------------

@@ -352,7 +352,7 @@ class ConfigValidationHelperTest {
     @Test
     void testValidateContextManagementConfig_allFieldsNull_ok() {
         // All fields null — no checks needed.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         verifyNoInteractions(modelRepository);
     }
@@ -364,7 +364,7 @@ class ConfigValidationHelperTest {
         // No context window available (returns empty) — check is skipped.
         when(modelRepository.getContextWindow("anthropic", "claude-haiku-4-5")).thenReturn(Optional.empty());
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
         verify(modelRepository).isModelActive("anthropic", "claude-haiku-4-5");
     }
@@ -372,7 +372,7 @@ class ConfigValidationHelperTest {
     @Test
     void testValidateContextManagementConfig_summarizerModelBlankString_skipped() {
         // Empty or whitespace-only summarizer_model behaves like absence — no lookup.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("   ", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("   ", null, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         verifyNoInteractions(modelRepository);
     }
@@ -382,7 +382,7 @@ class ConfigValidationHelperTest {
         // Unknown summarizer_model — rejected with the same shape as validateModel.
         when(modelRepository.isModelActive("openai", "nonexistent-model")).thenReturn(false);
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("nonexistent-model", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("nonexistent-model", null, null, null);
         ValidationException ex = assertThrows(ValidationException.class,
                 () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         assertTrue(ex.getMessage().contains("nonexistent-model"),
@@ -396,7 +396,7 @@ class ConfigValidationHelperTest {
         // Model exists but is inactive — same 400 path.
         when(modelRepository.isModelActive("openai", "retired-model")).thenReturn(false);
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("retired-model", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("retired-model", null, null, null);
         assertThrows(ValidationException.class,
                 () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
     }
@@ -411,7 +411,7 @@ class ConfigValidationHelperTest {
         when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
                 .thenReturn(Optional.of(200_000));
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("small-model", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("small-model", null, null, null);
         ValidationException ex = assertThrows(ValidationException.class,
                 () -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
         assertTrue(ex.getMessage().contains("small-model"),
@@ -430,7 +430,7 @@ class ConfigValidationHelperTest {
         when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
                 .thenReturn(Optional.of(200_000));
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
     }
 
@@ -443,7 +443,7 @@ class ConfigValidationHelperTest {
         when(modelRepository.getContextWindow("anthropic", "claude-sonnet-4-6"))
                 .thenReturn(Optional.empty()); // primary window unknown
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("claude-haiku-4-5", null, null, null);
         // Skips the check when primary window is unknown — no 400.
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
     }
@@ -455,7 +455,7 @@ class ConfigValidationHelperTest {
         for (int i = 0; i < 50; i++) {
             tools.add("tool_" + i);
         }
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
     }
 
@@ -466,7 +466,7 @@ class ConfigValidationHelperTest {
         for (int i = 0; i < 51; i++) {
             tools.add("tool_" + i);
         }
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null, null);
         ValidationException ex = assertThrows(ValidationException.class,
                 () -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         assertTrue(ex.getMessage().contains("50"),
@@ -477,21 +477,21 @@ class ConfigValidationHelperTest {
     void testValidateContextManagementConfig_excludeTools_unknownToolNames_ok() {
         // Unknown tool names are allowed — customers can add custom tools before wiring.
         List<String> tools = List.of("memory_note", "unknown_tool_xyz");
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, tools, null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
     }
 
     @Test
     void testValidateContextManagementConfig_excludeTools_empty_ok() {
         // Empty exclude_tools list is valid.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of(), null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of(), null, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
     }
 
     @Test
     void testValidateContextManagementConfig_preTier3MemoryFlush_true_ok() {
         // pre_tier3_memory_flush=true is valid regardless of memory.enabled state.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, true);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, true, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         verifyNoInteractions(modelRepository);
     }
@@ -499,7 +499,7 @@ class ConfigValidationHelperTest {
     @Test
     void testValidateContextManagementConfig_preTier3MemoryFlush_false_ok() {
         // pre_tier3_memory_flush=false is also valid.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, false);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, false, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "openai", "gpt-4o"));
         verifyNoInteractions(modelRepository);
     }
@@ -515,7 +515,7 @@ class ConfigValidationHelperTest {
 
         List<String> tools = List.of("memory_note", "custom_tool");
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(
-                "claude-haiku-4-5", tools, true);
+                "claude-haiku-4-5", tools, true, null);
         assertDoesNotThrow(() -> helper.validateContextManagementConfig(cm, "anthropic", "claude-sonnet-4-6"));
     }
 
@@ -526,7 +526,7 @@ class ConfigValidationHelperTest {
         when(modelRepository.isModelActive("openai", "gpt-4o")).thenReturn(true);
         when(modelRepository.isModelActive("openai", "bad-cm-model")).thenReturn(false);
 
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("bad-cm-model", null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest("bad-cm-model", null, null, null);
         com.persistentagent.api.model.request.AgentConfigRequest config =
                 new com.persistentagent.api.model.request.AgentConfigRequest(
                         "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);

@@ -136,7 +136,15 @@ from tools.memory_tools import (
 )
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
-from executor.compaction.caps import cap_tool_result
+from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
+from executor.compaction.ingestion import (
+    offload_ai_message_args,
+    offload_tool_messages_batch,
+)
+from executor.compaction.tool_result_store import (
+    S3ToolResultStore,
+    ToolResultArtifactStore,
+)
 
 import httpx
 
@@ -168,40 +176,19 @@ def _handle_tool_error(e: Exception) -> str:
 
 
 def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id: str):
-    """Decorator factory: wraps an async tool function to cap its result to
-    PER_TOOL_RESULT_CAP_BYTES before returning to the ToolNode.
+    """Back-compat no-op decorator (Track 7 Follow-up, Task 4).
 
-    Cap is applied to the string representation of the return value.  When the
-    cap fires a ``compaction.per_result_capped`` structured log is emitted.
-
-    This is Track 7 Tier 0 — always-on, no per-agent opt-out.
-
-    Args:
-        tool_name: Name of the tool (used in CapEvent and structured log).
-        tenant_id: Bound from the caller's task context (not LLM-supplied).
-        agent_id: Bound from the caller's task context.
-        task_id: Bound from the caller's task context.
-
-    Returns:
-        A decorator that wraps an async callable.
+    The legacy head+tail 25KB trim it used to apply has been replaced by
+    S3-backed ingestion offload at the ``tools`` node boundary — see
+    :func:`executor.compaction.ingestion.offload_tool_messages_batch` wired
+    into ``_OffloadingToolNode`` below. Call sites are preserved as no-ops
+    so that Task 3's pipeline rewrite can remove them during its touches of
+    this file without blocking Task 4's ship.
     """
+
     def decorator(fn):
-        async def wrapper(*args, **kwargs):
-            result = await fn(*args, **kwargs)
-            result_str = result if isinstance(result, str) else str(result)
-            capped, event = cap_tool_result(result_str, tool_name)
-            if event is not None:
-                _compaction_logger.info(
-                    "compaction.per_result_capped",
-                    tool=event.tool,
-                    orig_bytes=event.orig_bytes,
-                    capped_bytes=event.capped_bytes,
-                    tenant_id=tenant_id,
-                    agent_id=agent_id,
-                    task_id=task_id,
-                )
-            return capped
-        return wrapper
+        return fn
+
     return decorator
 
 
@@ -618,10 +605,12 @@ class GraphExecutor:
         sandbox=None,
         s3_client=None,
     ) -> list[StructuredTool]:
-        # Shorthand: build a per-tool-result cap decorator bound to this task's
-        # context.  Every tool coroutine is wrapped so its return value is
-        # head+tail capped to PER_TOOL_RESULT_CAP_BYTES before the ToolNode
-        # sees it.  The cap is Track 7 Tier 0 — always-on, no opt-out.
+        # Shorthand: build a per-tool result wrapper bound to this task's
+        # context. As of Track 7 Follow-up (Task 4), the decorator is a
+        # no-op — tool-result byte bounding moved from head+tail trimming to
+        # S3-backed ingestion offload, wired on the ToolNode output boundary
+        # via ``_OffloadingToolNode`` below. The decorator call sites are
+        # preserved so Task 3's pipeline rewrite can remove them cleanly.
         def _cap(name: str):
             return _apply_result_cap(
                 name,
@@ -1175,6 +1164,32 @@ class GraphExecutor:
                         task_id=task_id,
                         operation="agent",
                     )
+                    # Track 7 Follow-up (Task 4) — Tier 0 ingestion offload
+                    # for oversized tool-call args on the AIMessage about to
+                    # land in ``state["messages"]``. This is the arg-side
+                    # counterpart to the ToolNode wrapper above. When the
+                    # ``offload_tool_results`` config flag is off, this is a
+                    # passthrough.
+                    #
+                    # Runs BEFORE the conversation-log append so the logged
+                    # tool_call args reflect the reference-replaced view
+                    # (the pre-offload values are still in S3 if Task 5's
+                    # recall tool needs them).
+                    if (
+                        _offload_enabled
+                        and _offload_store is not None
+                        and isinstance(response, AIMessage)
+                        and getattr(response, "tool_calls", None)
+                    ):
+                        _offload_outcome = await offload_ai_message_args(
+                            response,
+                            store=_offload_store,
+                            tenant_id=tenant_id,
+                            task_id=task_id,
+                            threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                            log_context=_offload_log_ctx,
+                        )
+                        response = _offload_outcome.message  # type: ignore[assignment]
                     # Track 7 Task 13 — append the agent's response and any
                     # tool-call requests to the user-facing conversation log
                     # BEFORE returning (and therefore before LangGraph
@@ -1280,8 +1295,68 @@ class GraphExecutor:
             )
             return decision
 
+        # Track 7 Follow-up (Task 4) — Tier 0 ingestion offload.
+        #
+        # The agent config's ``context_management.offload_tool_results`` flag
+        # (default true) toggles both result-side and arg-side offload for
+        # this graph. We resolve it once here and close over the value so
+        # the ToolNode wrapper and agent_node's AIMessage post-processing
+        # share a single decision.
+        _cm_cfg = (agent_config.get("context_management") or {})
+        _offload_flag = _cm_cfg.get("offload_tool_results")
+        _offload_enabled: bool = True if _offload_flag is None else bool(_offload_flag)
+        _offload_store: ToolResultArtifactStore | None = (
+            S3ToolResultStore(self.s3_client) if _offload_enabled else None
+        )
+        _offload_log_ctx = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "task_id": task_id,
+        }
+
         if tools:
-            tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
+            _raw_tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
+
+            async def tool_node(state, config):
+                """ToolNode wrapper that applies Tier 0 ingestion offload.
+
+                Invokes the underlying ``ToolNode`` and, before the resulting
+                ``ToolMessage`` list lands in ``state["messages"]``, routes
+                any message whose ``content`` exceeds
+                ``OFFLOAD_THRESHOLD_BYTES`` through
+                :func:`offload_tool_messages_batch`. Below-threshold messages
+                pass through verbatim. When
+                ``context_management.offload_tool_results = false`` this
+                wrapper is a trivial passthrough — no S3 writes.
+                """
+                out = await _raw_tool_node.ainvoke(state, config)
+                if not _offload_enabled or _offload_store is None:
+                    return out
+                # LangGraph ToolNode returns either {"messages": [...]} or a
+                # list of messages depending on version. Handle both.
+                if isinstance(out, dict):
+                    msgs = out.get("messages") or []
+                    new_msgs, _events = await offload_tool_messages_batch(
+                        msgs,
+                        store=_offload_store,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                        log_context=_offload_log_ctx,
+                    )
+                    return {**out, "messages": new_msgs}
+                if isinstance(out, list):
+                    new_msgs, _events = await offload_tool_messages_batch(
+                        out,
+                        store=_offload_store,
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                        log_context=_offload_log_ctx,
+                    )
+                    return new_msgs
+                return out
+
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
             if stack_enabled:
