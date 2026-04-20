@@ -467,6 +467,27 @@ async def _emit_compaction_task_events(
         try:
             async with pool.acquire() as conn:
                 async with conn.transaction():
+                    # Replay dedup — compaction only fires inside a leased
+                    # worker on a single super-step, so there is no cross-
+                    # writer race. A pre-INSERT SELECT on
+                    # (task_id, event_type, last_turn_index) is sufficient
+                    # to collapse replays of the same firing after a
+                    # post-event-INSERT crash; the watermark advances
+                    # monotonically per task, so each value represents
+                    # exactly one legitimate firing.
+                    already_emitted = await conn.fetchval(
+                        """
+                        SELECT 1 FROM task_events
+                        WHERE task_id = $1::uuid
+                          AND event_type = 'task_compaction_fired'
+                          AND (details->>'last_turn_index')::int = $2
+                        LIMIT 1
+                        """,
+                        task_id,
+                        int(ev.new_summarized_through),
+                    )
+                    if already_emitted is not None:
+                        continue
                     await _insert_task_event(
                         conn, task_id, tenant_id, agent_id,
                         "task_compaction_fired", None, None, worker_id,
@@ -1124,6 +1145,22 @@ class GraphExecutor:
             S3ToolResultStore(self.s3_client) if _offload_enabled else None
         )
 
+        # Resolve the summariser's own context window so the hook can forward
+        # it to summarize_slice — otherwise the recursive-chunking path in
+        # summarizer._chunk_summarize is unreachable and an oversized middle
+        # returns a non-retryable provider 400 that permanently sets
+        # tier3_fatal_short_circuited and dead-letters the task.
+        from executor.compaction.defaults import (  # local import — no circular load
+            get_platform_default_summarizer_model,
+        )
+        _compaction_summarizer_model_id: str = (
+            _cm_cfg.get("summarizer_model")
+            or get_platform_default_summarizer_model()
+        )
+        _summarizer_context_window: int = await self._get_model_context_window(
+            _compaction_summarizer_model_id
+        )
+
         # Build a separate platform system message with tool instructions
         platform_system_msg = self._build_platform_system_message(
             allowed_tools,
@@ -1389,6 +1426,7 @@ class GraphExecutor:
                 estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
                 system_prompt=system_prompt if system_prompt else None,
                 platform_system_message=platform_system_msg if platform_system_msg else None,
+                summarizer_context_window=_summarizer_context_window,
             )
             messages_for_llm = pass_result.messages
             compaction_state_updates = pass_result.state_updates

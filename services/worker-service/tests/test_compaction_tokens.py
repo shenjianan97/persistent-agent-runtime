@@ -202,46 +202,30 @@ class TestEstimateTokensOpenAI:
 
 
 class TestEstimateTokensAnthropic:
-    def test_anthropic_uses_count_tokens(self):
-        """Anthropic path calls anthropic.Anthropic().count_tokens(serialized)."""
-        mock_client = MagicMock()
-        mock_client.count_tokens.return_value = 42
+    def test_anthropic_uses_heuristic(self):
+        """Anthropic provider uses the heuristic fallback.
 
-        with patch("executor.compaction.tokens._get_anthropic_client", return_value=mock_client):
-            msgs = [HumanMessage(content="test")]
-            count = estimate_tokens(msgs, provider="anthropic")
+        The legacy ``anthropic.Anthropic().count_tokens()`` method was removed
+        from modern anthropic SDKs (≥ 0.40); the replacement
+        ``client.messages.count_tokens`` is async + needs a model id, so we
+        punt and use the heuristic until that surface is wired through. The
+        heuristic is provider-agnostic and deterministic — matching the
+        ``unknown_provider`` path exactly.
+        """
+        from executor.compaction.tokens import _serialize_for_token_count
+        msgs = [HumanMessage(content="test")]
+        serialized = _serialize_for_token_count(msgs)
+        expected = len(serialized.encode("utf-8")) // 3
+        count = estimate_tokens(msgs, provider="anthropic")
+        assert count == expected
 
-        assert count == 42
-        mock_client.count_tokens.assert_called_once()
-
-    def test_anthropic_falls_back_to_heuristic_on_import_error(self):
-        """If anthropic package import fails, fall back to heuristic."""
-        import sys
-        original = sys.modules.get("anthropic")
-        try:
-            sys.modules["anthropic"] = None  # type: ignore
-            msgs = [HumanMessage(content="hello")]
-            count = estimate_tokens(msgs, provider="anthropic")
-            # Should not raise; returns heuristic estimate
-            assert isinstance(count, int)
-            assert count >= 0
-        finally:
-            if original is not None:
-                sys.modules["anthropic"] = original
-            elif "anthropic" in sys.modules:
-                del sys.modules["anthropic"]
-
-    def test_anthropic_falls_back_on_exception(self):
-        """If count_tokens raises, fall back to heuristic without crashing."""
-        mock_client = MagicMock()
-        mock_client.count_tokens.side_effect = RuntimeError("API error")
-
-        with patch("executor.compaction.tokens._get_anthropic_client", return_value=mock_client):
-            msgs = [HumanMessage(content="hello")]
-            count = estimate_tokens(msgs, provider="anthropic")
-
-        assert isinstance(count, int)
-        assert count >= 0
+    def test_anthropic_deterministic(self):
+        """Anthropic estimates are deterministic across calls."""
+        msgs = [HumanMessage(content="Same message")]
+        assert (
+            estimate_tokens(msgs, provider="anthropic")
+            == estimate_tokens(msgs, provider="anthropic")
+        )
 
 
 # ---------------------------------------------------------------------------

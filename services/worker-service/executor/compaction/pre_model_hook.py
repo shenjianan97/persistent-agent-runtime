@@ -52,7 +52,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from executor.compaction.defaults import (
     COMPACTION_TRIGGER_FRACTION,
@@ -627,6 +633,41 @@ async def compaction_pre_model_hook(
     middle = list(raw_messages[summarized_through:keep_window_start])
     keep_window = list(raw_messages[keep_window_start:])
 
+    # Adaptive keep-window shrink — rescue the "no escape" case where middle
+    # is empty (e.g. exactly KEEP_TOOL_USES oversized tool pairs, or first-
+    # turn content) but the projection still blows the main model window.
+    # Without this, the empty_slice skip below falls straight into HardFloor
+    # and dead-letters the task despite there being history we could reduce.
+    #
+    # Strategy: when middle is empty AND the pre-projection est already
+    # exceeds the model window, progressively reduce the effective
+    # ``keep`` count from KEEP_TOOL_USES down to 1, promoting older pairs
+    # into middle. We only shrink when there are strictly more tool pairs
+    # than the current keep setting — otherwise there is nothing to promote
+    # and the hard-floor safety net takes over as before. Evaluated up
+    # front (before the token-estimate) so we don't waste cycles on the
+    # common case where middle is non-empty already.
+    if not middle:
+        _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
+        _probe_est = estimate_tokens_fn(
+            _build_projection(
+                system_prompt=system_prompt,
+                platform_system_message=platform_system_message,
+                summary=summary,
+                middle=[],
+                keep_window=keep_window,
+            )
+        )
+        if _probe_est > model_context_window and _tool_count >= 2:
+            # Shrink to the minimum viable keep (1 pair) and re-derive the
+            # boundary. find_keep_window_start handles orphan alignment so
+            # tool_use / tool_result pairs stay intact across the new split.
+            _shrunk_start = find_keep_window_start(raw_messages, keep=1)
+            if _shrunk_start > keep_window_start:
+                keep_window_start = _shrunk_start
+                middle = list(raw_messages[summarized_through:keep_window_start])
+                keep_window = list(raw_messages[keep_window_start:])
+
     # Projection rule for recalled ToolMessages: keep verbatim inside the
     # keep window (the agent recalled them on purpose) but STUB their
     # ``.content`` when they land in ``middle``. Stubbing — not dropping —
@@ -732,7 +773,15 @@ async def compaction_pre_model_hook(
     # the projection asking the agent to write any cross-task-valuable facts
     # to memory; the summariser call itself is deferred to the next turn.
     if should_fire_pre_tier3_flush(state, agent_config, raw_messages):
-        flush_message = SystemMessage(
+        # Must NOT be a SystemMessage: langchain_anthropic._format_messages
+        # raises "Received multiple non-consecutive system messages" when any
+        # system block appears after a non-system turn. Emit as HumanMessage
+        # instead — _merge_messages folds it into the preceding tool_result /
+        # user turn so Anthropic sees a single well-formed user turn, while
+        # OpenAI accepts consecutive user turns natively. The
+        # ``compaction_event`` marker on additional_kwargs is preserved so
+        # downstream consumers can still detect the flush turn.
+        flush_message = HumanMessage(
             content=_PRE_TIER3_FLUSH_PROMPT,
             additional_kwargs={
                 "compaction": True,
@@ -808,20 +857,54 @@ async def compaction_pre_model_hook(
     # cost=0 with a WARN log — see summarizer._summarize_single_call.
     pricing_lookup = task_context.get("pricing_lookup")
 
-    summarize_result = await summarizer(
-        slice_messages=middle,
-        summarizer_model_id=summarizer_model_id,
-        task_id=task_id,
-        tenant_id=tenant_id,
-        agent_id=agent_id,
-        checkpoint_id=checkpoint_id,
-        cost_ledger=cost_ledger,
-        callbacks=callbacks,
-        summarized_through_turn_index_after=new_summarized_through,
-        prior_summary=summary,
-        summarizer_context_window=summarizer_context_window,
-        pricing_lookup=pricing_lookup,
-    )
+    # Any unexpected exception from the summariser is caught here and
+    # converted to a fatal skip. summarize_slice itself traps known provider
+    # / retry paths; this wrapper covers the rest (e.g. init_chat_model
+    # raising on a misconfigured ``summarizer_model``, non-JSON-serialisable
+    # tool args reaching format_messages_for_summary). Without this guard,
+    # one typo in an agent config dead-letters every task with a generic
+    # non-retryable error and never sets ``tier3_fatal_short_circuited``.
+    try:
+        summarize_result = await summarizer(
+            slice_messages=middle,
+            summarizer_model_id=summarizer_model_id,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            checkpoint_id=checkpoint_id,
+            cost_ledger=cost_ledger,
+            callbacks=callbacks,
+            summarized_through_turn_index_after=new_summarized_through,
+            prior_summary=summary,
+            summarizer_context_window=summarizer_context_window,
+            pricing_lookup=pricing_lookup,
+        )
+    except Exception:
+        state_updates["tier3_fatal_short_circuited"] = True
+        events.append(
+            Tier3SkippedEvent(
+                reason="fatal",
+                task_id=task_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+            )
+        )
+        if est_tokens > model_context_window:
+            events.append(
+                HardFloorEvent(
+                    est_tokens=est_tokens,
+                    model_context_window=model_context_window,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                )
+            )
+        return CompactionPassResult(
+            messages=projection,
+            state_updates=state_updates,
+            events=events,
+            tier3_skipped=True,
+        )
 
     if summarize_result.skipped:
         # Fatal vs retryable.
@@ -855,8 +938,39 @@ async def compaction_pre_model_hook(
             tier3_skipped=tier3_skipped,
         )
 
+    # Empty / whitespace-only summary — treat as retryable skip, not success.
+    # Advancing the watermark with an empty summary would silently discard
+    # the absorbed history (the projection omits empty summaries). Policy
+    # filtering and content-truncation edge cases can produce this; next
+    # hook turn will retry.
+    new_summary = (summarize_result.summary_text or "").strip()
+    if not new_summary:
+        events.append(
+            Tier3SkippedEvent(
+                reason="empty_summary",
+                task_id=task_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+            )
+        )
+        if est_tokens > model_context_window:
+            events.append(
+                HardFloorEvent(
+                    est_tokens=est_tokens,
+                    model_context_window=model_context_window,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                )
+            )
+        return CompactionPassResult(
+            messages=projection,
+            state_updates=state_updates,
+            events=events,
+            tier3_skipped=True,
+        )
+
     # Success — replace summary + advance watermark + increment firings.
-    new_summary = summarize_result.summary_text or ""
     state_updates["summary"] = new_summary
     state_updates["summarized_through_turn_index"] = new_summarized_through
     state_updates["tier3_firings_count"] = tier3_firings_count + 1

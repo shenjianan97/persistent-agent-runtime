@@ -487,9 +487,15 @@ async def test_memory_flush_fires_when_all_conditions_hold():
     assert any(isinstance(e, MemoryFlushFiredEvent) for e in result.events)
     assert result.state_updates.get("memory_flush_fired_this_task") is True
 
-    # Flush SystemMessage appended at end.
+    # Flush message appended at end — must NOT be a SystemMessage because
+    # langchain_anthropic rejects non-consecutive system messages. Carries
+    # the ``pre_tier3_memory_flush`` marker in ``additional_kwargs`` so
+    # downstream consumers can still detect the flush turn.
     last = result.messages[-1]
-    assert isinstance(last, SystemMessage)
+    assert not isinstance(last, SystemMessage), (
+        "flush tail must not be a SystemMessage — see "
+        "test_memory_flush_projection_has_no_tail_system_message"
+    )
     assert last.additional_kwargs.get("compaction_event") == "pre_tier3_memory_flush"
 
 
@@ -724,3 +730,207 @@ async def test_last_super_step_message_count_always_updated():
         estimate_tokens_fn=_fixed_estimator(100),
     )
     assert result.state_updates["last_super_step_message_count"] == len(msgs)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (2026-04-20) — regression guards for reviewer findings
+# ---------------------------------------------------------------------------
+
+
+def test_graph_threads_summarizer_context_window():
+    """``agent_node`` must forward ``summarizer_context_window`` to the hook.
+
+    Without this kwarg, :func:`summarize_slice` skips the recursive-chunking
+    path, and any oversized middle trips a non-retryable provider 400 that
+    sets ``tier3_fatal_short_circuited`` and permanently dead-letters the
+    task. Source-grep because agent_node integration setup is large.
+    """
+    import re as _re
+
+    graph_path = pathlib.Path(__file__).parent.parent / "executor" / "graph.py"
+    src = graph_path.read_text()
+    m = _re.search(
+        r"await\s+compaction_pre_model_hook\s*\((.*?)\)\s*\n",
+        src,
+        _re.DOTALL,
+    )
+    assert m is not None, "compaction_pre_model_hook call not found in graph.py"
+    call_args = m.group(1)
+    assert "summarizer_context_window" in call_args, (
+        "agent_node must forward summarizer_context_window to "
+        "compaction_pre_model_hook; otherwise summarize_slice's chunking "
+        "path is unreachable and oversized middles dead-letter the task."
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_summary_preserves_watermark():
+    """A successful summariser call returning empty/whitespace-only summary
+    must NOT advance the watermark.
+
+    Policy-filtered or whitespace-only responses would otherwise silently
+    absorb history into a blank summary, making the agent lose context with
+    no signal. Surface as a retryable skip instead.
+    """
+    msgs = _build_messages(n_pairs=5)
+    state = _fresh_state(msgs)
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(summary_text="   "),
+        estimate_tokens_fn=_fixed_estimator(9_500),
+    )
+    assert "summary" not in result.state_updates, (
+        "empty summary must not overwrite prior summary"
+    )
+    assert "summarized_through_turn_index" not in result.state_updates, (
+        "empty summary must not advance the watermark"
+    )
+    assert any(
+        isinstance(e, Tier3SkippedEvent) and e.reason == "empty_summary"
+        for e in result.events
+    ), "empty summary must emit a Tier3SkippedEvent(reason='empty_summary')"
+    assert result.state_updates.get("tier3_fatal_short_circuited") is not True, (
+        "empty summary is retryable, not fatal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_summarizer_exception_converted_to_fatal_skip():
+    """Unexpected exception from the summariser must be caught and converted
+    to a fatal skip — not propagated.
+
+    A typo in ``context_management.summarizer_model`` causes
+    ``init_chat_model`` to raise outside the retry loop. If the hook
+    propagates, every task for that agent dead-letters with a generic
+    non-retryable error and no ``tier3_fatal_short_circuited`` fallback.
+    """
+    msgs = _build_messages(n_pairs=5)
+    state = _fresh_state(msgs)
+
+    async def _raising(**_kwargs):
+        raise RuntimeError("summariser misconfig: unknown model")
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_raising,
+        estimate_tokens_fn=_fixed_estimator(9_500),
+    )
+    assert result.state_updates.get("tier3_fatal_short_circuited") is True, (
+        "unexpected summariser exception must set tier3_fatal_short_circuited"
+    )
+    assert any(
+        isinstance(e, Tier3SkippedEvent) and e.reason == "fatal"
+        for e in result.events
+    ), "unexpected summariser exception must emit a fatal Tier3SkippedEvent"
+
+
+@pytest.mark.asyncio
+async def test_empty_middle_over_window_shrinks_keep_to_summarise():
+    """When ``middle`` is empty and ``est > model_context_window``, the hook
+    must shrink the keep window so the summariser has something to reduce.
+
+    Without this rescue a task with exactly ``KEEP_TOOL_USES`` oversized tool
+    pairs (or ``>KEEP_TOOL_USES`` with the ``est`` dominated by keep-window
+    content) hits ``HardFloorEvent`` with no escape — a silent dead-letter
+    despite there being history we could legitimately compact.
+    """
+    from executor.compaction.defaults import KEEP_TOOL_USES
+
+    # Exactly KEEP_TOOL_USES pairs → find_keep_window_start returns 0, middle
+    # is empty without the shrink rescue.
+    msgs = _build_messages(n_pairs=KEEP_TOOL_USES)
+    state = _fresh_state(msgs)
+
+    summarizer = _make_summarizer(summary_text="SHORT")
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=summarizer,
+        estimate_tokens_fn=_fixed_estimator(15_000),  # well over window
+    )
+
+    # Rescue expected: summariser called with non-empty middle (at least the
+    # oldest tool pair promoted out of keep_window).
+    summarizer.assert_awaited_once()
+    call_kwargs = summarizer.await_args.kwargs
+    assert len(call_kwargs["slice_messages"]) > 0, (
+        "shrink rescue must promote at least one message from keep_window "
+        "into middle so the summariser has input"
+    )
+    # Must not skip as empty_slice.
+    assert not any(
+        isinstance(e, Tier3SkippedEvent) and e.reason == "empty_slice"
+        for e in result.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_middle_below_window_stays_empty():
+    """When middle is empty and est is BELOW the window, keep behaviour
+    unchanged — no need to shrink, no summariser call.
+    """
+    from executor.compaction.defaults import KEEP_TOOL_USES
+
+    msgs = _build_messages(n_pairs=KEEP_TOOL_USES)
+    state = _fresh_state(msgs)
+
+    summarizer = _make_summarizer()
+    await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=summarizer,
+        estimate_tokens_fn=_fixed_estimator(1_000),  # well under trigger
+    )
+    summarizer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_memory_flush_projection_has_no_tail_system_message():
+    """The memory-flush projection must not end with a ``SystemMessage``.
+
+    ``langchain_anthropic._format_messages`` raises
+    ``"Received multiple non-consecutive system messages"`` when system
+    messages appear after any non-system message, dead-lettering the task.
+    """
+    msgs = _build_messages(n_pairs=5)
+    state = _fresh_state(msgs)
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(memory_enabled=True, pre_flush=True),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(9_500),
+        system_prompt="SYSTEM PROMPT",
+    )
+    # Flush did fire (sanity).
+    assert any(isinstance(e, MemoryFlushFiredEvent) for e in result.events)
+
+    projection = result.messages
+    first_non_system = next(
+        (i for i, m in enumerate(projection) if not isinstance(m, SystemMessage)),
+        len(projection),
+    )
+    for idx, m in enumerate(projection[first_non_system:], start=first_non_system):
+        assert not isinstance(m, SystemMessage), (
+            f"SystemMessage at position {idx} (after first non-system at "
+            f"{first_non_system}) will be rejected by "
+            "langchain_anthropic._format_messages."
+        )

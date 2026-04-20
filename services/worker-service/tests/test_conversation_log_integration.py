@@ -512,6 +512,52 @@ async def test_tier3_fired_emits_task_compaction_event(
 
 
 @pytest.mark.asyncio
+async def test_tier3_fired_task_event_dedups_on_replay(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """Replay of the same Tier-3 firing must not insert a second task_event row.
+
+    Regression guard: without dedup, a crash between the task_event INSERT
+    and the LangGraph checkpoint commit causes the replay to re-invoke
+    ``_emit_compaction_task_events`` and double-mark the Execution History
+    tab.
+    """
+    task_id = await _seed_task(integration_pool)
+
+    ev = Tier3FiredEvent(
+        summarizer_model_id="claude-haiku-4-5",
+        tokens_in=1_000,
+        tokens_out=200,
+        new_summarized_through=42,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+    )
+    for _ in range(3):
+        await _emit_compaction_task_events(
+            pool=integration_pool,
+            task_id=task_id,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            worker_id=WORKER_ID,
+            events=[ev],
+            summarized_through_before=10,
+            summary_after="summary text",
+        )
+
+    async with integration_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = $1::uuid AND event_type = 'task_compaction_fired'",
+            task_id,
+        )
+    assert count == 1, (
+        f"expected exactly one task_compaction_fired row per (task, watermark) "
+        f"across replays; got {count}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_tier3_events_do_not_emit_task_event(
     integration_pool: asyncpg.Pool,
 ) -> None:

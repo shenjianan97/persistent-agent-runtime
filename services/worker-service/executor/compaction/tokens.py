@@ -2,9 +2,13 @@
 
 Entry point: :func:`estimate_tokens`.
 
-Uses the real tokenizer when available (tiktoken for OpenAI; Anthropic SDK
-``count_tokens`` for Anthropic) and falls back to a ``len(serialized) // 3``
-heuristic for Gemini, BYOT, and any unknown provider.
+Uses the real tokenizer when available (tiktoken for OpenAI) and falls back
+to a ``len(serialized) // 3`` heuristic for Anthropic, Gemini, BYOT, and any
+unknown provider. The heuristic is canonical for Anthropic because the
+legacy ``anthropic.Anthropic().count_tokens()`` entry point was removed from
+modern SDKs (≥ 0.40); the replacement ``client.messages.count_tokens`` is
+async and requires a model id, so migrating to it means threading `async` +
+model name through the hook — a larger change deferred to a future PR.
 
 Imports are lazy so non-provider agents (e.g., Gemini-only) do not pay the
 startup cost of importing packages they do not use.
@@ -128,25 +132,6 @@ def _serialize_for_token_count(messages: list[BaseMessage]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Anthropic client factory (lazy import, cached per process)
-# ---------------------------------------------------------------------------
-
-_anthropic_client = None
-
-
-def _get_anthropic_client():
-    """Lazily construct and cache an Anthropic client for count_tokens calls."""
-    global _anthropic_client
-    if _anthropic_client is None:
-        try:
-            import anthropic  # noqa: PLC0415 (lazy)
-            _anthropic_client = anthropic.Anthropic()
-        except Exception:
-            _anthropic_client = None
-    return _anthropic_client
-
-
-# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -156,12 +141,10 @@ def estimate_tokens(messages: list[BaseMessage], provider: str) -> int:
 
     Provider dispatch
     -----------------
-    * ``"anthropic"`` — uses ``anthropic.Anthropic().count_tokens(serialized)``.
-      Falls back to heuristic if the SDK is not installed or raises.
-    * ``"openai"``    — uses ``tiktoken.get_encoding("cl100k_base").encode(serialized)``.
+    * ``"openai"``  — uses ``tiktoken.get_encoding("cl100k_base").encode(serialized)``.
       Falls back to heuristic if tiktoken is not installed or raises.
-    * anything else   — ``len(serialized_utf8_bytes) // 3`` heuristic.
-      Tolerance ±30%; acceptable for Gemini, BYOT, and unknown providers.
+    * everything else (``"anthropic"``, Gemini, BYOT, unknown) —
+      ``len(serialized_utf8_bytes) // 3`` heuristic. Tolerance ±30%.
 
     Args:
         messages: The message list to estimate.  May be empty (returns 0).
@@ -177,25 +160,9 @@ def estimate_tokens(messages: list[BaseMessage], provider: str) -> int:
     serialized_bytes = serialized.encode("utf-8")
 
     # -----------------------------------------------------------------------
-    # Anthropic: use SDK count_tokens
-    # -----------------------------------------------------------------------
-    if provider == "anthropic":
-        try:
-            import anthropic as _anthropic  # noqa: PLC0415 (lazy)
-            client = _get_anthropic_client()
-            if client is not None:
-                return int(client.count_tokens(serialized))
-        except Exception:
-            logger.debug(
-                "estimate_tokens: anthropic count_tokens failed; falling back to heuristic",
-                exc_info=True,
-            )
-        # Fall through to heuristic
-
-    # -----------------------------------------------------------------------
     # OpenAI: use tiktoken
     # -----------------------------------------------------------------------
-    elif provider == "openai":
+    if provider == "openai":
         try:
             import tiktoken  # noqa: PLC0415 (lazy)
             enc = tiktoken.get_encoding("cl100k_base")
@@ -208,6 +175,6 @@ def estimate_tokens(messages: list[BaseMessage], provider: str) -> int:
         # Fall through to heuristic
 
     # -----------------------------------------------------------------------
-    # Heuristic fallback — char/3 (covers Gemini, BYOT, unknown, fallthrough)
+    # Heuristic fallback — char/3 (anthropic, Gemini, BYOT, unknown)
     # -----------------------------------------------------------------------
     return max(0, len(serialized_bytes) // 3)
