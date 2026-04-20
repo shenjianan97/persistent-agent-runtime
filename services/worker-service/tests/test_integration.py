@@ -243,13 +243,27 @@ async def test_worker_mcp_tool_execution_integration():
         worker_pool_id="test_pool"
     )
     
-    from executor.router import DefaultTaskRouter
-    router = DefaultTaskRouter(config, pool)
-    worker = WorkerService(config, pool, router)
-    
     from unittest.mock import AsyncMock
-    # We patch create_llm to simulate an LLM deciding to call the web_search tool
-    with patch("executor.providers.create_llm", new_callable=AsyncMock) as MockChat:
+    from tools.definitions import ToolDependencies
+    from tools.providers.search import StubSearchProvider
+    from tools.read_url import ReadUrlFetcher
+
+    def _stub_deps() -> ToolDependencies:
+        return ToolDependencies(
+            search_provider=StubSearchProvider(),
+            read_url_fetcher=ReadUrlFetcher(),
+        )
+
+    # We patch create_llm to simulate an LLM deciding to call the web_search tool,
+    # and swap TavilySearchProvider for a no-network stub so the tool call succeeds
+    # without a TAVILY_API_KEY. The patches must be active *before* DefaultTaskRouter
+    # builds its GraphExecutor — that constructor is where create_default_dependencies
+    # gets called.
+    with patch("executor.graph.create_default_dependencies", side_effect=_stub_deps), \
+         patch("executor.providers.create_llm", new_callable=AsyncMock) as MockChat:
+        from executor.router import DefaultTaskRouter
+        router = DefaultTaskRouter(config, pool)
+        worker = WorkerService(config, pool, router)
         mock_llm = MagicMock()
         mock_ainvoke = AsyncMock()
         

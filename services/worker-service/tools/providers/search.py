@@ -143,3 +143,30 @@ def _trim_text(value: object, *, fallback: str, limit: int) -> str:
     text = str(value or fallback).strip()
     text = " ".join(text.split())
     return text[:limit]
+
+
+class StubSearchProvider:
+    """Deterministic no-network search provider for tests.
+
+    Tests drive the agent with a mocked LLM that often asks to call
+    ``web_search`` as a generic tool invocation. Without this stub the
+    real :class:`TavilySearchProvider` fails closed on the first call
+    (no ``TAVILY_API_KEY`` in CI), exhausts retries, and dead-letters
+    the task — breaking tests that only care that the tool *ran*, not
+    what it returned. The stub returns a single deterministic result so
+    ``web_search`` succeeds without touching the network.
+    """
+
+    @property
+    def provider_name(self) -> str:
+        return "stub"
+
+    async def search(self, query: str, max_results: int) -> Sequence[SearchResult]:
+        del max_results
+        return [
+            SearchResult(
+                title=f"stub result for {query}",
+                url="https://example.invalid/stub",
+                snippet=f"stub snippet for query: {query}",
+            )
+        ]
