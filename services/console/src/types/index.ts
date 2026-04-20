@@ -4,7 +4,7 @@ export type TaskEventType = 'task_submitted' | 'task_claimed' | 'task_retry_sche
     'task_reclaimed_after_lease_expiry' | 'task_dead_lettered' | 'task_redriven' |
     'task_completed' | 'task_paused' | 'task_resumed' | 'task_approval_requested' |
     'task_approved' | 'task_rejected' | 'task_input_requested' | 'task_input_received' | 'task_cancelled' |
-    'task_follow_up';
+    'task_follow_up' | 'task_compaction_fired';
 
 export interface TaskEventResponse {
     event_id: string;

@@ -443,6 +443,56 @@ async def _convlog_append_compaction_events(
             )
 
 
+async def _emit_compaction_task_events(
+    *,
+    pool,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    worker_id: str,
+    events: list,
+    summarized_through_before: int,
+    summary_after: str,
+) -> None:
+    """Insert a ``task_compaction_fired`` task_event per Tier3Fired event.
+
+    Surfaces Tier 3 compaction in the Execution History tab alongside HITL
+    markers. Best-effort — compaction itself is already durable via the
+    conversation_log ``compaction_boundary`` row and the watermark; losing
+    the marker only costs the UI indicator, never correctness.
+    """
+    for ev in events:
+        if not isinstance(ev, Tier3FiredEvent):
+            continue
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await _insert_task_event(
+                        conn, task_id, tenant_id, agent_id,
+                        "task_compaction_fired", None, None, worker_id,
+                        details={
+                            "tier": 3,
+                            "summarizer_model_id": ev.summarizer_model_id,
+                            "tokens_in": int(ev.tokens_in),
+                            "tokens_out": int(ev.tokens_out),
+                            "turns_summarized": int(
+                                ev.new_summarized_through - summarized_through_before
+                            ),
+                            "first_turn_index": int(summarized_through_before),
+                            "last_turn_index": int(ev.new_summarized_through),
+                            "summary_bytes": len(summary_after.encode("utf-8")),
+                        },
+                    )
+        except Exception as err:
+            _compaction_logger.warning(
+                "compaction.tier3_event_insert_failed",
+                error=str(err),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )
+
+
 async def _convlog_append_offload_emitted(
     repo: ConversationLogRepository,
     *,
@@ -1396,6 +1446,20 @@ class GraphExecutor:
                 events=pass_result.events,
                 summarized_through_before=_summarized_through_before,
                 summary_before=_summary_before,
+                summary_after=_summary_after,
+            )
+
+            # Surface Tier3 firings in the Execution History tab via a
+            # task_event (reusing the existing task_events feed rather than
+            # adding a new Console endpoint).
+            await _emit_compaction_task_events(
+                pool=self.pool,
+                task_id=task_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                worker_id=self.config.worker_id,
+                events=pass_result.events,
+                summarized_through_before=_summarized_through_before,
                 summary_after=_summary_after,
             )
 
