@@ -90,7 +90,12 @@ CONTEXT_WINDOW_DEFAULTS = {
     "anthropic.claude-3-5-sonnet-20241022-v2:0": 200_000,
     "anthropic.claude-3-5-haiku-20241022-v1:0": 200_000,
     "anthropic.claude-3-opus-20240229-v1:0": 200_000,
-    # OpenAI — gpt-4.1 family is 1M; gpt-4o is 128K; gpt-5 is 400K; o-series is 200K.
+    # OpenAI — gpt-4.1 family is 1M; gpt-4o is 128K; gpt-5.x is 400K (5.4 is 272K default);
+    # o-series is 200K. Sources:
+    #   gpt-5.1 / gpt-5.2 — https://platform.openai.com/docs/models/gpt-5.1,
+    #     https://platform.openai.com/docs/models/gpt-5.2
+    #   gpt-5.4 — https://developers.openai.com/api/docs/models/gpt-5.4
+    #   o1-pro — https://developers.openai.com/api/docs/models/o1-pro
     "gpt-4.1": 1_000_000,
     "gpt-4.1-mini": 1_000_000,
     "gpt-4.1-nano": 1_000_000,
@@ -99,18 +104,108 @@ CONTEXT_WINDOW_DEFAULTS = {
     "gpt-5": 400_000,
     "gpt-5-mini": 400_000,
     "gpt-5-nano": 400_000,
+    "gpt-5.1": 400_000,
+    "gpt-5.2": 400_000,
+    # gpt-5.4 standard is 272K; Codex users can opt in to a 1M experimental
+    # mode via model_context_window, but the default that the Responses API
+    # enforces is 272K — pin to the default.
+    "gpt-5.4": 272_000,
     "o1": 200_000,
     "o1-mini": 128_000,
+    "o1-pro": 200_000,
     "o3": 200_000,
     "o3-mini": 200_000,
     # Z.AI GLM on Bedrock — 200K input, 128K output.
     "zai.glm-5": 200_000,
     "zai.glm-4.7": 200_000,
     "zai.glm-4.7-flash": 200_000,
-    # Amazon Nova on Bedrock — 300K for Pro/Lite, 128K for Micro.
+    # Amazon Nova on Bedrock — 300K for Pro/Lite v1, 128K for Micro, 1M for Nova 2 Lite.
+    # Nova 2 Lite context expanded from 300K to 1M (and max output from 10K
+    # to 65K) per the launch blog:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html
     "amazon.nova-pro-v1:0": 300_000,
     "amazon.nova-lite-v1:0": 300_000,
     "amazon.nova-micro-v1:0": 128_000,
+    "amazon.nova-2-lite-v1:0": 1_000_000,
+    # Google Gemma 3 on Bedrock — 128K for the 4B / 12B / 27B sizes (the
+    # smaller 1B / 270M sizes are 32K and aren't surfaced via Bedrock).
+    # Source: https://ai.google.dev/gemma/docs/core/model_card_3 and
+    # https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-google-gemma-3-27b-pt.html
+    "google.gemma-3-4b-it": 128_000,
+    "google.gemma-3-12b-it": 128_000,
+    "google.gemma-3-27b-it": 128_000,
+    # Mistral on Bedrock — Large-3 is 128K on Bedrock (256K native);
+    # Devstral-2 is 256K; the Ministral-3 family is 128K.
+    # Magistral (40K) and Voxtral (audio, 32K) fall below the 128K platform
+    # floor and/or are non-chat modalities — intentionally omitted so they
+    # either fall through to provider fallback and surface compaction-unknown
+    # WARNs, or (for audio) never reach the compaction pipeline. Sources:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-mistral-ai-mistral-large-3.html
+    #   https://docs.mistral.ai/getting-started/changelog/ (Devstral 2, Ministral 3)
+    "mistral.mistral-large-3-675b-instruct": 128_000,
+    "mistral.devstral-2-123b": 256_000,
+    "mistral.ministral-3-3b-instruct": 128_000,
+    "mistral.ministral-3-8b-instruct": 128_000,
+    "mistral.ministral-3-14b-instruct": 128_000,
+    # Nvidia Nemotron on Bedrock — Nano family is 128K (Nano-3 30B, Nano 9B v2,
+    # Nano 12B v2 all 128K per NVIDIA ADLR). Super-3 120B defaults to 256K on
+    # Bedrock (native supports 1M, but the Bedrock default for the model card
+    # is the 262,144-token window that avoids OOM on the deployed hardware).
+    # Sources:
+    #   https://research.nvidia.com/labs/adlr/NVIDIA-Nemotron-Nano-2/
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-nvidia-nemotron-super-3-120b.html
+    "nvidia.nemotron-nano-3-30b": 128_000,
+    "nvidia.nemotron-nano-9b-v2": 128_000,
+    "nvidia.nemotron-nano-12b-v2": 128_000,
+    "nvidia.nemotron-super-3-120b": 262_144,
+    # Alibaba Qwen3 on Bedrock — Bedrock normalises all current Qwen3 SKUs
+    # (32B dense, Coder 30B A3B, Coder-Next, Next 80B A3B, VL 235B A22B) to
+    # a 128K context window even though several natively support 256K+ with
+    # YaRN scaling. Sources:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-32b.html
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-coder-30b-a3b-instruct.html
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-next-80b-a3b.html
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-qwen-qwen3-vl-235b-a22b.html
+    "qwen.qwen3-32b-v1:0": 128_000,
+    "qwen.qwen3-coder-30b-a3b-v1:0": 128_000,
+    "qwen.qwen3-coder-next": 128_000,
+    "qwen.qwen3-next-80b-a3b": 128_000,
+    "qwen.qwen3-vl-235b-a22b": 128_000,
+    # Moonshot Kimi on Bedrock — Bedrock deploys both K2-Thinking and K2.5
+    # with a 128K window even though the native models expose 256K. Source:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-thinking.html
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-5.html
+    "moonshot.kimi-k2-thinking": 128_000,
+    "moonshotai.kimi-k2.5": 128_000,
+    # Writer Palmyra on Bedrock — X4 is 128K, X5 introduced the 1M-token
+    # long-context window (1,040,000 exactly). Palmyra Vision 7B has a 4K
+    # window (below the platform floor) and is a non-chat modality, so it
+    # is intentionally omitted and falls to provider fallback. Sources:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-palmyra-x4.html
+    #   https://writer.com/llms/palmyra-x5/
+    "writer.palmyra-x4-v1:0": 128_000,
+    "writer.palmyra-x5-v1:0": 1_040_000,
+    # OpenAI gpt-oss on Bedrock — the open-weight 20B / 120B models (and the
+    # gpt-oss-safeguard-20B / safeguard-120B variants derived from them) all
+    # share the upstream 128K context window (131,072 tokens, rounded to
+    # 128K for consistency with the platform floor). Sources:
+    #   https://huggingface.co/openai/gpt-oss-120b
+    #   https://huggingface.co/openai/gpt-oss-20b
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-120b.html
+    # NOTE: the gpt-oss-safeguard model_ids are on the "believed-active as
+    # of 2026-04" tier — the upstream release is confirmed at 128K, but the
+    # exact Bedrock SKU IDs may differ once the safeguard variants land.
+    "openai.gpt-oss-20b-1:0": 128_000,
+    "openai.gpt-oss-120b-1:0": 128_000,
+    "openai.gpt-oss-safeguard-20b": 128_000,
+    "openai.gpt-oss-safeguard-120b": 128_000,
+    # MiniMax on Bedrock — M2 launched with a 1M-token context window on
+    # Bedrock. M2.1 and M2.5 are part of the same family but their exact
+    # Bedrock windows were not confidently verifiable at the time of this
+    # change; they intentionally fall through to the 128K bedrock fallback
+    # until verified. Source:
+    #   https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-minimax-minimax-m2.html
+    "minimax.minimax-m2": 1_000_000,
 }
 
 # Fallback per provider when a model isn't in CONTEXT_WINDOW_DEFAULTS. 128K is

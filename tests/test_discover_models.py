@@ -110,10 +110,50 @@ def test_resolve_model_pricing_uses_global_fallback_for_unknown_provider():
 def test_resolve_model_context_window_returns_explicit_value():
     discover_models = load_discover_models_module()
 
-    # Known value from CONTEXT_WINDOW_DEFAULTS.
+    # Known values from CONTEXT_WINDOW_DEFAULTS (PR #80 baseline).
     assert discover_models.resolve_model_context_window("bedrock", "zai.glm-5") == 200_000
     assert discover_models.resolve_model_context_window("anthropic", "claude-opus-4-7") == 1_000_000
     assert discover_models.resolve_model_context_window("openai", "gpt-4.1") == 1_000_000
+
+    # Newly-covered model families (Task 7 — Phase 2 Track 7 follow-up).
+    # At least five representative IDs across distinct families, so a
+    # regression in any one family's block trips this assertion.
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "google.gemma-3-27b-it")
+        == 128_000
+    )
+    assert (
+        discover_models.resolve_model_context_window(
+            "bedrock", "mistral.mistral-large-3-675b-instruct"
+        )
+        == 128_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "nvidia.nemotron-super-3-120b")
+        == 262_144
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "qwen.qwen3-vl-235b-a22b")
+        == 128_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "writer.palmyra-x5-v1:0")
+        == 1_040_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "minimax.minimax-m2")
+        == 1_000_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("bedrock", "amazon.nova-2-lite-v1:0")
+        == 1_000_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("openai", "gpt-5.4") == 272_000
+    )
+    assert (
+        discover_models.resolve_model_context_window("openai", "o1-pro") == 200_000
+    )
 
 
 def test_resolve_model_context_window_falls_back_by_provider():
