@@ -142,7 +142,14 @@ async def offload_tool_message(
 
     Fail-closed: any exception raised by ``store.put`` is caught, logged at
     WARN, and the original message is returned unchanged.
+
+    Non-``ToolMessage`` inputs (e.g. LangGraph ``Command`` objects produced
+    by tools like ``memory_note`` / ``save_memory``) pass through unchanged
+    — they have no ``.content`` attribute and do not represent tool output
+    bytes that can be offloaded.
     """
+    if not isinstance(msg, ToolMessage):
+        return OffloadOutcome(message=msg)
     content = msg.content
     if not isinstance(content, str):
         return OffloadOutcome(message=msg)
@@ -362,7 +369,11 @@ async def offload_tool_messages_batch(
     total_candidates = 0
     total_failed = 0
     for m in messages:
-        if isinstance(m.content, str) and _byte_len(m.content) > threshold_bytes:
+        # Defensive: the ToolNode wrapper may pass through non-ToolMessage
+        # entries (e.g. LangGraph ``Command`` objects produced by tools like
+        # ``memory_note`` / ``save_memory``). They have no ``.content`` and
+        # represent state updates, not tool output bytes — pass through.
+        if isinstance(m, ToolMessage) and isinstance(m.content, str) and _byte_len(m.content) > threshold_bytes:
             total_candidates += 1
         outcome = await offload_tool_message(
             m,

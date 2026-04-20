@@ -192,6 +192,31 @@ class TestOffloadToolMessagesBatch:
         assert "failed" in kinds
         assert "success" in kinds
 
+    async def test_passthrough_for_non_toolmessage_commands(self):
+        """Track 7 Follow-up Task 5 regression: the ToolNode may emit
+        ``Command`` objects (from tools like ``memory_note`` / ``save_memory``).
+        They have no ``.content`` attribute and must not be offloaded —
+        the batch helper must pass them through unchanged while still
+        offloading the real ToolMessage candidates.
+        """
+        from langgraph.types import Command
+
+        store = InMemoryToolResultStore()
+        cmd = Command(update={"observations": ["user noted X"]})
+        big = "z" * (OFFLOAD_THRESHOLD_BYTES + 500)
+        tm = ToolMessage(content=big, tool_call_id="tm1", name="read_url")
+        out, events = await offload_tool_messages_batch(
+            [cmd, tm],
+            store=store,
+            tenant_id="t1",
+            task_id="task-1",
+        )
+        # Command passed through identity; ToolMessage was offloaded.
+        assert out[0] is cmd
+        assert isinstance(out[1], ToolMessage)
+        assert out[1].content.startswith("[tool result ")
+        assert [e.kind for e in events] == ["success"]
+
     async def test_all_failures_emits_all_failed_warn(self, monkeypatch):
         """Every candidate fails → a single ``compaction.offload_all_failed``
         WARN fires for the pass."""
