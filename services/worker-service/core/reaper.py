@@ -55,6 +55,12 @@ FROM requeued;
 """
 
 # Reaper — expired leases, dead-letter (retry_count >= max_retries)
+#
+# ``human_response`` is cleared alongside the status flip to keep dead-letter
+# semantics aligned with the worker's own ``_handle_dead_letter`` path — a
+# subsequent redrive must not re-inject a pending follow-up / input payload
+# whose HumanMessage is already persisted in state["messages"] via the
+# pre-crash checkpoint.
 REAPER_DEAD_LETTER_QUERY = """
 UPDATE tasks
 SET status = 'dead_letter',
@@ -65,6 +71,7 @@ SET status = 'dead_letter',
     last_error_message = 'max retries reached after lease expiry',
     dead_letter_reason = 'retries_exhausted',
     dead_lettered_at = NOW(),
+    human_response = NULL,
     version = version + 1,
     updated_at = NOW()
 WHERE status = 'running'
@@ -84,6 +91,7 @@ SET status = 'dead_letter',
     last_error_message = 'task exceeded task_timeout_seconds',
     dead_letter_reason = 'task_timeout',
     dead_lettered_at = NOW(),
+    human_response = NULL,
     version = version + 1,
     updated_at = NOW()
 WHERE status IN ('running', 'queued')

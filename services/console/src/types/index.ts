@@ -4,7 +4,7 @@ export type TaskEventType = 'task_submitted' | 'task_claimed' | 'task_retry_sche
     'task_reclaimed_after_lease_expiry' | 'task_dead_lettered' | 'task_redriven' |
     'task_completed' | 'task_paused' | 'task_resumed' | 'task_approval_requested' |
     'task_approved' | 'task_rejected' | 'task_input_requested' | 'task_input_received' | 'task_cancelled' |
-    'task_follow_up';
+    'task_follow_up' | 'task_compaction_fired';
 
 export interface TaskEventResponse {
     event_id: string;
@@ -261,6 +261,13 @@ export interface ContextManagementConfig {
     summarizer_model?: string;
     exclude_tools?: string[];
     pre_tier3_memory_flush?: boolean;
+    /**
+     * Track 7 Follow-up (Task 4) — Tier 0 ingestion offload kill switch.
+     * Default `true` (applied server-side when absent). Not rendered in v1;
+     * field exists to preserve round-trip stability of the `context_management`
+     * sub-object when the worker writes it back into `agent_config`.
+     */
+    offload_tool_results?: boolean;
 }
 
 export interface AgentConfig {
@@ -435,7 +442,11 @@ export type ConversationEntryKind =
     | 'memory_flush'
     | 'hitl_pause'
     | 'hitl_resume'
-    | 'system_note';
+    | 'system_note'
+    // Phase 2 Track 7 Follow-up Task 5 — one entry per ingestion-offload
+    // pass that moved ≥1 tool result / arg to S3. Compact inline notice
+    // (smaller than a Tier 3 boundary, not a full divider).
+    | 'offload_emitted';
 
 /**
  * Metadata attached to a conversation entry. Shape is intentionally permissive:
@@ -452,6 +463,11 @@ export interface ConversationEntryMetadata {
     tier3_firing_index?: number;
     first_turn_index?: number;
     last_turn_index?: number;
+    // offload_emitted — the content is the authoritative payload; metadata
+    // stays empty in v1. Declared here so render sites can opt into a
+    // roll-up summary without a type cast.
+    offload_count?: number;
+    offload_total_bytes?: number;
     [key: string]: unknown;
 }
 
@@ -473,5 +489,5 @@ export interface ConversationEntry {
 export interface ConversationListResponse {
     entries: ConversationEntry[];
     /** Present when more entries exist past the requested window. */
-    next_after_sequence?: number;
+    next_sequence?: number;
 }

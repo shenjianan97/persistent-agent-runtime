@@ -1,0 +1,283 @@
+name: Offline LLM Evaluation
+
+# Scheduled real-provider evaluation of the worker agent loop.
+#
+# This is a SEPARATE workflow from the per-commit `ci.yml` — it makes live
+# LLM calls, costs real money, and runs on a different cadence. See
+# services/worker-service/tests_offline/README.md for the runbook.
+#
+# Triggers:
+#   - schedule: nightly at 08:17 UTC (low-traffic hour, off the top-of-hour
+#     cron-stampede window).
+#   - push to tags matching `release-*` or `v*` (pre-release gate).
+#   - workflow_dispatch with an optional scenario filter input.
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  push:
+    tags:
+      - "release-*"
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Optional pytest -k filter (leave empty to run all scenarios)"
+        required: false
+        default: ""
+      provider:
+        description: "Optional provider filter (bedrock / anthropic / openai / all)"
+        required: false
+        default: "all"
+
+# Only one offline run at a time. If a tag-push and the nightly cron collide,
+# the later one waits; we don't care which wins.
+concurrency:
+  group: offline-llm-eval
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Needed so ::notice / ::warning annotations attach to the workflow run.
+  actions: read
+  checks: write
+
+jobs:
+  run-offline-eval:
+    name: Offline Eval (${{ matrix.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each provider runs its own matrix cell with its own per-run budget
+        # cap. Scenarios that target a specific provider skip on the others.
+        provider: [bedrock, anthropic, openai]
+        # Skip a provider via workflow_dispatch input without editing the file.
+        # (Empty / "all" runs every cell.)
+        exclude: []
+
+    services:
+      # Ephemeral Postgres — mirrors the e2e-tests job's shape. Scenarios
+      # write to this DB only; it has no relationship to dev / staging.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: persistent_agent_runtime
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      localstack:
+        image: localstack/localstack:3
+        env:
+          SERVICES: s3
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        ports:
+          - 4566:4566
+
+    steps:
+      - name: Filter matrix by workflow_dispatch provider input
+        id: provider-filter
+        run: |
+          requested="${{ github.event.inputs.provider }}"
+          current="${{ matrix.provider }}"
+          if [ -n "$requested" ] && [ "$requested" != "all" ] && [ "$requested" != "$current" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Offline Eval skipped::provider=$current filtered out by dispatch input '$requested'"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.provider-filter.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.provider-filter.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install PostgreSQL client
+        if: steps.provider-filter.outputs.skip != 'true'
+        run: sudo apt-get install -y postgresql-client
+
+      - name: Install worker dependencies
+        if: steps.provider-filter.outputs.skip != 'true'
+        run: pip install -e 'services/worker-service[dev]'
+
+      - name: Apply database migrations
+        if: steps.provider-filter.outputs.skip != 'true'
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in infrastructure/database/migrations/[0-9][0-9][0-9][0-9]_*.sql; do
+            psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime -f "$f"
+          done
+          psql -h localhost -p 55432 -U postgres -d persistent_agent_runtime \
+            -f infrastructure/database/migrations/test_seed.sql
+
+      - name: Create S3 bucket in LocalStack
+        if: steps.provider-filter.outputs.skip != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+        run: aws --endpoint-url=http://localhost:4566 s3 mb s3://platform-artifacts
+
+      - name: Pre-run budget kill-switch sanity check
+        if: steps.provider-filter.outputs.skip != 'true'
+        # Defence in depth — if the per-run cap constant somehow got set to
+        # an absurd value (e.g. during a bad merge) this step will fail loudly
+        # before any real-provider call happens.
+        run: |
+          python -c "
+          from tests_offline._budget_guard import (
+              PER_RUN_OFFLINE_BUDGET_MICRODOLLARS,
+              cap_microdollars,
+          )
+          cap = cap_microdollars()
+          hard_ceiling = 10_000_000  # 10 dollars — never exceed without code review
+          assert cap <= hard_ceiling, f'per-run cap {cap} exceeds hard ceiling {hard_ceiling}'
+          print(f'OK: per-run cap = {cap} microdollars (constant={PER_RUN_OFFLINE_BUDGET_MICRODOLLARS})')
+          "
+        working-directory: services/worker-service
+
+      - name: Run offline evaluation suite
+        if: steps.provider-filter.outputs.skip != 'true'
+        working-directory: services/worker-service
+        env:
+          # Ephemeral DB — mirrors the e2e-tests job.
+          E2E_DB_HOST: localhost
+          E2E_DB_PORT: "55432"
+          E2E_DB_NAME: persistent_agent_runtime
+          E2E_DB_USER: postgres
+          E2E_DB_PASSWORD: postgres
+          E2E_DB_DSN: postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime
+          # S3 offload (Task 4) goes to LocalStack.
+          S3_ENDPOINT_URL: http://localhost:4566
+          S3_BUCKET_NAME: platform-artifacts
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_REGION: us-east-1
+          # Matrix + budget guard + tenant isolation.
+          OFFLINE_LLM_EVAL_PROVIDER: ${{ matrix.provider }}
+          OFFLINE_LLM_EVAL_TENANT_ID: offline-llm-eval
+          # Real-provider secrets. Scenarios auto-skip when the matching var is
+          # unset, so a missing secret doesn't fail the workflow — it only
+          # reduces coverage.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          # Langfuse observability off — offline suite is not a Langfuse signal.
+          LANGFUSE_ENABLED: "false"
+          # Optional dispatch-input scenario filter → pytest -k expression.
+          OFFLINE_SCENARIO_FILTER: ${{ github.event.inputs.scenario }}
+        run: |
+          set -o pipefail
+          filter_args=()
+          if [ -n "${OFFLINE_SCENARIO_FILTER:-}" ]; then
+            filter_args=("-k" "${OFFLINE_SCENARIO_FILTER}")
+          fi
+          python -m pytest tests_offline/ \
+            -m offline \
+            --junitxml=offline-results.xml \
+            -ra -q "${filter_args[@]}" 2>&1 | tee /tmp/offline.log
+
+      - name: Parse JUnit results → workflow annotations
+        if: steps.provider-filter.outputs.skip != 'true' && always()
+        working-directory: services/worker-service
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          provider = os.environ.get("OFFLINE_LLM_EVAL_PROVIDER", "unknown")
+          xml_path = Path("offline-results.xml")
+          if not xml_path.exists():
+              print(f"::warning title=Offline Eval::no offline-results.xml produced for {provider}")
+              raise SystemExit(0)
+
+          tree = ET.parse(xml_path)
+          root = tree.getroot()
+          # JUnit XML from pytest: either <testsuites><testsuite>…</testsuite></testsuites>
+          # or a bare <testsuite>.
+          suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+          total = passed = failed = skipped = 0
+          for suite in suites:
+              for case in suite.findall("testcase"):
+                  total += 1
+                  classname = case.get("classname", "")
+                  name = case.get("name", "")
+                  time = case.get("time", "0")
+                  nodeid = f"{classname}::{name}" if classname else name
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      failed += 1
+                      msg = ""
+                      f = case.find("failure") or case.find("error")
+                      if f is not None:
+                          msg = (f.get("message") or f.text or "").splitlines()[0][:300]
+                      print(f"::error title=Offline Eval FAIL [{provider}] {nodeid}::{msg} (t={time}s)")
+                  elif case.find("skipped") is not None:
+                      skipped += 1
+                      skip = case.find("skipped")
+                      msg = (skip.get("message") or "") if skip is not None else ""
+                      print(f"::notice title=Offline Eval skip [{provider}] {nodeid}::{msg} (t={time}s)")
+                  else:
+                      passed += 1
+                      print(f"::notice title=Offline Eval PASS [{provider}] {nodeid}::t={time}s")
+
+          print(f"::notice title=Offline Eval summary [{provider}]::total={total} passed={passed} failed={failed} skipped={skipped}")
+          PY
+        env:
+          OFFLINE_LLM_EVAL_PROVIDER: ${{ matrix.provider }}
+
+      - name: Emit budget annotation
+        if: steps.provider-filter.outputs.skip != 'true' && always()
+        working-directory: services/worker-service
+        # Grep the pytest terminal summary for our OFFLINE_BUDGET_* lines
+        # (emitted by conftest.py::pytest_terminal_summary) and turn them into
+        # workflow annotations.
+        run: |
+          if [ ! -f /tmp/offline.log ]; then
+            exit 0
+          fi
+          spent=$(grep -oE 'OFFLINE_BUDGET_SPENT_MICRODOLLARS=[0-9]+' /tmp/offline.log | tail -n1 || true)
+          cap=$(grep -oE 'OFFLINE_BUDGET_CAP_MICRODOLLARS=[0-9]+' /tmp/offline.log | tail -n1 || true)
+          skipped=$(grep -oE 'OFFLINE_BUDGET_SKIPPED_SCENARIOS=[0-9]+' /tmp/offline.log | tail -n1 || true)
+          provider="${{ matrix.provider }}"
+          if [ -n "$spent" ] || [ -n "$cap" ]; then
+            echo "::notice title=Offline Eval budget [$provider]::$spent $cap $skipped"
+          fi
+          if [ -n "$skipped" ]; then
+            skipped_count=$(echo "$skipped" | sed 's/OFFLINE_BUDGET_SKIPPED_SCENARIOS=//')
+            if [ "${skipped_count:-0}" -gt 0 ]; then
+              echo "::warning title=Offline Eval budget exceeded [$provider]::$skipped_count scenarios skipped due to per-run budget cap"
+            fi
+          fi
+
+      - name: Upload JUnit XML
+        if: steps.provider-filter.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-results-${{ matrix.provider }}
+          path: services/worker-service/offline-results.xml
+          if-no-files-found: ignore
+
+      - name: Upload raw pytest log
+        if: steps.provider-filter.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-log-${{ matrix.provider }}
+          path: /tmp/offline.log
+          if-no-files-found: ignore

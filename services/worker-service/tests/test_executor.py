@@ -379,6 +379,7 @@ async def test_timeout_dead_letter(mock_worker, task_data):
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL
@@ -453,6 +454,7 @@ async def test_non_retryable_error(mock_worker, task_data):
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL
@@ -499,6 +501,7 @@ async def test_graph_recursion_error(mock_worker, task_data):
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL
@@ -547,6 +550,7 @@ async def test_retries_exhausted(mock_worker, task_data):
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL

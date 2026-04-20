@@ -11,7 +11,7 @@ dependencies = [
     "asyncpg>=0.29.0",
     "beautifulsoup4>=4.13.0",
     "boto3>=1.35.0",
-    "ddgs>=9.12.1",
+    "tavily-python>=0.5.0",
     "e2b-code-interpreter>=1.2.0",
     "httpx>=0.28.0",
     "langchain>=0.3.0",
@@ -41,7 +41,32 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Default collection roots — explicitly excludes ``tests_offline/`` so per-commit
+# runs (`pytest`, `pytest tests/`, `make worker-test`) never pick up the
+# real-provider offline eval suite. The offline suite opts-in via an explicit
+# path: ``pytest tests_offline/ -m offline``.
 testpaths = ["tests"]
+# Belt-and-suspenders: even if someone passes ``--collect-only`` without a
+# path, ignore the offline directory to stop accidental real-provider calls.
+# Include pytest's default ignores (``.*``, ``build``, ``dist``, etc.) and
+# the hypothesis plugin's ``.hypothesis`` dir explicitly, because setting
+# ``norecursedirs`` replaces rather than extends pytest's defaults.
+norecursedirs = [
+    "tests_offline",
+    ".venv",
+    "node_modules",
+    ".*",
+    "build",
+    "dist",
+    "CVS",
+    "_darcs",
+    "{arch}",
+    "*.egg",
+    ".hypothesis",
+]
+markers = [
+    "offline: real-provider offline evaluation suite (scheduled only; never on per-commit CI)",
+]
 filterwarnings = [
     "ignore:Core Pydantic V1 functionality isn't compatible with Python 3.14:UserWarning",
     "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning",

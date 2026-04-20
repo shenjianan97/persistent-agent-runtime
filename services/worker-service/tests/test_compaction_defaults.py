@@ -36,10 +36,19 @@ class TestConstants:
 
         assert KEEP_TOOL_USES == 3
 
-    def test_per_tool_result_cap_bytes(self):
-        from executor.compaction.defaults import PER_TOOL_RESULT_CAP_BYTES
+    def test_offload_threshold_bytes(self):
+        """Track 7 Follow-up (Task 4) — replaces PER_TOOL_RESULT_CAP_BYTES."""
+        from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
 
-        assert PER_TOOL_RESULT_CAP_BYTES == 25_000
+        assert OFFLOAD_THRESHOLD_BYTES == 20_000
+
+    def test_truncatable_arg_keys(self):
+        """Track 7 Follow-up (Task 4) — the offload arg-key allowlist."""
+        from executor.compaction.defaults import TRUNCATABLE_ARG_KEYS
+
+        assert TRUNCATABLE_ARG_KEYS == frozenset(
+            {"content", "new_string", "old_string", "text", "body"}
+        )
 
     def test_arg_truncation_cap_bytes(self):
         from executor.compaction.defaults import ARG_TRUNCATION_CAP_BYTES

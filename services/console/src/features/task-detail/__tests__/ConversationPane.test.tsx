@@ -81,6 +81,11 @@ const ALL_KINDS_RESPONSE: ConversationListResponse = {
             },
         }),
         entry({ sequence: 9, kind: 'system_note', content: { text: 'Task was retried once.' } }),
+        entry({
+            sequence: 10,
+            kind: 'offload_emitted',
+            content: { count: 3, total_bytes: 43_008, step_index: 7 },
+        }),
     ],
 };
 
@@ -129,7 +134,7 @@ afterEach(() => {
 // ─── Tests ─────────────────────────────────────────────────────────
 
 describe('ConversationPane — rendering', () => {
-    it('renders all 9 known kinds with kind-specific testids', async () => {
+    it('renders all known kinds with kind-specific testids', async () => {
         listConversationMock.mockResolvedValue(ALL_KINDS_RESPONSE);
 
         await renderPane({ status: 'completed' });
@@ -145,6 +150,47 @@ describe('ConversationPane — rendering', () => {
         expect(screen.getByTestId('conversation-entry-hitl_pause')).toBeInTheDocument();
         expect(screen.getByTestId('conversation-entry-hitl_resume')).toBeInTheDocument();
         expect(screen.getByTestId('conversation-entry-system_note')).toBeInTheDocument();
+        expect(
+            screen.getByTestId('conversation-entry-offload_emitted'),
+        ).toBeInTheDocument();
+    });
+
+    it('renders the offload_emitted banner with count and byte roll-up', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({
+                    sequence: 1,
+                    kind: 'offload_emitted',
+                    content: { count: 3, total_bytes: 43_008, step_index: 7 },
+                }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+
+        const banner = await screen.findByTestId(
+            'conversation-entry-offload_emitted',
+        );
+        // Count + human-readable byte roll-up (42.0 KB for 43008 bytes).
+        expect(banner).toHaveTextContent(/3 older tool outputs archived/);
+        expect(banner).toHaveTextContent(/42\.0 KB/);
+    });
+
+    it('uses singular copy when a single item was offloaded', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({
+                    sequence: 1,
+                    kind: 'offload_emitted',
+                    content: { count: 1, total_bytes: 20_480, step_index: 2 },
+                }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+        const banner = await screen.findByTestId(
+            'conversation-entry-offload_emitted',
+        );
+        expect(banner).toHaveTextContent(/1 older tool output archived/);
+        expect(banner).not.toHaveTextContent(/tool outputs/);
     });
 
     it('renders user / agent turn text content', async () => {
@@ -334,5 +380,72 @@ describe('ConversationPane — error boundary', () => {
             expect(screen.getByTestId('conversation-pane-error')).toBeInTheDocument();
         });
         expect(screen.getByTestId('conversation-pane-error')).toHaveTextContent('network down');
+    });
+});
+
+// Regression guard: the API caps one page at 200 rows. Without pagination the
+// Console silently loses everything past the cap — including the new entries a
+// long-running task emits right around the time Tier 3 compaction fires.
+describe('ConversationPane — server-side pagination', () => {
+    it('walks next_sequence until the server stops setting it', async () => {
+        const firstPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 1, kind: 'agent_turn', content: { text: 'first' } }),
+                entry({ sequence: 2, kind: 'agent_turn', content: { text: 'second' } }),
+            ],
+            next_sequence: 2,
+        };
+        const secondPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 3, kind: 'compaction_boundary', content: { summary_text: 'mid' } }),
+                entry({ sequence: 4, kind: 'agent_turn', content: { text: 'post-compaction' } }),
+            ],
+            next_sequence: 4,
+        };
+        const thirdPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 5, kind: 'tool_call', content: { tool_name: 'search', args: {} } }),
+            ],
+            // No next_sequence → client should stop.
+        };
+
+        listConversationMock
+            .mockResolvedValueOnce(firstPage)
+            .mockResolvedValueOnce(secondPage)
+            .mockResolvedValueOnce(thirdPage);
+
+        await renderPane({ status: 'completed' });
+
+        // All pages merge → everything renders, including the post-compaction row.
+        await waitFor(() => {
+            expect(screen.getByText('post-compaction')).toBeInTheDocument();
+        });
+        expect(screen.getByText('first')).toBeInTheDocument();
+        expect(screen.getByText('second')).toBeInTheDocument();
+        expect(
+            screen.getByTestId('conversation-entry-compaction_boundary'),
+        ).toBeInTheDocument();
+        expect(screen.getByTestId('conversation-entry-tool_call')).toBeInTheDocument();
+
+        // Pagination cursor contract: page 1 passes no cursor, subsequent pages
+        // carry the prior page's next_sequence.
+        expect(listConversationMock.mock.calls[0][1]).toBeUndefined();
+        expect(listConversationMock.mock.calls[1][1]).toBe(2);
+        expect(listConversationMock.mock.calls[2][1]).toBe(4);
+        expect(listConversationMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('stops at the first page when the server does not set next_sequence', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({ sequence: 1, kind: 'agent_turn', content: { text: 'only page' } }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+        await waitFor(() => {
+            expect(screen.getByText('only page')).toBeInTheDocument();
+        });
+        // No follow-up pagination call.
+        expect(listConversationMock).toHaveBeenCalledTimes(1);
     });
 });

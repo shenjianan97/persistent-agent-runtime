@@ -4,7 +4,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import {
     AlertCircle, BrainCircuit, MoveRight, RotateCcw, User, Wrench, Zap,
     Pause, PlayCircle, CheckCircle2, ShieldCheck, ShieldX,
-    MessageSquare, MessageCircle, Ban, RefreshCw,
+    MessageSquare, MessageCircle, Ban, RefreshCw, Scissors,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef } from 'react';
 import { formatUsd } from '@/lib/utils';
@@ -24,6 +24,7 @@ const HITL_EVENT_TYPES = new Set<TaskEventType>([
     'task_redriven',
     'task_completed',
     'task_follow_up',
+    'task_compaction_fired',
 ]);
 
 interface HitlMarkerStyle {
@@ -45,6 +46,7 @@ const HITL_STYLES: Partial<Record<TaskEventType, HitlMarkerStyle>> = {
     task_redriven:           { label: 'Task Redriven',       colorClass: 'text-blue-400',   bgClass: 'bg-blue-500',   icon: RefreshCw },
     task_completed:          { label: 'Task Completed',      colorClass: 'text-emerald-400', bgClass: 'bg-emerald-500', icon: CheckCircle2 },
     task_follow_up:          { label: 'Follow Up',           colorClass: 'text-primary',     bgClass: 'bg-primary',     icon: MessageSquare },
+    task_compaction_fired:   { label: 'Context Compacted',   colorClass: 'text-purple-400',  bgClass: 'bg-purple-500',  icon: Scissors },
 };
 
 // ─── Unified timeline entry ────────────────────────────────────────
@@ -407,6 +409,22 @@ export function CheckpointTimeline({
                                                 detailText = 'Resumed by operator';
                                             }
                                         }
+                                    } else if (ev.event_type === 'task_compaction_fired') {
+                                        const tokensIn = detail?.tokens_in as number | undefined;
+                                        const tokensOut = detail?.tokens_out as number | undefined;
+                                        const turns = detail?.turns_summarized as number | undefined;
+                                        const first = detail?.first_turn_index as number | undefined;
+                                        const last = detail?.last_turn_index as number | undefined;
+                                        const model = detail?.summarizer_model_id as string | undefined;
+                                        const parts: string[] = [];
+                                        if (turns !== undefined && first !== undefined && last !== undefined) {
+                                            parts.push(`${turns} turns (${first}→${last})`);
+                                        }
+                                        if (tokensIn !== undefined && tokensOut !== undefined) {
+                                            parts.push(`${tokensIn.toLocaleString()} in → ${tokensOut.toLocaleString()} out`);
+                                        }
+                                        if (model) parts.push(model);
+                                        if (parts.length > 0) detailText = parts.join(' · ');
                                     }
 
                                     return (

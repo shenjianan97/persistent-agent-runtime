@@ -296,6 +296,12 @@ public class ConfigValidationHelper {
         // pre_tier3_memory_flush: pure boolean toggle — no further validation.
         // No cross-field check against memory.enabled; runtime gating is the worker's
         // job (Task 9).
+
+        // offload_tool_results: pure boolean toggle; null-tolerant (absence == default
+        // true applied by the worker). Track 7 Follow-up (Task 4) kill switch for the
+        // Tier 0 ingestion offload. No cross-field validation; if the field is present
+        // it must be a boolean — record field typing enforces that — and any legal
+        // value passes this validator.
     }
 
     public void validateAgentConfig(AgentConfigRequest config) {

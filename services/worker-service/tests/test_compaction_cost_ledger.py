@@ -284,6 +284,98 @@ async def test_tier3_skipped_no_cost_ledger_row():
 
 
 @pytest.mark.asyncio
+async def test_tier3_cost_microdollars_matches_pricing_lookup():
+    """Regression for the telemetry gap: when a pricing_lookup is injected,
+    the ledger row carries ``cost_microdollars > 0`` exactly equal to
+    ``(tokens_in * input_rate + tokens_out * output_rate) // 1_000_000``.
+
+    Before this fix the value was always 0 because the summariser only
+    recorded tokens; see task 0ec010f9-b75f-4f19-ab8d-c91576ab5317 where a
+    91_426-in / 1_445-out compaction call was logged at $0.
+    """
+    slice_msgs = _make_slice_messages()
+    ledger = FakeCostLedger()
+    TOKENS_IN = 91_426
+    TOKENS_OUT = 1_445
+    fake_response = _make_fake_llm_response(tokens_in=TOKENS_IN, tokens_out=TOKENS_OUT)
+
+    # Claude Haiku 4.5 Bedrock rates: $0.80 / $4.00 per million tokens.
+    INPUT_RATE = 800_000
+    OUTPUT_RATE = 4_000_000
+
+    async def pricing_lookup(model_id: str):
+        return (INPUT_RATE, OUTPUT_RATE)
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = MagicMock()
+        mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+        mock_init.return_value = mock_llm
+
+        result = await summarize_slice(
+            slice_messages=slice_msgs,
+            summarizer_model_id="claude-haiku-4-5",
+            task_id="task-pricing",
+            tenant_id="tenant-1",
+            agent_id="agent-1",
+            checkpoint_id="cp-pricing",
+            cost_ledger=ledger,
+            pricing_lookup=pricing_lookup,
+        )
+
+    assert not result.skipped
+    expected = (TOKENS_IN * INPUT_RATE + TOKENS_OUT * OUTPUT_RATE) // 1_000_000
+    assert expected > 0
+    assert result.cost_microdollars == expected
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0]["cost_microdollars"] == expected
+
+
+@pytest.mark.asyncio
+async def test_tier3_pricing_failure_logs_warn_and_continues():
+    """If pricing_lookup raises, the summariser must NOT fail — it writes a
+    ledger row with cost_microdollars=0 and emits a WARN log so operators
+    can spot pricing-metadata gaps without losing the attribution row."""
+    slice_msgs = _make_slice_messages()
+    ledger = FakeCostLedger()
+    fake_response = _make_fake_llm_response(tokens_in=1000, tokens_out=200)
+
+    async def broken_lookup(model_id: str):
+        raise RuntimeError("models table lookup failed (DB unavailable)")
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        with patch("executor.compaction.summarizer._logger") as mock_logger:
+            mock_llm = MagicMock()
+            mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+            mock_init.return_value = mock_llm
+
+            result = await summarize_slice(
+                slice_messages=slice_msgs,
+                summarizer_model_id="unknown-summariser",
+                task_id="task-warn",
+                tenant_id="tenant-1",
+                agent_id="agent-1",
+                checkpoint_id="cp-warn",
+                cost_ledger=ledger,
+                pricing_lookup=broken_lookup,
+            )
+
+    # Summariser must not raise — compaction goes through
+    assert not result.skipped
+    assert result.cost_microdollars == 0
+    # Ledger row still written: tokens attributed, cost zeroed
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0]["cost_microdollars"] == 0
+    assert ledger.rows[0]["tokens_in"] == 1000
+    assert ledger.rows[0]["tokens_out"] == 200
+    # WARN log so this gap is observable
+    assert mock_logger.warning.called
+    assert any(
+        c.args and c.args[0] == "compaction.tier3_pricing_lookup_failed"
+        for c in mock_logger.warning.call_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_tier3_fatal_error_no_cost_ledger_row():
     """On fatal error, no cost-ledger row must be written."""
     slice_msgs = _make_slice_messages()

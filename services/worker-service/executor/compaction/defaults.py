@@ -25,20 +25,37 @@ MIN_TIER_SEPARATION_TOKENS: int = 2_000
 # Most recent tool-use turns kept intact (never cleared by Tier 1).
 KEEP_TOOL_USES: int = 3
 
-# Hard byte cap enforced at tool-result ingestion (head + tail truncation).
-# Measured in bytes (not tokens) because it applies at tool-execution time
-# before any tokenization. 25,000 bytes ≈ 6–8K tokens on most tokenizers.
-PER_TOOL_RESULT_CAP_BYTES: int = 25_000
+# Track 7 Follow-up (Task 3): fraction of the agent's ``model_context_window``
+# at which the ``pre_model_hook`` fires summarisation. Matches DeepAgents'
+# ``SummarizationMiddleware`` trigger; raised from Track 7's 0.75 because the
+# new replace-and-rehydrate architecture produces higher-quality summaries and
+# we want to delay the KV-cache-invalidating replacement as long as possible.
+COMPACTION_TRIGGER_FRACTION: float = 0.85
 
-# Tool-call argument keys subject to Tier 1.5 truncation. Agents rarely need to
-# re-read their own inputs once the tool has executed.
-TRUNCATABLE_TOOL_ARG_KEYS: frozenset[str] = frozenset({
+# Byte threshold above which a tool RESULT or a string-valued tool-call ARG
+# is offloaded to S3 at ingestion time (Phase 2 Track 7 Follow-up, Task 4).
+# Replaces the legacy PER_TOOL_RESULT_CAP_BYTES head+tail 25KB trim.
+# Measured in bytes (not tokens) because it applies at tool-execution time
+# before any tokenization. 20,000 bytes ≈ 5–6K tokens on most tokenizers.
+OFFLOAD_THRESHOLD_BYTES: int = 20_000
+
+# Tool-call argument keys subject to Tier 0 ingestion offload (Track 7
+# Follow-up, Task 4). Agents rarely need to re-read their own inputs once
+# the tool has executed, so offloading these to S3 and replacing with a
+# reference + preview is safe. Non-truncatable keys (path, query,
+# search_phrase, ...) are never offloaded even when oversized.
+TRUNCATABLE_ARG_KEYS: frozenset[str] = frozenset({
     "content",
     "new_string",
     "old_string",
     "text",
     "body",
 })
+
+# Back-compat alias — legacy name used by Track 7 Tier 1.5 code. Kept so that
+# call sites still scheduled for deletion in Task 3 continue to import
+# cleanly. Remove once Tier 1.5 is fully retired.
+TRUNCATABLE_TOOL_ARG_KEYS: frozenset[str] = TRUNCATABLE_ARG_KEYS
 
 # Byte threshold above which a truncatable argument in an older turn is
 # replaced with "[N bytes — arg truncated after step K]".
@@ -63,6 +80,28 @@ PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
 # re-attempts if the threshold is still exceeded.
 SUMMARIZER_MAX_RETRIES: int = 2
 
+# Hard cap on the Tier 3 summarizer's output tokens, forwarded to the LLM as
+# ``max_tokens``. Acts as a safety net when a model ignores the prompt-level
+# ≤500-token budget. 1500 gives a well-behaved model headroom to wrap up
+# gracefully while capping a pathological runaway at ~3× the target.
+#
+# Sized for today's Track 7 workload (Tier-1-stubbed input). Under the Track 7
+# Follow-up Task 3 replace-and-rehydrate rewrite the summarizer sees raw
+# ``prior_summary + middle`` — 10-50× larger input — so legitimately longer
+# summaries are expected; re-calibrate upward if truncation WARN rate exceeds
+# 5% of firings post-Task 3.
+SUMMARIZER_MAX_OUTPUT_TOKENS: int = 1500
+
+# Input headroom (tokens) subtracted from the summarizer's context window when
+# deciding whether the `prior_summary + middle` payload needs to be chunked.
+# Accounts for the ~1K-token SUMMARIZER_PROMPT, the SUMMARIZER_MAX_OUTPUT_TOKENS
+# reservation, serialisation overhead from `format_messages_for_summary`
+# (~10% over raw tokens for JSON-dumped tool args), and a per-provider safety
+# margin. On a 200K summarizer, this leaves ~188K for `prior_summary +
+# serialised middle` — still massive. If the output cap rises, bump headroom
+# proportionally.
+SUMMARIZER_INPUT_HEADROOM_TOKENS: int = 12_000
+
 # Maximum number of Tier 3 firings allowed per task. Beyond this cap the
 # pipeline stops invoking the summarizer and falls through to the hard-floor
 # path if the input still exceeds the floor. Bounds worst-case cost for
@@ -86,9 +125,14 @@ assert 0 < TIER_1_TRIGGER_FRACTION < TIER_3_TRIGGER_FRACTION < 1.0
 assert OUTPUT_BUDGET_RESERVE_TOKENS >= 0
 assert MIN_TIER_SEPARATION_TOKENS > 0
 assert KEEP_TOOL_USES >= 1
-assert PER_TOOL_RESULT_CAP_BYTES > 0
+assert 0 < COMPACTION_TRIGGER_FRACTION < 1.0
+assert OFFLOAD_THRESHOLD_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
+assert isinstance(TRUNCATABLE_ARG_KEYS, frozenset)
+assert len(TRUNCATABLE_ARG_KEYS) > 0
 assert SUMMARIZER_MAX_RETRIES >= 0
+assert SUMMARIZER_MAX_OUTPUT_TOKENS > 0
+assert SUMMARIZER_INPUT_HEADROOM_TOKENS > 0
 
 
 def get_platform_default_summarizer_model() -> str:

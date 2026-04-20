@@ -97,7 +97,7 @@ The `GraphExecutor` calls tool functions directly as in-process LangGraph `Struc
 
 | Tool | Description | Credentials |
 |------|-------------|-------------|
-| `web_search(query, max_results=5)` | DuckDuckGo-backed web search | None |
+| `web_search(query, max_results=5)` | Tavily-backed web search | `TAVILY_API_KEY` |
 | `read_url(url, max_chars=5000)` | Bounded URL fetch with SSRF guards | None |
 | `calculator(expression)` | Safe AST-based arithmetic | None |
 

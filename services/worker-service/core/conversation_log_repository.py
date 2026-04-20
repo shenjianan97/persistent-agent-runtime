@@ -54,6 +54,11 @@ ConversationLogKind = Literal[
     "memory_flush",
     "hitl_pause",
     "hitl_resume",
+    # Track 7 Follow-up Task 5 — one entry per ingestion-offload pass that
+    # moved ≥1 tool result / arg to S3. Payload: {count, total_bytes,
+    # step_index}. Emission is best-effort (same contract as every other
+    # kind) and does not block the agent super-step.
+    "offload_emitted",
 ]
 
 
@@ -68,6 +73,7 @@ _VALID_KINDS: frozenset[str] = frozenset(
         "memory_flush",
         "hitl_pause",
         "hitl_resume",
+        "offload_emitted",
     }
 )
 

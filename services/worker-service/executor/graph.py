@@ -44,14 +44,12 @@ from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnect
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
 from executor.compaction.state import RuntimeState
-from executor.compaction.pipeline import (
-    compact_for_llm,
+from executor.compaction.pre_model_hook import (
     HardFloorEvent,
     MemoryFlushFiredEvent,
-    Tier1AppliedEvent,
-    Tier15AppliedEvent,
     Tier3FiredEvent,
     Tier3SkippedEvent,
+    compaction_pre_model_hook,
 )
 from executor.compaction.tokens import estimate_tokens as _estimate_tokens
 from executor.compaction.summarizer import summarize_slice
@@ -136,7 +134,20 @@ from tools.memory_tools import (
 )
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
-from executor.compaction.caps import cap_tool_result
+from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
+from executor.compaction.ingestion import (
+    offload_ai_message_args,
+    offload_tool_messages_batch,
+)
+from executor.compaction.tool_result_store import (
+    S3ToolResultStore,
+    ToolResultArtifactStore,
+)
+from executor.builtin_tools import (
+    RECALL_TOOL_RESULT_NAME,
+    RECALL_TOOL_RESULT_SYSTEM_PROMPT_HINT,
+    build_recall_tool_result_tool,
+)
 
 import httpx
 
@@ -168,40 +179,19 @@ def _handle_tool_error(e: Exception) -> str:
 
 
 def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id: str):
-    """Decorator factory: wraps an async tool function to cap its result to
-    PER_TOOL_RESULT_CAP_BYTES before returning to the ToolNode.
+    """Back-compat no-op decorator (Track 7 Follow-up, Task 4).
 
-    Cap is applied to the string representation of the return value.  When the
-    cap fires a ``compaction.per_result_capped`` structured log is emitted.
-
-    This is Track 7 Tier 0 — always-on, no per-agent opt-out.
-
-    Args:
-        tool_name: Name of the tool (used in CapEvent and structured log).
-        tenant_id: Bound from the caller's task context (not LLM-supplied).
-        agent_id: Bound from the caller's task context.
-        task_id: Bound from the caller's task context.
-
-    Returns:
-        A decorator that wraps an async callable.
+    The legacy head+tail 25KB trim it used to apply has been replaced by
+    S3-backed ingestion offload at the ``tools`` node boundary — see
+    :func:`executor.compaction.ingestion.offload_tool_messages_batch` wired
+    into ``_OffloadingToolNode`` below. Call sites are preserved as no-ops
+    so that Task 3's pipeline rewrite can remove them during its touches of
+    this file without blocking Task 4's ship.
     """
+
     def decorator(fn):
-        async def wrapper(*args, **kwargs):
-            result = await fn(*args, **kwargs)
-            result_str = result if isinstance(result, str) else str(result)
-            capped, event = cap_tool_result(result_str, tool_name)
-            if event is not None:
-                _compaction_logger.info(
-                    "compaction.per_result_capped",
-                    tool=event.tool,
-                    orig_bytes=event.orig_bytes,
-                    capped_bytes=event.capped_bytes,
-                    tenant_id=tenant_id,
-                    agent_id=agent_id,
-                    task_id=task_id,
-                )
-            return capped
-        return wrapper
+        return fn
+
     return decorator
 
 
@@ -389,22 +379,25 @@ async def _convlog_append_compaction_events(
     checkpoint_id: str | None,
     events: list,
     summarized_through_before: int,
-    summary_marker_before: str,
-    summary_marker_after: str,
+    summary_before: str,
+    summary_after: str,
 ) -> None:
-    """Append one entry per Tier3Fired / MemoryFlushFired event from the pipeline.
+    """Append one entry per Tier3Fired / MemoryFlushFired event from the hook.
 
-    Tier1/Tier1.5 events are intentionally skipped — spec says those are
-    invisible to the user.
+    Under the Track 7 Follow-up (Task 3) replace-and-rehydrate architecture
+    the summary is REPLACED on each firing rather than appended to, so the
+    conversation-log's ``summary_text`` is simply ``summary_after`` and we
+    no longer compute an append delta. The prior ``summary_before`` is kept
+    on the signature for future diff-style log entries (not used in v1).
     """
+    # ``summary_before`` is retained in the signature as a forward-looking
+    # hook but is intentionally unused — replace semantics means every firing
+    # renders a fresh summary independent of prior content.
+    _ = summary_before
     for ev in events:
         if isinstance(ev, Tier3FiredEvent):
-            # Compute the summary_text as the delta that was just
-            # appended to the marker (summary_marker is strict-append).
-            if summary_marker_before and summary_marker_after.startswith(summary_marker_before):
-                summary_text = summary_marker_after[len(summary_marker_before):]
-            else:
-                summary_text = summary_marker_after
+            # Replace semantics — the entry's summary_text IS the new summary.
+            summary_text = summary_after
             origin = f"tier3:{summarized_through_before}->{ev.new_summarized_through}"
             key = _convlog_key(
                 task_id=task_id,
@@ -448,6 +441,305 @@ async def _convlog_append_compaction_events(
                 content={},
                 metadata={"fired_at_step": int(ev.fired_at_step)},
             )
+
+
+async def _emit_compaction_task_events(
+    *,
+    pool,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    worker_id: str,
+    events: list,
+    summarized_through_before: int,
+    summary_after: str,
+) -> None:
+    """Insert a ``task_compaction_fired`` task_event per Tier3Fired event.
+
+    Surfaces Tier 3 compaction in the Execution History tab alongside HITL
+    markers. Best-effort — compaction itself is already durable via the
+    conversation_log ``compaction_boundary`` row and the watermark; losing
+    the marker only costs the UI indicator, never correctness.
+    """
+    for ev in events:
+        if not isinstance(ev, Tier3FiredEvent):
+            continue
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    # Replay dedup — compaction only fires inside a leased
+                    # worker on a single super-step, so there is no cross-
+                    # writer race. A pre-INSERT SELECT on
+                    # (task_id, event_type, last_turn_index) is sufficient
+                    # to collapse replays of the same firing after a
+                    # post-event-INSERT crash; the watermark advances
+                    # monotonically per task, so each value represents
+                    # exactly one legitimate firing.
+                    already_emitted = await conn.fetchval(
+                        """
+                        SELECT 1 FROM task_events
+                        WHERE task_id = $1::uuid
+                          AND event_type = 'task_compaction_fired'
+                          AND (details->>'last_turn_index')::int = $2
+                        LIMIT 1
+                        """,
+                        task_id,
+                        int(ev.new_summarized_through),
+                    )
+                    if already_emitted is not None:
+                        continue
+                    await _insert_task_event(
+                        conn, task_id, tenant_id, agent_id,
+                        "task_compaction_fired", None, None, worker_id,
+                        details={
+                            "tier": 3,
+                            "summarizer_model_id": ev.summarizer_model_id,
+                            "tokens_in": int(ev.tokens_in),
+                            "tokens_out": int(ev.tokens_out),
+                            "turns_summarized": int(
+                                ev.new_summarized_through - summarized_through_before
+                            ),
+                            "first_turn_index": int(summarized_through_before),
+                            "last_turn_index": int(ev.new_summarized_through),
+                            "summary_bytes": len(summary_after.encode("utf-8")),
+                        },
+                    )
+        except Exception as err:
+            _compaction_logger.warning(
+                "compaction.tier3_event_insert_failed",
+                error=str(err),
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                task_id=task_id,
+            )
+
+
+async def _convlog_append_offload_emitted(
+    repo: ConversationLogRepository,
+    *,
+    task_id: str,
+    tenant_id: str,
+    checkpoint_id: str | None,
+    events: tuple,
+    step_index: int,
+) -> None:
+    """Emit one ``offload_emitted`` entry per ingestion-offload pass.
+
+    Track 7 Follow-up Task 5 contract: ONE entry per pass that offloaded
+    ≥1 item — not one per item (the per-item form would spam the log on
+    tasks with many small offloads). Payload is the roll-up:
+
+        content  = {"count": N, "total_bytes": B, "step_index": S}
+
+    ``step_index`` is the agent super-step index (approximated via the
+    journal length so we don't need to thread the LangGraph step counter
+    through the tool-node wrapper). All failures are swallowed by the
+    repository's best-effort envelope.
+    """
+    success_events = [ev for ev in events if getattr(ev, "kind", "") == "success"]
+    if not success_events:
+        return
+    total_bytes = sum(
+        int(getattr(ev, "size_bytes", 0) or 0) for ev in success_events
+    )
+    count = len(success_events)
+    # Deterministic idempotency-ref: the set of URIs uniquely identifies
+    # this pass. Hashing inside ``_convlog_key`` (sha256) folds them into
+    # the final key; we just need the material to be stable under retry.
+    uri_material = "|".join(
+        sorted(str(getattr(ev, "uri", "") or "") for ev in success_events)
+    )
+    origin = f"offload:{step_index}:{uri_material}"
+    key = _convlog_key(
+        task_id=task_id,
+        checkpoint_id=checkpoint_id,
+        origin_ref=origin,
+    )
+    await repo.append_entry(
+        task_id=task_id,
+        tenant_id=tenant_id,
+        checkpoint_id=checkpoint_id,
+        idempotency_key=key,
+        kind="offload_emitted",
+        role="system",
+        content={
+            "count": count,
+            "total_bytes": total_bytes,
+            "step_index": int(step_index),
+        },
+    )
+
+
+def _convlog_checkpoint_id_from_config(config: Any) -> str | None:
+    """Best-effort checkpoint-id extraction from a LangGraph RunnableConfig.
+
+    Falls back to ``None`` when the config shape is unexpected — the convlog
+    repo substitutes the literal ``"init"`` for missing checkpoints so the
+    idempotency hash remains stable.
+    """
+    try:
+        if isinstance(config, dict):
+            configurable = config.get("configurable") or {}
+            ckpt = configurable.get("checkpoint_id")
+            return str(ckpt) if ckpt is not None else None
+    except Exception:
+        return None
+    return None
+
+
+def _convlog_step_index_from_state(state: Any) -> int:
+    """Return a stable super-step index for the current tool-node invocation.
+
+    We use ``len(state["messages"])`` because the LangGraph step counter is
+    not exposed in the RunnableConfig shape we receive here. Message-count-
+    based indexing is coarser than a true step counter but monotone, stable
+    under retry (idempotent key includes URIs so the retry dedups regardless),
+    and sufficient for operator-facing ordering in the Console.
+    """
+    try:
+        if isinstance(state, dict):
+            msgs = state.get("messages")
+            return len(msgs) if msgs is not None else 0
+        msgs = getattr(state, "messages", None)
+        return len(msgs) if msgs is not None else 0
+    except Exception:
+        return 0
+
+
+def _extract_messages(out: Any):
+    """Unpack a ToolNode's ``out`` into (messages_list, rewrap_fn).
+
+    LangGraph ToolNode returns either ``{"messages": [...]}`` or a bare
+    list; we normalise both into a list for downstream per-message work and
+    return a callable that puts everything back into the original shape.
+    """
+    if isinstance(out, dict):
+        msgs = list(out.get("messages") or [])
+
+        def wrap(new_msgs: list) -> dict:
+            return {**out, "messages": new_msgs}
+
+        return msgs, wrap
+    if isinstance(out, list):
+        return list(out), lambda new_msgs: new_msgs
+    # Unknown shape — pass through with no changes.
+    return [], lambda _new: out
+
+
+def _raw_tool_node_input_messages(state: Any) -> list:
+    """Return ``state["messages"]`` in a way tolerant of either shape."""
+    if isinstance(state, dict):
+        return list(state.get("messages") or [])
+    msgs = getattr(state, "messages", None)
+    return list(msgs) if msgs is not None else []
+
+
+def _recall_call_ids_from_state(state: Any) -> dict[str, str]:
+    """Map ``tool_call_id → tool_name`` from the most recent AIMessage.
+
+    Used to decide whether each ToolMessage emitted by the ToolNode
+    corresponds to a ``recall_tool_result`` call — those need to bypass the
+    ingestion offload path and get tagged so the compaction hook can
+    recognise them later.
+    """
+    msgs = _raw_tool_node_input_messages(state)
+    # Scan backward for the most recent AIMessage with tool_calls.
+    for msg in reversed(msgs):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            out: dict[str, str] = {}
+            for call in msg.tool_calls or []:
+                call_id = call.get("id") if isinstance(call, dict) else None
+                call_name = call.get("name") if isinstance(call, dict) else None
+                if isinstance(call_id, str) and isinstance(call_name, str):
+                    out[call_id] = call_name
+            return out
+    return {}
+
+
+def _tag_recall_message(
+    msg: ToolMessage, original_tool_call_id: str
+) -> ToolMessage:
+    """Return a copy of ``msg`` with ``recalled`` metadata applied.
+
+    The tool surface itself returns a plain string (see
+    ``executor.builtin_tools.recall_tool_result``); LangGraph's ToolNode
+    wraps it into a ``ToolMessage`` with the call's id — we use THAT id as
+    ``original_tool_call_id`` so the recall-pointer rewrite can point readers
+    back at the right S3 artefact. The ToolMessage also carries a fresh id
+    (assigned by LangGraph later) so add_messages replay semantics stay
+    consistent.
+    """
+    existing_kwargs = dict(getattr(msg, "additional_kwargs", None) or {})
+    existing_kwargs.setdefault("recalled", True)
+    existing_kwargs.setdefault("original_tool_call_id", original_tool_call_id)
+    return msg.model_copy(update={"additional_kwargs": existing_kwargs})
+
+
+def _tag_recall_outputs_in_toolnode_output(out: Any, state_msgs: list) -> Any:
+    """Pass-through variant for the offload-disabled branch.
+
+    Even when offloading is off we still tag the recall-tool's ToolMessage
+    so downstream compaction logic treats it the same way. Mirrors the
+    enabled branch's tagging.
+    """
+    msgs, wrap = _extract_messages(out)
+    if not msgs:
+        return out
+    # Build a map of tool_call_id → tool_name from the most recent AIMessage.
+    name_by_id: dict[str, str] = {}
+    for m in reversed(state_msgs):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for call in m.tool_calls or []:
+                call_id = call.get("id") if isinstance(call, dict) else None
+                call_name = call.get("name") if isinstance(call, dict) else None
+                if isinstance(call_id, str) and isinstance(call_name, str):
+                    name_by_id[call_id] = call_name
+            break
+    new_msgs: list = []
+    for m in msgs:
+        if isinstance(m, ToolMessage):
+            call_id = getattr(m, "tool_call_id", "") or ""
+            if name_by_id.get(call_id) == RECALL_TOOL_RESULT_NAME:
+                new_msgs.append(_tag_recall_message(m, call_id))
+                continue
+        new_msgs.append(m)
+    return wrap(new_msgs)
+
+
+def _reweave_messages(
+    original: list,
+    recall_msgs: list,
+    offloaded_non_recall: list,
+) -> list:
+    """Recombine the two partitions while preserving the ToolNode's output order.
+
+    ``original`` is the ToolNode output verbatim; ``recall_msgs`` are the
+    recall-tagged ToolMessages (in ``original`` order); ``offloaded_non_recall``
+    is the offload-rewritten list of everything else (also in order).
+    """
+    recall_iter = iter(recall_msgs)
+    other_iter = iter(offloaded_non_recall)
+    # Build a set of tool_call_ids that belong to the recall partition.
+    recall_ids = {
+        getattr(m, "tool_call_id", "") or ""
+        for m in recall_msgs
+        if isinstance(m, ToolMessage)
+    }
+    out: list = []
+    for m in original:
+        if isinstance(m, ToolMessage) and (
+            (getattr(m, "tool_call_id", "") or "") in recall_ids
+        ):
+            try:
+                out.append(next(recall_iter))
+            except StopIteration:
+                out.append(m)
+        else:
+            try:
+                out.append(next(other_iter))
+            except StopIteration:
+                out.append(m)
+    return out
 
 
 class GraphExecutor:
@@ -618,10 +910,12 @@ class GraphExecutor:
         sandbox=None,
         s3_client=None,
     ) -> list[StructuredTool]:
-        # Shorthand: build a per-tool-result cap decorator bound to this task's
-        # context.  Every tool coroutine is wrapped so its return value is
-        # head+tail capped to PER_TOOL_RESULT_CAP_BYTES before the ToolNode
-        # sees it.  The cap is Track 7 Tier 0 — always-on, no opt-out.
+        # Shorthand: build a per-tool result wrapper bound to this task's
+        # context. As of Track 7 Follow-up (Task 4), the decorator is a
+        # no-op — tool-result byte bounding moved from head+tail trimming to
+        # S3-backed ingestion offload, wired on the ToolNode output boundary
+        # via ``_OffloadingToolNode`` below. The decorator call sites are
+        # preserved so Task 3's pipeline rewrite can remove them cleanly.
         def _cap(name: str):
             return _apply_result_cap(
                 name,
@@ -839,12 +1133,41 @@ class GraphExecutor:
         system_prompt = agent_config.get("system_prompt", "")
         sandbox_template = (agent_config.get("sandbox") or {}).get("template")
 
+        # Track 7 Follow-up (Task 4/5) — resolve the ``offload_tool_results``
+        # flag up front. Default ``true``; explicit ``false`` disables both
+        # ingestion offload and Task 5's ``recall_tool_result`` registration
+        # + system-prompt hint. The store is only constructed when the flag
+        # is on so disabled deployments pay no boto3 / S3 overhead.
+        _cm_cfg = agent_config.get("context_management") or {}
+        _offload_flag = _cm_cfg.get("offload_tool_results")
+        _offload_enabled: bool = True if _offload_flag is None else bool(_offload_flag)
+        _offload_store: ToolResultArtifactStore | None = (
+            S3ToolResultStore(self.s3_client) if _offload_enabled else None
+        )
+
+        # Resolve the summariser's own context window so the hook can forward
+        # it to summarize_slice — otherwise the recursive-chunking path in
+        # summarizer._chunk_summarize is unreachable and an oversized middle
+        # returns a non-retryable provider 400 that permanently sets
+        # tier3_fatal_short_circuited and dead-letters the task.
+        from executor.compaction.defaults import (  # local import — no circular load
+            get_platform_default_summarizer_model,
+        )
+        _compaction_summarizer_model_id: str = (
+            _cm_cfg.get("summarizer_model")
+            or get_platform_default_summarizer_model()
+        )
+        _summarizer_context_window: int = await self._get_model_context_window(
+            _compaction_summarizer_model_id
+        )
+
         # Build a separate platform system message with tool instructions
         platform_system_msg = self._build_platform_system_message(
             allowed_tools,
             injected_files=injected_files,
             sandbox_template=sandbox_template,
             memory_decision=memory_decision,
+            offload_tool_results_enabled=_offload_enabled,
         )
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
@@ -933,6 +1256,23 @@ class GraphExecutor:
         )
         tools = tools + [_wrap_tool_with_cap(t) for t in raw_memory_tools]
 
+        # Track 7 Follow-up Task 5 — register ``recall_tool_result`` when the
+        # ingestion-offload flag is on. The tool is closure-bound over
+        # ``(tenant_id, task_id, store)`` so the LLM cannot broaden scope or
+        # point at a different tenant's artifacts. We DO NOT run it through
+        # ``_wrap_tool_with_cap`` (that back-compat decorator is a no-op
+        # under Task 4, but Task 5's output is explicitly exempt from Task
+        # 4's ingestion offload anyway — see the special-case bypass in
+        # ``tool_node`` below).
+        if _offload_enabled and _offload_store is not None:
+            tools.append(
+                build_recall_tool_result_tool(
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    store=_offload_store,
+                )
+            )
+
         # Merge custom tools from MCP servers — cap each one.
         if custom_tools:
             tools = tools + [_wrap_tool_with_cap(t) for t in custom_tools]
@@ -1010,6 +1350,12 @@ class GraphExecutor:
             "checkpoint_id": None,
             "cost_ledger": _compaction_cost_ledger,
             "callbacks": [],
+            # Follow-up fix: expose the same pricing lookup used by the main-
+            # agent cost path so compaction.tier3 ledger rows record real
+            # cost_microdollars instead of always being 0. Bound-method
+            # reference — the LRU cache inside GraphExecutor persists across
+            # compaction firings within one task.
+            "pricing_lookup": self._get_model_cost_rates,
         }
 
         # Track 7 Task 13 — user-facing conversation-log repo.  Appends are
@@ -1019,21 +1365,16 @@ class GraphExecutor:
         self._last_conversation_log_repo = conversation_log_repo
 
         async def agent_node(state: RuntimeState, config: RunnableConfig):
-            messages = state["messages"]
-            if not any(isinstance(m, SystemMessage) for m in messages):
-                sys_messages = []
-                if system_prompt:
-                    sys_messages.append(SystemMessage(content=system_prompt))
-                if platform_system_msg:
-                    sys_messages.append(SystemMessage(content=platform_system_msg))
-                messages = sys_messages + messages
-
-            # Track 7 Task 13 — dual-write BEFORE compact_for_llm fires so
-            # the conversation log holds the raw view of the super-step's
-            # new turns (not the compacted model view).  Slice is computed
-            # against ``state["messages"]`` (which excludes any transient
-            # SystemMessage prepended to the local ``messages`` variable).
+            # Track 7 Follow-up (Task 3) — the pre_model_hook owns system-
+            # prompt placement and projection assembly, so we pass the raw
+            # journal (``state["messages"]``) to the hook and let it assemble
+            # the final ``[SystemMessage(system_prompt), SystemMessage(summary)?,
+            # *middle, *keep_window]`` shape.
             _raw_state_messages = state["messages"]
+
+            # Track 7 Task 13 — dual-write BEFORE compaction_pre_model_hook
+            # fires so the conversation log holds the raw view of the super-
+            # step's new turns (not the projection the LLM sees).
             _last_count = state.get("last_super_step_message_count", 0) or 0
             # Attempt to read a LangGraph-assigned checkpoint id off the
             # runnable config.  When absent (first turn / pre-Task-10),
@@ -1058,37 +1399,39 @@ class GraphExecutor:
                 last_super_step_message_count=_last_count,
             )
 
-            # Capture watermark values BEFORE compaction so we can compute
-            # the compaction_boundary delta after the pipeline returns.
-            _summary_marker_before = state.get("summary_marker") or ""
+            # Capture state values BEFORE compaction so we can compute the
+            # compaction_boundary entry after the hook returns.
+            _summary_before = state.get("summary", "") or ""
             _summarized_through_before = int(
                 state.get("summarized_through_turn_index", 0) or 0
             )
 
             # Shallow-copy the shared task_context with the live checkpoint_id
-            # so the Tier 3 summariser writes a cost-ledger row tagged to the
-            # right checkpoint.  Falls back to None (adapter substitutes a
+            # so the summariser writes a cost-ledger row tagged to the right
+            # checkpoint.  Falls back to None (adapter substitutes a
             # deterministic placeholder so the INSERT still dedups correctly).
             _per_call_task_context = {**task_context, "checkpoint_id": _convlog_ckpt_id}
 
-            # Track 7 Task 8 — run compaction pipeline before every LLM call.
-            # The pipeline is pure: it returns the compacted message view, a
-            # state_updates dict (watermarks, summary_marker, etc.), and a list
-            # of structured-log events.  We emit those events here so the
-            # pipeline module itself has zero logger coupling.
-            pass_result = await compact_for_llm(
-                raw_messages=messages,
+            # Track 7 Follow-up (Task 3) — run the pre_model_hook before every
+            # LLM call. The hook is pure w.r.t. the journal (never mutates
+            # ``state["messages"]``); it returns the three-region projection
+            # as ``pass_result.messages`` plus a ``state_updates`` dict.
+            pass_result = await compaction_pre_model_hook(
+                raw_messages=_raw_state_messages,
                 state=state,
                 agent_config=agent_config,
                 model_context_window=model_context_window,
                 task_context=_per_call_task_context,
                 summarizer=summarize_slice,
                 estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+                system_prompt=system_prompt if system_prompt else None,
+                platform_system_message=platform_system_msg if platform_system_msg else None,
+                summarizer_context_window=_summarizer_context_window,
             )
             messages_for_llm = pass_result.messages
             compaction_state_updates = pass_result.state_updates
 
-            # Emit structured-log events from the pipeline and raise immediately
+            # Emit structured-log events from the hook and raise immediately
             # on HardFloorEvent — single pass avoids re-iterating the list.
             for ev in pass_result.events:
                 if isinstance(ev, HardFloorEvent):
@@ -1100,31 +1443,11 @@ class GraphExecutor:
                         agent_id=agent_id,
                         task_id=task_id,
                     )
-                    # Raise a sentinel exception so the astream loop can catch it
-                    # and invoke _handle_dead_letter.
+                    # Raise a sentinel exception so the astream loop can catch
+                    # it and invoke _handle_dead_letter.
                     raise _ContextExceededIrrecoverableError(
                         f"Context window exceeded irrecoverably: "
                         f"{ev.est_tokens} tokens > {ev.model_context_window} window"
-                    )
-                elif isinstance(ev, Tier1AppliedEvent):
-                    _compaction_logger.info(
-                        "compaction.tier1_applied",
-                        messages_cleared=ev.messages_cleared,
-                        est_tokens_saved=ev.est_tokens_saved,
-                        new_watermark=ev.new_watermark,
-                        tenant_id=tenant_id,
-                        agent_id=agent_id,
-                        task_id=task_id,
-                    )
-                elif isinstance(ev, Tier15AppliedEvent):
-                    _compaction_logger.info(
-                        "compaction.tier15_applied",
-                        args_truncated=ev.args_truncated,
-                        bytes_saved=ev.bytes_saved,
-                        new_watermark=ev.new_watermark,
-                        tenant_id=tenant_id,
-                        agent_id=agent_id,
-                        task_id=task_id,
                     )
                 elif isinstance(ev, Tier3FiredEvent):
                     _compaction_logger.info(
@@ -1147,12 +1470,12 @@ class GraphExecutor:
                     )
 
             # Track 7 Task 13 — mirror Tier3Fired / MemoryFlushFired events
-            # into the user-facing conversation log.  Tier 1 / Tier 1.5 are
-            # intentionally invisible (see task-13 spec §Design principle).
-            _summary_marker_after = (
-                compaction_state_updates.get("summary_marker")
-                or _summary_marker_before
-            )
+            # into the user-facing conversation log.
+            _summary_after = (
+                compaction_state_updates.get("summary")
+                if "summary" in compaction_state_updates
+                else _summary_before
+            ) or ""
             await _convlog_append_compaction_events(
                 conversation_log_repo,
                 task_id=task_id,
@@ -1160,8 +1483,22 @@ class GraphExecutor:
                 checkpoint_id=_convlog_ckpt_id,
                 events=pass_result.events,
                 summarized_through_before=_summarized_through_before,
-                summary_marker_before=_summary_marker_before,
-                summary_marker_after=_summary_marker_after,
+                summary_before=_summary_before,
+                summary_after=_summary_after,
+            )
+
+            # Surface Tier3 firings in the Execution History tab via a
+            # task_event (reusing the existing task_events feed rather than
+            # adding a new Console endpoint).
+            await _emit_compaction_task_events(
+                pool=self.pool,
+                task_id=task_id,
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                worker_id=self.config.worker_id,
+                events=pass_result.events,
+                summarized_through_before=_summarized_through_before,
+                summary_after=_summary_after,
             )
 
             # Retry on rate limits inside the execution loop instead of
@@ -1175,6 +1512,44 @@ class GraphExecutor:
                         task_id=task_id,
                         operation="agent",
                     )
+                    # Track 7 Follow-up (Task 4) — Tier 0 ingestion offload
+                    # for oversized tool-call args on the AIMessage about to
+                    # land in ``state["messages"]``. This is the arg-side
+                    # counterpart to the ToolNode wrapper above. When the
+                    # ``offload_tool_results`` config flag is off, this is a
+                    # passthrough.
+                    #
+                    # Runs BEFORE the conversation-log append so the logged
+                    # tool_call args reflect the reference-replaced view
+                    # (the pre-offload values are still in S3 if Task 5's
+                    # recall tool needs them).
+                    if (
+                        _offload_enabled
+                        and _offload_store is not None
+                        and isinstance(response, AIMessage)
+                        and getattr(response, "tool_calls", None)
+                    ):
+                        _offload_outcome = await offload_ai_message_args(
+                            response,
+                            store=_offload_store,
+                            tenant_id=tenant_id,
+                            task_id=task_id,
+                            threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                            log_context=_offload_log_ctx,
+                        )
+                        response = _offload_outcome.message  # type: ignore[assignment]
+                        # Track 7 Follow-up Task 5 — one ``offload_emitted``
+                        # convlog entry per AIMessage-arg-offload pass with
+                        # ≥1 success. Aligns with the tool-result side in
+                        # ``tool_node``.
+                        await _convlog_append_offload_emitted(
+                            conversation_log_repo,
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            checkpoint_id=_convlog_ckpt_id,
+                            events=_offload_outcome.events,
+                            step_index=len(_raw_state_messages),
+                        )
                     # Track 7 Task 13 — append the agent's response and any
                     # tool-call requests to the user-facing conversation log
                     # BEFORE returning (and therefore before LangGraph
@@ -1187,7 +1562,20 @@ class GraphExecutor:
                         checkpoint_id=_convlog_ckpt_id,
                         response=response,
                     )
-                    return {"messages": [response], **compaction_state_updates}
+                    # Merge the new assistant ``response`` with any ``messages``
+                    # update from the compaction hook (the recall-pointer
+                    # rewrite returns ToolMessage replacements keyed by id).
+                    # A naive ``{"messages": [response], **compaction_state_updates}``
+                    # would let the hook's ``messages`` key overwrite ``[response]``
+                    # via dict-literal collision semantics, dropping the assistant
+                    # turn (including any pending tool_calls) on the recall-and-
+                    # summarize path. ``add_messages`` handles append + replace
+                    # in one list, so we combine both.
+                    _hook_messages = compaction_state_updates.get("messages", [])
+                    return {
+                        **compaction_state_updates,
+                        "messages": [*_hook_messages, response],
+                    }
                 except Exception as e:
                     if self._is_rate_limit_error(e) and attempt < max_rate_limit_retries:
                         backoff = self._get_retry_after(e) or min(30, 5 * (2 ** attempt))
@@ -1280,8 +1668,103 @@ class GraphExecutor:
             )
             return decision
 
+        # Track 7 Follow-up (Task 4) — Tier 0 ingestion offload.
+        #
+        # ``_offload_enabled`` + ``_offload_store`` were resolved at the top
+        # of this method (we pass the flag into the platform system-message
+        # builder and close over the store for the recall tool). The
+        # ToolNode wrapper and agent_node's AIMessage post-processing share
+        # the same pair of values so the three offload sites cannot
+        # disagree.
+        _offload_log_ctx = {
+            "tenant_id": tenant_id,
+            "agent_id": agent_id,
+            "task_id": task_id,
+        }
+
         if tools:
-            tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
+            _raw_tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
+
+            async def tool_node(state, config):
+                """ToolNode wrapper that applies Tier 0 ingestion offload.
+
+                Invokes the underlying ``ToolNode`` and, before the resulting
+                ``ToolMessage`` list lands in ``state["messages"]``, routes
+                any message whose ``content`` exceeds
+                ``OFFLOAD_THRESHOLD_BYTES`` through
+                :func:`offload_tool_messages_batch`. Below-threshold messages
+                pass through verbatim. When
+                ``context_management.offload_tool_results = false`` this
+                wrapper is a trivial passthrough — no S3 writes.
+
+                Track 7 Follow-up Task 5 — the ``recall_tool_result`` tool's
+                own output BYPASSES this offload path. Re-offloading content
+                the agent explicitly asked to see would create a re-read
+                loop that defeats the purpose. The recall output is tagged
+                with ``additional_kwargs={"recalled": True,
+                "original_tool_call_id": ...}`` so the compaction hook's
+                recall-pointer rewrite and the projection stub rule can
+                recognise it later.
+                """
+                out = await _raw_tool_node.ainvoke(state, config)
+                if not _offload_enabled or _offload_store is None:
+                    # When the flag is off, still tag recall-tool outputs so
+                    # the compaction hook's projection stub + recall-pointer
+                    # rewrite can find them. Re-offload is already disabled
+                    # in this branch.
+                    out = _tag_recall_outputs_in_toolnode_output(
+                        out, _raw_tool_node_input_messages(state)
+                    )
+                    return out
+                # Split the ToolNode output into "recalled" (bypass offload,
+                # tag additional_kwargs) and "other" (route through
+                # offload_tool_messages_batch).
+                msgs, wrap = _extract_messages(out)
+                # Identify the calling AIMessage's tool_calls so we can tell
+                # which ToolMessage corresponds to a ``recall_tool_result``
+                # call. ToolNode preserves tool_call_id on each ToolMessage;
+                # we match by id against the prior AIMessage's tool_calls.
+                call_name_by_id = _recall_call_ids_from_state(state)
+                recall_msgs: list[ToolMessage] = []
+                other_msgs: list[ToolMessage] = []
+                for m in msgs:
+                    if not isinstance(m, ToolMessage):
+                        other_msgs.append(m)  # type: ignore[arg-type]
+                        continue
+                    call_id = getattr(m, "tool_call_id", "") or ""
+                    if call_name_by_id.get(call_id) == RECALL_TOOL_RESULT_NAME:
+                        recall_msgs.append(_tag_recall_message(m, call_id))
+                    else:
+                        other_msgs.append(m)
+
+                new_other, _events = await offload_tool_messages_batch(
+                    other_msgs,
+                    store=_offload_store,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                    log_context=_offload_log_ctx,
+                )
+
+                # Best-effort ``offload_emitted`` convlog entry — one entry
+                # per pass with ≥1 successful offload.
+                await _convlog_append_offload_emitted(
+                    conversation_log_repo,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    checkpoint_id=_convlog_checkpoint_id_from_config(config),
+                    events=_events,
+                    step_index=_convlog_step_index_from_state(state),
+                )
+
+                # Rebuild the list in the same order ``ToolNode`` produced —
+                # the graph's downstream agent step assumes per-tool_call_id
+                # pairing stability but does not depend on interleaving of
+                # recall vs other messages (both land in the journal under
+                # the same super-step).
+                recombined = _reweave_messages(msgs, recall_msgs, new_other)
+                return wrap(recombined)
+
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
             if stack_enabled:
@@ -1349,8 +1832,9 @@ class GraphExecutor:
         structured warning when the default fires so operators can act.
 
         This value is resolved once at graph-build time (``execute_task``)
-        and passed into ``_build_graph`` so ``compact_for_llm`` always has
-        a known-good value without an extra DB round-trip per LLM call.
+        and passed into ``_build_graph`` so ``compaction_pre_model_hook``
+        always has a known-good value without an extra DB round-trip per
+        LLM call.
         """
         try:
             row = await self.pool.fetchrow(
@@ -1907,11 +2391,16 @@ class GraphExecutor:
         injected_files: list[str] | None = None,
         sandbox_template: str | None = None,
         memory_decision: MemoryDecision | None = None,
+        offload_tool_results_enabled: bool = True,
     ) -> str:
         """Build platform-generated system message with tool instructions.
 
         This is injected as a separate SystemMessage, hidden from the customer's
         system prompt — similar to how Claude Code injects system context.
+
+        ``offload_tool_results_enabled`` (Track 7 Follow-up Task 5): when true,
+        append a short directive telling the agent how to recognise the
+        ingestion-offload placeholders and when to call ``recall_tool_result``.
         """
         sections = []
 
@@ -1985,6 +2474,13 @@ class GraphExecutor:
                     "Skip the call for routine or trivial runs — the absence "
                     "of a call means no memory entry is written."
                 )
+
+        # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended
+        # only when the feature is on so agents running with the flag off
+        # don't see references to a tool they won't find in their tool
+        # list.
+        if offload_tool_results_enabled:
+            sections.append(RECALL_TOOL_RESULT_SYSTEM_PROMPT_HINT)
 
         return "\n\n".join(sections)
 
@@ -2252,8 +2748,8 @@ class GraphExecutor:
 
             # Track 7 Task 8 — resolve model context window once at graph-build
             # time (not per LLM call) and cache it for the lifetime of this
-            # execute_task invocation.  Passed through to compact_for_llm via
-            # _build_graph so agent_node always has the right value.
+            # execute_task invocation.  Passed through to the pre_model_hook
+            # via _build_graph so agent_node always has the right value.
             _model_name_for_ctx = agent_config.get("model", "claude-3-5-sonnet-latest")
             _model_context_window = await self._get_model_context_window(_model_name_for_ctx)
 
@@ -2348,14 +2844,12 @@ class GraphExecutor:
                         )
 
                 # Build initial message list. Attachment preamble (when
-                # present) is prepended as a SystemMessage BEFORE the agent's
-                # own system prompt — the distinction between "agent rules"
-                # and "customer-attached memory" must be preserved. Because
-                # the ``agent_node`` only auto-synthesizes system prompts
-                # when NO SystemMessage is present in state, we explicitly
-                # include the agent's system prompt + platform system
-                # message here when we're also injecting the preamble, so
-                # those aren't silently dropped on the first super-step.
+                # present) is stored as a SystemMessage in state so it flows
+                # through the projection via ``middle`` / ``keep_window``.
+                # The agent system prompt and platform system message are
+                # NOT added here — the pre_model_hook prepends them on every
+                # turn (``_build_projection``), so adding them to state too
+                # would duplicate system directives and inflate token count.
                 initial_messages: list[Any] = []
                 if attached_preamble is not None:
                     initial_messages.append(
@@ -2368,31 +2862,6 @@ class GraphExecutor:
                             )
                         )
                     )
-                    # Reconstruct the agent's system prompts that
-                    # ``agent_node`` would normally synthesise on the first
-                    # super-step — see agent_node's "no SystemMessage"
-                    # branch in _build_graph.
-                    agent_system_prompt = agent_config.get("system_prompt", "")
-                    allowed_tools_for_sys = agent_config.get("allowed_tools", [])
-                    sandbox_template_for_sys = (
-                        agent_config.get("sandbox") or {}
-                    ).get("template")
-                    platform_system_msg = self._build_platform_system_message(
-                        allowed_tools_for_sys,
-                        injected_files=(
-                            injected_files if sandbox_enabled else None
-                        ),
-                        sandbox_template=sandbox_template_for_sys,
-                        memory_decision=memory_decision,
-                    )
-                    if agent_system_prompt:
-                        initial_messages.append(
-                            SystemMessage(content=agent_system_prompt)
-                        )
-                    if platform_system_msg:
-                        initial_messages.append(
-                            SystemMessage(content=platform_system_msg)
-                        )
                 if first_execution:
                     initial_messages.append(HumanMessage(content=task_input))
 
@@ -2418,16 +2887,15 @@ class GraphExecutor:
                         # guarantees the agent must re-earn the opt-in on each
                         # run.
                         "memory_opt_in": False,
-                        # Track 7 Task 8 — seed ALL compaction watermarks at
-                        # reducer-safe defaults so every task graph starts from
-                        # a known-good state.  Reducer-annotated fields use the
-                        # seed only on the FIRST write; subsequent node returns
-                        # go through the reducer (max / any / strict-append).
-                        # MUST be 0 / "" / False — NEVER None.
-                        "cleared_through_turn_index": 0,
-                        "truncated_args_through_turn_index": 0,
+                        # Track 7 Follow-up (Task 3) — seed the replace-and-
+                        # rehydrate compaction fields at reducer-safe defaults
+                        # so every task graph starts from a known-good state.
+                        # Reducer-annotated fields use the seed only on the
+                        # FIRST write; subsequent node returns go through the
+                        # reducer (max / any / replace). MUST be 0 / "" / False
+                        # — NEVER None.
+                        "summary": "",
                         "summarized_through_turn_index": 0,
-                        "summary_marker": "",
                         "memory_flush_fired_this_task": False,
                         "last_super_step_message_count": 0,
                         "tier3_firings_count": 0,
@@ -3704,6 +4172,16 @@ class GraphExecutor:
                                 )
 
                     # 2. Lease-validated task dead-letter update.
+                    #
+                    # Clear ``human_response`` alongside the status flip so a
+                    # subsequent redrive does NOT re-inject the pending
+                    # follow-up / input / approval payload. The message is
+                    # already in ``state["messages"]`` via the pre-crash
+                    # checkpoint (durability="sync"), so redrive resumes
+                    # with the message present; re-reading human_response
+                    # would duplicate it (observed on task 75f5a223 —
+                    # second follow-up appeared twice in the journal after
+                    # redrive, rendering twice in the Console).
                     updated = await conn.fetchval(
                         '''UPDATE tasks
                            SET status='dead_letter',
@@ -3712,6 +4190,7 @@ class GraphExecutor:
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL

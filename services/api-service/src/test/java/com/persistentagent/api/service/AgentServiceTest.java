@@ -600,7 +600,7 @@ class AgentServiceTest {
     void createAgent_contextManagementEmptyObject_roundTripsIntact() throws Exception {
         // Empty context_management sub-object (all fields null) — persisted JSON has the
         // context_management key with null fields, but the sub-object itself is present.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null, null);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
@@ -627,6 +627,7 @@ class AgentServiceTest {
         assertNull(parsed.contextManagement().summarizerModel());
         assertNull(parsed.contextManagement().excludeTools());
         assertNull(parsed.contextManagement().preTier3MemoryFlush());
+        assertNull(parsed.contextManagement().offloadToolResults());
     }
 
     @Test
@@ -634,7 +635,7 @@ class AgentServiceTest {
         // All three fields set — persisted JSON preserves them exactly with snake_case keys.
         List<String> excludeTools = List.of("web_search", "custom_tool_x");
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(
-                "claude-haiku-4-5", excludeTools, true);
+                "claude-haiku-4-5", excludeTools, true, false);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
@@ -660,6 +661,7 @@ class AgentServiceTest {
         assertEquals("claude-haiku-4-5", parsed.contextManagement().summarizerModel());
         assertEquals(excludeTools, parsed.contextManagement().excludeTools());
         assertEquals(Boolean.TRUE, parsed.contextManagement().preTier3MemoryFlush());
+        assertEquals(Boolean.FALSE, parsed.contextManagement().offloadToolResults());
 
         // Must use snake_case JSON keys.
         assertTrue(persistedJson.contains("\"summarizer_model\":\"claude-haiku-4-5\""),
@@ -668,12 +670,14 @@ class AgentServiceTest {
                 "exclude_tools must use snake_case JSON key: " + persistedJson);
         assertTrue(persistedJson.contains("\"pre_tier3_memory_flush\":true"),
                 "pre_tier3_memory_flush must use snake_case JSON key: " + persistedJson);
+        assertTrue(persistedJson.contains("\"offload_tool_results\":false"),
+                "offload_tool_results must use snake_case JSON key: " + persistedJson);
     }
 
     @Test
     void updateAgent_contextManagement_roundTripsIntact() throws Exception {
         // PUT path must canonicalize context_management identically to POST.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of("custom_tool"), false);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of("custom_tool"), false, null);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);

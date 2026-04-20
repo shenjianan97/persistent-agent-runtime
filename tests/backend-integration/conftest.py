@@ -499,6 +499,35 @@ def llm_provider() -> DynamicChatProvider:
         patcher.stop()
 
 
+@pytest.fixture(autouse=True)
+def _stub_search_provider():
+    """Swap TavilySearchProvider for a no-network stub in e2e runs.
+
+    Several tests drive a mocked LLM that calls ``web_search`` as a
+    generic tool. The real Tavily provider fails closed without
+    ``TAVILY_API_KEY``, retries exhaust, and the task dead-letters —
+    masking whatever the test was actually trying to assert. The stub
+    returns a deterministic result so ``web_search`` succeeds; tests
+    that care about actual search hits should stub at a higher layer.
+    """
+    from tools.definitions import ToolDependencies
+    from tools.providers.search import StubSearchProvider
+    from tools.read_url import ReadUrlFetcher
+
+    def _factory() -> ToolDependencies:
+        return ToolDependencies(
+            search_provider=StubSearchProvider(),
+            read_url_fetcher=ReadUrlFetcher(),
+        )
+
+    patcher = patch("executor.graph.create_default_dependencies", side_effect=_factory)
+    patcher.start()
+    try:
+        yield
+    finally:
+        patcher.stop()
+
+
 class WorkerManager:
     def __init__(self, pool: asyncpg.Pool):
         self._pool = pool

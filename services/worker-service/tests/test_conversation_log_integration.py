@@ -26,10 +26,8 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from core.conversation_log_repository import ConversationLogRepository
-from executor.compaction.pipeline import (
+from executor.compaction.pre_model_hook import (
     MemoryFlushFiredEvent,
-    Tier1AppliedEvent,
-    Tier15AppliedEvent,
     Tier3FiredEvent,
 )
 from executor.graph import (
@@ -37,6 +35,7 @@ from executor.graph import (
     _convlog_append_llm_response,
     _convlog_append_pre_llm_turns,
     _convlog_origin_ref_for_message,
+    _emit_compaction_task_events,
 )
 
 
@@ -62,6 +61,10 @@ async def integration_pool():
             "DELETE FROM task_conversation_log WHERE tenant_id = $1", TENANT_ID
         )
         await conn.execute(
+            "DELETE FROM task_events WHERE tenant_id = $1 AND agent_id = $2",
+            TENANT_ID, AGENT_ID,
+        )
+        await conn.execute(
             "DELETE FROM tasks WHERE tenant_id = $1 AND agent_id = $2",
             TENANT_ID, AGENT_ID,
         )
@@ -83,6 +86,10 @@ async def integration_pool():
         async with pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM task_conversation_log WHERE tenant_id = $1", TENANT_ID
+            )
+            await conn.execute(
+                "DELETE FROM task_events WHERE tenant_id = $1 AND agent_id = $2",
+                TENANT_ID, AGENT_ID,
             )
             await conn.execute(
                 "DELETE FROM tasks WHERE tenant_id = $1 AND agent_id = $2",
@@ -349,8 +356,8 @@ async def test_tier3_fired_emits_compaction_boundary(
         checkpoint_id="ckpt-t3",
         events=[ev],
         summarized_through_before=5,
-        summary_marker_before="",
-        summary_marker_after="Earlier: agent explored /tmp.",
+        summary_before="",
+        summary_after="Earlier: agent explored /tmp.",
     )
 
     rows = await _fetch_entries(integration_pool, task_id)
@@ -367,10 +374,14 @@ async def test_tier3_fired_emits_compaction_boundary(
 
 
 @pytest.mark.asyncio
-async def test_tier3_second_fire_computes_append_delta(
+async def test_tier3_second_fire_logs_replaced_summary(
     integration_pool: asyncpg.Pool,
 ) -> None:
-    """Second Tier 3 firing within same task: summary_text is the appended delta."""
+    """Second Tier 3 firing within same task: summary_text is the NEW summary.
+
+    Track 7 Follow-up (Task 3) replaces ``summary`` each firing instead of
+    appending, so the conversation-log entry simply records the replacement.
+    """
     task_id = await _seed_task(integration_pool)
     repo = ConversationLogRepository(integration_pool)
 
@@ -387,36 +398,35 @@ async def test_tier3_second_fire_computes_append_delta(
         checkpoint_id="ckpt-t3b",
         events=[ev],
         summarized_through_before=12,
-        summary_marker_before="Earlier: A.",
-        summary_marker_after="Earlier: A.\nLater: B.",
+        summary_before="Earlier: A.",
+        summary_after="Rewritten: combined A + B.",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     import json as _json
     content = _json.loads(rows[0]["content"]) if isinstance(rows[0]["content"], str) else rows[0]["content"]
-    assert content["summary_text"] == "\nLater: B."
+    assert content["summary_text"] == "Rewritten: combined A + B."
 
 
 @pytest.mark.asyncio
-async def test_tier1_and_tier15_events_produce_no_log_entries(
+async def test_empty_events_list_produces_no_log_entries(
     integration_pool: asyncpg.Pool,
 ) -> None:
+    """Track 7 Follow-up (Task 3): with no Tier3Fired / MemoryFlush events
+    the compaction helper produces zero log entries. Tier 1 / Tier 1.5 event
+    types were removed by the replace-and-rehydrate rewrite.
+    """
     task_id = await _seed_task(integration_pool)
     repo = ConversationLogRepository(integration_pool)
-
-    events = [
-        Tier1AppliedEvent(messages_cleared=5, est_tokens_saved=1500, new_watermark=5),
-        Tier15AppliedEvent(args_truncated=3, bytes_saved=4200, new_watermark=5),
-    ]
 
     await _convlog_append_compaction_events(
         repo,
         task_id=task_id,
         tenant_id=TENANT_ID,
         checkpoint_id="ckpt-silent",
-        events=events,
+        events=[],
         summarized_through_before=0,
-        summary_marker_before="",
-        summary_marker_after="",
+        summary_before="",
+        summary_after="",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     assert rows == []
@@ -442,8 +452,8 @@ async def test_memory_flush_event_emits_memory_flush_entry(
         checkpoint_id="ckpt-mf",
         events=[ev],
         summarized_through_before=0,
-        summary_marker_before="",
-        summary_marker_after="",
+        summary_before="",
+        summary_after="",
     )
     rows = await _fetch_entries(integration_pool, task_id)
     assert len(rows) == 1
@@ -451,6 +461,125 @@ async def test_memory_flush_event_emits_memory_flush_entry(
     import json as _json
     metadata = _json.loads(rows[0]["metadata"]) if isinstance(rows[0]["metadata"], str) else rows[0]["metadata"]
     assert metadata["fired_at_step"] == 8
+
+
+@pytest.mark.asyncio
+async def test_tier3_fired_emits_task_compaction_event(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """Tier 3 firings surface in the Execution History tab via task_events."""
+    task_id = await _seed_task(integration_pool)
+
+    ev = Tier3FiredEvent(
+        summarizer_model_id="claude-haiku-4-5",
+        tokens_in=91_426,
+        tokens_out=1_445,
+        new_summarized_through=42,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+    )
+    await _emit_compaction_task_events(
+        pool=integration_pool,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+        worker_id=WORKER_ID,
+        events=[ev],
+        summarized_through_before=10,
+        summary_after="Earlier: agent explored files.",
+    )
+
+    async with integration_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT event_type, details::jsonb as details, worker_id "
+            "FROM task_events WHERE task_id = $1::uuid ORDER BY created_at",
+            task_id,
+        )
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "task_compaction_fired"
+    assert rows[0]["worker_id"] == WORKER_ID
+    import json as _json
+    details = _json.loads(rows[0]["details"]) if isinstance(rows[0]["details"], str) else rows[0]["details"]
+    assert details["tier"] == 3
+    assert details["tokens_in"] == 91_426
+    assert details["tokens_out"] == 1_445
+    assert details["turns_summarized"] == 32  # 42 - 10
+    assert details["first_turn_index"] == 10
+    assert details["last_turn_index"] == 42
+    assert details["summarizer_model_id"] == "claude-haiku-4-5"
+    assert details["summary_bytes"] == len("Earlier: agent explored files.".encode("utf-8"))
+
+
+@pytest.mark.asyncio
+async def test_tier3_fired_task_event_dedups_on_replay(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """Replay of the same Tier-3 firing must not insert a second task_event row.
+
+    Regression guard: without dedup, a crash between the task_event INSERT
+    and the LangGraph checkpoint commit causes the replay to re-invoke
+    ``_emit_compaction_task_events`` and double-mark the Execution History
+    tab.
+    """
+    task_id = await _seed_task(integration_pool)
+
+    ev = Tier3FiredEvent(
+        summarizer_model_id="claude-haiku-4-5",
+        tokens_in=1_000,
+        tokens_out=200,
+        new_summarized_through=42,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+    )
+    for _ in range(3):
+        await _emit_compaction_task_events(
+            pool=integration_pool,
+            task_id=task_id,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            worker_id=WORKER_ID,
+            events=[ev],
+            summarized_through_before=10,
+            summary_after="summary text",
+        )
+
+    async with integration_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = $1::uuid AND event_type = 'task_compaction_fired'",
+            task_id,
+        )
+    assert count == 1, (
+        f"expected exactly one task_compaction_fired row per (task, watermark) "
+        f"across replays; got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_tier3_events_do_not_emit_task_event(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """MemoryFlushFired alone — no task_compaction_fired row."""
+    task_id = await _seed_task(integration_pool)
+
+    await _emit_compaction_task_events(
+        pool=integration_pool,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+        worker_id=WORKER_ID,
+        events=[MemoryFlushFiredEvent(fired_at_step=1)],
+        summarized_through_before=0,
+        summary_after="",
+    )
+    async with integration_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT event_type FROM task_events WHERE task_id = $1::uuid",
+            task_id,
+        )
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -470,8 +599,8 @@ async def test_memory_flush_event_dedups_within_task(
             checkpoint_id="ckpt-dup",
             events=[ev],
             summarized_through_before=0,
-            summary_marker_before="",
-            summary_marker_after="",
+            summary_before="",
+            summary_after="",
         )
     rows = await _fetch_entries(integration_pool, task_id)
     assert len(rows) == 1
