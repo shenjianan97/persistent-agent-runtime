@@ -682,3 +682,243 @@ def test_summarize_result_skipped_has_no_text():
     )
     assert r.summary_text is None
     assert r.skipped is True
+
+
+# ---------------------------------------------------------------------------
+# Prompt guidance — homogeneous-batch collapse
+#
+# These tests verify that the prompt text the summarizer LLM actually sees
+# asks for collapse of homogeneous tool_call batches and preservation of
+# one-off individual calls. The collapse behavior itself is a prompt-only
+# contract — these tests capture the prompt at invocation time and assert
+# on its contents.
+# ---------------------------------------------------------------------------
+
+
+def _capture_invocation_prompt(captured: dict) -> Any:
+    """Build an ainvoke side_effect that captures the prompt messages sent to the LLM."""
+    fake_response = _make_fake_llm_response("stub summary")
+
+    async def side_effect(messages, config=None):
+        captured["messages"] = messages
+        return fake_response
+
+    return side_effect
+
+
+def _make_homogeneous_read_url_batch(n: int) -> AIMessage:
+    """AIMessage with n homogeneous read_url tool_calls on Wikipedia article paths."""
+    topics = [
+        "Ancient_Egypt", "Ancient_Rome", "Ancient_Greece", "Byzantine_Empire",
+        "Ottoman_Empire", "Mongol_Empire", "British_Empire", "Roman_Republic",
+        "Han_dynasty", "Tang_dynasty", "Ming_dynasty", "Qing_dynasty",
+        "Mauryan_Empire", "Gupta_Empire", "Persian_Empire", "Aztec_Empire",
+        "Inca_Empire", "Maya_civilization", "Sumer", "Babylonia",
+    ]
+    tool_calls = []
+    for i in range(n):
+        topic = topics[i % len(topics)]
+        tool_calls.append(
+            {
+                "id": f"call_hom_{i}",
+                "name": "read_url",
+                "args": {"url": f"https://en.wikipedia.org/wiki/{topic}"},
+            }
+        )
+    return AIMessage(
+        content="Fetching historical context in parallel.",
+        tool_calls=tool_calls,
+    )
+
+
+@pytest.mark.asyncio
+async def test_prompt_instructs_collapse_of_homogeneous_tool_call_batches():
+    """A middle region with 20 homogeneous read_url tool_calls: the prompt the LLM
+    receives must contain explicit guidance to collapse homogeneous batches
+    (count + pattern) rather than list each call.
+    """
+    ledger = _FakeCostLedger()
+    ai_msg = _make_homogeneous_read_url_batch(20)
+    slice_msgs: list[BaseMessage] = [
+        HumanMessage(content="Give me an overview of major ancient civilizations."),
+        ai_msg,
+        # One ToolMessage so the slice has the shape of a real middle
+        _make_tool_message("page body ...", tool_call_id="call_hom_0", name="read_url"),
+    ]
+
+    captured: dict = {}
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=_capture_invocation_prompt(captured))
+        mock_init.return_value = mock_llm
+
+        await summarize_slice(
+            slice_messages=slice_msgs,
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+        )
+
+    assert "messages" in captured, "LLM was not invoked"
+    messages = captured["messages"]
+    assert len(messages) >= 2
+    system_text = messages[0].content
+    user_text = messages[1].content
+
+    # System prompt must carry the core collapse contract.
+    lowered_system = system_text.lower()
+    assert "collapse" in lowered_system, (
+        "System prompt must explicitly instruct collapse of homogeneous batches"
+    )
+    assert "homogeneous" in lowered_system, (
+        "System prompt must use the word 'homogeneous' (or equivalent) to describe the batches"
+    )
+    # The pattern concept — counts + shared arg template — must be present.
+    assert "count" in lowered_system and "pattern" in lowered_system, (
+        "System prompt must ask for count + pattern as the collapse form"
+    )
+    # A concrete anti-pattern example: re-listing individual URLs is what we are
+    # trying to stop. The prompt should either show a BAD example or explicitly
+    # forbid re-listing the members of a batch.
+    assert "re-list" in lowered_system or "list each" in lowered_system or "bad" in lowered_system, (
+        "System prompt should explicitly forbid re-listing batch members"
+    )
+
+    # The user-message framing should reinforce collapse (belt + suspenders —
+    # the batch arrives in the serialized history, so the reminder is at the
+    # point where the LLM will see the temptation to copy the list verbatim).
+    lowered_user = user_text.lower()
+    assert "collapse" in lowered_user or "count + pattern" in lowered_user, (
+        "User-message framing must reinforce the collapse instruction"
+    )
+
+    # Sanity: the full serialized history did get passed through to the LLM,
+    # including (some of) the homogeneous URLs, so it has the raw material to
+    # collapse. We don't require all 20 — just that the history was attached.
+    assert "en.wikipedia.org" in user_text
+    assert "read_url" in user_text
+
+
+@pytest.mark.asyncio
+async def test_prompt_preserves_individual_nonbatch_tool_calls():
+    """A middle region with a single heterogeneous write_file: the prompt must
+    instruct preservation of individual tool calls that carry unique
+    information (single writes, memory_notes, etc.), NOT collapse them.
+    """
+    ledger = _FakeCostLedger()
+    write_ai = AIMessage(
+        content="Writing the analysis result to disk.",
+        tool_calls=[
+            {
+                "id": "call_write_1",
+                "name": "write_file",
+                "args": {
+                    "path": "/workspace/report.md",
+                    "content": "# Report\n\nFindings: ...",
+                },
+            }
+        ],
+    )
+    slice_msgs: list[BaseMessage] = [
+        HumanMessage(content="Save the findings to a file."),
+        write_ai,
+        _make_tool_message("wrote 128 bytes", tool_call_id="call_write_1", name="write_file"),
+    ]
+
+    captured: dict = {}
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=_capture_invocation_prompt(captured))
+        mock_init.return_value = mock_llm
+
+        await summarize_slice(
+            slice_messages=slice_msgs,
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+        )
+
+    assert "messages" in captured, "LLM was not invoked"
+    messages = captured["messages"]
+    system_text = messages[0].content
+    user_text = messages[1].content
+
+    lowered_system = system_text.lower()
+    # The prompt must distinguish unique individual calls from homogeneous batches
+    # and explicitly preserve them. These names are called out in the rule body.
+    assert "write_file" in lowered_system or "write_file / edit_file" in lowered_system, (
+        "System prompt must name write_file as an individual-call keeper example"
+    )
+    assert "memory_note" in lowered_system or "save_memory" in lowered_system, (
+        "System prompt must name memory_note/save_memory as keeper examples"
+    )
+    # The preservation predicate — if removal would lose information, keep it.
+    assert (
+        "non-redundant" in lowered_system
+        or "cannot reconstruct" in lowered_system
+        or "cannot re-derive" in lowered_system
+        or "cannot cheaply re-derive" in lowered_system
+    ), (
+        "System prompt must articulate the preservation predicate (remove-would-lose-info)"
+    )
+    # Decisions, user intent, preferences — explicitly preserved.
+    assert "decisions" in lowered_system
+    assert "user" in lowered_system and (
+        "intent" in lowered_system or "preference" in lowered_system
+    ), "System prompt must preserve user intent / preferences"
+
+    # The serialized history is attached to the user message.
+    assert "write_file" in user_text
+    assert "/workspace/report.md" in user_text
+
+
+@pytest.mark.asyncio
+async def test_prompt_includes_prior_summary_merge_guidance():
+    """When the caller ever wires in a prior summary (e.g. via a PRIOR_SUMMARY:
+    SystemMessage at the head of the slice, or a future prior_summary kwarg),
+    the prompt must tell the summarizer to merge — not concatenate.
+    """
+    ledger = _FakeCostLedger()
+    # Place a summary SystemMessage at the head to simulate prior-summary carry-through.
+    slice_msgs: list[BaseMessage] = [
+        SystemMessage(content="PRIOR_SUMMARY: Agent previously inventoried 10 files under /src."),
+        HumanMessage(content="Continue and list each file's top-level function."),
+        _make_ai_message_with_tool_call("Reading first file.", "read_file", {"path": "/src/a.py"}),
+        _make_tool_message("def foo(): ...", "call_abc123", "read_file"),
+    ]
+
+    captured: dict = {}
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=_capture_invocation_prompt(captured))
+        mock_init.return_value = mock_llm
+
+        await summarize_slice(
+            slice_messages=slice_msgs,
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+        )
+
+    system_text = captured["messages"][0].content.lower()
+    assert "prior" in system_text and "summary" in system_text, (
+        "System prompt must reference prior-summary handling"
+    )
+    assert "merge" in system_text, (
+        "System prompt must instruct merging (not concatenation) of prior + new"
+    )
+    assert "concatenation" in system_text or "concatenate" in system_text or "not a concatenation" in system_text, (
+        "System prompt should explicitly contrast merge vs concatenation"
+    )

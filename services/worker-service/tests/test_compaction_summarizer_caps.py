@@ -374,7 +374,10 @@ async def test_no_warn_when_finish_reason_missing():
 def test_prompt_states_token_budget():
     """Budget must be stated in tokens, not words — tokens are the load-bearing unit."""
     assert "token" in SUMMARIZER_PROMPT.lower()
-    assert "500" in SUMMARIZER_PROMPT
+    # The cap is SUMMARIZER_MAX_OUTPUT_TOKENS (1500) — the literal number must
+    # appear so the model has a concrete target rather than a vague "keep it
+    # short".
+    assert "1500" in SUMMARIZER_PROMPT
 
 
 def test_prompt_warns_about_truncation():
@@ -382,10 +385,13 @@ def test_prompt_warns_about_truncation():
     assert "truncat" in SUMMARIZER_PROMPT.lower()
 
 
-def test_prompt_instructs_preserve_recent_when_forced_to_choose():
-    """Prompt must instruct preserving the most recent facts on truncation."""
+def test_prompt_instructs_homogeneous_batch_collapse_when_forced_to_choose():
+    """Prompt must instruct collapsing homogeneous tool_call batches — the
+    primary mechanism for keeping output under the cap when the slice is
+    dominated by mass-parallel tool usage."""
     lowered = SUMMARIZER_PROMPT.lower()
-    assert "recent" in lowered
+    assert "collapse" in lowered
+    assert "homogeneous" in lowered or "count + pattern" in lowered
 
 
 def test_prompt_contains_concrete_example():
