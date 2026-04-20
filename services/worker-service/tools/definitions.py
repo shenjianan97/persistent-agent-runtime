@@ -20,7 +20,7 @@ from tools.memory_tools import (
     MEMORY_SEARCH_DESCRIPTION,
     TASK_HISTORY_GET_DESCRIPTION,
 )
-from tools.providers.search import DuckDuckGoSearchProvider, SearchProvider, SearchResult
+from tools.providers.search import SearchProvider, SearchResult, TavilySearchProvider
 from tools.read_url import ReadUrlFetcher
 from tools.runtime_logging import get_tools_logger
 from tools.upload_artifact import CreateTextArtifactArguments, CreateTextArtifactResult
@@ -311,7 +311,7 @@ LOGGER = get_tools_logger()
 
 def create_default_dependencies() -> ToolDependencies:
     return ToolDependencies(
-        search_provider=DuckDuckGoSearchProvider(),
+        search_provider=TavilySearchProvider(),
         read_url_fetcher=ReadUrlFetcher(),
     )
 
