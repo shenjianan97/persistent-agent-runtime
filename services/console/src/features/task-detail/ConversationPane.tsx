@@ -29,7 +29,7 @@ import type {
 // enough to trigger Tier 3 compaction — easily blows past that cap, at which
 // point newer entries (tool_call / tool_result / agent_turn / compaction_
 // boundary itself) would never reach the Console without pagination. The
-// client walks `next_after_sequence` until the server stops setting it.
+// client walks `next_sequence` until the server stops setting it.
 async function fetchAllConversation(
     taskId: string,
 ): Promise<ConversationListResponse> {
@@ -45,10 +45,10 @@ async function fetchAllConversation(
         if (page.entries?.length) {
             all.push(...page.entries);
         }
-        if (typeof page.next_after_sequence !== 'number') {
+        if (typeof page.next_sequence !== 'number') {
             break;
         }
-        cursor = page.next_after_sequence;
+        cursor = page.next_sequence;
     }
     return { entries: all };
 }

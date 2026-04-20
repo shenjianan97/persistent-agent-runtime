@@ -489,5 +489,5 @@ export interface ConversationEntry {
 export interface ConversationListResponse {
     entries: ConversationEntry[];
     /** Present when more entries exist past the requested window. */
-    next_after_sequence?: number;
+    next_sequence?: number;
 }
