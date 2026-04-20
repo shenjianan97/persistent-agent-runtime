@@ -261,6 +261,13 @@ export interface ContextManagementConfig {
     summarizer_model?: string;
     exclude_tools?: string[];
     pre_tier3_memory_flush?: boolean;
+    /**
+     * Track 7 Follow-up (Task 4) — Tier 0 ingestion offload kill switch.
+     * Default `true` (applied server-side when absent). Not rendered in v1;
+     * field exists to preserve round-trip stability of the `context_management`
+     * sub-object when the worker writes it back into `agent_config`.
+     */
+    offload_tool_results?: boolean;
 }
 
 export interface AgentConfig {

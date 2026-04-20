@@ -14,19 +14,21 @@ State schema:
     _summary_marker_strict_append_reducer
 
 Platform defaults:
-    KEEP_TOOL_USES, PLATFORM_EXCLUDE_TOOLS, TRUNCATABLE_TOOL_ARG_KEYS,
-    ARG_TRUNCATION_CAP_BYTES, TIER_3_MAX_FIRINGS_PER_TASK,
+    KEEP_TOOL_USES, PLATFORM_EXCLUDE_TOOLS, TRUNCATABLE_ARG_KEYS,
+    TRUNCATABLE_TOOL_ARG_KEYS (alias), ARG_TRUNCATION_CAP_BYTES,
+    OFFLOAD_THRESHOLD_BYTES, TIER_3_MAX_FIRINGS_PER_TASK,
     get_platform_default_summarizer_model
 
 Threshold resolution:
     resolve_thresholds, Thresholds
 
-Per-tool-result cap:
-    cap_tool_result, CapEvent
-
-Tier 1 / 1.5 transforms:
+Tier 1 transforms:
     clear_tool_results, ClearResult
-    truncate_tool_call_args, TruncateResult
+
+Tier 0 ingestion offload (Track 7 Follow-up, Task 4):
+    offload_tool_message, offload_ai_message_args, OffloadOutcome,
+    OffloadEvent, ToolResultArtifactStore, S3ToolResultStore,
+    InMemoryToolResultStore, parse_tool_result_uri, ToolResultURI
 
 Tier 3 summarizer:
     summarize_slice, SummarizeResult
@@ -56,10 +58,12 @@ from executor.compaction.state import (
 from executor.compaction.defaults import (
     ARG_TRUNCATION_CAP_BYTES,
     KEEP_TOOL_USES,
+    OFFLOAD_THRESHOLD_BYTES,
     PLATFORM_DEFAULT_SUMMARIZER_MODEL,
     PLATFORM_EXCLUDE_TOOLS,
     SUMMARIZER_MAX_RETRIES,
     TIER_3_MAX_FIRINGS_PER_TASK,
+    TRUNCATABLE_ARG_KEYS,
     TRUNCATABLE_TOOL_ARG_KEYS,
     get_platform_default_summarizer_model,
 )
@@ -70,18 +74,29 @@ from executor.compaction.defaults import (
 from executor.compaction.thresholds import Thresholds, resolve_thresholds
 
 # ---------------------------------------------------------------------------
-# Per-tool-result cap
-# ---------------------------------------------------------------------------
-from executor.compaction.caps import CapEvent, cap_tool_result
-
-# ---------------------------------------------------------------------------
-# Tier 1 / 1.5 transforms
+# Tier 1 transforms
 # ---------------------------------------------------------------------------
 from executor.compaction.transforms import (
     ClearResult,
-    TruncateResult,
     clear_tool_results,
-    truncate_tool_call_args,
+)
+
+# ---------------------------------------------------------------------------
+# Tier 0 ingestion offload (Track 7 Follow-up, Task 4)
+# ---------------------------------------------------------------------------
+from executor.compaction.ingestion import (
+    OffloadEvent,
+    OffloadOutcome,
+    offload_ai_message_args,
+    offload_tool_message,
+    offload_tool_messages_batch,
+)
+from executor.compaction.tool_result_store import (
+    InMemoryToolResultStore,
+    S3ToolResultStore,
+    ToolResultArtifactStore,
+    ToolResultURI,
+    parse_tool_result_uri,
 )
 
 # ---------------------------------------------------------------------------
@@ -116,7 +131,9 @@ __all__ = [
     "_summary_marker_strict_append_reducer",
     # Defaults
     "KEEP_TOOL_USES",
+    "OFFLOAD_THRESHOLD_BYTES",
     "PLATFORM_EXCLUDE_TOOLS",
+    "TRUNCATABLE_ARG_KEYS",
     "TRUNCATABLE_TOOL_ARG_KEYS",
     "ARG_TRUNCATION_CAP_BYTES",
     "TIER_3_MAX_FIRINGS_PER_TASK",
@@ -126,14 +143,20 @@ __all__ = [
     # Thresholds
     "Thresholds",
     "resolve_thresholds",
-    # Cap
-    "CapEvent",
-    "cap_tool_result",
     # Transforms
     "ClearResult",
-    "TruncateResult",
     "clear_tool_results",
-    "truncate_tool_call_args",
+    # Ingestion offload (Track 7 Follow-up, Task 4)
+    "OffloadEvent",
+    "OffloadOutcome",
+    "offload_ai_message_args",
+    "offload_tool_message",
+    "offload_tool_messages_batch",
+    "ToolResultArtifactStore",
+    "ToolResultURI",
+    "InMemoryToolResultStore",
+    "S3ToolResultStore",
+    "parse_tool_result_uri",
     # Summarizer
     "SummarizeResult",
     "summarize_slice",

@@ -48,5 +48,16 @@ public record ContextManagementConfigRequest(
          * runtime gating is the worker's responsibility (Task 9).
          */
         @JsonProperty("pre_tier3_memory_flush")
-        Boolean preTier3MemoryFlush) {
+        Boolean preTier3MemoryFlush,
+
+        /**
+         * Optional kill-switch for Tier 0 ingestion offload of oversized tool results
+         * and oversized tool-call args (Track 7 Follow-up, Task 4). Default {@code true}
+         * — when {@code null} the worker applies {@code true}. Set {@code false} to keep
+         * all tool-result content and tool-call args inline regardless of size (matches
+         * pre-Follow-up behaviour). Not Console-editable in v1; operators needing to
+         * disable per-agent use the agent-update API directly.
+         */
+        @JsonProperty("offload_tool_results")
+        Boolean offloadToolResults) {
 }

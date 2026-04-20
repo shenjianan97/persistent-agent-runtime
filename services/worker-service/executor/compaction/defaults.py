@@ -25,20 +25,30 @@ MIN_TIER_SEPARATION_TOKENS: int = 2_000
 # Most recent tool-use turns kept intact (never cleared by Tier 1).
 KEEP_TOOL_USES: int = 3
 
-# Hard byte cap enforced at tool-result ingestion (head + tail truncation).
+# Byte threshold above which a tool RESULT or a string-valued tool-call ARG
+# is offloaded to S3 at ingestion time (Phase 2 Track 7 Follow-up, Task 4).
+# Replaces the legacy PER_TOOL_RESULT_CAP_BYTES head+tail 25KB trim.
 # Measured in bytes (not tokens) because it applies at tool-execution time
-# before any tokenization. 25,000 bytes ≈ 6–8K tokens on most tokenizers.
-PER_TOOL_RESULT_CAP_BYTES: int = 25_000
+# before any tokenization. 20,000 bytes ≈ 5–6K tokens on most tokenizers.
+OFFLOAD_THRESHOLD_BYTES: int = 20_000
 
-# Tool-call argument keys subject to Tier 1.5 truncation. Agents rarely need to
-# re-read their own inputs once the tool has executed.
-TRUNCATABLE_TOOL_ARG_KEYS: frozenset[str] = frozenset({
+# Tool-call argument keys subject to Tier 0 ingestion offload (Track 7
+# Follow-up, Task 4). Agents rarely need to re-read their own inputs once
+# the tool has executed, so offloading these to S3 and replacing with a
+# reference + preview is safe. Non-truncatable keys (path, query,
+# search_phrase, ...) are never offloaded even when oversized.
+TRUNCATABLE_ARG_KEYS: frozenset[str] = frozenset({
     "content",
     "new_string",
     "old_string",
     "text",
     "body",
 })
+
+# Back-compat alias — legacy name used by Track 7 Tier 1.5 code. Kept so that
+# call sites still scheduled for deletion in Task 3 continue to import
+# cleanly. Remove once Tier 1.5 is fully retired.
+TRUNCATABLE_TOOL_ARG_KEYS: frozenset[str] = TRUNCATABLE_ARG_KEYS
 
 # Byte threshold above which a truncatable argument in an older turn is
 # replaced with "[N bytes — arg truncated after step K]".
@@ -108,8 +118,10 @@ assert 0 < TIER_1_TRIGGER_FRACTION < TIER_3_TRIGGER_FRACTION < 1.0
 assert OUTPUT_BUDGET_RESERVE_TOKENS >= 0
 assert MIN_TIER_SEPARATION_TOKENS > 0
 assert KEEP_TOOL_USES >= 1
-assert PER_TOOL_RESULT_CAP_BYTES > 0
+assert OFFLOAD_THRESHOLD_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
+assert isinstance(TRUNCATABLE_ARG_KEYS, frozenset)
+assert len(TRUNCATABLE_ARG_KEYS) > 0
 assert SUMMARIZER_MAX_RETRIES >= 0
 assert SUMMARIZER_MAX_OUTPUT_TOKENS > 0
 assert SUMMARIZER_INPUT_HEADROOM_TOKENS > 0
