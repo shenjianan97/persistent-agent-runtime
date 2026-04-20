@@ -11,6 +11,7 @@ import {
     ChevronDown,
     ChevronRight,
     AlertTriangle,
+    Archive,
 } from 'lucide-react';
 
 import { api } from '@/api/client';
@@ -67,7 +68,15 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<ConversationEntryKind>([
     'hitl_pause',
     'hitl_resume',
     'system_note',
+    'offload_emitted',
 ]);
+
+function formatByteCount(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    if (bytes < 1024) return `${Math.round(bytes)} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 // ─── Expand/collapse fold ──────────────────────────────────────────
 
@@ -307,6 +316,30 @@ function HitlResumeBanner({ entry }: { entry: ConversationEntry }) {
     );
 }
 
+function OffloadEmittedBanner({ entry }: { entry: ConversationEntry }) {
+    // Payload shape (Task 5 §8): {count, total_bytes, step_index}.
+    const rawCount = entry.content.count;
+    const rawBytes = entry.content.total_bytes;
+    const count = typeof rawCount === 'number' ? rawCount : Number(rawCount) || 0;
+    const totalBytes = typeof rawBytes === 'number' ? rawBytes : Number(rawBytes) || 0;
+    const label =
+        count === 1
+            ? `1 older tool output archived (${formatByteCount(totalBytes)})`
+            : `${count} older tool outputs archived (${formatByteCount(totalBytes)})`;
+    return (
+        <div
+            data-testid="conversation-entry-offload_emitted"
+            className="flex items-center gap-2 text-xs font-mono text-muted-foreground/80 py-1.5 px-2 animate-in fade-in duration-300"
+        >
+            <Archive className="w-3 h-3 shrink-0" />
+            <span className="truncate">— {label} —</span>
+            <span className="ml-auto tabular-nums">
+                {new Date(entry.created_at).toLocaleTimeString()}
+            </span>
+        </div>
+    );
+}
+
 function SystemNoteBanner({ entry }: { entry: ConversationEntry }) {
     const text = asString(entry.content.text, '');
     return (
@@ -368,6 +401,8 @@ function ConversationEntryRow({ entry }: { entry: ConversationEntry }) {
             return <HitlResumeBanner entry={entry} />;
         case 'system_note':
             return <SystemNoteBanner entry={entry} />;
+        case 'offload_emitted':
+            return <OffloadEmittedBanner entry={entry} />;
         default:
             return <UnknownEntryBanner entry={entry} />;
     }

@@ -442,7 +442,11 @@ export type ConversationEntryKind =
     | 'memory_flush'
     | 'hitl_pause'
     | 'hitl_resume'
-    | 'system_note';
+    | 'system_note'
+    // Phase 2 Track 7 Follow-up Task 5 — one entry per ingestion-offload
+    // pass that moved ≥1 tool result / arg to S3. Compact inline notice
+    // (smaller than a Tier 3 boundary, not a full divider).
+    | 'offload_emitted';
 
 /**
  * Metadata attached to a conversation entry. Shape is intentionally permissive:
@@ -459,6 +463,11 @@ export interface ConversationEntryMetadata {
     tier3_firing_index?: number;
     first_turn_index?: number;
     last_turn_index?: number;
+    // offload_emitted — the content is the authoritative payload; metadata
+    // stays empty in v1. Declared here so render sites can opt into a
+    // roll-up summary without a type cast.
+    offload_count?: number;
+    offload_total_bytes?: number;
     [key: string]: unknown;
 }
 

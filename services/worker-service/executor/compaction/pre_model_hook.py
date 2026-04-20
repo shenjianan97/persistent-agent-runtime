@@ -61,6 +61,137 @@ from executor.compaction.defaults import (
 
 
 # ---------------------------------------------------------------------------
+# Option C — reference-replacement for recalled ToolMessages absorbed into
+# ``summary``. Exported so Task 5's tests can exercise it directly without
+# running the full hook.
+# ---------------------------------------------------------------------------
+
+
+def _is_recalled_tool_message(msg: BaseMessage) -> bool:
+    """Return True when ``msg`` is a ``recall_tool_result`` output."""
+    if not isinstance(msg, ToolMessage):
+        return False
+    kwargs = getattr(msg, "additional_kwargs", None) or {}
+    return bool(kwargs.get("recalled"))
+
+
+def _reference_placeholder(original_tool_call_id: str) -> str:
+    """Return the canonical Option C reference string.
+
+    Shared between :func:`option_c_reference_replacement` and tests so the
+    exact wording stays aligned. Keeping the original ``tool_call_id``
+    inline lets the agent re-issue ``recall_tool_result`` to fetch the full
+    content again if it still needs it post-summarisation.
+    """
+    return (
+        f"[recalled content summarized; full content remains at original "
+        f"tool_call_id='{original_tool_call_id}']"
+    )
+
+
+def option_c_reference_replacement(
+    raw_messages: list[BaseMessage],
+    *,
+    previous_summarized_through: int,
+    new_summarized_through: int,
+) -> list[BaseMessage]:
+    """Return replacement ``ToolMessage``s for any recalled messages
+    absorbed into the new summary window.
+
+    This is the ONE sanctioned mutation to ``state["messages"]`` under the
+    replace-and-rehydrate architecture — everywhere else the durable journal
+    is strictly append-only. The mutation is executed via LangGraph's
+    ``add_messages`` reducer: we return ``ToolMessage`` instances whose
+    ``id`` matches the original, and the reducer replaces them in place.
+
+    Parameters
+    ----------
+    raw_messages:
+        ``state["messages"]`` at entry to the compaction pass. Read-only.
+    previous_summarized_through:
+        The watermark BEFORE this compaction firing.
+    new_summarized_through:
+        The watermark after this firing — typically ``keep_window_start``.
+
+    Returns
+    -------
+    list[BaseMessage]
+        Zero or more replacement ``ToolMessage`` instances. An empty list
+        means no recalled messages fell within the newly-summarised range
+        (the common case — most tasks never call the recall tool).
+    """
+    if new_summarized_through <= previous_summarized_through:
+        return []
+
+    start = max(0, previous_summarized_through)
+    end = min(len(raw_messages), new_summarized_through)
+    if start >= end:
+        return []
+
+    replacements: list[BaseMessage] = []
+    for i in range(start, end):
+        msg = raw_messages[i]
+        if not _is_recalled_tool_message(msg):
+            continue
+        existing_kwargs: dict[str, Any] = dict(
+            getattr(msg, "additional_kwargs", None) or {}
+        )
+        # Idempotent: if this ToolMessage has already been reference-
+        # replaced (a prior firing touched it), skip it so we don't
+        # churn the id through the reducer again.
+        if existing_kwargs.get("content_offloaded"):
+            continue
+        original_id = existing_kwargs.get("original_tool_call_id", "")
+        existing_kwargs["content_offloaded"] = True
+        replacement = ToolMessage(
+            content=_reference_placeholder(original_id),
+            tool_call_id=getattr(msg, "tool_call_id", "") or "",
+            name=getattr(msg, "name", None),
+            additional_kwargs=existing_kwargs,
+        )
+        # Preserve the message id so ``add_messages`` updates in place
+        # rather than appending a duplicate entry.
+        original_msg_id = getattr(msg, "id", None)
+        if original_msg_id is not None:
+            try:
+                replacement.id = original_msg_id  # type: ignore[attr-defined]
+            except Exception:
+                # BaseModel.__setattr__ is permissive in LangChain; if a
+                # future version tightens it, fall back to a model_copy so
+                # we at least carry the id through.
+                replacement = msg.model_copy(
+                    update={
+                        "content": replacement.content,
+                        "additional_kwargs": existing_kwargs,
+                    }
+                )
+        replacements.append(replacement)
+    return replacements
+
+
+# ---------------------------------------------------------------------------
+# Projection rules for recalled ToolMessages (Task 5 §5):
+#   inside keep window → verbatim (already recalled for a reason)
+#   outside keep window → DROPPED (avoid re-offload/re-recall oscillation)
+# ---------------------------------------------------------------------------
+
+
+def _drop_recalled_outside_keep_window(
+    middle: list[BaseMessage],
+) -> list[BaseMessage]:
+    """Return ``middle`` with any recalled ToolMessages removed.
+
+    Everything in ``middle`` sits BETWEEN ``summarized_through`` and the
+    keep-window start — i.e. outside the keep window. Per Task 5 §5,
+    recalled messages there are dropped from the projection to prevent a
+    re-offload / re-recall loop (the agent would see the placeholder in the
+    keep window, recall it, get the content, and on the next turn it lands
+    back in middle, drops out of view, triggers another recall, etc).
+    """
+    return [m for m in middle if not _is_recalled_tool_message(m)]
+
+
+# ---------------------------------------------------------------------------
 # Event types — returned by the hook, emitted by the caller
 # ---------------------------------------------------------------------------
 
@@ -402,17 +533,6 @@ async def compaction_pre_model_hook(
     ):
         summarized_through += 1
 
-    # Option C hook-point (Task 5).
-    # When Task 5 lands it will, in this function or its caller, replace the
-    # content of recalled ``ToolMessage`` instances whose indices fall below
-    # ``summarized_through`` with a reference string pointing into S3. That
-    # mutation is the SOLE sanctioned write to ``state["messages"]`` under
-    # the replace-and-rehydrate architecture — every other code path must
-    # treat the journal as append-only. Task 3 deliberately leaves this as
-    # a documented no-op so Task 5's implementation can fill in the body
-    # without re-touching the hook.
-    # --- option_c_reference_replacement(raw_messages, summarized_through) ---
-
     # Compute the three regions.
     keep_window_start = find_keep_window_start(raw_messages, keep=KEEP_TOOL_USES)
     # Safety: keep_window_start must be >= summarized_through. If the journal
@@ -423,6 +543,16 @@ async def compaction_pre_model_hook(
 
     middle = list(raw_messages[summarized_through:keep_window_start])
     keep_window = list(raw_messages[keep_window_start:])
+
+    # Task 5 §5 — projection rule for recalled ToolMessages: keep verbatim
+    # inside the keep window (the agent recalled them on purpose and we want
+    # them rendered in full) but DROP them from ``middle``. Letting them sit
+    # in middle would re-expose the full recalled content on every turn until
+    # the next compaction absorbs them — exactly the re-offload / re-recall
+    # loop Task 5's design brief calls out. Once absorbed into ``summary``,
+    # the Option C replacement below keeps the journal entry lossless
+    # (S3 still holds the original bytes).
+    middle = _drop_recalled_outside_keep_window(middle)
 
     # Build the initial projection and estimate tokens.
     projection = _build_projection(
@@ -638,6 +768,26 @@ async def compaction_pre_model_hook(
     state_updates["summary"] = new_summary
     state_updates["summarized_through_turn_index"] = new_summarized_through
     state_updates["tier3_firings_count"] = tier3_firings_count + 1
+
+    # Task 5 §6 — Option C reference-replacement. This is the SOLE sanctioned
+    # mutation to ``state["messages"]`` under the replace-and-rehydrate
+    # architecture; every other code path treats the journal as append-only.
+    # Recalled ``ToolMessage`` instances whose indices fall within the newly-
+    # absorbed window get their content replaced with a short reference
+    # string pointing back at the original ``tool_call_id`` — the full bytes
+    # stay in S3 and a fresh ``recall_tool_result`` call still returns them.
+    # LangGraph's ``add_messages`` reducer performs the replacement by id;
+    # ``option_c_reference_replacement`` preserves the original message id on
+    # every returned instance. The mutation is part of the SAME state update
+    # as ``summary`` / ``summarized_through_turn_index`` so no intermediate
+    # state is ever observed externally.
+    _replacements = option_c_reference_replacement(
+        raw_messages,
+        previous_summarized_through=summarized_through,
+        new_summarized_through=new_summarized_through,
+    )
+    if _replacements:
+        state_updates["messages"] = _replacements
 
     events.append(
         Tier3FiredEvent(

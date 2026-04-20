@@ -143,6 +143,11 @@ from executor.compaction.tool_result_store import (
     S3ToolResultStore,
     ToolResultArtifactStore,
 )
+from executor.builtin_tools import (
+    RECALL_TOOL_RESULT_NAME,
+    RECALL_TOOL_RESULT_SYSTEM_PROMPT_HINT,
+    build_recall_tool_result_tool,
+)
 
 import httpx
 
@@ -436,6 +441,234 @@ async def _convlog_append_compaction_events(
                 content={},
                 metadata={"fired_at_step": int(ev.fired_at_step)},
             )
+
+
+async def _convlog_append_offload_emitted(
+    repo: ConversationLogRepository,
+    *,
+    task_id: str,
+    tenant_id: str,
+    checkpoint_id: str | None,
+    events: tuple,
+    step_index: int,
+) -> None:
+    """Emit one ``offload_emitted`` entry per ingestion-offload pass.
+
+    Track 7 Follow-up Task 5 contract: ONE entry per pass that offloaded
+    ≥1 item — not one per item (the per-item form would spam the log on
+    tasks with many small offloads). Payload is the roll-up:
+
+        content  = {"count": N, "total_bytes": B, "step_index": S}
+
+    ``step_index`` is the agent super-step index (approximated via the
+    journal length so we don't need to thread the LangGraph step counter
+    through the tool-node wrapper). All failures are swallowed by the
+    repository's best-effort envelope.
+    """
+    success_events = [ev for ev in events if getattr(ev, "kind", "") == "success"]
+    if not success_events:
+        return
+    total_bytes = sum(
+        int(getattr(ev, "size_bytes", 0) or 0) for ev in success_events
+    )
+    count = len(success_events)
+    # Deterministic idempotency-ref: the set of URIs uniquely identifies
+    # this pass. Hashing inside ``_convlog_key`` (sha256) folds them into
+    # the final key; we just need the material to be stable under retry.
+    uri_material = "|".join(
+        sorted(str(getattr(ev, "uri", "") or "") for ev in success_events)
+    )
+    origin = f"offload:{step_index}:{uri_material}"
+    key = _convlog_key(
+        task_id=task_id,
+        checkpoint_id=checkpoint_id,
+        origin_ref=origin,
+    )
+    await repo.append_entry(
+        task_id=task_id,
+        tenant_id=tenant_id,
+        checkpoint_id=checkpoint_id,
+        idempotency_key=key,
+        kind="offload_emitted",
+        role="system",
+        content={
+            "count": count,
+            "total_bytes": total_bytes,
+            "step_index": int(step_index),
+        },
+    )
+
+
+def _convlog_checkpoint_id_from_config(config: Any) -> str | None:
+    """Best-effort checkpoint-id extraction from a LangGraph RunnableConfig.
+
+    Falls back to ``None`` when the config shape is unexpected — the convlog
+    repo substitutes the literal ``"init"`` for missing checkpoints so the
+    idempotency hash remains stable.
+    """
+    try:
+        if isinstance(config, dict):
+            configurable = config.get("configurable") or {}
+            ckpt = configurable.get("checkpoint_id")
+            return str(ckpt) if ckpt is not None else None
+    except Exception:
+        return None
+    return None
+
+
+def _convlog_step_index_from_state(state: Any) -> int:
+    """Return a stable super-step index for the current tool-node invocation.
+
+    We use ``len(state["messages"])`` because the LangGraph step counter is
+    not exposed in the RunnableConfig shape we receive here. Message-count-
+    based indexing is coarser than a true step counter but monotone, stable
+    under retry (idempotent key includes URIs so the retry dedups regardless),
+    and sufficient for operator-facing ordering in the Console.
+    """
+    try:
+        if isinstance(state, dict):
+            msgs = state.get("messages")
+            return len(msgs) if msgs is not None else 0
+        msgs = getattr(state, "messages", None)
+        return len(msgs) if msgs is not None else 0
+    except Exception:
+        return 0
+
+
+def _extract_messages(out: Any):
+    """Unpack a ToolNode's ``out`` into (messages_list, rewrap_fn).
+
+    LangGraph ToolNode returns either ``{"messages": [...]}`` or a bare
+    list; we normalise both into a list for downstream per-message work and
+    return a callable that puts everything back into the original shape.
+    """
+    if isinstance(out, dict):
+        msgs = list(out.get("messages") or [])
+
+        def wrap(new_msgs: list) -> dict:
+            return {**out, "messages": new_msgs}
+
+        return msgs, wrap
+    if isinstance(out, list):
+        return list(out), lambda new_msgs: new_msgs
+    # Unknown shape — pass through with no changes.
+    return [], lambda _new: out
+
+
+def _raw_tool_node_input_messages(state: Any) -> list:
+    """Return ``state["messages"]`` in a way tolerant of either shape."""
+    if isinstance(state, dict):
+        return list(state.get("messages") or [])
+    msgs = getattr(state, "messages", None)
+    return list(msgs) if msgs is not None else []
+
+
+def _recall_call_ids_from_state(state: Any) -> dict[str, str]:
+    """Map ``tool_call_id → tool_name`` from the most recent AIMessage.
+
+    Used to decide whether each ToolMessage emitted by the ToolNode
+    corresponds to a ``recall_tool_result`` call — those need to bypass the
+    ingestion offload path and get tagged so the compaction hook can
+    recognise them later.
+    """
+    msgs = _raw_tool_node_input_messages(state)
+    # Scan backward for the most recent AIMessage with tool_calls.
+    for msg in reversed(msgs):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            out: dict[str, str] = {}
+            for call in msg.tool_calls or []:
+                call_id = call.get("id") if isinstance(call, dict) else None
+                call_name = call.get("name") if isinstance(call, dict) else None
+                if isinstance(call_id, str) and isinstance(call_name, str):
+                    out[call_id] = call_name
+            return out
+    return {}
+
+
+def _tag_recall_message(
+    msg: ToolMessage, original_tool_call_id: str
+) -> ToolMessage:
+    """Return a copy of ``msg`` with ``recalled`` metadata applied.
+
+    The tool surface itself returns a plain string (see
+    ``executor.builtin_tools.recall_tool_result``); LangGraph's ToolNode
+    wraps it into a ``ToolMessage`` with the call's id — we use THAT id as
+    ``original_tool_call_id`` so the Option C replacement can point readers
+    back at the right S3 artefact. The ToolMessage also carries a fresh id
+    (assigned by LangGraph later) so add_messages replay semantics stay
+    consistent.
+    """
+    existing_kwargs = dict(getattr(msg, "additional_kwargs", None) or {})
+    existing_kwargs.setdefault("recalled", True)
+    existing_kwargs.setdefault("original_tool_call_id", original_tool_call_id)
+    return msg.model_copy(update={"additional_kwargs": existing_kwargs})
+
+
+def _tag_recall_outputs_in_toolnode_output(out: Any, state_msgs: list) -> Any:
+    """Pass-through variant for the offload-disabled branch.
+
+    Even when offloading is off we still tag the recall-tool's ToolMessage
+    so downstream compaction logic treats it the same way. Mirrors the
+    enabled branch's tagging.
+    """
+    msgs, wrap = _extract_messages(out)
+    if not msgs:
+        return out
+    # Build a map of tool_call_id → tool_name from the most recent AIMessage.
+    name_by_id: dict[str, str] = {}
+    for m in reversed(state_msgs):
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for call in m.tool_calls or []:
+                call_id = call.get("id") if isinstance(call, dict) else None
+                call_name = call.get("name") if isinstance(call, dict) else None
+                if isinstance(call_id, str) and isinstance(call_name, str):
+                    name_by_id[call_id] = call_name
+            break
+    new_msgs: list = []
+    for m in msgs:
+        if isinstance(m, ToolMessage):
+            call_id = getattr(m, "tool_call_id", "") or ""
+            if name_by_id.get(call_id) == RECALL_TOOL_RESULT_NAME:
+                new_msgs.append(_tag_recall_message(m, call_id))
+                continue
+        new_msgs.append(m)
+    return wrap(new_msgs)
+
+
+def _reweave_messages(
+    original: list,
+    recall_msgs: list,
+    offloaded_non_recall: list,
+) -> list:
+    """Recombine the two partitions while preserving the ToolNode's output order.
+
+    ``original`` is the ToolNode output verbatim; ``recall_msgs`` are the
+    recall-tagged ToolMessages (in ``original`` order); ``offloaded_non_recall``
+    is the offload-rewritten list of everything else (also in order).
+    """
+    recall_iter = iter(recall_msgs)
+    other_iter = iter(offloaded_non_recall)
+    # Build a set of tool_call_ids that belong to the recall partition.
+    recall_ids = {
+        getattr(m, "tool_call_id", "") or ""
+        for m in recall_msgs
+        if isinstance(m, ToolMessage)
+    }
+    out: list = []
+    for m in original:
+        if isinstance(m, ToolMessage) and (
+            (getattr(m, "tool_call_id", "") or "") in recall_ids
+        ):
+            try:
+                out.append(next(recall_iter))
+            except StopIteration:
+                out.append(m)
+        else:
+            try:
+                out.append(next(other_iter))
+            except StopIteration:
+                out.append(m)
+    return out
 
 
 class GraphExecutor:
@@ -829,12 +1062,25 @@ class GraphExecutor:
         system_prompt = agent_config.get("system_prompt", "")
         sandbox_template = (agent_config.get("sandbox") or {}).get("template")
 
+        # Track 7 Follow-up (Task 4/5) — resolve the ``offload_tool_results``
+        # flag up front. Default ``true``; explicit ``false`` disables both
+        # ingestion offload and Task 5's ``recall_tool_result`` registration
+        # + system-prompt hint. The store is only constructed when the flag
+        # is on so disabled deployments pay no boto3 / S3 overhead.
+        _cm_cfg = agent_config.get("context_management") or {}
+        _offload_flag = _cm_cfg.get("offload_tool_results")
+        _offload_enabled: bool = True if _offload_flag is None else bool(_offload_flag)
+        _offload_store: ToolResultArtifactStore | None = (
+            S3ToolResultStore(self.s3_client) if _offload_enabled else None
+        )
+
         # Build a separate platform system message with tool instructions
         platform_system_msg = self._build_platform_system_message(
             allowed_tools,
             injected_files=injected_files,
             sandbox_template=sandbox_template,
             memory_decision=memory_decision,
+            offload_tool_results_enabled=_offload_enabled,
         )
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
@@ -922,6 +1168,23 @@ class GraphExecutor:
             auto_write=decision.auto_write,
         )
         tools = tools + [_wrap_tool_with_cap(t) for t in raw_memory_tools]
+
+        # Track 7 Follow-up Task 5 — register ``recall_tool_result`` when the
+        # ingestion-offload flag is on. The tool is closure-bound over
+        # ``(tenant_id, task_id, store)`` so the LLM cannot broaden scope or
+        # point at a different tenant's artifacts. We DO NOT run it through
+        # ``_wrap_tool_with_cap`` (that back-compat decorator is a no-op
+        # under Task 4, but Task 5's output is explicitly exempt from Task
+        # 4's ingestion offload anyway — see the special-case bypass in
+        # ``tool_node`` below).
+        if _offload_enabled and _offload_store is not None:
+            tools.append(
+                build_recall_tool_result_tool(
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    store=_offload_store,
+                )
+            )
 
         # Merge custom tools from MCP servers — cap each one.
         if custom_tools:
@@ -1167,6 +1430,18 @@ class GraphExecutor:
                             log_context=_offload_log_ctx,
                         )
                         response = _offload_outcome.message  # type: ignore[assignment]
+                        # Track 7 Follow-up Task 5 — one ``offload_emitted``
+                        # convlog entry per AIMessage-arg-offload pass with
+                        # ≥1 success. Aligns with the tool-result side in
+                        # ``tool_node``.
+                        await _convlog_append_offload_emitted(
+                            conversation_log_repo,
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            checkpoint_id=_convlog_ckpt_id,
+                            events=_offload_outcome.events,
+                            step_index=len(_raw_state_messages),
+                        )
                     # Track 7 Task 13 — append the agent's response and any
                     # tool-call requests to the user-facing conversation log
                     # BEFORE returning (and therefore before LangGraph
@@ -1274,17 +1549,12 @@ class GraphExecutor:
 
         # Track 7 Follow-up (Task 4) — Tier 0 ingestion offload.
         #
-        # The agent config's ``context_management.offload_tool_results`` flag
-        # (default true) toggles both result-side and arg-side offload for
-        # this graph. We resolve it once here and close over the value so
-        # the ToolNode wrapper and agent_node's AIMessage post-processing
-        # share a single decision.
-        _cm_cfg = (agent_config.get("context_management") or {})
-        _offload_flag = _cm_cfg.get("offload_tool_results")
-        _offload_enabled: bool = True if _offload_flag is None else bool(_offload_flag)
-        _offload_store: ToolResultArtifactStore | None = (
-            S3ToolResultStore(self.s3_client) if _offload_enabled else None
-        )
+        # ``_offload_enabled`` + ``_offload_store`` were resolved at the top
+        # of this method (we pass the flag into the platform system-message
+        # builder and close over the store for the recall tool). The
+        # ToolNode wrapper and agent_node's AIMessage post-processing share
+        # the same pair of values so the three offload sites cannot
+        # disagree.
         _offload_log_ctx = {
             "tenant_id": tenant_id,
             "agent_id": agent_id,
@@ -1305,34 +1575,74 @@ class GraphExecutor:
                 pass through verbatim. When
                 ``context_management.offload_tool_results = false`` this
                 wrapper is a trivial passthrough — no S3 writes.
+
+                Track 7 Follow-up Task 5 — the ``recall_tool_result`` tool's
+                own output BYPASSES this offload path. Re-offloading content
+                the agent explicitly asked to see would create a re-read
+                loop that defeats the purpose. The recall output is tagged
+                with ``additional_kwargs={"recalled": True,
+                "original_tool_call_id": ...}`` so the compaction hook's
+                Option C replacement and the projection rule can recognise
+                it later.
                 """
                 out = await _raw_tool_node.ainvoke(state, config)
                 if not _offload_enabled or _offload_store is None:
+                    # When the flag is off, still tag recall-tool outputs so
+                    # the compaction hook's projection/Option-C logic can
+                    # find them. Re-offload is already disabled in this
+                    # branch.
+                    out = _tag_recall_outputs_in_toolnode_output(
+                        out, _raw_tool_node_input_messages(state)
+                    )
                     return out
-                # LangGraph ToolNode returns either {"messages": [...]} or a
-                # list of messages depending on version. Handle both.
-                if isinstance(out, dict):
-                    msgs = out.get("messages") or []
-                    new_msgs, _events = await offload_tool_messages_batch(
-                        msgs,
-                        store=_offload_store,
-                        tenant_id=tenant_id,
-                        task_id=task_id,
-                        threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
-                        log_context=_offload_log_ctx,
-                    )
-                    return {**out, "messages": new_msgs}
-                if isinstance(out, list):
-                    new_msgs, _events = await offload_tool_messages_batch(
-                        out,
-                        store=_offload_store,
-                        tenant_id=tenant_id,
-                        task_id=task_id,
-                        threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
-                        log_context=_offload_log_ctx,
-                    )
-                    return new_msgs
-                return out
+                # Split the ToolNode output into "recalled" (bypass offload,
+                # tag additional_kwargs) and "other" (route through
+                # offload_tool_messages_batch).
+                msgs, wrap = _extract_messages(out)
+                # Identify the calling AIMessage's tool_calls so we can tell
+                # which ToolMessage corresponds to a ``recall_tool_result``
+                # call. ToolNode preserves tool_call_id on each ToolMessage;
+                # we match by id against the prior AIMessage's tool_calls.
+                call_name_by_id = _recall_call_ids_from_state(state)
+                recall_msgs: list[ToolMessage] = []
+                other_msgs: list[ToolMessage] = []
+                for m in msgs:
+                    if not isinstance(m, ToolMessage):
+                        other_msgs.append(m)  # type: ignore[arg-type]
+                        continue
+                    call_id = getattr(m, "tool_call_id", "") or ""
+                    if call_name_by_id.get(call_id) == RECALL_TOOL_RESULT_NAME:
+                        recall_msgs.append(_tag_recall_message(m, call_id))
+                    else:
+                        other_msgs.append(m)
+
+                new_other, _events = await offload_tool_messages_batch(
+                    other_msgs,
+                    store=_offload_store,
+                    tenant_id=tenant_id,
+                    task_id=task_id,
+                    threshold_bytes=OFFLOAD_THRESHOLD_BYTES,
+                    log_context=_offload_log_ctx,
+                )
+
+                # Best-effort ``offload_emitted`` convlog entry — one entry
+                # per pass with ≥1 successful offload.
+                await _convlog_append_offload_emitted(
+                    conversation_log_repo,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    checkpoint_id=_convlog_checkpoint_id_from_config(config),
+                    events=_events,
+                    step_index=_convlog_step_index_from_state(state),
+                )
+
+                # Rebuild the list in the same order ``ToolNode`` produced —
+                # the graph's downstream agent step assumes per-tool_call_id
+                # pairing stability but does not depend on interleaving of
+                # recall vs other messages (both land in the journal under
+                # the same super-step).
+                recombined = _reweave_messages(msgs, recall_msgs, new_other)
+                return wrap(recombined)
 
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
@@ -1960,11 +2270,16 @@ class GraphExecutor:
         injected_files: list[str] | None = None,
         sandbox_template: str | None = None,
         memory_decision: MemoryDecision | None = None,
+        offload_tool_results_enabled: bool = True,
     ) -> str:
         """Build platform-generated system message with tool instructions.
 
         This is injected as a separate SystemMessage, hidden from the customer's
         system prompt — similar to how Claude Code injects system context.
+
+        ``offload_tool_results_enabled`` (Track 7 Follow-up Task 5): when true,
+        append a short directive telling the agent how to recognise the
+        ingestion-offload placeholders and when to call ``recall_tool_result``.
         """
         sections = []
 
@@ -2038,6 +2353,13 @@ class GraphExecutor:
                     "Skip the call for routine or trivial runs — the absence "
                     "of a call means no memory entry is written."
                 )
+
+        # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended
+        # only when the feature is on so agents running with the flag off
+        # don't see references to a tool they won't find in their tool
+        # list.
+        if offload_tool_results_enabled:
+            sections.append(RECALL_TOOL_RESULT_SYSTEM_PROMPT_HINT)
 
         return "\n\n".join(sections)
 
@@ -2430,6 +2752,20 @@ class GraphExecutor:
                     sandbox_template_for_sys = (
                         agent_config.get("sandbox") or {}
                     ).get("template")
+                    # Track 7 Follow-up Task 5 — mirror the graph-build-time
+                    # resolution so the initial platform SystemMessage shows
+                    # (or hides) the ``recall_tool_result`` hint consistently
+                    # with the tool registration gate in ``_build_graph``.
+                    _cm_cfg_for_sys = (
+                        agent_config.get("context_management") or {}
+                    )
+                    _offload_flag_for_sys = _cm_cfg_for_sys.get(
+                        "offload_tool_results"
+                    )
+                    _offload_enabled_for_sys = (
+                        True if _offload_flag_for_sys is None
+                        else bool(_offload_flag_for_sys)
+                    )
                     platform_system_msg = self._build_platform_system_message(
                         allowed_tools_for_sys,
                         injected_files=(
@@ -2437,6 +2773,7 @@ class GraphExecutor:
                         ),
                         sandbox_template=sandbox_template_for_sys,
                         memory_decision=memory_decision,
+                        offload_tool_results_enabled=_offload_enabled_for_sys,
                     )
                     if agent_system_prompt:
                         initial_messages.append(

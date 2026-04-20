@@ -81,6 +81,11 @@ const ALL_KINDS_RESPONSE: ConversationListResponse = {
             },
         }),
         entry({ sequence: 9, kind: 'system_note', content: { text: 'Task was retried once.' } }),
+        entry({
+            sequence: 10,
+            kind: 'offload_emitted',
+            content: { count: 3, total_bytes: 43_008, step_index: 7 },
+        }),
     ],
 };
 
@@ -129,7 +134,7 @@ afterEach(() => {
 // ─── Tests ─────────────────────────────────────────────────────────
 
 describe('ConversationPane — rendering', () => {
-    it('renders all 9 known kinds with kind-specific testids', async () => {
+    it('renders all known kinds with kind-specific testids', async () => {
         listConversationMock.mockResolvedValue(ALL_KINDS_RESPONSE);
 
         await renderPane({ status: 'completed' });
@@ -145,6 +150,47 @@ describe('ConversationPane — rendering', () => {
         expect(screen.getByTestId('conversation-entry-hitl_pause')).toBeInTheDocument();
         expect(screen.getByTestId('conversation-entry-hitl_resume')).toBeInTheDocument();
         expect(screen.getByTestId('conversation-entry-system_note')).toBeInTheDocument();
+        expect(
+            screen.getByTestId('conversation-entry-offload_emitted'),
+        ).toBeInTheDocument();
+    });
+
+    it('renders the offload_emitted banner with count and byte roll-up', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({
+                    sequence: 1,
+                    kind: 'offload_emitted',
+                    content: { count: 3, total_bytes: 43_008, step_index: 7 },
+                }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+
+        const banner = await screen.findByTestId(
+            'conversation-entry-offload_emitted',
+        );
+        // Count + human-readable byte roll-up (42.0 KB for 43008 bytes).
+        expect(banner).toHaveTextContent(/3 older tool outputs archived/);
+        expect(banner).toHaveTextContent(/42\.0 KB/);
+    });
+
+    it('uses singular copy when a single item was offloaded', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({
+                    sequence: 1,
+                    kind: 'offload_emitted',
+                    content: { count: 1, total_bytes: 20_480, step_index: 2 },
+                }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+        const banner = await screen.findByTestId(
+            'conversation-entry-offload_emitted',
+        );
+        expect(banner).toHaveTextContent(/1 older tool output archived/);
+        expect(banner).not.toHaveTextContent(/tool outputs/);
     });
 
     it('renders user / agent turn text content', async () => {
