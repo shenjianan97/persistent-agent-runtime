@@ -63,6 +63,18 @@ PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
 # re-attempts if the threshold is still exceeded.
 SUMMARIZER_MAX_RETRIES: int = 2
 
+# Hard cap on the Tier 3 summarizer's output tokens, forwarded to the LLM as
+# ``max_tokens``. Acts as a safety net when a model ignores the prompt-level
+# ≤500-token budget. 1500 gives a well-behaved model headroom to wrap up
+# gracefully while capping a pathological runaway at ~3× the target.
+#
+# Sized for today's Track 7 workload (Tier-1-stubbed input). Under the Track 7
+# Follow-up Task 3 replace-and-rehydrate rewrite the summarizer sees raw
+# ``prior_summary + middle`` — 10-50× larger input — so legitimately longer
+# summaries are expected; re-calibrate upward if truncation WARN rate exceeds
+# 5% of firings post-Task 3.
+SUMMARIZER_MAX_OUTPUT_TOKENS: int = 1500
+
 # Maximum number of Tier 3 firings allowed per task. Beyond this cap the
 # pipeline stops invoking the summarizer and falls through to the hard-floor
 # path if the input still exceeds the floor. Bounds worst-case cost for
@@ -89,6 +101,7 @@ assert KEEP_TOOL_USES >= 1
 assert PER_TOOL_RESULT_CAP_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
 assert SUMMARIZER_MAX_RETRIES >= 0
+assert SUMMARIZER_MAX_OUTPUT_TOKENS > 0
 
 
 def get_platform_default_summarizer_model() -> str:

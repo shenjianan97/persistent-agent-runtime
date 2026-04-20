@@ -50,7 +50,10 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from executor.compaction.defaults import SUMMARIZER_MAX_RETRIES
+from executor.compaction.defaults import (
+    SUMMARIZER_MAX_OUTPUT_TOKENS,
+    SUMMARIZER_MAX_RETRIES,
+)
 from executor.compaction.tokens import _extract_text_content as _extract_content_from_value
 
 if TYPE_CHECKING:
@@ -67,9 +70,17 @@ _logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 SUMMARIZER_PROMPT: str = (
-    "You are compressing a portion of an autonomous agent's tool-use history so the\n"
-    "agent can continue the task within its context window. Produce a compact\n"
-    "factual summary (at most 400 words) that preserves:\n"
+    "You are compressing a portion of an autonomous agent's tool-use history so\n"
+    "the agent can continue its task within a limited context window.\n"
+    "\n"
+    "OUTPUT BUDGET (binding): your summary MUST be at most 500 tokens. The\n"
+    "caller enforces this cap at the API layer — any response longer than the\n"
+    "cap is cut off at the cap and the tail is permanently lost. Plan your\n"
+    "summary so the most important facts fit inside the budget. If you must\n"
+    "choose what to drop, drop older context first and preserve the most\n"
+    "recent facts — those are what the agent needs to continue.\n"
+    "\n"
+    "Preserve (in priority order):\n"
     "- Files the agent has created, read, or modified (full paths)\n"
     "- External URLs or API responses whose contents matter for the rest of the task\n"
     "- Decisions the agent has committed to and their reasoning\n"
@@ -79,7 +90,19 @@ SUMMARIZER_PROMPT: str = (
     "Do NOT:\n"
     "- Address the agent in the second person.\n"
     "- Invent next steps or give instructions.\n"
-    "- Comment on the compression itself.\n"
+    "- Comment on the compression itself or on the budget.\n"
+    "\n"
+    "Example of budget failure — DO NOT do this:\n"
+    "  The agent began by reading the project README in full, including the\n"
+    "  introduction, the installation section, the configuration section, the\n"
+    "  usage examples, the troubleshooting appendix, the contributor guide,\n"
+    "  the licensing note, and then [... 600 more tokens of recap ...] and\n"
+    "  finally the agent fixed the bug in auth.py by — <TRUNCATED AT CAP; THE\n"
+    "  FIX AND EVERY FACT AFTER IT IS LOST>.\n"
+    "The correct summary instead leads with the load-bearing recent facts\n"
+    "(files edited, errors fixed, decisions made) and omits the narrative\n"
+    "recap.\n"
+    "\n"
     "Return the summary only."
 )
 
@@ -294,6 +317,38 @@ def _get_retry_after(e: Exception) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+# Finish / stop reasons that indicate the response hit the ``max_tokens`` cap.
+# - ``"length"``     : OpenAI, Bedrock Converse, most OpenAI-compatible APIs.
+# - ``"max_tokens"`` : Anthropic (surfaced as ``stop_reason``).
+# Normal completions are ``"stop"`` (OpenAI) or ``"end_turn"`` (Anthropic) —
+# anything other than the truncation values above is treated as not-truncated.
+_TRUNCATION_FINISH_REASONS: frozenset[str] = frozenset({"length", "max_tokens"})
+
+
+def _is_response_truncated_at_cap(metadata: dict) -> bool:
+    """Return ``True`` when the LLM response indicates truncation at ``max_tokens``.
+
+    Walks the provider-specific keys (OpenAI/Bedrock ``finish_reason`` and
+    Anthropic ``stop_reason``) found either at the top level of
+    ``response_metadata`` or nested inside ``usage_metadata``. Missing reason
+    is treated as not-truncated — we prefer false-negative over false-positive
+    WARN emission so the alert stays actionable.
+    """
+    candidates: list[Any] = [
+        metadata.get("finish_reason"),
+        metadata.get("stop_reason"),
+    ]
+    # Some provider wrappers bury the reason inside usage_metadata
+    nested = metadata.get("usage_metadata")
+    if isinstance(nested, dict):
+        candidates.append(nested.get("finish_reason"))
+        candidates.append(nested.get("stop_reason"))
+    for reason in candidates:
+        if isinstance(reason, str) and reason in _TRUNCATION_FINISH_REASONS:
+            return True
+    return False
+
+
 def _extract_tokens(metadata: dict) -> tuple[int, int]:
     """Return ``(input_tokens, output_tokens)`` from LLM response metadata.
 
@@ -399,6 +454,12 @@ async def summarize_slice(
         temperature=0.2,
         max_retries=0,  # retries handled in our own loop
         timeout=120,
+        # ``max_tokens`` is the safety net for a model that ignores the
+        # prompt-level ≤500-token budget. 1500 caps pathological runaways
+        # at ~3× the target while leaving headroom for well-behaved models
+        # to wrap up gracefully. See docs/exec-plans/active/phase-2/
+        # track-7-follow-up/agent_tasks/task-1-summarizer-prompt-and-caps.md.
+        max_tokens=SUMMARIZER_MAX_OUTPUT_TOKENS,
     )
 
     # ------------------------------------------------------------------ #
@@ -425,6 +486,26 @@ async def summarize_slice(
                 resp_meta.setdefault("usage_metadata", response.usage_metadata)
 
             tokens_in, tokens_out = _extract_tokens(resp_meta)
+
+            # ---------------------------------------------------------- #
+            # 5a. Truncation telemetry                                    #
+            # ---------------------------------------------------------- #
+            # When ``max_tokens=SUMMARIZER_MAX_OUTPUT_TOKENS`` clips the
+            # response, the provider surfaces a truncation finish/stop
+            # reason. Emit a WARN so operators can see the cap firing in
+            # observability; the truncated summary is still consumed
+            # (replace-and-rehydrate tolerates a shorter summary this
+            # firing — next firing re-summarizes from the updated slice).
+            # Repeated firings on the same task are the signal that the
+            # prompt still isn't binding or that the cap needs to rise.
+            if _is_response_truncated_at_cap(resp_meta):
+                _logger.warning(
+                    "compaction.tier3_output_truncated",
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                    tokens_out=tokens_out,
+                )
 
             # Cost rates are intentionally 0 in this standalone module.
             # The caller (Task 8 pipeline / GraphExecutor) is responsible for
