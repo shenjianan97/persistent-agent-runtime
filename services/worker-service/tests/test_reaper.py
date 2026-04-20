@@ -199,3 +199,58 @@ class TestReaperLifecycle:
 
         await reaper.stop()
         assert reaper.running is False
+
+
+class TestReaperDeadLetterClearsHumanResponse:
+    """Regression guard for the redrive duplicate-follow-up bug.
+
+    When a task dead-letters, ``human_response`` MUST be cleared alongside
+    the status flip. If it isn't, a subsequent redrive re-reads the stale
+    payload and re-injects the follow-up's HumanMessage into
+    state["messages"] — but the message was already persisted in the
+    pre-crash checkpoint (durability=sync), so the journal ends up with
+    two copies. Production observed this on task 75f5a223: the second
+    follow-up rendered twice in the Console and the model saw it twice in
+    its prompt.
+
+    The worker-side ``_handle_dead_letter`` path has the same guarantee —
+    see the test in ``test_executor.py`` / graph-level integration tests.
+    """
+
+    def test_reaper_expired_lease_dead_letter_clears_human_response(self):
+        from core.reaper import REAPER_DEAD_LETTER_QUERY
+
+        # Normalise whitespace so the assertion isn't tripped by formatting.
+        sql = " ".join(REAPER_DEAD_LETTER_QUERY.split()).lower()
+        assert "human_response = null" in sql, (
+            "REAPER_DEAD_LETTER_QUERY must clear human_response to stop "
+            "redrive from re-injecting a pending follow-up payload."
+        )
+
+    def test_reaper_timeout_dead_letter_clears_human_response(self):
+        from core.reaper import REAPER_TIMEOUT_QUERY
+
+        sql = " ".join(REAPER_TIMEOUT_QUERY.split()).lower()
+        assert "human_response = null" in sql, (
+            "REAPER_TIMEOUT_QUERY must clear human_response to stop "
+            "redrive from re-injecting a pending follow-up payload."
+        )
+
+    def test_worker_handle_dead_letter_update_clears_human_response(self):
+        """Mirrors the reaper-side guard for the worker's own dead-letter
+        UPDATE in ``TaskExecutor._handle_dead_letter``."""
+        import inspect
+
+        from executor import graph as graph_module
+
+        src = inspect.getsource(graph_module.GraphExecutor._handle_dead_letter)
+        normalised = " ".join(src.split()).lower()
+        # The literal appears inside a triple-quoted SQL string — the
+        # whitespace-collapsing comparison is enough to pin the clause.
+        assert "status='dead_letter'" in normalised
+        assert "human_response=null" in normalised, (
+            "_handle_dead_letter's UPDATE tasks SET ... must clear "
+            "human_response to stop redrive from re-injecting a pending "
+            "follow-up payload. Regression for task 75f5a223 — the second "
+            "follow-up ended up twice in state[\"messages\"] after redrive."
+        )

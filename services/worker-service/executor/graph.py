@@ -4093,6 +4093,16 @@ class GraphExecutor:
                                 )
 
                     # 2. Lease-validated task dead-letter update.
+                    #
+                    # Clear ``human_response`` alongside the status flip so a
+                    # subsequent redrive does NOT re-inject the pending
+                    # follow-up / input / approval payload. The message is
+                    # already in ``state["messages"]`` via the pre-crash
+                    # checkpoint (durability="sync"), so redrive resumes
+                    # with the message present; re-reading human_response
+                    # would duplicate it (observed on task 75f5a223 —
+                    # second follow-up appeared twice in the journal after
+                    # redrive, rendering twice in the Console).
                     updated = await conn.fetchval(
                         '''UPDATE tasks
                            SET status='dead_letter',
@@ -4101,6 +4111,7 @@ class GraphExecutor:
                                last_error_code=$3,
                                last_worker_id=$4,
                                dead_lettered_at=NOW(),
+                               human_response=NULL,
                                version=version+1,
                                lease_owner=NULL,
                                lease_expiry=NULL
