@@ -88,31 +88,44 @@ class TestRuntimeStateSchemaShape:
         assert metadata is None
         assert ann is bool
 
-    def test_track7_fields_present(self) -> None:
-        """Task 8 added Track 7 compaction fields — confirm they exist."""
+    def test_track7_followup_fields_present(self) -> None:
+        """Track 7 Follow-up (Task 3) reshaped the compaction fields:
+        ``summary_marker`` + Tier 1/1.5 watermarks → single ``summary`` +
+        ``summarized_through_turn_index``.
+        """
         hints = get_type_hints(RuntimeState, include_extras=True)
-        track7_fields = {
-            "cleared_through_turn_index",
-            "truncated_args_through_turn_index",
+        required = {
+            "summary",
             "summarized_through_turn_index",
-            "summary_marker",
             "memory_flush_fired_this_task",
             "last_super_step_message_count",
             "tier3_firings_count",
             "tier3_fatal_short_circuited",
         }
-        missing = track7_fields - set(hints)
-        assert not missing, f"Missing Track 7 fields after Task 8: {missing}"
+        missing = required - set(hints)
+        assert not missing, f"Missing Track 7 Follow-up fields: {missing}"
 
-    def test_exactly_twelve_fields(self) -> None:
-        """Task 8: 4 Track 5 + 8 Track 7 = 12 total fields."""
+    def test_legacy_fields_removed(self) -> None:
+        """The replace-and-rehydrate rewrite drops the legacy Track 7 fields."""
+        hints = get_type_hints(RuntimeState, include_extras=True)
+        for legacy in (
+            "summary_marker",
+            "cleared_through_turn_index",
+            "truncated_args_through_turn_index",
+        ):
+            assert legacy not in hints, (
+                f"Legacy Track 7 field {legacy!r} should have been removed by "
+                "the Track 7 Follow-up (Task 3) pipeline rewrite."
+            )
+
+    def test_exactly_ten_fields(self) -> None:
+        """Track 7 Follow-up shape: 4 Track 5 + 6 compaction = 10 total."""
         hints = get_type_hints(RuntimeState, include_extras=True)
         expected = {
             # Track 5
             "messages", "observations", "pending_memory", "memory_opt_in",
-            # Track 7
-            "cleared_through_turn_index", "truncated_args_through_turn_index",
-            "summarized_through_turn_index", "summary_marker",
+            # Track 7 Follow-up (replace-and-rehydrate)
+            "summary", "summarized_through_turn_index",
             "memory_flush_fired_this_task", "last_super_step_message_count",
             "tier3_firings_count", "tier3_fatal_short_circuited",
         }

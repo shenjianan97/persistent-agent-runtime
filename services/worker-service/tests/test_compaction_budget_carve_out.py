@@ -92,7 +92,7 @@ class TestCompactionPipelineIsIndependentOfBudgetPause:
 
     def test_pipeline_does_not_import_check_budget_and_pause(self):
         """executor.compaction.pipeline must not reference budget-pause internals."""
-        pipeline_path = GRAPH_PY.parent.parent / "executor" / "compaction" / "pipeline.py"
+        pipeline_path = GRAPH_PY.parent.parent / "executor" / "compaction" / "pre_model_hook.py"
         source = pipeline_path.read_text()
         assert "_check_budget_and_pause" not in source, (
             "executor/compaction/pipeline.py must not reference _check_budget_and_pause; "
@@ -101,7 +101,7 @@ class TestCompactionPipelineIsIndependentOfBudgetPause:
 
     def test_pipeline_does_not_reference_waiting_for_budget(self):
         """Pipeline must not reference 'waiting_for_budget' status transition."""
-        pipeline_path = GRAPH_PY.parent.parent / "executor" / "compaction" / "pipeline.py"
+        pipeline_path = GRAPH_PY.parent.parent / "executor" / "compaction" / "pre_model_hook.py"
         source = pipeline_path.read_text()
         assert "waiting_for_budget" not in source, (
             "executor/compaction/pipeline.py must not produce 'waiting_for_budget' "

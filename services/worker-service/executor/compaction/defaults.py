@@ -25,6 +25,13 @@ MIN_TIER_SEPARATION_TOKENS: int = 2_000
 # Most recent tool-use turns kept intact (never cleared by Tier 1).
 KEEP_TOOL_USES: int = 3
 
+# Track 7 Follow-up (Task 3): fraction of the agent's ``model_context_window``
+# at which the ``pre_model_hook`` fires summarisation. Matches DeepAgents'
+# ``SummarizationMiddleware`` trigger; raised from Track 7's 0.75 because the
+# new replace-and-rehydrate architecture produces higher-quality summaries and
+# we want to delay the KV-cache-invalidating replacement as long as possible.
+COMPACTION_TRIGGER_FRACTION: float = 0.85
+
 # Byte threshold above which a tool RESULT or a string-valued tool-call ARG
 # is offloaded to S3 at ingestion time (Phase 2 Track 7 Follow-up, Task 4).
 # Replaces the legacy PER_TOOL_RESULT_CAP_BYTES head+tail 25KB trim.
@@ -118,6 +125,7 @@ assert 0 < TIER_1_TRIGGER_FRACTION < TIER_3_TRIGGER_FRACTION < 1.0
 assert OUTPUT_BUDGET_RESERVE_TOKENS >= 0
 assert MIN_TIER_SEPARATION_TOKENS > 0
 assert KEEP_TOOL_USES >= 1
+assert 0 < COMPACTION_TRIGGER_FRACTION < 1.0
 assert OFFLOAD_THRESHOLD_BYTES > 0
 assert ARG_TRUNCATION_CAP_BYTES > 0
 assert isinstance(TRUNCATABLE_ARG_KEYS, frozenset)

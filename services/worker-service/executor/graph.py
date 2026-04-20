@@ -44,14 +44,12 @@ from executor.mcp_session import McpSessionManager, ToolServerConfig, McpConnect
 from executor.schema_converter import mcp_tools_to_structured_tools, MAX_TOOLS_PER_AGENT
 from executor import url_safety
 from executor.compaction.state import RuntimeState
-from executor.compaction.pipeline import (
-    compact_for_llm,
+from executor.compaction.pre_model_hook import (
     HardFloorEvent,
     MemoryFlushFiredEvent,
-    Tier1AppliedEvent,
-    Tier15AppliedEvent,
     Tier3FiredEvent,
     Tier3SkippedEvent,
+    compaction_pre_model_hook,
 )
 from executor.compaction.tokens import estimate_tokens as _estimate_tokens
 from executor.compaction.summarizer import summarize_slice
@@ -376,22 +374,25 @@ async def _convlog_append_compaction_events(
     checkpoint_id: str | None,
     events: list,
     summarized_through_before: int,
-    summary_marker_before: str,
-    summary_marker_after: str,
+    summary_before: str,
+    summary_after: str,
 ) -> None:
-    """Append one entry per Tier3Fired / MemoryFlushFired event from the pipeline.
+    """Append one entry per Tier3Fired / MemoryFlushFired event from the hook.
 
-    Tier1/Tier1.5 events are intentionally skipped — spec says those are
-    invisible to the user.
+    Under the Track 7 Follow-up (Task 3) replace-and-rehydrate architecture
+    the summary is REPLACED on each firing rather than appended to, so the
+    conversation-log's ``summary_text`` is simply ``summary_after`` and we
+    no longer compute an append delta. The prior ``summary_before`` is kept
+    on the signature for future diff-style log entries (not used in v1).
     """
+    # ``summary_before`` is retained in the signature as a forward-looking
+    # hook but is intentionally unused — replace semantics means every firing
+    # renders a fresh summary independent of prior content.
+    _ = summary_before
     for ev in events:
         if isinstance(ev, Tier3FiredEvent):
-            # Compute the summary_text as the delta that was just
-            # appended to the marker (summary_marker is strict-append).
-            if summary_marker_before and summary_marker_after.startswith(summary_marker_before):
-                summary_text = summary_marker_after[len(summary_marker_before):]
-            else:
-                summary_text = summary_marker_after
+            # Replace semantics — the entry's summary_text IS the new summary.
+            summary_text = summary_after
             origin = f"tier3:{summarized_through_before}->{ev.new_summarized_through}"
             key = _convlog_key(
                 task_id=task_id,
@@ -1008,21 +1009,16 @@ class GraphExecutor:
         self._last_conversation_log_repo = conversation_log_repo
 
         async def agent_node(state: RuntimeState, config: RunnableConfig):
-            messages = state["messages"]
-            if not any(isinstance(m, SystemMessage) for m in messages):
-                sys_messages = []
-                if system_prompt:
-                    sys_messages.append(SystemMessage(content=system_prompt))
-                if platform_system_msg:
-                    sys_messages.append(SystemMessage(content=platform_system_msg))
-                messages = sys_messages + messages
-
-            # Track 7 Task 13 — dual-write BEFORE compact_for_llm fires so
-            # the conversation log holds the raw view of the super-step's
-            # new turns (not the compacted model view).  Slice is computed
-            # against ``state["messages"]`` (which excludes any transient
-            # SystemMessage prepended to the local ``messages`` variable).
+            # Track 7 Follow-up (Task 3) — the pre_model_hook owns system-
+            # prompt placement and projection assembly, so we pass the raw
+            # journal (``state["messages"]``) to the hook and let it assemble
+            # the final ``[SystemMessage(system_prompt), SystemMessage(summary)?,
+            # *middle, *keep_window]`` shape.
             _raw_state_messages = state["messages"]
+
+            # Track 7 Task 13 — dual-write BEFORE compaction_pre_model_hook
+            # fires so the conversation log holds the raw view of the super-
+            # step's new turns (not the projection the LLM sees).
             _last_count = state.get("last_super_step_message_count", 0) or 0
             # Attempt to read a LangGraph-assigned checkpoint id off the
             # runnable config.  When absent (first turn / pre-Task-10),
@@ -1047,37 +1043,38 @@ class GraphExecutor:
                 last_super_step_message_count=_last_count,
             )
 
-            # Capture watermark values BEFORE compaction so we can compute
-            # the compaction_boundary delta after the pipeline returns.
-            _summary_marker_before = state.get("summary_marker") or ""
+            # Capture state values BEFORE compaction so we can compute the
+            # compaction_boundary entry after the hook returns.
+            _summary_before = state.get("summary", "") or ""
             _summarized_through_before = int(
                 state.get("summarized_through_turn_index", 0) or 0
             )
 
             # Shallow-copy the shared task_context with the live checkpoint_id
-            # so the Tier 3 summariser writes a cost-ledger row tagged to the
-            # right checkpoint.  Falls back to None (adapter substitutes a
+            # so the summariser writes a cost-ledger row tagged to the right
+            # checkpoint.  Falls back to None (adapter substitutes a
             # deterministic placeholder so the INSERT still dedups correctly).
             _per_call_task_context = {**task_context, "checkpoint_id": _convlog_ckpt_id}
 
-            # Track 7 Task 8 — run compaction pipeline before every LLM call.
-            # The pipeline is pure: it returns the compacted message view, a
-            # state_updates dict (watermarks, summary_marker, etc.), and a list
-            # of structured-log events.  We emit those events here so the
-            # pipeline module itself has zero logger coupling.
-            pass_result = await compact_for_llm(
-                raw_messages=messages,
+            # Track 7 Follow-up (Task 3) — run the pre_model_hook before every
+            # LLM call. The hook is pure w.r.t. the journal (never mutates
+            # ``state["messages"]``); it returns the three-region projection
+            # as ``pass_result.messages`` plus a ``state_updates`` dict.
+            pass_result = await compaction_pre_model_hook(
+                raw_messages=_raw_state_messages,
                 state=state,
                 agent_config=agent_config,
                 model_context_window=model_context_window,
                 task_context=_per_call_task_context,
                 summarizer=summarize_slice,
                 estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+                system_prompt=system_prompt if system_prompt else None,
+                platform_system_message=platform_system_msg if platform_system_msg else None,
             )
             messages_for_llm = pass_result.messages
             compaction_state_updates = pass_result.state_updates
 
-            # Emit structured-log events from the pipeline and raise immediately
+            # Emit structured-log events from the hook and raise immediately
             # on HardFloorEvent — single pass avoids re-iterating the list.
             for ev in pass_result.events:
                 if isinstance(ev, HardFloorEvent):
@@ -1089,31 +1086,11 @@ class GraphExecutor:
                         agent_id=agent_id,
                         task_id=task_id,
                     )
-                    # Raise a sentinel exception so the astream loop can catch it
-                    # and invoke _handle_dead_letter.
+                    # Raise a sentinel exception so the astream loop can catch
+                    # it and invoke _handle_dead_letter.
                     raise _ContextExceededIrrecoverableError(
                         f"Context window exceeded irrecoverably: "
                         f"{ev.est_tokens} tokens > {ev.model_context_window} window"
-                    )
-                elif isinstance(ev, Tier1AppliedEvent):
-                    _compaction_logger.info(
-                        "compaction.tier1_applied",
-                        messages_cleared=ev.messages_cleared,
-                        est_tokens_saved=ev.est_tokens_saved,
-                        new_watermark=ev.new_watermark,
-                        tenant_id=tenant_id,
-                        agent_id=agent_id,
-                        task_id=task_id,
-                    )
-                elif isinstance(ev, Tier15AppliedEvent):
-                    _compaction_logger.info(
-                        "compaction.tier15_applied",
-                        args_truncated=ev.args_truncated,
-                        bytes_saved=ev.bytes_saved,
-                        new_watermark=ev.new_watermark,
-                        tenant_id=tenant_id,
-                        agent_id=agent_id,
-                        task_id=task_id,
                     )
                 elif isinstance(ev, Tier3FiredEvent):
                     _compaction_logger.info(
@@ -1136,12 +1113,12 @@ class GraphExecutor:
                     )
 
             # Track 7 Task 13 — mirror Tier3Fired / MemoryFlushFired events
-            # into the user-facing conversation log.  Tier 1 / Tier 1.5 are
-            # intentionally invisible (see task-13 spec §Design principle).
-            _summary_marker_after = (
-                compaction_state_updates.get("summary_marker")
-                or _summary_marker_before
-            )
+            # into the user-facing conversation log.
+            _summary_after = (
+                compaction_state_updates.get("summary")
+                if "summary" in compaction_state_updates
+                else _summary_before
+            ) or ""
             await _convlog_append_compaction_events(
                 conversation_log_repo,
                 task_id=task_id,
@@ -1149,8 +1126,8 @@ class GraphExecutor:
                 checkpoint_id=_convlog_ckpt_id,
                 events=pass_result.events,
                 summarized_through_before=_summarized_through_before,
-                summary_marker_before=_summary_marker_before,
-                summary_marker_after=_summary_marker_after,
+                summary_before=_summary_before,
+                summary_after=_summary_after,
             )
 
             # Retry on rate limits inside the execution loop instead of
@@ -1424,8 +1401,9 @@ class GraphExecutor:
         structured warning when the default fires so operators can act.
 
         This value is resolved once at graph-build time (``execute_task``)
-        and passed into ``_build_graph`` so ``compact_for_llm`` always has
-        a known-good value without an extra DB round-trip per LLM call.
+        and passed into ``_build_graph`` so ``compaction_pre_model_hook``
+        always has a known-good value without an extra DB round-trip per
+        LLM call.
         """
         try:
             row = await self.pool.fetchrow(
@@ -2327,8 +2305,8 @@ class GraphExecutor:
 
             # Track 7 Task 8 — resolve model context window once at graph-build
             # time (not per LLM call) and cache it for the lifetime of this
-            # execute_task invocation.  Passed through to compact_for_llm via
-            # _build_graph so agent_node always has the right value.
+            # execute_task invocation.  Passed through to the pre_model_hook
+            # via _build_graph so agent_node always has the right value.
             _model_name_for_ctx = agent_config.get("model", "claude-3-5-sonnet-latest")
             _model_context_window = await self._get_model_context_window(_model_name_for_ctx)
 
@@ -2493,16 +2471,15 @@ class GraphExecutor:
                         # guarantees the agent must re-earn the opt-in on each
                         # run.
                         "memory_opt_in": False,
-                        # Track 7 Task 8 — seed ALL compaction watermarks at
-                        # reducer-safe defaults so every task graph starts from
-                        # a known-good state.  Reducer-annotated fields use the
-                        # seed only on the FIRST write; subsequent node returns
-                        # go through the reducer (max / any / strict-append).
-                        # MUST be 0 / "" / False — NEVER None.
-                        "cleared_through_turn_index": 0,
-                        "truncated_args_through_turn_index": 0,
+                        # Track 7 Follow-up (Task 3) — seed the replace-and-
+                        # rehydrate compaction fields at reducer-safe defaults
+                        # so every task graph starts from a known-good state.
+                        # Reducer-annotated fields use the seed only on the
+                        # FIRST write; subsequent node returns go through the
+                        # reducer (max / any / replace). MUST be 0 / "" / False
+                        # — NEVER None.
+                        "summary": "",
                         "summarized_through_turn_index": 0,
-                        "summary_marker": "",
                         "memory_flush_fired_this_task": False,
                         "last_super_step_message_count": 0,
                         "tier3_firings_count": 0,

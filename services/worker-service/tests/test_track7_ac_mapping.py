@@ -1,19 +1,16 @@
-"""Phase 2 Track 7 — Acceptance-Criteria to Test mapping manifest.
+"""Phase 2 Track 7 Follow-up (Task 3) — Acceptance-Criteria → Test mapping.
 
-This file is Task 12's primary audit document: it lists every one of the 14
-design-doc acceptance criteria (see
-``docs/design-docs/phase-2/track-7-context-window-management.md``
-§Acceptance criteria) and points at the concrete tests that exercise them.
+The original Track 7 design (three-tier in-place transforms) has been
+superseded by the Track 7 Follow-up's replace-and-rehydrate
+``pre_model_hook`` pipeline (Task 3). This manifest points at the tests
+that exercise the 14 acceptance criteria in
+``docs/exec-plans/active/phase-2/track-7-follow-up/agent_tasks/
+task-3-pre-model-hook-architecture.md``.
 
 Two meta-tests enforce the manifest:
 
-- ``test_every_ac_has_a_linked_test`` — asserts every referenced test file
-  actually exists in the repository.
-- ``test_manifest_covers_all_fourteen_criteria`` — asserts the manifest has an
-  entry for each of the 14 criteria, keyed 1..14.
-
-If a future refactor renames or moves a referenced test, the manifest fails
-with a clear pointer to fix the map.
+- ``test_every_ac_has_a_linked_test`` — every referenced file exists.
+- ``test_manifest_covers_all_fourteen_criteria`` — keys 1..14 are present.
 """
 
 from __future__ import annotations
@@ -27,123 +24,79 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-# Each key is the AC number (1..14). Each value is an iterable of tests that
-# exercise that AC, either as a full file (covers the whole criterion) or as a
-# specific ``file::test`` identifier. Multiple entries are allowed per AC.
-#
-# File paths are repo-root-relative.
+# Each key is the AC number (1..14) from the Task 3 spec. Entries list tests
+# that exercise that AC, either as full files or ``file::test`` identifiers.
 AC_TO_TESTS: dict[int, list[str]] = {
-    # AC-1 — All agents serve LLM calls with raw history below Tier 1 threshold
-    # with masked/truncated history above it.
+    # AC-1 — compact_for_llm no longer exists; pre_model_hook is the entry point.
     1: [
-        "services/worker-service/tests/test_graph_compaction_integration.py",
-        "services/worker-service/tests/test_compaction_pipeline.py::test_tier1_fires_when_over_threshold",
+        "services/worker-service/tests/test_pre_model_hook.py::test_compact_for_llm_symbol_gone",
+        "services/worker-service/tests/test_pre_model_hook.py::test_graph_wires_pre_model_hook",
     ],
-    # AC-2 — Per-tool-result byte bounding applied before ToolMessage enters state.
-    # Track 7 Follow-up (Task 4) replaced the head+tail 25KB trim with S3-backed
-    # ingestion offload. The acceptance criterion shifts meaning slightly
-    # (offload + placeholder instead of hard cap) but the observable invariant —
-    # oversized tool-result bytes do NOT land in state — is unchanged.
+    # AC-2 — RuntimeState schema shape (legacy fields gone; new fields present).
     2: [
-        "services/worker-service/tests/test_tool_result_store.py",
-        "services/worker-service/tests/test_compaction_ingestion_offload.py",
+        "services/worker-service/tests/test_runtime_state_schema.py::TestRuntimeStateSchemaShape::test_track7_followup_fields_present",
+        "services/worker-service/tests/test_runtime_state_schema.py::TestRuntimeStateSchemaShape::test_legacy_fields_removed",
     ],
-    # AC-3 — Tier 3 fires only when Tier 1+1.5 together cannot bring input below
-    # TIER_3_TRIGGER_FRACTION.
+    # AC-3 — three-region projection order.
     3: [
-        "services/worker-service/tests/test_compaction_pipeline.py::test_tier3_fires_only_when_tier1_insufficient",
-        "services/worker-service/tests/test_compaction_pipeline.py::test_tier3_not_fired_when_tier1_sufficient",
+        "services/worker-service/tests/test_pre_model_hook.py::test_projection_region_order",
+        "services/worker-service/tests/test_pre_model_hook.py::test_projection_omits_summary_when_empty",
     ],
-    # AC-4 — Watermark fields on graph state only advance; a unit test that feeds
-    # back a regressing watermark confirms the reducer ignores it.
+    # AC-4 — Summariser receives RAW middle (never stubbed).
     4: [
-        "services/worker-service/tests/test_compaction_state_reducers.py::TestMaxReducer::test_max_reducer_stale_does_not_regress",
-        "services/worker-service/tests/test_compaction_state_reducers.py::TestCheckpointBackwardCompat::test_stale_watermark_does_not_regress_in_graph",
+        "services/worker-service/tests/test_pre_model_hook.py::test_summarizer_receives_raw_middle",
     ],
-    # AC-5 — Cache-stability invariant: running the same compaction pipeline on
-    # the same state twice produces byte-identical output.
+    # AC-5 — Main LLM never sees stubs.
     5: [
-        "services/worker-service/tests/test_compaction_cache_stability.py::test_cache_stability_tier1_only",
-        "services/worker-service/tests/test_compaction_cache_stability.py::test_cache_stability_tier3_fires",
-        "services/worker-service/tests/test_compaction_cache_stability.py::test_cache_stability_no_op_path",
-        "services/worker-service/tests/test_compaction_pipeline.py::test_cache_stability_identical_output_on_second_call",
+        "services/worker-service/tests/test_pre_model_hook.py::test_main_llm_sees_no_stubs",
     ],
-    # AC-6 — exclude_tools entries are never masked. Given a task with memory_note
-    # results scattered through history, after Tier 1 runs every memory_note
-    # ToolMessage retains its original content.
+    # AC-6 — Post-summarisation state (replace, not append).
     6: [
-        "services/worker-service/tests/test_compaction_exclude_tools.py::test_memory_note_never_cleared_by_tier1",
-        "services/worker-service/tests/test_compaction_exclude_tools.py::test_pipeline_exclude_tools_never_cleared_by_tier1",
-        "services/worker-service/tests/test_compaction_exclude_tools.py::test_agent_exclude_tools_union_with_platform_list",
+        "services/worker-service/tests/test_pre_model_hook.py::test_post_firing_state_replace_semantics",
+        "services/worker-service/tests/test_pre_model_hook.py::test_journal_not_mutated_on_firing",
     ],
-    # AC-7 — Pre-Tier-3 memory flush fires at most once per task. Fires for agents
-    # with memory.enabled=true AND pre_tier3_memory_flush=true. Does not fire on
-    # heartbeat / recovery turns. Survives redrive (one-shot flag restored).
+    # AC-7 — Summarisation trigger fraction (0.85 × context window).
     7: [
-        "services/worker-service/tests/test_compaction_pre_tier3_flush.py::test_flush_fires_when_all_conditions_true_and_over_tier3",
-        "services/worker-service/tests/test_compaction_pre_tier3_flush.py::test_flush_fires_only_once_across_two_calls",
-        "services/worker-service/tests/test_compaction_pre_tier3_flush.py::test_flush_does_not_fire_on_heartbeat_turn",
-        "services/worker-service/tests/test_compaction_pre_tier3_flush_redrive.py::test_redrive_from_post_flush_checkpoint_does_not_refire",
-        "services/worker-service/tests/test_compaction_pre_tier3_flush_redrive.py::test_flush_fires_exactly_once_across_redrive_cycle",
+        "services/worker-service/tests/test_pre_model_hook.py::test_trigger_at_or_above_compaction_fraction",
+        "services/worker-service/tests/test_pre_model_hook.py::test_no_summarizer_below_threshold",
     ],
-    # AC-8 — summary_marker is append-only. A second Tier 3 firing within the same
-    # task appends a new summary rather than rewriting the existing one.
+    # AC-8 — Keep-window orphan alignment.
     8: [
-        "services/worker-service/tests/test_compaction_summary_marker_append.py::test_second_tier3_appends_to_marker",
-        "services/worker-service/tests/test_compaction_summary_marker_append.py::test_strict_append_reducer_rejects_non_append",
-        "services/worker-service/tests/test_compaction_summary_marker_append.py::test_strict_append_reducer_emits_log_on_rejection",
-        "services/worker-service/tests/test_compaction_state_reducers.py::TestSummaryMarkerStrictAppendReducer::test_non_append_rejected_returns_a",
-        "services/worker-service/tests/test_compaction_state_reducers.py::TestSummaryMarkerStrictAppendReducer::test_non_append_logs_structured_event",
+        "services/worker-service/tests/test_pre_model_hook.py::test_keep_window_orphan_alignment",
+        "services/worker-service/tests/test_pre_model_hook.py::test_keep_window_with_few_tools_returns_zero",
     ],
-    # AC-9 — Tier 3 cost lands in agent_cost_ledger tagged compaction.tier3,
-    # attributed to the current task and checkpoint.
+    # AC-9 — Pre-summarisation memory flush preserved.
     9: [
-        "services/worker-service/tests/test_compaction_cost_ledger.py::test_tier3_writes_cost_ledger_row_tagged_compaction_tier3",
-        "services/worker-service/tests/test_compaction_cost_ledger.py::test_tier3_cost_ledger_row_attribution",
-        "services/worker-service/tests/test_compaction_cost_ledger.py::test_tier3_cost_ledger_row_has_token_counts",
-        "services/worker-service/tests/test_compaction_summarizer.py",
+        "services/worker-service/tests/test_pre_model_hook.py::test_memory_flush_fires_when_all_conditions_hold",
+        "services/worker-service/tests/test_pre_model_hook.py::test_memory_flush_does_not_fire_twice",
+        "services/worker-service/tests/test_pre_model_hook.py::test_memory_flush_skipped_when_memory_disabled",
     ],
-    # AC-10 — Budget carve-out: tasks with budget_max_per_task close to Tier 3 cost
-    # do not pause mid-summarization.
+    # AC-10 — Hypothesis property test.
     10: [
-        "services/worker-service/tests/test_compaction_budget_carve_out.py::TestCompactionTier3BudgetCarveOut::test_compaction_tier3_in_graph_py_source",
-        "services/worker-service/tests/test_graph_compaction_integration.py::TestBudgetCarveOut::test_compaction_tier3_in_carve_out",
+        "services/worker-service/tests/test_compaction_shape_property.py",
     ],
-    # AC-11 — Dead-letter with reason context_exceeded_irrecoverable transitions
-    # the task cleanly.
+    # AC-11 — Chunking integration (forwarded via summarizer_context_window).
     11: [
-        "services/worker-service/tests/test_dead_letter_check_constraints_integration.py",
-        "services/worker-service/tests/test_compaction_pipeline.py::test_hard_floor_event_emitted_when_still_over_limit",
+        "services/worker-service/tests/test_pre_model_hook.py::test_summarizer_context_window_forwarded",
     ],
-    # AC-12 — POST/PUT /v1/agents validates context_management fields.
-    # summarizer_model pointing at inactive/wrong-provider model returns 400.
+    # AC-12 — Dead-letter / hard-floor path.
     12: [
-        "tests/backend-integration/test_context_management_validation.py",
+        "services/worker-service/tests/test_pre_model_hook.py::test_hard_floor_event_emitted_when_over_window",
     ],
-    # AC-13 — Memory-disabled agents never fire the pre-Tier-3 flush, even if
-    # pre_tier3_memory_flush=true in their config.
+    # AC-13 — Firing-rate regression budget (asserted as a bound in Task 6's
+    # offline suite; unit-level this manifest pins the invariant that one
+    # firing per invocation is the cap at the hook level).
     13: [
-        "services/worker-service/tests/test_compaction_memory_disabled_no_flush.py::test_memory_disabled_flush_never_fires",
-        "services/worker-service/tests/test_compaction_memory_disabled_no_flush.py::test_memory_disabled_no_flush_system_message_in_compacted",
-        "services/worker-service/tests/test_compaction_pre_tier3_flush.py::test_flush_does_not_fire_when_memory_disabled",
+        "services/worker-service/tests/test_pre_model_hook.py::test_single_firing_per_invocation",
     ],
-    # AC-14 — Langfuse trace of a task that exercised all three tiers shows one
-    # compaction.tier3 span per firing, one compaction.inline span per call that
-    # fires tier 1/1.5, and per-result cap annotations on affected tool spans.
-    # Automated: structured-log events assert correct shapes (this task).
-    # Manual: orchestrator Playwright Scenario 16 confirms Langfuse UI.
+    # AC-14 — Append-only invariant on state["messages"].
     14: [
-        "services/worker-service/tests/test_compaction_observability.py::test_per_result_capped_event_fires_above_cap",
-        "services/worker-service/tests/test_compaction_observability.py::test_tier1_applied_event_emitted_when_threshold_crossed",
-        "services/worker-service/tests/test_compaction_observability.py::test_tier3_fired_event_emitted_on_success",
-        "services/worker-service/tests/test_compaction_observability.py::test_memory_flush_fired_event_emitted_when_flush_fires",
-        "services/worker-service/tests/test_compaction_observability.py::test_hard_floor_event_emitted_when_still_over_context",
+        "services/worker-service/tests/test_pre_model_hook.py::test_journal_append_only_across_turns",
     ],
 }
 
 
 def _strip_test_id(entry: str) -> str:
-    """Return the repo-root-relative file portion of a possibly-qualified id."""
     return entry.split("::", 1)[0]
 
 
@@ -154,7 +107,6 @@ def _expected_files() -> Iterable[Path]:
 
 
 def test_manifest_covers_all_fourteen_criteria() -> None:
-    """Every AC (1..14) must have at least one linked test."""
     expected = set(range(1, 15))
     assert set(AC_TO_TESTS.keys()) == expected, (
         f"Missing AC keys: {expected - set(AC_TO_TESTS.keys())}, "
@@ -165,11 +117,6 @@ def test_manifest_covers_all_fourteen_criteria() -> None:
 
 
 def test_every_ac_has_a_linked_test() -> None:
-    """Every file referenced in the manifest must exist on disk.
-
-    This catches renames / moves that would otherwise leave the manifest out
-    of sync with the suite silently.
-    """
     missing: list[str] = []
     for path in _expected_files():
         if not path.is_file():
@@ -182,5 +129,4 @@ def test_every_ac_has_a_linked_test() -> None:
 
 @pytest.mark.parametrize("ac", sorted(AC_TO_TESTS.keys()))
 def test_ac_has_nonempty_mapping(ac: int) -> None:
-    """Per-AC parametrised coverage check — surfaces the gap per row."""
     assert AC_TO_TESTS[ac], f"AC-{ac} has no linked tests"
