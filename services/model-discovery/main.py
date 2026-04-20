@@ -17,6 +17,12 @@ PRICING_DEFAULTS = {
     "claude-3-7-sonnet-20250219": {"input": 3_000_000, "output": 15_000_000},
     "claude-3-5-sonnet-20241022": {"input": 3_000_000, "output": 15_000_000},
     "claude-3-5-haiku-20241022": {"input": 1_000_000, "output": 5_000_000},
+    # Claude Haiku 4.5 — published Bedrock/Anthropic rates are $0.80 / $4.00
+    # per million input / output tokens.  Listed under both the bare family
+    # alias (which is the platform default for the compaction summariser)
+    # and the dated on-demand ID used by direct Anthropic API callers.
+    "claude-haiku-4-5": {"input": 800_000, "output": 4_000_000},
+    "claude-haiku-4-5-20251001": {"input": 800_000, "output": 4_000_000},
     "claude-3-opus-20240229": {"input": 15_000_000, "output": 75_000_000},
     # OpenAI
     "gpt-4o": {"input": 2_500_000, "output": 10_000_000},
@@ -32,7 +38,8 @@ PRICING_DEFAULTS = {
     "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3_000_000, "output": 15_000_000},
     "anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3_000_000, "output": 15_000_000},
     "anthropic.claude-sonnet-4-6": {"input": 3_000_000, "output": 15_000_000},
-    "anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 1_000_000, "output": 5_000_000},
+    # Claude Haiku 4.5 via Bedrock — $0.80 / $4.00 per million tokens.
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 800_000, "output": 4_000_000},
     "anthropic.claude-opus-4-20250514-v1:0": {"input": 15_000_000, "output": 75_000_000},
     "anthropic.claude-opus-4-1-20250805-v1:0": {"input": 15_000_000, "output": 75_000_000},
     "anthropic.claude-opus-4-5-20251101-v1:0": {"input": 15_000_000, "output": 75_000_000},

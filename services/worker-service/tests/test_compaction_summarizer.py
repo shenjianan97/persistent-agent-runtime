@@ -922,3 +922,149 @@ async def test_prompt_includes_prior_summary_merge_guidance():
     assert "concatenation" in system_text or "concatenate" in system_text or "not a concatenation" in system_text, (
         "System prompt should explicitly contrast merge vs concatenation"
     )
+
+
+# ---------------------------------------------------------------------------
+# summarize_slice — pricing_lookup wiring (compaction cost telemetry)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pricing_lookup_populates_cost_microdollars():
+    """When pricing_lookup returns non-zero rates, ledger row and result carry
+    ``cost_microdollars = (tokens_in * input_rate + tokens_out * output_rate) // 1_000_000``.
+    """
+    ledger = _FakeCostLedger()
+    # _make_fake_llm_response sets usage.input_tokens=120, output_tokens=40.
+    fake_response = _make_fake_llm_response("Summary.")
+
+    input_rate = 800_000    # $0.80 per million input tokens  (Haiku 4.5)
+    output_rate = 4_000_000  # $4.00 per million output tokens
+
+    async def pricing_lookup(model_id: str) -> tuple[int, int]:
+        assert model_id == MODEL_ID
+        return (input_rate, output_rate)
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+        mock_init.return_value = mock_llm
+
+        result = await summarize_slice(
+            slice_messages=_two_message_slice(),
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+            pricing_lookup=pricing_lookup,
+        )
+
+    expected = (120 * input_rate + 40 * output_rate) // 1_000_000
+    assert expected > 0
+    assert result.cost_microdollars == expected
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0].cost_microdollars == expected
+
+
+@pytest.mark.asyncio
+async def test_pricing_lookup_missing_writes_zero_cost():
+    """No pricing_lookup provided → ledger row carries cost_microdollars=0
+    (back-compat: the module stays usable without the injection)."""
+    ledger = _FakeCostLedger()
+    fake_response = _make_fake_llm_response("Summary.")
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+        mock_init.return_value = mock_llm
+
+        result = await summarize_slice(
+            slice_messages=_two_message_slice(),
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+        )
+
+    assert result.skipped is False
+    assert result.cost_microdollars == 0
+    assert ledger.rows[0].cost_microdollars == 0
+
+
+@pytest.mark.asyncio
+async def test_pricing_lookup_failure_does_not_raise():
+    """An exception inside pricing_lookup (unknown model, DB outage, etc.)
+    must be swallowed with a WARN log — result.skipped=False, cost=0, and
+    the ledger row is still written."""
+    ledger = _FakeCostLedger()
+    fake_response = _make_fake_llm_response("Summary.")
+
+    async def flaky_lookup(model_id: str) -> tuple[int, int]:
+        raise RuntimeError("pricing lookup failed: unknown model XYZ")
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        with patch("executor.compaction.summarizer._logger") as mock_logger:
+            mock_llm = AsyncMock()
+            mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+            mock_init.return_value = mock_llm
+
+            result = await summarize_slice(
+                slice_messages=_two_message_slice(),
+                summarizer_model_id="unknown-model-id",
+                task_id=TASK_ID,
+                tenant_id=TENANT_ID,
+                agent_id=AGENT_ID,
+                checkpoint_id=CHECKPOINT_ID,
+                cost_ledger=ledger,
+                pricing_lookup=flaky_lookup,
+            )
+
+    # Summarisation succeeds despite the pricing failure
+    assert result.skipped is False
+    assert result.cost_microdollars == 0
+
+    # Ledger row still written with cost=0 and actual token counts
+    assert len(ledger.rows) == 1
+    assert ledger.rows[0].cost_microdollars == 0
+    assert ledger.rows[0].tokens_in == 120
+    assert ledger.rows[0].tokens_out == 40
+
+    # WARN log emitted so operators see the pricing gap
+    assert mock_logger.warning.called, "Expected a WARN log on pricing failure"
+    event = mock_logger.warning.call_args.args[0]
+    assert event == "compaction.tier3_pricing_lookup_failed"
+
+
+@pytest.mark.asyncio
+async def test_pricing_lookup_zero_rates_writes_zero_cost():
+    """If the pricing_lookup returns (0, 0) — e.g. model row missing from the
+    models table — ledger row still writes and carries cost_microdollars=0."""
+    ledger = _FakeCostLedger()
+    fake_response = _make_fake_llm_response("Summary.")
+
+    async def zero_rate_lookup(model_id: str) -> tuple[int, int]:
+        return (0, 0)
+
+    with patch("executor.compaction.summarizer.init_chat_model") as mock_init:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=fake_response)
+        mock_init.return_value = mock_llm
+
+        result = await summarize_slice(
+            slice_messages=_two_message_slice(),
+            summarizer_model_id=MODEL_ID,
+            task_id=TASK_ID,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            checkpoint_id=CHECKPOINT_ID,
+            cost_ledger=ledger,
+            pricing_lookup=zero_rate_lookup,
+        )
+
+    assert result.skipped is False
+    assert result.cost_microdollars == 0
+    assert ledger.rows[0].cost_microdollars == 0

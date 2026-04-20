@@ -751,6 +751,12 @@ async def compaction_pre_model_hook(
 
     new_summarized_through = keep_window_start
 
+    # Forward the optional pricing_lookup from task_context if present.
+    # Follow-up fix: populates cost_microdollars on compaction.tier3 ledger
+    # rows. When absent (legacy caller / test shim), summarizer degrades to
+    # cost=0 with a WARN log — see summarizer._summarize_single_call.
+    pricing_lookup = task_context.get("pricing_lookup")
+
     summarize_result = await summarizer(
         slice_messages=middle,
         summarizer_model_id=summarizer_model_id,
@@ -763,6 +769,7 @@ async def compaction_pre_model_hook(
         summarized_through_turn_index_after=new_summarized_through,
         prior_summary=summary,
         summarizer_context_window=summarizer_context_window,
+        pricing_lookup=pricing_lookup,
     )
 
     if summarize_result.skipped:

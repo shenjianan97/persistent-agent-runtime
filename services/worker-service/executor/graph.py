@@ -1263,6 +1263,12 @@ class GraphExecutor:
             "checkpoint_id": None,
             "cost_ledger": _compaction_cost_ledger,
             "callbacks": [],
+            # Follow-up fix: expose the same pricing lookup used by the main-
+            # agent cost path so compaction.tier3 ledger rows record real
+            # cost_microdollars instead of always being 0. Bound-method
+            # reference — the LRU cache inside GraphExecutor persists across
+            # compaction firings within one task.
+            "pricing_lookup": self._get_model_cost_rates,
         }
 
         # Track 7 Task 13 — user-facing conversation-log repo.  Appends are

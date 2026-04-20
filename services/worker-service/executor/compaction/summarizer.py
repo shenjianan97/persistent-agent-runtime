@@ -37,7 +37,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import structlog
 from langchain.chat_models import init_chat_model
@@ -407,6 +407,19 @@ def _rollup_cost(tokens_in: int, tokens_out: int, input_rate: int, output_rate: 
     return (tokens_in * input_rate + tokens_out * output_rate) // 1_000_000
 
 
+#: Signature for the optional pricing lookup injected by the pipeline layer.
+#:
+#: Takes a model ID (LangChain identifier) and returns the per-million-token
+#: cost rates as ``(input_microdollars_per_million,
+#: output_microdollars_per_million)``. The main-agent path in
+#: :mod:`executor.graph` exposes this via
+#: :meth:`GraphExecutor._get_model_cost_rates` which reads from the ``models``
+#: table populated by the model-discovery service. Injecting it via
+#: ``task_context`` keeps the summariser decoupled from DB internals while
+#: letting the ledger row record accurate spend.
+PricingLookup = Callable[[str], Awaitable[tuple[int, int]]]
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -429,6 +442,13 @@ async def summarize_slice(
     # Task 2 additions — recursive chunking for oversized middles.
     prior_summary: str = "",
     summarizer_context_window: int | None = None,
+    # Follow-up fix: optional async callable returning
+    # ``(input_rate, output_rate)`` in microdollars-per-million-tokens for
+    # ``summarizer_model_id``. Injected via ``task_context["pricing_lookup"]``
+    # by the GraphExecutor (reads the ``models`` table). When omitted or when
+    # the lookup raises / returns zero rates, the ledger row still writes
+    # ``cost_microdollars=0`` (best-effort — see note in _summarize_single_call).
+    pricing_lookup: PricingLookup | None = None,
 ) -> SummarizeResult:
     """Summarise a message slice using a cheap LLM call.
 
@@ -517,6 +537,7 @@ async def summarize_slice(
             callbacks=callbacks,
             summarized_through_turn_index_after=summarized_through_turn_index_after,
             summarizer_context_window=summarizer_context_window,
+            pricing_lookup=pricing_lookup,
         )
 
     # ------------------------------------------------------------------ #
@@ -534,6 +555,7 @@ async def summarize_slice(
         cost_ledger=cost_ledger,
         callbacks=callbacks,
         summarized_through_turn_index_after=summarized_through_turn_index_after,
+        pricing_lookup=pricing_lookup,
     )
 
 
@@ -559,6 +581,7 @@ async def _summarize_single_call(
     cost_ledger: CostLedgerRepository,
     callbacks: list[BaseCallbackHandler] | None,
     summarized_through_turn_index_after: int | None,
+    pricing_lookup: PricingLookup | None = None,
 ) -> SummarizeResult:
     """Execute one summariser LLM call with the module's retry policy.
 
@@ -645,9 +668,39 @@ async def _summarize_single_call(
                     tokens_out=tokens_out,
                 )
 
-            # See note in summarize_slice docstring — cost is best-effort 0
-            # in this standalone module; the pipeline layer owns rate lookup.
+            # Roll up cost using the injected pricing lookup. Never raise:
+            # an unknown model / DB outage / malformed rates must degrade to
+            # ``cost_microdollars=0`` + a WARN log — a compaction firing is
+            # too cheap to fail over pricing-metadata gaps, and tokens_in /
+            # tokens_out are still recorded on the ledger row for retroactive
+            # reconciliation.
             cost_microdollars = 0
+            if pricing_lookup is not None:
+                try:
+                    input_rate, output_rate = await pricing_lookup(summarizer_model_id)
+                    cost_microdollars = _rollup_cost(
+                        tokens_in, tokens_out, int(input_rate), int(output_rate)
+                    )
+                    if cost_microdollars == 0 and (tokens_in > 0 or tokens_out > 0):
+                        _logger.warning(
+                            "compaction.tier3_pricing_zero_rate",
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            task_id=task_id,
+                            summarizer_model=summarizer_model_id,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                        )
+                except Exception as price_exc:  # noqa: BLE001 — defensive, never raise
+                    _logger.warning(
+                        "compaction.tier3_pricing_lookup_failed",
+                        tenant_id=tenant_id,
+                        agent_id=agent_id,
+                        task_id=task_id,
+                        summarizer_model=summarizer_model_id,
+                        error=str(price_exc)[:200],
+                    )
+                    cost_microdollars = 0
 
             await cost_ledger.insert(
                 tenant_id=tenant_id,
@@ -864,6 +917,7 @@ async def _chunk_summarize(
     callbacks: list[BaseCallbackHandler] | None,
     summarized_through_turn_index_after: int | None,
     summarizer_context_window: int,
+    pricing_lookup: PricingLookup | None = None,
 ) -> SummarizeResult:
     """Recursive chunk-summariser for middles that exceed the summariser's
     effective context budget.
@@ -938,6 +992,7 @@ async def _chunk_summarize(
         callbacks=callbacks,
         summarized_through_turn_index_after=summarized_through_turn_index_after,
         summarizer_context_window=summarizer_context_window,
+        pricing_lookup=pricing_lookup,
     )
     if left_result.skipped:
         # Strict-append: propagate skip; NO partial summary written.
@@ -954,6 +1009,7 @@ async def _chunk_summarize(
         callbacks=callbacks,
         summarized_through_turn_index_after=summarized_through_turn_index_after,
         summarizer_context_window=summarizer_context_window,
+        pricing_lookup=pricing_lookup,
     )
     if right_result.skipped:
         return _zero_out_cost_on_skip(right_result)
@@ -994,6 +1050,7 @@ async def _chunk_summarize(
         cost_ledger=cost_ledger,
         callbacks=callbacks,
         summarized_through_turn_index_after=summarized_through_turn_index_after,
+        pricing_lookup=pricing_lookup,
     )
 
     if final_result.skipped:
@@ -1030,6 +1087,7 @@ async def _summarize_chunk_half(
     callbacks: list[BaseCallbackHandler] | None,
     summarized_through_turn_index_after: int | None,
     summarizer_context_window: int,
+    pricing_lookup: PricingLookup | None = None,
 ) -> SummarizeResult:
     """Summarise one half of a chunked middle.
 
@@ -1074,6 +1132,7 @@ async def _summarize_chunk_half(
             cost_ledger=cost_ledger,
             callbacks=callbacks,
             summarized_through_turn_index_after=summarized_through_turn_index_after,
+            pricing_lookup=pricing_lookup,
         )
 
     if _payload_fits(
@@ -1093,6 +1152,7 @@ async def _summarize_chunk_half(
             cost_ledger=cost_ledger,
             callbacks=callbacks,
             summarized_through_turn_index_after=summarized_through_turn_index_after,
+            pricing_lookup=pricing_lookup,
         )
 
     return await _chunk_summarize(
@@ -1108,6 +1168,7 @@ async def _summarize_chunk_half(
         callbacks=callbacks,
         summarized_through_turn_index_after=summarized_through_turn_index_after,
         summarizer_context_window=summarizer_context_window,
+        pricing_lookup=pricing_lookup,
     )
 
 
