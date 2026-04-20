@@ -22,6 +22,37 @@ import type {
     TaskStatus,
 } from '@/types';
 
+// ─── Paginated fetch ───────────────────────────────────────────────
+//
+// The server caps one response at 200 entries (ConversationLogService
+// DEFAULT_LIMIT). A long-running task — especially one that survives long
+// enough to trigger Tier 3 compaction — easily blows past that cap, at which
+// point newer entries (tool_call / tool_result / agent_turn / compaction_
+// boundary itself) would never reach the Console without pagination. The
+// client walks `next_after_sequence` until the server stops setting it.
+async function fetchAllConversation(
+    taskId: string,
+): Promise<ConversationListResponse> {
+    const all: ConversationEntry[] = [];
+    let cursor: number | undefined = undefined;
+    // Hard safety bound: stop after 200 pages (≈40k entries). A runaway
+    // server would otherwise spin the client forever.
+    for (let pages = 0; pages < 200; pages++) {
+        const page: ConversationListResponse = await api.listConversation(
+            taskId,
+            cursor,
+        );
+        if (page.entries?.length) {
+            all.push(...page.entries);
+        }
+        if (typeof page.next_after_sequence !== 'number') {
+            break;
+        }
+        cursor = page.next_after_sequence;
+    }
+    return { entries: all };
+}
+
 // ─── Terminal-status gate (drives polling) ─────────────────────────
 
 const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
@@ -420,7 +451,7 @@ export function ConversationPane({ taskId, status }: ConversationPaneProps) {
 
     const { data, isLoading, isError, error } = useQuery<ConversationListResponse, Error>({
         queryKey: ['task-conversation', taskId],
-        queryFn: () => api.listConversation(taskId),
+        queryFn: () => fetchAllConversation(taskId),
         refetchInterval: terminal ? false : 5000,
         enabled: !!taskId,
     });

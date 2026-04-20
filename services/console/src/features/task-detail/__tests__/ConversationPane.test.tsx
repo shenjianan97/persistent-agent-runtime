@@ -382,3 +382,70 @@ describe('ConversationPane — error boundary', () => {
         expect(screen.getByTestId('conversation-pane-error')).toHaveTextContent('network down');
     });
 });
+
+// Regression guard: the API caps one page at 200 rows. Without pagination the
+// Console silently loses everything past the cap — including the new entries a
+// long-running task emits right around the time Tier 3 compaction fires.
+describe('ConversationPane — server-side pagination', () => {
+    it('walks next_after_sequence until the server stops setting it', async () => {
+        const firstPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 1, kind: 'agent_turn', content: { text: 'first' } }),
+                entry({ sequence: 2, kind: 'agent_turn', content: { text: 'second' } }),
+            ],
+            next_after_sequence: 2,
+        };
+        const secondPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 3, kind: 'compaction_boundary', content: { summary_text: 'mid' } }),
+                entry({ sequence: 4, kind: 'agent_turn', content: { text: 'post-compaction' } }),
+            ],
+            next_after_sequence: 4,
+        };
+        const thirdPage: ConversationListResponse = {
+            entries: [
+                entry({ sequence: 5, kind: 'tool_call', content: { tool_name: 'search', args: {} } }),
+            ],
+            // No next_after_sequence → client should stop.
+        };
+
+        listConversationMock
+            .mockResolvedValueOnce(firstPage)
+            .mockResolvedValueOnce(secondPage)
+            .mockResolvedValueOnce(thirdPage);
+
+        await renderPane({ status: 'completed' });
+
+        // All pages merge → everything renders, including the post-compaction row.
+        await waitFor(() => {
+            expect(screen.getByText('post-compaction')).toBeInTheDocument();
+        });
+        expect(screen.getByText('first')).toBeInTheDocument();
+        expect(screen.getByText('second')).toBeInTheDocument();
+        expect(
+            screen.getByTestId('conversation-entry-compaction_boundary'),
+        ).toBeInTheDocument();
+        expect(screen.getByTestId('conversation-entry-tool_call')).toBeInTheDocument();
+
+        // Pagination cursor contract: page 1 passes no cursor, subsequent pages
+        // carry the prior page's next_after_sequence.
+        expect(listConversationMock.mock.calls[0][1]).toBeUndefined();
+        expect(listConversationMock.mock.calls[1][1]).toBe(2);
+        expect(listConversationMock.mock.calls[2][1]).toBe(4);
+        expect(listConversationMock).toHaveBeenCalledTimes(3);
+    });
+
+    it('stops at the first page when the server does not set next_after_sequence', async () => {
+        listConversationMock.mockResolvedValue({
+            entries: [
+                entry({ sequence: 1, kind: 'agent_turn', content: { text: 'only page' } }),
+            ],
+        });
+        await renderPane({ status: 'completed' });
+        await waitFor(() => {
+            expect(screen.getByText('only page')).toBeInTheDocument();
+        });
+        // No follow-up pagination call.
+        expect(listConversationMock).toHaveBeenCalledTimes(1);
+    });
+});
