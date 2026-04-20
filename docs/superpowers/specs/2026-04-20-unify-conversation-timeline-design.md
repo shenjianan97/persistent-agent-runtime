@@ -41,21 +41,39 @@ Collapse onto a single source of truth:
 
 ```
 Worker writes:
-  checkpoints   ← state["messages"] (LLM-facing turns)   [unchanged]
-  task_events   ← markers + bodies in details JSONB      [extended]
+  checkpoints   ← state["messages"] with per-message emitted_at
+                  (LLM-facing turns; root-ns only)           [extended]
+  task_events   ← markers + bodies in details JSONB          [extended]
 
 API reads:
   GET /tasks/{id}/activity
-    1. SELECT latest checkpoint row by task_id
-    2. Deserialize state, extract messages
-    3. SELECT task_events WHERE task_id = ?
-    4. Merge by ordering key (checkpoint seq + event created_at)
+    1. SELECT latest checkpoint row WHERE task_id = ?
+         AND checkpoint_ns = ''
+         ORDER BY created_at DESC LIMIT 1
+    2. Deserialize checkpoint_payload (JSONB), extract state["messages"]
+    3. SELECT task_events WHERE task_id = ? ORDER BY created_at
+    4. Merge by ordering key:
+         - turn timestamp = message.additional_kwargs.emitted_at
+           (fallback: checkpoint.created_at for pre-flag messages)
+         - marker timestamp = task_events.created_at
     5. Return unified event stream
 
 Console renders:
   Single "Activity" tab, role-anchored default view,
   "Show details" toggle exposes infra markers inline.
 ```
+
+### Ordering key
+
+LangGraph `state["messages"]` is an ordered list but has no per-element timestamp by default. Replace-and-rehydrate (Track 7 Follow-up Task 3) guarantees the journal is preserved in the latest root checkpoint, but we still need to place `task_events` markers *between* the correct turns.
+
+**Solution:** the worker stamps each message with `emitted_at` (ISO-8601 string) in `additional_kwargs` when appending to state. The projection uses `message.additional_kwargs.emitted_at` as the turn's ordering key. Task events use their native `created_at`. The merge is a linear interleave on a shared time axis.
+
+**Fallback for pre-flag tasks:** historical messages without `emitted_at` fall back to the containing checkpoint's `created_at`. This is coarse (all messages in a checkpoint collapse to one timestamp) but monotonic and acceptable for tasks that predate the worker change.
+
+### Checkpoint namespace scope
+
+The `checkpoints` table stores subgraph and tool checkpoints under non-empty `checkpoint_ns` values; only `checkpoint_ns = ''` is the root/main-graph state users see. The projection **must** scope to `checkpoint_ns = ''` in every read. Reuse the existing helper at `services/worker-service/core/checkpoint_repository.py:98` (`latest root-ns checkpoint id`) or its Java equivalent in `TaskRepository.java` (existing queries already filter on `checkpoint_ns = ''` — precedent set). The supporting index `idx_checkpoints_task_created ON (task_id, checkpoint_ns, created_at)` keeps this query on a primary-key-style path.
 
 ### Why on-demand projection, not materialization
 
@@ -111,7 +129,7 @@ ActivityEvent (discriminated union on kind):
 - `ActivityProjectionService` (new) orchestrates the merge: fetches latest checkpoint, deserializes `state["messages"]`, fetches task events, interleaves by ordering key, maps to `ActivityEvent` DTOs.
 - `include_details=false` (default): filter out marker events except `compaction_fired` (summary is user-visible even in default mode).
 
-**Checkpoint deserialization:** the payload format (msgpack/pickle blob vs JSONB column) is the single implementation unknown worth verifying during planning. If the payload is opaque in Java, options are (a) decode in API via a thin library, (b) have the worker project `messages` into a JSONB column on checkpoint write (no dual-write — same transaction), (c) rely on a Python sidecar. This choice belongs in the exec plan, not the spec.
+**Checkpoint deserialization:** `checkpoints.checkpoint_payload` is a JSONB column (`infrastructure/database/migrations/0001_phase1_durable_execution.sql:80`), so the Java API can read `state["messages"]` directly via Jackson/PGJsonb. No sidecar, no schema change. The exec plan should confirm the nested-message shape (`type`, `content`, `additional_kwargs`, `tool_calls`) matches LangChain's serialized schema for mapping to the `ActivityEvent` DTO.
 
 ### 2. Worker: extend `task_events` for markers currently in convlog
 
@@ -125,6 +143,8 @@ Add the following `event_type` values via a CHECK-constraint migration:
 
 Add `task_events` INSERTs for the new marker kinds in the same transaction as the checkpoint write. The `_convlog_append_*` helpers remain in Phase A for parity (dual-write during rollout); they are removed in Phase B once the flag has stabilized.
 
+**Per-message `emitted_at` stamping.** Every time the worker appends to `state["messages"]`, it sets `additional_kwargs.emitted_at = <UTC ISO-8601 string>` on the new message(s). This is the ordering key the projection depends on. Touches the same append sites as the `_convlog_append_*` helpers (pre-LLM turn, LLM response, tool result) — one-line change each.
+
 **No synthetic system messages.** Per research, treating infrastructure markers as messages in `state["messages"]` risks blurring the LLM-facing-context boundary that replace-and-rehydrate carefully maintains. All markers live in `task_events`.
 
 ### 3. Console: unified Activity tab
@@ -137,11 +157,18 @@ Add `task_events` INSERTs for the new marker kinds in the same transaction as th
 
 ### 4. Deprecation path
 
-- Phase A (same PR): backend endpoint + Console UI behind `unified_activity_view` flag. Worker still dual-writes.
-- Phase B (follow-up, after flag validated): worker stops writing to `task_conversation_log`. Old tabs removed.
-- Phase C (follow-up): drop `task_conversation_log` table via migration. Remove `ConversationLogRepository`.
+- **Phase A (same PR):** backend endpoint + Console UI behind `unified_activity_view` flag. Worker dual-writes — old `_convlog_append_*` helpers stay; new `task_events` INSERTs added in parallel. Worker also begins stamping `emitted_at` on every appended message.
+- **Phase A.5 (before flag flip):** run one-time backfill job (see below). Validate parity by sampling tasks in both views.
+- **Phase B (after flag validated):** worker stops writing to `task_conversation_log`. Old tabs removed from Console.
+- **Phase C (follow-up):** drop `task_conversation_log` table via migration. Remove `ConversationLogRepository`, `ConversationPane`, `_convlog_append_*` helpers, and the `unified_activity_view` flag.
 
-Backfill is not needed: existing tasks' turn data already lives in `checkpoints`, and markers in `task_conversation_log` that aren't mirrored in `task_events` are acceptable to lose for historical tasks (user-facing parity starts from the flag flip).
+### Backfill — required for in-flight tasks
+
+If `unified_activity_view` flips while tasks are still running, their pre-flip marker history (`memory_flush`, `system_note`, `offload_emitted`, HITL-detail) would silently drop from the Activity view because those markers only exist in `task_conversation_log` today. To prevent regressions:
+
+- **One-time backfill job (run in Phase A.5):** read `task_conversation_log` rows for tasks whose status is not terminal (`running`, `paused`, `approval_requested`, `input_requested`), and insert equivalent rows into `task_events` (with `details.backfilled_from_convlog = true` for auditability). Idempotent on `(task_id, created_at, event_type)`.
+- **Completed tasks are not backfilled.** They keep working through the old `ConversationLogRepository` read path during Phases A–B (the old Console tabs remain available until Phase B); after Phase C the Activity view falls back to checkpoint-only rendering with a "detailed history unavailable" banner for any historical task.
+- **Turn data does not need backfill.** `state["messages"]` in `checkpoints` already contains the full journal (Track 7 Follow-up Task 3 replace-and-rehydrate invariant). The `emitted_at` fallback path in the ordering-key section covers messages written before the worker change.
 
 ## Tradeoffs
 
@@ -160,6 +187,8 @@ Backfill is not needed: existing tasks' turn data already lives in `checkpoints`
 - **Worker:** tests for each marker kind — `memory_flush`, `system_note`, `offload_emitted`, `task_compaction_summary`, `hitl_*_detail` — assert `task_events` row shape and that no `task_conversation_log` write happens when flag is on.
 - **Console unit:** `ActivityPane` renders each event kind; toggle filters correctly.
 - **Console browser (BLOCKING):** new Playwright scenario, smoke + details-toggle + per-row-expand. Flag on and off. Coverage matrix updated for `memory`, `context_management`, and `hitl` sub-objects.
+- **Backfill job:** unit tests asserting idempotence on `(task_id, created_at, event_type)`, correct mapping of convlog kinds → `task_events.event_type`, and that terminal-status tasks are skipped.
+- **Ordering-key invariants:** test that `emitted_at`-stamped messages interleave correctly with `task_events` markers around compaction boundaries, and that fallback-to-checkpoint-`created_at` still produces a monotonic stream for historical tasks without `emitted_at`.
 
 ## References
 
