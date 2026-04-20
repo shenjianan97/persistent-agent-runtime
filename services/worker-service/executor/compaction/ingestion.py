@@ -107,15 +107,36 @@ def _utf8_preview(content: str) -> str:
     return by_lines if len(by_lines.encode("utf-8")) <= len(by_bytes.encode("utf-8")) else by_bytes
 
 
-def _result_placeholder(*, size_bytes: int, uri: str, preview: str) -> str:
-    return f"[tool result {size_bytes} bytes @ {uri} preview: {preview}]"
+def _result_placeholder(
+    *, size_bytes: int, uri: str, preview: str, tool_call_id: str
+) -> str:
+    """Render the tool-result placeholder with an explicit recall example.
+
+    Including the literal ``recall_tool_result(tool_call_id=...)`` call
+    inline makes the id unambiguous for the model: production saw a case
+    where the model parsed the id out of the URI path and stripped the
+    ``tooluse_`` prefix (task 75f5a223). A quoted, copy-pasteable example
+    avoids that heuristic entirely.
+    """
+    return (
+        f"[tool result {size_bytes} bytes @ {uri} preview: {preview} "
+        f"— to fetch full content call "
+        f"recall_tool_result(tool_call_id={tool_call_id!r})]"
+    )
 
 
 def _arg_placeholder(
-    *, key: str, size_bytes: int, uri: str, preview: str
+    *, key: str, size_bytes: int, uri: str, preview: str, tool_call_id: str
 ) -> str:
+    """Render the tool-arg placeholder with an explicit recall example.
+
+    See ``_result_placeholder`` for the rationale behind the inline
+    invocation example.
+    """
     return (
-        f"[tool arg '{key}' {size_bytes} bytes @ {uri} preview: {preview}]"
+        f"[tool arg '{key}' {size_bytes} bytes @ {uri} preview: {preview} "
+        f"— to fetch full content call "
+        f"recall_tool_result(tool_call_id={tool_call_id!r}, arg_key={key!r})]"
     )
 
 
@@ -194,7 +215,10 @@ async def offload_tool_message(
 
     preview = _utf8_preview(content)
     placeholder = _result_placeholder(
-        size_bytes=size_bytes, uri=uri, preview=preview
+        size_bytes=size_bytes,
+        uri=uri,
+        preview=preview,
+        tool_call_id=tool_call_id,
     )
 
     # Construct a new ToolMessage (model_copy preserves id/status/etc.)
@@ -303,7 +327,11 @@ async def offload_ai_message_args(
 
             preview = _utf8_preview(value)
             args[key] = _arg_placeholder(
-                key=key, size_bytes=size_bytes, uri=uri, preview=preview
+                key=key,
+                size_bytes=size_bytes,
+                uri=uri,
+                preview=preview,
+                tool_call_id=call_id,
             )
             touched = True
             # TODO(Task 5): emit `offload_emitted` conversation-log event here

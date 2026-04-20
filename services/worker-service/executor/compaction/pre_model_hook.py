@@ -170,25 +170,59 @@ def option_c_reference_replacement(
 
 
 # ---------------------------------------------------------------------------
-# Projection rules for recalled ToolMessages (Task 5 §5):
+# Projection rules for recalled ToolMessages (Task 5 §5, revised):
 #   inside keep window → verbatim (already recalled for a reason)
-#   outside keep window → DROPPED (avoid re-offload/re-recall oscillation)
+#   outside keep window → STUBBED in place (envelope preserved, content short)
+#
+# We stub rather than drop because providers (Bedrock / Anthropic) require
+# every ``tool_use`` block to be paired with its matching ``tool_result``.
+# Dropping a recall response when the keep-window boundary falls between the
+# invoking AIMessage and its ToolMessage leaves an orphan tool_use and the
+# provider rejects the turn (observed on task 75f5a223 — dead-lettered with
+# "Expected toolResult blocks at messages.N.content" from Bedrock Converse).
+# The stub keeps the ToolMessage structurally valid and still prevents the
+# re-offload / re-recall oscillation the original drop rule targeted, because
+# the bytes are replaced with a short placeholder (not the full recalled
+# content), so the projection does not grow turn-over-turn.
 # ---------------------------------------------------------------------------
 
 
-def _drop_recalled_outside_keep_window(
+_OUT_OF_WINDOW_STUB_TEMPLATE = (
+    "[recall response elided from older context; full content remains at "
+    "original tool_call_id='{original}']"
+)
+
+
+def _stub_recalled_outside_keep_window(
     middle: list[BaseMessage],
 ) -> list[BaseMessage]:
-    """Return ``middle`` with any recalled ToolMessages removed.
+    """Return ``middle`` with recalled ToolMessages' content stubbed.
 
-    Everything in ``middle`` sits BETWEEN ``summarized_through`` and the
-    keep-window start — i.e. outside the keep window. Per Task 5 §5,
-    recalled messages there are dropped from the projection to prevent a
-    re-offload / re-recall loop (the agent would see the placeholder in the
-    keep window, recall it, get the content, and on the next turn it lands
-    back in middle, drops out of view, triggers another recall, etc).
+    The ToolMessage envelope (role, ``tool_call_id``, ``name``,
+    ``additional_kwargs``) is preserved verbatim so the invoking
+    ``AIMessage.tool_calls`` entry still has its matching ``tool_result``
+    and the provider accepts the request. Only ``.content`` is swapped for
+    a short stub string pointing back at the original tool_call_id — the
+    full recalled bytes remain in the artifact store and a fresh
+    ``recall_tool_result`` call still returns them.
+
+    Idempotent: re-stubbing a message that already carries the stub content
+    is a no-op (no new instance allocated, no churn through reducers).
     """
-    return [m for m in middle if not _is_recalled_tool_message(m)]
+    out: list[BaseMessage] = []
+    for m in middle:
+        if not _is_recalled_tool_message(m):
+            out.append(m)
+            continue
+        kwargs = dict(getattr(m, "additional_kwargs", None) or {})
+        original = kwargs.get("original_tool_call_id", "") or ""
+        stub_content = _OUT_OF_WINDOW_STUB_TEMPLATE.format(original=original)
+        current = getattr(m, "content", None)
+        if isinstance(current, str) and current == stub_content:
+            out.append(m)
+            continue
+        out.append(m.model_copy(update={"content": stub_content}))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -544,15 +578,15 @@ async def compaction_pre_model_hook(
     middle = list(raw_messages[summarized_through:keep_window_start])
     keep_window = list(raw_messages[keep_window_start:])
 
-    # Task 5 §5 — projection rule for recalled ToolMessages: keep verbatim
-    # inside the keep window (the agent recalled them on purpose and we want
-    # them rendered in full) but DROP them from ``middle``. Letting them sit
-    # in middle would re-expose the full recalled content on every turn until
-    # the next compaction absorbs them — exactly the re-offload / re-recall
-    # loop Task 5's design brief calls out. Once absorbed into ``summary``,
-    # the Option C replacement below keeps the journal entry lossless
-    # (S3 still holds the original bytes).
-    middle = _drop_recalled_outside_keep_window(middle)
+    # Task 5 §5 (revised) — projection rule for recalled ToolMessages: keep
+    # verbatim inside the keep window (the agent recalled them on purpose)
+    # but STUB them in ``middle``. Stubbing, not dropping, preserves the
+    # tool_use/tool_result pairing the provider requires; the short stub
+    # still prevents the re-offload / re-recall oscillation the original
+    # rule targeted because the bytes are replaced with a placeholder.
+    # Once absorbed into ``summary``, the Option C replacement below keeps
+    # the journal entry lossless (S3 still holds the original bytes).
+    middle = _stub_recalled_outside_keep_window(middle)
 
     # Build the initial projection and estimate tokens.
     projection = _build_projection(

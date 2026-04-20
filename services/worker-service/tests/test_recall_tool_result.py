@@ -148,11 +148,89 @@ async def test_empty_tool_call_id_returns_malformed_without_calling_store(
 async def test_missing_tool_call_id_returns_no_hash(
     store: InMemoryToolResultStore,
 ):
-    # Store is empty for this tool_call_id.
+    # Store is empty for this tool_call_id AND empty for the whole task, so
+    # the diagnostic listing is empty and the response is the base constant.
     out = await _resolve_and_fetch(
         ctx=_ctx(store), tool_call_id="tooluse_unknown", arg_key=None
     )
     assert out == ERROR_NO_HASH
+
+
+@pytest.mark.asyncio
+async def test_missing_id_lists_available_ids_when_store_has_other_entries(
+    store: InMemoryToolResultStore,
+):
+    """Regression for task 75f5a223: model called ``recall_tool_result`` with
+    a stripped id (``"vIEO..."``) while the real id was
+    ``"tooluse_vIEO..."``. The old response was an opaque "not found" string
+    that gave the model no signal to self-correct. The enriched response
+    echoes the input and lists the ids that DO exist for this task so the
+    model can spot the mismatch on the next turn.
+
+    We deliberately do NOT auto-correct the id — the model needs to see its
+    own mistake to learn from it. This test asserts the diagnostic shape,
+    not any fuzzy-matching behaviour."""
+    # Seed the store with two real offloads under this task.
+    await store.put(
+        tenant_id=TENANT,
+        task_id=TASK,
+        tool_call_id="tooluse_real_one",
+        content="A" * 100,
+    )
+    await store.put(
+        tenant_id=TENANT,
+        task_id=TASK,
+        tool_call_id="tooluse_real_two",
+        content="B" * 100,
+        arg_key="content",
+    )
+
+    out = await _resolve_and_fetch(
+        # Drop the ``tooluse_`` prefix — the actual mistake observed in
+        # production.
+        ctx=_ctx(store),
+        tool_call_id="real_one",
+        arg_key=None,
+    )
+
+    # Base error message is preserved — existing string-equality callers
+    # looking for the substring still work.
+    assert out.startswith(ERROR_NO_HASH)
+    # Echoes what the model supplied, so it sees its own wrong argument.
+    assert "'real_one'" in out
+    # Lists the available ids, INCLUDING the one the model probably meant.
+    assert "tooluse_real_one" in out
+    # And the arg-side entry, with its arg_key annotated.
+    assert "tooluse_real_two" in out
+    assert "arg_key='content'" in out
+    # Does NOT silently claim success.
+    assert "A" * 100 not in out
+    assert "B" * 100 not in out
+
+
+@pytest.mark.asyncio
+async def test_missing_id_diagnostic_listing_is_bounded(
+    store: InMemoryToolResultStore,
+):
+    """When a task has many offloads, the diagnostic listing is capped so
+    the error response stays bounded in size (no multi-KB error text)."""
+    # Seed 50 entries; cap is 20.
+    for i in range(50):
+        await store.put(
+            tenant_id=TENANT,
+            task_id=TASK,
+            tool_call_id=f"tooluse_entry_{i:03d}",
+            content=f"payload-{i}",
+        )
+
+    out = await _resolve_and_fetch(
+        ctx=_ctx(store), tool_call_id="does_not_exist", arg_key=None
+    )
+    # Count lines naming a tool_call_id. The response format is
+    # "  - tool_call_id='...'" one per entry.
+    listed = sum(1 for line in out.splitlines() if "tool_call_id='" in line)
+    # One line is the "You supplied" echo; the rest are the listing.
+    assert 1 < listed <= 21
 
 
 # ---------------------------------------------------------------------------

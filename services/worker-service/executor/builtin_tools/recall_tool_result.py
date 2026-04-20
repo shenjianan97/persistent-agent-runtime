@@ -152,6 +152,17 @@ ERROR_NO_HASH: str = (
     "have been offloaded, or has already been purged)"
 )
 
+# When NO_HASH fires, callers see this base string followed (on a newline)
+# by diagnostic lines showing what they supplied and which ids ARE available
+# in this task's artifact store — when any are found. The goal is to let the
+# model self-correct its argument (e.g. it passed a stripped id without the
+# ``tooluse_`` prefix) rather than silently guess for it. Production note:
+# task 75f5a223 dead-lettered after the model called
+# ``recall_tool_result(tool_call_id="vIEO28OtSiKBQVhMWM6KKb")`` when the real
+# id was ``tooluse_vIEO28OtSiKBQVhMWM6KKb`` — we want that mistake to be
+# obvious from the response string on the next turn.
+_MAX_AVAILABLE_ENTRIES_IN_NO_HASH: int = 20
+
 
 # ---------------------------------------------------------------------------
 # Hash resolution
@@ -194,6 +205,82 @@ def _single_hash_from_keys(keys: Iterable[str]) -> tuple[str | None, int]:
     if not unique:
         return (None, 0)
     return (unique[0] if len(unique) == 1 else None, len(unique))
+
+
+async def _list_task_offloaded_entries(
+    store: ToolResultArtifactStore,
+    *,
+    tenant_id: str,
+    task_id: str,
+    limit: int = _MAX_AVAILABLE_ENTRIES_IN_NO_HASH,
+) -> list[dict[str, Any]]:
+    """Enumerate (tool_call_id, arg_key?) pairs present under this task.
+
+    Returns an empty list when the store cannot list, when listing raises,
+    or when nothing is offloaded. Bounded to ``limit`` entries so a task
+    with hundreds of offloads does not produce a multi-KB error response.
+    """
+    prefix = f"{tenant_id}/{task_id}/"
+    try:
+        keys = await _list_prefix(store, prefix)
+    except Exception:  # noqa: BLE001 — diagnostic-only, never raise
+        return []
+    if not keys:
+        return []
+
+    seen: set[tuple[str, str | None]] = set()
+    entries: list[dict[str, Any]] = []
+    for key in keys:
+        # Strip the leading ``{tenant}/{task}/`` then look at path segments.
+        rel = key[len(prefix):] if key.startswith(prefix) else key
+        parts = rel.split("/")
+        if len(parts) < 2:
+            continue
+        tool_call_id = parts[0]
+        arg_key: str | None = None
+        # Arg form: {tool_call_id}/args/{arg_key}/{hash}.txt
+        if len(parts) >= 4 and parts[1] == "args":
+            arg_key = parts[2]
+        k = (tool_call_id, arg_key)
+        if k in seen:
+            continue
+        seen.add(k)
+        entries.append({"tool_call_id": tool_call_id, "arg_key": arg_key})
+        if len(entries) >= limit:
+            break
+    return entries
+
+
+def _render_no_hash_with_diagnostics(
+    *,
+    supplied_tool_call_id: str,
+    supplied_arg_key: str | None,
+    available: list[dict[str, Any]],
+) -> str:
+    """Compose a NO_HASH response with echo + available-ids list.
+
+    When ``available`` is empty we return ``ERROR_NO_HASH`` unchanged so
+    callers asserting equality with the base constant keep working in the
+    "nothing offloaded at all" case. Otherwise we append diagnostic lines
+    echoing the caller-supplied id (so the model can spot its own mistake)
+    plus the list of ids that DO exist in the store for this task.
+    """
+    if not available:
+        return ERROR_NO_HASH
+    lines: list[str] = [ERROR_NO_HASH]
+    supplied_suffix = (
+        f", arg_key={supplied_arg_key!r}" if supplied_arg_key else ""
+    )
+    lines.append(
+        f"You supplied tool_call_id={supplied_tool_call_id!r}{supplied_suffix}."
+    )
+    lines.append("Available offloaded entries in this task:")
+    for entry in available:
+        tc = entry["tool_call_id"]
+        arg = entry.get("arg_key")
+        arg_suffix = f", arg_key={arg!r}" if arg else ""
+        lines.append(f"  - tool_call_id={tc!r}{arg_suffix}")
+    return "\n".join(lines)
 
 
 async def _list_prefix(
@@ -305,7 +392,20 @@ async def _resolve_and_fetch(
 
     content_hash, count = _single_hash_from_keys(keys)
     if count == 0:
-        return ERROR_NO_HASH
+        # The id the model passed didn't match any offloaded entry.
+        # Echo the input + list the ids that DO exist for this task so the
+        # model can spot its own mistake (e.g. missing the ``tooluse_``
+        # prefix) and retry with the correct argument. Diagnostic listing
+        # is bounded; errors during listing are swallowed (this path is
+        # already the error path — don't compound).
+        available = await _list_task_offloaded_entries(
+            ctx.store, tenant_id=ctx.tenant_id, task_id=ctx.task_id
+        )
+        return _render_no_hash_with_diagnostics(
+            supplied_tool_call_id=tool_call_id,
+            supplied_arg_key=clean_arg_key,
+            available=available,
+        )
     if content_hash is None:
         # Multiple distinct hashes — provider retry produced multiple
         # offloads. Rare; ask the agent to retry with a fresher id.

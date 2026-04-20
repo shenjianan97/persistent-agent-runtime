@@ -17,8 +17,9 @@ Covers (see task-5 spec §6):
 * Recovery path — after replacement, a direct ``recall_tool_result`` call
   still returns the original content (the artefact store is the source of
   truth; Option C is lossless).
-* Projection rule — recalled ToolMessages outside the keep window are
-  dropped from ``middle`` in the hook's output.
+* Projection rule — recalled ToolMessages outside the keep window have
+  their ``content`` stubbed in ``middle`` (envelope preserved so the
+  tool_use / tool_result pair stays valid for Bedrock / Anthropic).
 * Idempotence — running Option C twice on the same range is a no-op (no
   churn through the reducer).
 """
@@ -237,7 +238,9 @@ async def test_option_c_is_lossless_s3_still_returns_original_content():
 
 
 # ---------------------------------------------------------------------------
-# Integration with the hook — projection drops recalled outside keep window
+# Integration with the hook — projection stubs recalled outside keep window
+# (content replaced, envelope preserved so tool_use/tool_result pair stays
+# valid for Bedrock / Anthropic).
 # ---------------------------------------------------------------------------
 
 
@@ -246,10 +249,16 @@ def _estimate_small(msgs: list[BaseMessage]) -> int:
     return 10 * len(msgs)
 
 
-async def test_projection_drops_recalled_messages_outside_keep_window():
+async def test_projection_stubs_recalled_messages_outside_keep_window():
     """Recalled ``ToolMessage`` entries sitting in ``middle`` (i.e. OUTSIDE
-    the keep window) are excluded from the projection the hook hands to the
-    LLM. Inside the keep window they're rendered verbatim."""
+    the keep window) have their ``content`` STUBBED — the envelope stays so
+    the tool_use / tool_result pair remains valid for Bedrock / Anthropic.
+    Inside the keep window they're rendered verbatim.
+
+    Regression target: task 75f5a223 was dead-lettered by Bedrock with
+    "Expected toolResult blocks at messages.N.content" because the prior
+    drop rule removed a recall response whose invoking AIMessage was still
+    in the projection. Stubbing preserves the pair."""
     # Build a journal long enough that find_keep_window_start keeps only
     # the last KEEP_TOOL_USES=3 ToolMessages. We'll put one recalled
     # message inside the keep window and one outside.
@@ -305,11 +314,118 @@ async def test_projection_drops_recalled_messages_outside_keep_window():
         estimate_tokens_fn=_estimate_small,
     )
 
-    # The old recalled message (outside keep window, in "middle") is DROPPED.
-    contents = [m.content for m in result.messages if isinstance(m, ToolMessage)]
+    tool_msgs = [m for m in result.messages if isinstance(m, ToolMessage)]
+    contents = [m.content for m in tool_msgs]
+    # The old recalled message is STUBBED (content replaced, envelope kept).
     assert "OLD RECALLED PAYLOAD" not in contents
+    assert any(
+        isinstance(c, str) and "tooluse_orig_old" in c and "elided" in c
+        for c in contents
+    ), f"expected stub content referencing original_tool_call_id; got {contents}"
     # The recent recalled message (inside keep window) is RENDERED VERBATIM.
     assert "RECENT RECALLED PAYLOAD" in contents
+
+    # Invariant: every ToolMessage in the projection still has a matching
+    # tool_use block preceding it (no orphans → provider will accept).
+    ai_tool_call_ids: set[str] = set()
+    for m in result.messages:
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    ai_tool_call_ids.add(tc["id"])
+        elif isinstance(m, ToolMessage):
+            assert m.tool_call_id in ai_tool_call_ids, (
+                f"orphan ToolMessage {m.tool_call_id!r} — "
+                f"no preceding AIMessage.tool_calls entry"
+            )
+
+
+async def test_projection_preserves_tool_pair_when_keep_window_cuts_between():
+    """Regression for task 75f5a223: the keep-window boundary falls between
+    the recall AIMessage and its ToolMessage response. The old drop rule
+    produced an orphan tool_use; the stub rule must preserve the pair."""
+    # Layout (indices):
+    #   0: HumanMessage
+    #   1..6: three (AIMessage+tool_calls, ToolMessage) pairs — these fill
+    #         the keep window (KEEP_TOOL_USES=3).
+    #   7: AIMessage with tool_calls=[{id:"rc_call"}] for recall_tool_result
+    #   8: recalled ToolMessage (response)
+    #   9..: more pairs to push the recall pair into middle
+    msgs: list[BaseMessage] = [HumanMessage(content="start")]
+
+    # The recall pair we care about — goes first so it ends up in middle
+    # once subsequent pairs fill the keep window.
+    msgs.append(
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "id": "rc_call",
+                    "name": "recall_tool_result",
+                    "args": {"tool_call_id": "tooluse_target"},
+                }
+            ],
+        )
+    )
+    msgs.append(
+        _recalled_tool_message(
+            msg_id="tm_recall",
+            tool_call_id="rc_call",
+            original_tool_call_id="tooluse_target",
+            content="RECALLED BYTES",
+        )
+    )
+
+    # Now append enough plain tool-use cycles to push the recall pair OUT of
+    # the keep window (KEEP_TOOL_USES=3 means we need 3 more ToolMessages).
+    for i in range(3):
+        msgs.append(
+            AIMessage(
+                content="",
+                tool_calls=[{"id": f"p{i}", "name": "x", "args": {}}],
+            )
+        )
+        msgs.append(ToolMessage(content="ok", tool_call_id=f"p{i}"))
+
+    state: dict[str, Any] = {
+        "messages": msgs,
+        "summary": "",
+        "summarized_through_turn_index": 0,
+    }
+
+    result: CompactionPassResult = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config={},
+        model_context_window=100_000,
+        task_context={"tenant_id": TENANT, "agent_id": "a", "task_id": TASK},
+        summarizer=_unused_summarizer,
+        estimate_tokens_fn=_estimate_small,
+    )
+
+    # Build the "which tool_call_ids are visible" set in projection order.
+    visible_tool_call_ids: set[str] = set()
+    for m in result.messages:
+        if isinstance(m, AIMessage):
+            for tc in m.tool_calls or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    visible_tool_call_ids.add(tc["id"])
+
+    # The recall's AIMessage is in middle, so its tool_call is visible.
+    assert "rc_call" in visible_tool_call_ids
+
+    # And its ToolMessage response MUST also be visible (stubbed, but
+    # structurally present). This is what Bedrock rejected before the fix.
+    tool_msgs = [m for m in result.messages if isinstance(m, ToolMessage)]
+    call_ids = {m.tool_call_id for m in tool_msgs}
+    assert "rc_call" in call_ids, (
+        "recall ToolMessage missing from projection — would produce "
+        "orphan tool_use and Bedrock would reject the request"
+    )
+    # And it's stubbed, not full content.
+    rc_tm = next(m for m in tool_msgs if m.tool_call_id == "rc_call")
+    assert "RECALLED BYTES" not in (rc_tm.content or "")
+    assert "tooluse_target" in (rc_tm.content or "")
 
 
 async def _unused_summarizer(**kwargs: Any) -> Any:
