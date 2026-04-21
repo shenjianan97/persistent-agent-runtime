@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Phase 2 Track 7 Follow-up Task 8 — unified Activity projection entry.
@@ -43,7 +44,12 @@ public record ActivityEventResponse(
         @JsonProperty("status_before") String statusBefore,
         @JsonProperty("status_after") String statusAfter,
         @JsonProperty("summary_text") String summaryText,
-        @JsonProperty("details") Object details
+        @JsonProperty("details") Object details,
+        // Per-turn cost & token usage on `turn.assistant` events — sourced
+        // from the AIMessage's `usage_metadata` (tokens) and the checkpoint
+        // that first materialised the message (cost). Null on other kinds.
+        @JsonProperty("usage") Map<String, Integer> usage,
+        @JsonProperty("cost_microdollars") Long costMicrodollars
 ) {
 
     /** Inline tool-call descriptor on an assistant turn. */

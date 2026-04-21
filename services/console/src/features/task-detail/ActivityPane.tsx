@@ -68,6 +68,23 @@ function truncate(value: string, max = 4000): string {
     return `${value.slice(0, max)}…`;
 }
 
+function formatTokenCount(n: number | undefined | null): string {
+    if (n == null || !Number.isFinite(n)) return '–';
+    if (n < 1000) return String(n);
+    if (n < 100_000) return `${(n / 1000).toFixed(1)}k`;
+    return `${Math.round(n / 1000)}k`;
+}
+
+function formatMicroUsd(microdollars: number | undefined | null): string | null {
+    if (microdollars == null || !Number.isFinite(microdollars) || microdollars <= 0) {
+        return null;
+    }
+    const usd = microdollars / 1_000_000;
+    if (usd < 0.01) return `$${usd.toFixed(4)}`;
+    if (usd < 1) return `$${usd.toFixed(3)}`;
+    return `$${usd.toFixed(2)}`;
+}
+
 // The Activity API stringifies Anthropic content-block lists as Python reprs:
 //   [{text=..., type=text}, {id=..., name=..., type=tool_use, input={...}}]
 // For the assistant bubble we only want the prose text; tool_use blocks are
@@ -241,6 +258,9 @@ function AssistantTurnRow({ event, index }: RowProps) {
     const toolCalls: ActivityToolCall[] = event.tool_calls ?? [];
     const hasText = !!text;
     const hasToolCalls = toolCalls.length > 0;
+    const usage = event.usage ?? undefined;
+    const cost = formatMicroUsd(event.cost_microdollars);
+    const showUsage = !!usage && (usage.input_tokens != null || usage.output_tokens != null);
 
     return (
         <li
@@ -250,11 +270,33 @@ function AssistantTurnRow({ event, index }: RowProps) {
             className="list-none flex justify-start animate-in fade-in duration-300"
         >
             <div className="max-w-[85%] w-full space-y-2">
-                <div className="inline-flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground bg-muted/5 border border-border/30 rounded-full px-3 py-1">
+                <div
+                    data-testid={`activity-row-${index}-pill`}
+                    className="inline-flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground bg-muted/5 border border-border/30 rounded-full px-3 py-1"
+                >
                     <Sparkles className="w-3 h-3" /> Agent
                     {event.timestamp && (
                         <span className="ml-1 text-muted-foreground/80 font-normal normal-case tracking-normal">
                             {formatTime(event.timestamp)}
+                        </span>
+                    )}
+                    {showUsage && (
+                        <span
+                            data-testid={`activity-row-${index}-usage`}
+                            className="ml-1 font-mono normal-case tracking-normal text-primary/80"
+                            title={`input_tokens=${usage!.input_tokens ?? '?'}, output_tokens=${usage!.output_tokens ?? '?'}, total_tokens=${usage!.total_tokens ?? '?'}`}
+                        >
+                            {formatTokenCount(usage!.input_tokens)} in
+                            {' → '}
+                            {formatTokenCount(usage!.output_tokens)} out
+                        </span>
+                    )}
+                    {cost && (
+                        <span
+                            data-testid={`activity-row-${index}-cost`}
+                            className="font-mono normal-case tracking-normal text-success/80"
+                        >
+                            · {cost}
                         </span>
                     )}
                 </div>
@@ -323,11 +365,6 @@ function ToolTurnRow({ event, index }: RowProps) {
                         {err && (
                             <span className="inline-flex items-center gap-1 text-destructive normal-case tracking-normal font-semibold">
                                 <AlertTriangle className="w-3 h-3" /> error
-                            </span>
-                        )}
-                        {event.timestamp && (
-                            <span className="ml-auto text-muted-foreground font-normal normal-case tracking-normal tabular-nums">
-                                {formatTime(event.timestamp)}
                             </span>
                         )}
                     </span>

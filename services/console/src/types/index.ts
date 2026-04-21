@@ -457,6 +457,12 @@ export interface ActivityToolCall {
     args?: unknown;
 }
 
+export interface ActivityUsage {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+}
+
 export interface ActivityEvent {
     kind: ActivityEventKind | string;
     timestamp: string | null;
@@ -471,6 +477,11 @@ export interface ActivityEvent {
     status_after?: string | null;
     summary_text?: string | null;
     details?: Record<string, unknown> | null;
+    // Populated on `turn.assistant` events. `usage` is pulled from the
+    // AIMessage's `usage_metadata`; `cost_microdollars` is the checkpoint
+    // `cost_microdollars` attributed to this AI message by the server.
+    usage?: ActivityUsage | null;
+    cost_microdollars?: number | null;
 }
 
 export interface ActivityListResponse {

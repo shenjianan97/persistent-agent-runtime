@@ -16,7 +16,10 @@ import java.sql.Timestamp;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -30,14 +33,13 @@ import java.util.UUID;
  * by {@code checkpoints}) into a single on-demand projection over
  * {@code checkpoints} (turns) + {@code task_events} (markers).
  *
- * <p><b>Write-heavy workload.</b> Checkpoints fire on every graph step and
- * reads are infrequent; we deliberately do NOT materialise a projection
- * table. Read cost is one primary-key-style checkpoint lookup plus one
- * indexed {@code task_events} scan — both cheap, no cache needed in v1.
- *
- * <p><b>Namespace scope.</b> Every checkpoint read uses
- * {@code checkpoint_ns = ''} (root main-graph state). Sub-graph / tool
- * checkpoints under non-empty namespaces are never surfaced to the user.
+ * <p>The final rendered surface carries the per-assistant-turn token usage
+ * (from each AIMessage's {@code usage_metadata}) and the per-assistant-turn
+ * cost (by walking the full checkpoint list and attributing each non-zero
+ * {@code cost_microdollars} to the AIMessage id that first appeared in that
+ * checkpoint). The per-turn attribution is what the deprecated Execution
+ * Timeline used to surface; carrying it forward is non-negotiable for
+ * operators who need to see which turn was expensive.
  */
 @Service
 public class ActivityProjectionService {
@@ -90,6 +92,12 @@ public class ActivityProjectionService {
             }
         }
 
+        // Build cost-attribution map up-front by walking every checkpoint for
+        // the task. The map is ai_message_id → cost_microdollars; only
+        // checkpoints whose cost is >0 produce entries, and only for AI
+        // messages that weren't present in any earlier checkpoint.
+        Map<String, Long> costByAiMessageId = buildCostAttributionMap(taskId, tenantId);
+
         List<ActivityEventResponse> events = new ArrayList<>();
 
         OffsetDateTime checkpointCreatedAt = null;
@@ -100,7 +108,7 @@ public class ActivityProjectionService {
                 checkpointCreatedAt = DateTimeUtil.toOffsetDateTime(ts);
             }
             Object payload = row.get("checkpoint_payload");
-            events.addAll(extractTurns(payload, checkpointCreatedAt));
+            events.addAll(extractTurns(payload, checkpointCreatedAt, costByAiMessageId));
         }
 
         for (TaskEventResponse marker : markerRows) {
@@ -129,11 +137,79 @@ public class ActivityProjectionService {
     }
 
     // ---------------------------------------------------------------------
+    // Per-turn cost attribution — walks all checkpoints in order, threads a
+    // running "already-seen AI message IDs" set across them, and assigns each
+    // checkpoint's cost to the first AI message that appears. Checkpoints
+    // with cost_microdollars == 0 are skipped entirely. Parsing every
+    // payload is not cheap but the checkpoint count per task stays O(100s)
+    // in practice; we revisit this when tasks routinely exceed that.
+    // ---------------------------------------------------------------------
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Long> buildCostAttributionMap(UUID taskId, String tenantId) {
+        var all = taskRepository.getCheckpoints(taskId, tenantId).orElse(Collections.emptyList());
+        if (all.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, Long> out = new HashMap<>();
+        Set<String> seen = new HashSet<>();
+        for (Map<String, Object> row : all) {
+            Object costObj = row.get("cost_microdollars");
+            long cost = 0;
+            if (costObj instanceof Number n) {
+                cost = n.longValue();
+            }
+            Object payload = row.get("checkpoint_payload");
+            Map<String, Object> parsed = parsePayload(payload);
+            if (parsed == null) {
+                continue;
+            }
+            Object channelValues = parsed.get("channel_values");
+            if (!(channelValues instanceof Map<?, ?> channelMap)) {
+                continue;
+            }
+            Object messages = ((Map<String, Object>) channelMap).get("messages");
+            if (!(messages instanceof List<?> messageList)) {
+                continue;
+            }
+            String firstNewAiId = null;
+            for (Object rawMessage : messageList) {
+                if (!(rawMessage instanceof Map<?, ?> messageWrapper)) {
+                    continue;
+                }
+                Object rawKwargs = ((Map<String, Object>) messageWrapper).get("kwargs");
+                if (!(rawKwargs instanceof Map<?, ?> kwargsMap)) {
+                    continue;
+                }
+                Map<String, Object> kwargs = (Map<String, Object>) kwargsMap;
+                String type = asString(kwargs.get("type"));
+                String id = asString(kwargs.get("id"));
+                if (id == null || id.isBlank()) {
+                    continue;
+                }
+                if ("ai".equals(type) && !seen.contains(id)) {
+                    if (firstNewAiId == null) {
+                        firstNewAiId = id;
+                    }
+                    seen.add(id);
+                }
+            }
+            if (cost > 0 && firstNewAiId != null) {
+                out.merge(firstNewAiId, cost, Long::sum);
+            }
+        }
+        return out;
+    }
+
+    // ---------------------------------------------------------------------
     // Turn extraction from checkpoint_payload.channel_values.messages
     // ---------------------------------------------------------------------
 
     @SuppressWarnings("unchecked")
-    private List<ActivityEventResponse> extractTurns(Object payload, OffsetDateTime fallbackTs) {
+    private List<ActivityEventResponse> extractTurns(
+            Object payload,
+            OffsetDateTime fallbackTs,
+            Map<String, Long> costByAiMessageId) {
         List<ActivityEventResponse> turns = new ArrayList<>();
         Map<String, Object> parsed = parsePayload(payload);
         if (parsed == null) {
@@ -176,8 +252,9 @@ public class ActivityProjectionService {
                         "user",
                         asString(kwargs.get("content")),
                         null, null, null, null,
-                        null, null, null, null, null));
-                case "ai" -> turns.add(buildAssistantTurn(kwargs, timestamp));
+                        null, null, null, null, null,
+                        null, null));
+                case "ai" -> turns.add(buildAssistantTurn(kwargs, timestamp, costByAiMessageId));
                 case "tool" -> turns.add(new ActivityEventResponse(
                         "turn.tool",
                         timestamp,
@@ -187,7 +264,8 @@ public class ActivityProjectionService {
                         asString(kwargs.get("tool_call_id")),
                         null,
                         "error".equalsIgnoreCase(asString(kwargs.get("status"))),
-                        null, null, null, null, null));
+                        null, null, null, null, null,
+                        null, null));
                 case "system" -> {
                     // SystemMessages in state["messages"] are platform
                     // directives the worker put there intentionally
@@ -201,7 +279,8 @@ public class ActivityProjectionService {
                             null,
                             asString(kwargs.get("content")),
                             null, null, null, null,
-                            "system_note", null, null, null, null));
+                            "system_note", null, null, null, null,
+                            null, null));
                 }
                 default -> { /* unknown type — skip */ }
             }
@@ -210,7 +289,10 @@ public class ActivityProjectionService {
     }
 
     @SuppressWarnings("unchecked")
-    private ActivityEventResponse buildAssistantTurn(Map<String, Object> kwargs, OffsetDateTime ts) {
+    private ActivityEventResponse buildAssistantTurn(
+            Map<String, Object> kwargs,
+            OffsetDateTime ts,
+            Map<String, Long> costByAiMessageId) {
         List<ActivityEventResponse.ToolCall> toolCalls = null;
         Object rawToolCalls = kwargs.get("tool_calls");
         if (rawToolCalls instanceof List<?> rawList && !rawList.isEmpty()) {
@@ -227,6 +309,14 @@ public class ActivityProjectionService {
                 toolCalls = null;
             }
         }
+
+        Map<String, Integer> usage = extractUsage(kwargs.get("usage_metadata"));
+        Long cost = null;
+        String messageId = asString(kwargs.get("id"));
+        if (messageId != null && costByAiMessageId.containsKey(messageId)) {
+            cost = costByAiMessageId.get(messageId);
+        }
+
         return new ActivityEventResponse(
                 "turn.assistant",
                 ts,
@@ -235,7 +325,42 @@ public class ActivityProjectionService {
                 null, null,
                 toolCalls,
                 null,
-                null, null, null, null, null);
+                null, null, null, null, null,
+                usage,
+                cost);
+    }
+
+    /**
+     * Reads the three token counters off a LangChain {@code usage_metadata}
+     * dict. Returns {@code null} when no usable data is present so
+     * {@link com.fasterxml.jackson.annotation.JsonInclude} keeps the
+     * response compact for legacy turns (pre-Track-7 AIMessages without
+     * usage).
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Integer> extractUsage(Object raw) {
+        if (!(raw instanceof Map<?, ?> map)) {
+            return null;
+        }
+        Map<String, Object> usage = (Map<String, Object>) map;
+        Integer in = readInt(usage.get("input_tokens"));
+        Integer out = readInt(usage.get("output_tokens"));
+        Integer total = readInt(usage.get("total_tokens"));
+        if (in == null && out == null && total == null) {
+            return null;
+        }
+        Map<String, Integer> result = new HashMap<>();
+        if (in != null) result.put("input_tokens", in);
+        if (out != null) result.put("output_tokens", out);
+        if (total != null) result.put("total_tokens", total);
+        return result;
+    }
+
+    private Integer readInt(Object value) {
+        if (value instanceof Number n) {
+            return n.intValue();
+        }
+        return null;
     }
 
     private OffsetDateTime readEmittedAt(Map<String, Object> kwargs) {
@@ -327,7 +452,9 @@ public class ActivityProjectionService {
                 event.statusBefore(),
                 event.statusAfter(),
                 summaryText,
-                event.details());
+                event.details(),
+                null,
+                null);
     }
 
     private static String asString(Object value) {
