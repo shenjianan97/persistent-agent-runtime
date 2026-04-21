@@ -82,8 +82,8 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
         defaultValues: {
             display_name: '',
             system_prompt: 'You are a helpful assistant. Provide concise and accurate answers.',
-            provider: 'anthropic',
-            model: 'claude-3-5-sonnet-latest',
+            provider: '',
+            model: '',
             temperature: 0.7,
             tool_servers: [],
             max_concurrent_tasks: 5,
@@ -104,6 +104,15 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const sandboxEnabled = form.watch('sandbox_enabled');
     const memoryEnabled = form.watch('memory_enabled');
     const selectedProvider = form.watch('provider');
+    const selectedModel = form.watch('model');
+
+    useEffect(() => {
+        if (models.length === 0) return;
+        if (selectedModel) return;
+        const first = models[0];
+        form.setValue('provider', first.provider);
+        form.setValue('model', first.model_id);
+    }, [models, selectedModel, form]);
     const providerFilteredModels = useMemo(
         () => models.filter((m) => m.provider === selectedProvider),
         [models, selectedProvider],
