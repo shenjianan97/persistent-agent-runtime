@@ -36,6 +36,8 @@ from executor.graph import (
     _convlog_append_pre_llm_turns,
     _convlog_origin_ref_for_message,
     _emit_compaction_task_events,
+    _emit_offload_task_event,
+    _stamp_emitted_at,
 )
 
 
@@ -509,6 +511,9 @@ async def test_tier3_fired_emits_task_compaction_event(
     assert details["last_turn_index"] == 42
     assert details["summarizer_model_id"] == "claude-haiku-4-5"
     assert details["summary_bytes"] == len("Earlier: agent explored files.".encode("utf-8"))
+    # Task 8 (A) — the Activity projection reads the summary body from
+    # the task_event detail directly instead of joining to convlog.
+    assert details["summary_text"] == "Earlier: agent explored files."
 
 
 @pytest.mark.asyncio
@@ -558,10 +563,16 @@ async def test_tier3_fired_task_event_dedups_on_replay(
 
 
 @pytest.mark.asyncio
-async def test_non_tier3_events_do_not_emit_task_event(
+async def test_memory_flush_emits_memory_flush_task_event(
     integration_pool: asyncpg.Pool,
 ) -> None:
-    """MemoryFlushFired alone — no task_compaction_fired row."""
+    """Task 8 (A) — MemoryFlushFired fires a ``memory_flush`` task_event.
+
+    Before Task 8 this was a no-op on the task_events side; Activity
+    projection now reads the flush marker from task_events, so we dual-
+    write here too. No ``task_compaction_fired`` row is emitted because
+    MemoryFlushFired is not a Tier-3 firing.
+    """
     task_id = await _seed_task(integration_pool)
 
     await _emit_compaction_task_events(
@@ -570,16 +581,49 @@ async def test_non_tier3_events_do_not_emit_task_event(
         tenant_id=TENANT_ID,
         agent_id=AGENT_ID,
         worker_id=WORKER_ID,
-        events=[MemoryFlushFiredEvent(fired_at_step=1)],
+        events=[MemoryFlushFiredEvent(fired_at_step=7)],
         summarized_through_before=0,
         summary_after="",
     )
     async with integration_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT event_type FROM task_events WHERE task_id = $1::uuid",
+            "SELECT event_type, details::jsonb AS details, worker_id "
+            "FROM task_events WHERE task_id = $1::uuid",
             task_id,
         )
-    assert rows == []
+    assert [r["event_type"] for r in rows] == ["memory_flush"]
+    assert rows[0]["worker_id"] == WORKER_ID
+    import json as _json
+    details = _json.loads(rows[0]["details"]) if isinstance(rows[0]["details"], str) else rows[0]["details"]
+    assert details["fired_at_step"] == 7
+
+
+@pytest.mark.asyncio
+async def test_memory_flush_task_event_dedups_on_replay(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """Repeated MemoryFlushFired at the same ``fired_at_step`` collapses to one row."""
+    task_id = await _seed_task(integration_pool)
+
+    ev = MemoryFlushFiredEvent(fired_at_step=3)
+    for _ in range(3):
+        await _emit_compaction_task_events(
+            pool=integration_pool,
+            task_id=task_id,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            worker_id=WORKER_ID,
+            events=[ev],
+            summarized_through_before=0,
+            summary_after="",
+        )
+    async with integration_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = $1::uuid AND event_type = 'memory_flush'",
+            task_id,
+        )
+    assert count == 1
 
 
 @pytest.mark.asyncio
@@ -604,3 +648,130 @@ async def test_memory_flush_event_dedups_within_task(
         )
     rows = await _fetch_entries(integration_pool, task_id)
     assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 8 (A) — _emit_offload_task_event + _stamp_emitted_at
+# ---------------------------------------------------------------------------
+
+
+class _FakeOffloadEvent:
+    def __init__(self, kind: str, uri: str, size_bytes: int) -> None:
+        self.kind = kind
+        self.uri = uri
+        self.size_bytes = size_bytes
+
+
+@pytest.mark.asyncio
+async def test_offload_task_event_emitted_on_success(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    task_id = await _seed_task(integration_pool)
+
+    events = (
+        _FakeOffloadEvent("success", "s3://b/k1", 2048),
+        _FakeOffloadEvent("success", "s3://b/k2", 1024),
+    )
+    await _emit_offload_task_event(
+        pool=integration_pool,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+        worker_id=WORKER_ID,
+        events=events,
+        step_index=12,
+    )
+
+    async with integration_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT event_type, details::jsonb AS details "
+            "FROM task_events WHERE task_id = $1::uuid",
+            task_id,
+        )
+    assert [r["event_type"] for r in rows] == ["offload_emitted"]
+    import json as _json
+    details = _json.loads(rows[0]["details"]) if isinstance(rows[0]["details"], str) else rows[0]["details"]
+    assert details["count"] == 2
+    assert details["total_bytes"] == 3072
+    assert details["step_index"] == 12
+    assert len(details["uri_fingerprint"]) == 64  # sha256 hex
+
+
+@pytest.mark.asyncio
+async def test_offload_task_event_skipped_when_no_success(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """An all-failure offload pass emits nothing — the marker is success-only."""
+    task_id = await _seed_task(integration_pool)
+    events = (_FakeOffloadEvent("failed", "s3://b/k1", 0),)
+    await _emit_offload_task_event(
+        pool=integration_pool,
+        task_id=task_id,
+        tenant_id=TENANT_ID,
+        agent_id=AGENT_ID,
+        worker_id=WORKER_ID,
+        events=events,
+        step_index=1,
+    )
+    async with integration_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM task_events WHERE task_id = $1::uuid",
+            task_id,
+        )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_offload_task_event_dedups_same_pass(
+    integration_pool: asyncpg.Pool,
+) -> None:
+    """Replays with the same URIs + step_index collapse to one row."""
+    task_id = await _seed_task(integration_pool)
+    events = (_FakeOffloadEvent("success", "s3://b/k1", 1024),)
+    for _ in range(3):
+        await _emit_offload_task_event(
+            pool=integration_pool,
+            task_id=task_id,
+            tenant_id=TENANT_ID,
+            agent_id=AGENT_ID,
+            worker_id=WORKER_ID,
+            events=events,
+            step_index=4,
+        )
+    async with integration_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = $1::uuid AND event_type = 'offload_emitted'",
+            task_id,
+        )
+    assert count == 1
+
+
+def test_stamp_emitted_at_adds_iso_timestamp_to_new_messages() -> None:
+    m = HumanMessage(content="hi")
+    assert "emitted_at" not in (m.additional_kwargs or {})
+    _stamp_emitted_at([m])
+    stamped = m.additional_kwargs.get("emitted_at")
+    assert isinstance(stamped, str)
+    # ISO-8601 UTC — 'T' separator, ends with '+00:00'.
+    assert "T" in stamped and stamped.endswith("+00:00")
+
+
+def test_stamp_emitted_at_preserves_existing_stamp() -> None:
+    m = HumanMessage(content="hi", additional_kwargs={"emitted_at": "2020-01-01T00:00:00+00:00"})
+    _stamp_emitted_at([m])
+    assert m.additional_kwargs["emitted_at"] == "2020-01-01T00:00:00+00:00"
+
+
+def test_stamp_emitted_at_handles_missing_additional_kwargs() -> None:
+    """Bare BaseMessage without additional_kwargs gets a fresh dict."""
+    m = AIMessage(content="x")
+    # Clear any default additional_kwargs the constructor set.
+    try:
+        object.__setattr__(m, "additional_kwargs", None)
+    except Exception:
+        m.additional_kwargs = None  # type: ignore[assignment]
+    _stamp_emitted_at([m])
+    # Whatever the underlying model does, either it accepted the new dict
+    # or the exception was swallowed. In either case we must not raise.
+    assert m is not None

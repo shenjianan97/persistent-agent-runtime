@@ -205,6 +205,38 @@ def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id:
 # ---------------------------------------------------------------------------
 
 
+def _stamp_emitted_at(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Stamp ``additional_kwargs.emitted_at`` on each message that lacks it.
+
+    Phase 2 Track 7 Follow-up Task 8 (A) — the unified Activity projection
+    uses ``additional_kwargs.emitted_at`` as the per-message ordering key
+    against ``task_events.created_at``. Every time the worker appends to
+    ``state["messages"]`` it calls this helper so the stamp lands in state
+    (and therefore in the checkpoint payload) rather than only in the
+    convlog projection. Existing stamps are preserved, so retries leave
+    the ordering key stable.
+
+    LangGraph serialises ``additional_kwargs`` through ``langchain_dumps``
+    (see ``checkpointer/postgres.py``), so the stamp round-trips the JSONB
+    ``checkpoint_payload`` column unchanged.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for msg in messages:
+        try:
+            ak = getattr(msg, "additional_kwargs", None)
+            if ak is None:
+                msg.additional_kwargs = {"emitted_at": now_iso}  # type: ignore[attr-defined]
+                continue
+            if not ak.get("emitted_at"):
+                ak["emitted_at"] = now_iso
+        except Exception:
+            # Defensive: if the underlying pydantic model forbids mutation,
+            # the projection falls back to the containing checkpoint's
+            # created_at (graceful-fallback path in the design spec).
+            pass
+    return messages
+
+
 def _convlog_origin_ref_for_message(msg: BaseMessage) -> str:
     """Return a stable origin_ref for a LangChain message.
 
@@ -462,56 +494,168 @@ async def _emit_compaction_task_events(
     the marker only costs the UI indicator, never correctness.
     """
     for ev in events:
-        if not isinstance(ev, Tier3FiredEvent):
-            continue
-        try:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    # Replay dedup — compaction only fires inside a leased
-                    # worker on a single super-step, so there is no cross-
-                    # writer race. A pre-INSERT SELECT on
-                    # (task_id, event_type, last_turn_index) is sufficient
-                    # to collapse replays of the same firing after a
-                    # post-event-INSERT crash; the watermark advances
-                    # monotonically per task, so each value represents
-                    # exactly one legitimate firing.
-                    already_emitted = await conn.fetchval(
-                        """
-                        SELECT 1 FROM task_events
-                        WHERE task_id = $1::uuid
-                          AND event_type = 'task_compaction_fired'
-                          AND (details->>'last_turn_index')::int = $2
-                        LIMIT 1
-                        """,
-                        task_id,
-                        int(ev.new_summarized_through),
-                    )
-                    if already_emitted is not None:
-                        continue
-                    await _insert_task_event(
-                        conn, task_id, tenant_id, agent_id,
-                        "task_compaction_fired", None, None, worker_id,
-                        details={
-                            "tier": 3,
-                            "summarizer_model_id": ev.summarizer_model_id,
-                            "tokens_in": int(ev.tokens_in),
-                            "tokens_out": int(ev.tokens_out),
-                            "turns_summarized": int(
-                                ev.new_summarized_through - summarized_through_before
-                            ),
-                            "first_turn_index": int(summarized_through_before),
-                            "last_turn_index": int(ev.new_summarized_through),
-                            "summary_bytes": len(summary_after.encode("utf-8")),
-                        },
-                    )
-        except Exception as err:
-            _compaction_logger.warning(
-                "compaction.tier3_event_insert_failed",
-                error=str(err),
-                tenant_id=tenant_id,
-                agent_id=agent_id,
-                task_id=task_id,
-            )
+        if isinstance(ev, Tier3FiredEvent):
+            try:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        # Replay dedup — compaction only fires inside a leased
+                        # worker on a single super-step, so there is no cross-
+                        # writer race. A pre-INSERT SELECT on
+                        # (task_id, event_type, last_turn_index) is sufficient
+                        # to collapse replays of the same firing after a
+                        # post-event-INSERT crash; the watermark advances
+                        # monotonically per task, so each value represents
+                        # exactly one legitimate firing.
+                        already_emitted = await conn.fetchval(
+                            """
+                            SELECT 1 FROM task_events
+                            WHERE task_id = $1::uuid
+                              AND event_type = 'task_compaction_fired'
+                              AND (details->>'last_turn_index')::int = $2
+                            LIMIT 1
+                            """,
+                            task_id,
+                            int(ev.new_summarized_through),
+                        )
+                        if already_emitted is not None:
+                            continue
+                        await _insert_task_event(
+                            conn, task_id, tenant_id, agent_id,
+                            "task_compaction_fired", None, None, worker_id,
+                            details={
+                                "tier": 3,
+                                "summarizer_model_id": ev.summarizer_model_id,
+                                "tokens_in": int(ev.tokens_in),
+                                "tokens_out": int(ev.tokens_out),
+                                "turns_summarized": int(
+                                    ev.new_summarized_through - summarized_through_before
+                                ),
+                                "first_turn_index": int(summarized_through_before),
+                                "last_turn_index": int(ev.new_summarized_through),
+                                "summary_bytes": len(summary_after.encode("utf-8")),
+                                # Task 8 (A) — carry the summary body in the
+                                # task_event so the Activity projection can
+                                # render the compaction boundary from a
+                                # single store (no convlog lookup needed).
+                                "summary_text": summary_after,
+                            },
+                        )
+            except Exception as err:
+                _compaction_logger.warning(
+                    "compaction.tier3_event_insert_failed",
+                    error=str(err),
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+        elif isinstance(ev, MemoryFlushFiredEvent):
+            # Task 8 (A) — mirror MemoryFlushFiredEvent into task_events as
+            # ``memory_flush``. Replay dedup scopes to
+            # ``(task_id, event_type, fired_at_step)`` — the flush fires at
+            # most once per super-step and is monotone in that index, so a
+            # (task_id, event_type, fired_at_step) tuple uniquely identifies
+            # the firing.
+            try:
+                async with pool.acquire() as conn:
+                    async with conn.transaction():
+                        already_emitted = await conn.fetchval(
+                            """
+                            SELECT 1 FROM task_events
+                            WHERE task_id = $1::uuid
+                              AND event_type = 'memory_flush'
+                              AND (details->>'fired_at_step')::int = $2
+                            LIMIT 1
+                            """,
+                            task_id,
+                            int(ev.fired_at_step),
+                        )
+                        if already_emitted is not None:
+                            continue
+                        await _insert_task_event(
+                            conn, task_id, tenant_id, agent_id,
+                            "memory_flush", None, None, worker_id,
+                            details={
+                                "fired_at_step": int(ev.fired_at_step),
+                            },
+                        )
+            except Exception as err:
+                _compaction_logger.warning(
+                    "compaction.memory_flush_event_insert_failed",
+                    error=str(err),
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    task_id=task_id,
+                )
+
+
+async def _emit_offload_task_event(
+    *,
+    pool,
+    task_id: str,
+    tenant_id: str,
+    agent_id: str,
+    worker_id: str,
+    events: tuple,
+    step_index: int,
+) -> None:
+    """Task 8 (A) — mirror ``offload_emitted`` convlog entry into task_events.
+
+    Best-effort: a failed insert never breaks the task — ingestion offload
+    itself is durable through the S3 write; the marker is purely operator
+    telemetry. Replay dedup scopes to
+    ``(task_id, event_type, step_index, uri_fingerprint)`` so repeated calls
+    for the same pass (after a mid-write crash) collapse to a single row.
+    """
+    success_events = [ev for ev in events if getattr(ev, "kind", "") == "success"]
+    if not success_events:
+        return
+    total_bytes = sum(
+        int(getattr(ev, "size_bytes", 0) or 0) for ev in success_events
+    )
+    count = len(success_events)
+    uri_material = "|".join(
+        sorted(str(getattr(ev, "uri", "") or "") for ev in success_events)
+    )
+    import hashlib as _hashlib
+    uri_fingerprint = _hashlib.sha256(uri_material.encode("utf-8")).hexdigest()
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                already_emitted = await conn.fetchval(
+                    """
+                    SELECT 1 FROM task_events
+                    WHERE task_id = $1::uuid
+                      AND event_type = 'offload_emitted'
+                      AND (details->>'step_index')::int = $2
+                      AND details->>'uri_fingerprint' = $3
+                    LIMIT 1
+                    """,
+                    task_id,
+                    int(step_index),
+                    uri_fingerprint,
+                )
+                if already_emitted is not None:
+                    return
+                await _insert_task_event(
+                    conn, task_id, tenant_id, agent_id,
+                    "offload_emitted", None, None, worker_id,
+                    details={
+                        "count": count,
+                        "total_bytes": total_bytes,
+                        "step_index": int(step_index),
+                        "uri_fingerprint": uri_fingerprint,
+                    },
+                )
+    except Exception as err:
+        logger.warning(
+            "offload.offload_emitted_event_insert_failed",
+            extra={
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "error": str(err)[:200],
+            },
+        )
 
 
 async def _convlog_append_offload_emitted(
@@ -1550,6 +1694,16 @@ class GraphExecutor:
                             events=_offload_outcome.events,
                             step_index=len(_raw_state_messages),
                         )
+                        # Task 8 (A) — mirror into task_events.
+                        await _emit_offload_task_event(
+                            pool=self.pool,
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            worker_id=self.config.worker_id,
+                            events=_offload_outcome.events,
+                            step_index=len(_raw_state_messages),
+                        )
                     # Track 7 Task 13 — append the agent's response and any
                     # tool-call requests to the user-facing conversation log
                     # BEFORE returning (and therefore before LangGraph
@@ -1562,6 +1716,10 @@ class GraphExecutor:
                         checkpoint_id=_convlog_ckpt_id,
                         response=response,
                     )
+                    # Task 8 (A) — stamp ``emitted_at`` on the assistant
+                    # response so the unified Activity projection can merge
+                    # it with task_events markers on a shared time axis.
+                    _stamp_emitted_at([response])
                     # Merge the new assistant ``response`` with any ``messages``
                     # update from the compaction hook (the recall-pointer
                     # rewrite returns ToolMessage replacements keyed by id).
@@ -1756,6 +1914,16 @@ class GraphExecutor:
                     events=_events,
                     step_index=_convlog_step_index_from_state(state),
                 )
+                # Task 8 (A) — mirror into task_events.
+                await _emit_offload_task_event(
+                    pool=self.pool,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    worker_id=self.config.worker_id,
+                    events=_events,
+                    step_index=_convlog_step_index_from_state(state),
+                )
 
                 # Rebuild the list in the same order ``ToolNode`` produced —
                 # the graph's downstream agent step assumes per-tool_call_id
@@ -1763,6 +1931,10 @@ class GraphExecutor:
                 # recall vs other messages (both land in the journal under
                 # the same super-step).
                 recombined = _reweave_messages(msgs, recall_msgs, new_other)
+                # Task 8 (A) — stamp ``emitted_at`` on every outgoing
+                # ToolMessage. Stamping happens after offload so the
+                # content-offloaded placeholder carries its timestamp too.
+                _stamp_emitted_at([m for m in recombined if isinstance(m, BaseMessage)])
                 return wrap(recombined)
 
             workflow.add_node("tools", tool_node)
@@ -2865,6 +3037,11 @@ class GraphExecutor:
                 if first_execution:
                     initial_messages.append(HumanMessage(content=task_input))
 
+                # Task 8 (A) — stamp ``emitted_at`` on every seeded message
+                # so the unified Activity projection has an ordering key on
+                # the initial HumanMessage and attached-preamble SystemMessage.
+                _stamp_emitted_at(initial_messages)
+
                 initial_input: Any
                 if first_execution:
                     # Track 7 Task 2 — seed ALL RuntimeState fields with
@@ -2969,12 +3146,16 @@ class GraphExecutor:
                             # runs must re-earn it (Task 12 per-run reset
                             # invariant). Track 7 Task 2: always include the
                             # field — memory-disabled tasks simply hold False.
+                            # Task 8 (A) — stamp ``emitted_at`` on the
+                            # follow-up HumanMessage before it lands in
+                            # state so the Activity projection orders the
+                            # follow-up turn against surrounding markers.
+                            _follow_up_message = HumanMessage(
+                                content=payload.get("message", "")
+                            )
+                            _stamp_emitted_at([_follow_up_message])
                             follow_up_payload: dict[str, Any] = {
-                                "messages": [
-                                    HumanMessage(
-                                        content=payload.get("message", "")
-                                    )
-                                ],
+                                "messages": [_follow_up_message],
                                 "memory_opt_in": False,
                             }
                             initial_input = follow_up_payload
@@ -3840,13 +4021,40 @@ class GraphExecutor:
                 if updated is not None:
                     # Track 3: Decrement running_task_count on HITL pause
                     await decrement_running_count(conn, tenant_id, agent_id)
-                    # Insert event in same transaction only if the UPDATE affected a row
-                    event_details = None
+                    # Insert event in same transaction only if the UPDATE affected a row.
+                    # Task 8 (A) — enrich HITL pause details with the
+                    # convlog-equivalent fields (reason, prompt_to_user,
+                    # tool_name) so the Activity projection can render
+                    # HITL markers without a convlog lookup.
+                    _tool_name_for_event = None
+                    if isinstance(interrupt_data, dict):
+                        _tool_name_for_event = (
+                            interrupt_data.get("tool_name")
+                            or (interrupt_data.get("action") or {}).get("tool_name")
+                        )
                     if interrupt_type == "input":
-                        # Use original tool argument, not the AI-context-enriched prompt
-                        event_details = {"prompt": original_tool_prompt if original_tool_prompt is not None else interrupt_data.get("prompt", "")}
-                    elif interrupt_type == "approval":
-                        event_details = {"action": interrupt_data.get("action", {})}
+                        _prompt = (
+                            original_tool_prompt
+                            if original_tool_prompt is not None
+                            else interrupt_data.get("prompt", "")
+                        )
+                        event_details = {
+                            "prompt": _prompt,
+                            "prompt_to_user": _prompt,
+                            "reason": interrupt_data.get("reason", "agent_requested"),
+                            "tool_name": _tool_name_for_event,
+                        }
+                    else:  # approval
+                        event_details = {
+                            "action": interrupt_data.get("action", {}),
+                            "prompt_to_user": (
+                                original_tool_prompt
+                                if original_tool_prompt is not None
+                                else interrupt_data.get("prompt", "")
+                            ),
+                            "reason": "tool_requires_approval",
+                            "tool_name": _tool_name_for_event,
+                        }
                     await _insert_task_event(
                         conn, task_id, tenant_id, agent_id, event_type,
                         "running", new_status, worker_id=worker_id,
