@@ -355,7 +355,7 @@ export function TaskDetailPage() {
 
                         {task.status === 'completed' && !!task.output && (
                             <Card className="console-surface border-success/30 flex flex-col max-h-[400px]">
-                                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5">
+                                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5 rounded-t-3xl">
                                     <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-success">
                                         <Terminal className="w-4 h-4" /> Output
                                     </CardTitle>
