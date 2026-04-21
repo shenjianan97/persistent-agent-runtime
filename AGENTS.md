@@ -109,6 +109,7 @@ If an external PR reference slips in, rewrite the commit / PR description before
 - When validating background `Makefile` targets (`make start`, `make status`, `make stop`), prefer an interactive shell / PTY.
 - **Python venv:** the worker venv at `services/worker-service/.venv/` has all deps pinned. Activate with `source services/worker-service/.venv/bin/activate` or call `services/worker-service/.venv/bin/python` directly.
 - **Test DB isolation:** `par-e2e-postgres` on port **55433** is the tests' DB; the dev DB on 55432 is off-limits for tests (it corrupts local state). `make worker-test` passes `E2E_DB_DSN`; `make e2e-test` passes `E2E_DB_*` vars.
+- **Tracking a running task:** two surfaces answer "what's this task doing?" — the worker log (`.tmp/worker-*.log`) for runtime decisions (lifecycle, compaction, memory routing, dead-letter, retries) and `GET /v1/tasks/<id>/conversation` for what the agent actually did (turns / tool calls / tool results). `make start` runs workers at `WORKER_LOG_LEVEL=DEBUG` by default so per-turn compaction traces are already there; quiet it with `WORKER_LOG_LEVEL=INFO make start-worker`. See [Tracking a running task](./docs/LOCAL_DEVELOPMENT.md#tracking-a-running-task) for the event catalogue and jq recipes.
 
 ## Testing (Mandatory)
 

@@ -52,6 +52,14 @@ SERVER_PORT ?= 8080
 VITE_API_BASE_URL ?= http://localhost:8080
 APP_DEV_TASK_CONTROLS_ENABLED ?= false
 VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
+
+# Local-dev default: emit the per-turn compaction.projection_built DEBUG trace
+# and other debug chatter so `make start` gives developers immediate visibility
+# into what the worker is doing (see docs/LOCAL_DEVELOPMENT.md § Tracking a
+# running task). The worker service itself defaults to INFO in code — this
+# override is Makefile-local. Override for a quieter log with:
+#   WORKER_LOG_LEVEL=INFO make start-worker
+WORKER_LOG_LEVEL ?= DEBUG
 # Langfuse is now configured per-agent via the Console Settings page.
 # These defaults are only used by test-langfuse-up / dev-langfuse-up.
 LANGFUSE_HOST ?= http://127.0.0.1:3300
@@ -409,7 +417,7 @@ start-worker:
 			skipped=$$((skipped + 1)); \
 		else \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); \
 		fi; \
 		i=$$((i + 1)); \
@@ -467,7 +475,7 @@ scale-worker:
 				slot=$$((slot + 1)); continue; \
 			fi; \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); slot=$$((slot + 1)); \
 		done; \
 		echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
