@@ -6,6 +6,7 @@ import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.response.AttachedMemoryPreview;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.service.ActivityProjectionService;
 import com.persistentagent.api.service.ConversationLogService;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
@@ -40,6 +41,9 @@ class TaskControllerTest {
 
         @MockitoBean
         private ConversationLogService conversationLogService;
+
+        @MockitoBean
+        private ActivityProjectionService activityProjectionService;
 
         // --- POST /v1/tasks ---
 
@@ -604,5 +608,43 @@ class TaskControllerTest {
 
                 mockMvc.perform(get("/v1/tasks/" + taskId + "/conversation?limit=5000"))
                                 .andExpect(status().isBadRequest());
+        }
+
+        // --- GET /v1/tasks/{taskId}/activity (Task 8 Follow-up) ---
+
+        @Test
+        void getActivity_existingTask_returns200() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                ActivityEventResponse.Page page = new ActivityEventResponse.Page(
+                                java.util.List.of(), null);
+                when(activityProjectionService.getActivity(eq(taskId), eq(false)))
+                                .thenReturn(page);
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/activity"))
+                                .andExpect(status().isOk())
+                                .andExpect(jsonPath("$.events").isArray())
+                                .andExpect(jsonPath("$.next_cursor").doesNotExist());
+        }
+
+        @Test
+        void getActivity_unknownTask_returns404() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                when(activityProjectionService.getActivity(eq(taskId), eq(false)))
+                                .thenThrow(new TaskNotFoundException(taskId));
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/activity"))
+                                .andExpect(status().isNotFound());
+        }
+
+        @Test
+        void getActivity_includeDetails_passesThroughToService() throws Exception {
+                UUID taskId = UUID.randomUUID();
+                ActivityEventResponse.Page page = new ActivityEventResponse.Page(
+                                java.util.List.of(), null);
+                when(activityProjectionService.getActivity(eq(taskId), eq(true)))
+                                .thenReturn(page);
+
+                mockMvc.perform(get("/v1/tasks/" + taskId + "/activity?include_details=true"))
+                                .andExpect(status().isOk());
         }
 }
