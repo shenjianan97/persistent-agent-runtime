@@ -71,16 +71,17 @@ function truncate(value: string, max = 4000): string {
 // The Activity API stringifies Anthropic content-block lists as Python reprs:
 //   [{text=..., type=text}, {id=..., name=..., type=tool_use, input={...}}]
 // For the assistant bubble we only want the prose text; tool_use blocks are
-// surfaced separately as `tool_calls`. This extractor pulls `text=...` values
-// out of that repr when it looks like a list-of-blocks, and falls back to the
-// raw string otherwise.
+// surfaced separately via `tool_calls`. This extractor returns text-only
+// content when the string looks like a list-of-blocks repr — including the
+// pure-tool-use case (no `type=text` at all), which must yield `""` so the
+// caller renders no bubble rather than leaking the raw repr.
 function extractAssistantText(content: string | null | undefined): string {
     if (!content) return '';
     const trimmed = content.trim();
     const looksLikeBlocksRepr =
         trimmed.startsWith('[{') &&
         trimmed.endsWith('}]') &&
-        trimmed.includes('type=text');
+        (trimmed.includes('type=text') || trimmed.includes('type=tool_use'));
     if (!looksLikeBlocksRepr) return content;
     const textParts: string[] = [];
     const re = /text=([\s\S]*?), type=text\b/g;
