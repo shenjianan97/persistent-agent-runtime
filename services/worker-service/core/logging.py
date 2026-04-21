@@ -2,16 +2,49 @@
 
 Provides structured logging with mandatory labels (task_id, worker_id, node_name)
 and metric emission primitives. Uses structlog for structured JSON output.
+
+**Worker-only.** The API service has its own logging configuration and does
+not share this module. The ``WORKER_LOG_LEVEL`` env var read below controls
+the worker's structlog filter exclusively; if the API service later adopts a
+shared logger, the env var name will want a rename to match.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
+
+
+_WORKER_LOG_LEVEL_ENV = "WORKER_LOG_LEVEL"
+
+
+def _resolve_level() -> int:
+    """Resolve the structlog filter level from ``WORKER_LOG_LEVEL``.
+
+    Accepts ``DEBUG``/``INFO``/``WARNING``/``ERROR``/``CRITICAL`` (case-
+    insensitive). Falls back to ``logging.INFO`` on unset or invalid values,
+    logging a one-time stdlib warning so the misconfig is visible. The default
+    keeps production behaviour unchanged — DEBUG is strictly opt-in for local
+    dev (see ``docs/LOCAL_DEVELOPMENT.md`` § Tracking a running task).
+    """
+    raw = os.environ.get(_WORKER_LOG_LEVEL_ENV)
+    if raw is None or raw == "":
+        return logging.INFO
+    candidate = raw.strip().upper()
+    level = logging.getLevelName(candidate)
+    # ``getLevelName`` returns the numeric level for known names and the
+    # string ``"Level <n>"`` for unknown input. Guard on both.
+    if isinstance(level, int):
+        return level
+    logging.getLogger(__name__).warning(
+        "Unknown %s=%r; falling back to INFO", _WORKER_LOG_LEVEL_ENV, raw
+    )
+    return logging.INFO
 
 
 def configure_logging() -> None:
@@ -25,7 +58,7 @@ def configure_logging() -> None:
             structlog.processors.format_exc_info,
             structlog.processors.JSONRenderer(),
         ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        wrapper_class=structlog.make_filtering_bound_logger(_resolve_level()),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,

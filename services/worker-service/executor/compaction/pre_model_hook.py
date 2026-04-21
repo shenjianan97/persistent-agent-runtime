@@ -60,12 +60,25 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from core.logging import get_logger as _get_structlog_logger
 from executor.compaction.defaults import (
     COMPACTION_TRIGGER_FRACTION,
     KEEP_TOOL_USES,
     TIER_3_MAX_FIRINGS_PER_TASK,
     get_platform_default_summarizer_model,
 )
+
+
+# The DEBUG-only per-invocation projection trace (``compaction.projection_built``)
+# is emitted inside ``_finalize`` via a freshly-resolved structlog logger rather
+# than a cached module-level proxy. Deliberate — a cached
+# ``BoundLoggerLazyProxy`` (with ``cache_logger_on_first_use=True``) captures
+# whatever structlog config existed at import time, which breaks
+# ``structlog.testing.capture_logs`` isolation in later-running tests once any
+# other test has called ``structlog.reset_defaults()``. The per-call lookup
+# cost is one dict access per LLM turn (negligible). INFO/WARN event emission
+# for concrete firings still lives in ``executor.graph._compaction_logger``;
+# this signal is gated by ``WORKER_LOG_LEVEL`` (see ``core/logging.py``).
 
 
 # ---------------------------------------------------------------------------
@@ -698,6 +711,59 @@ async def compaction_pre_model_hook(
     # model's context window.
     trigger_tokens = int(COMPACTION_TRIGGER_FRACTION * model_context_window)
 
+    # All return paths in this function MUST go through ``_finalize`` so the
+    # ``compaction.projection_built`` DEBUG trace fires exactly once per
+    # invocation. New return sites are easy to forget — a parametrised test
+    # in ``tests/test_pre_model_hook.py`` enforces the invariant.
+    def _finalize(
+        outcome: str,
+        *,
+        messages: list[BaseMessage],
+        state_updates: dict[str, Any],
+        events: list[CompactionEvent],
+        tier3_skipped: bool = False,
+        summary_for_trace: str | None = None,
+        middle_for_trace: list[BaseMessage] | None = None,
+        est_tokens_for_trace: int | None = None,
+    ) -> CompactionPassResult:
+        # Suffix ``:hard_floor`` when any HardFloorEvent was appended on this
+        # path so a single log line surfaces both decisions.
+        trace_outcome = outcome
+        if any(isinstance(ev, HardFloorEvent) for ev in events):
+            trace_outcome = f"{outcome}:hard_floor"
+        # Resolve a fresh logger each call (see module-level comment for why).
+        _get_structlog_logger(worker_id="compaction").debug(
+            "compaction.projection_built",
+            task_id=task_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            checkpoint_id=checkpoint_id,
+            outcome=trace_outcome,
+            est_tokens=(
+                est_tokens_for_trace if est_tokens_for_trace is not None else est_tokens
+            ),
+            trigger_tokens=trigger_tokens,
+            model_context_window=model_context_window,
+            summary_len=len(
+                summary_for_trace if summary_for_trace is not None else summary
+            ),
+            middle_len=len(
+                middle_for_trace if middle_for_trace is not None else middle
+            ),
+            keep_window_len=len(keep_window),
+            raw_messages_len=len(raw_messages),
+            summarized_through=summarized_through,
+            tier3_firings_count=state_updates.get(
+                "tier3_firings_count", tier3_firings_count
+            ),
+        )
+        return CompactionPassResult(
+            messages=messages,
+            state_updates=state_updates,
+            events=events,
+            tier3_skipped=tier3_skipped,
+        )
+
     if est_tokens < trigger_tokens:
         # Below threshold — emit the projection as-is.
         # Still run the hard-floor safety net in case of pathological inputs.
@@ -711,7 +777,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "below_threshold",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -734,7 +801,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "fatal_short_circuit",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -761,7 +829,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "skipped:cap_reached",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -809,11 +878,13 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "flush_fired",
             messages=flush_projection,
             state_updates=state_updates,
             events=events,
             tier3_skipped=False,
+            est_tokens_for_trace=est_tokens_with_flush,
         )
 
     # If middle is empty, there's nothing the summariser can reduce — skip.
@@ -836,7 +907,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "skipped:empty_slice",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -899,7 +971,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "skipped:fatal",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -931,7 +1004,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            f"skipped:{summarize_result.skipped_reason or 'unknown'}",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -963,7 +1037,8 @@ async def compaction_pre_model_hook(
                     agent_id=agent_id,
                 )
             )
-        return CompactionPassResult(
+        return _finalize(
+            "skipped:empty_summary",
             messages=projection,
             state_updates=state_updates,
             events=events,
@@ -1029,9 +1104,13 @@ async def compaction_pre_model_hook(
             )
         )
 
-    return CompactionPassResult(
+    return _finalize(
+        "fired",
         messages=post_projection,
         state_updates=state_updates,
         events=events,
         tier3_skipped=False,
+        summary_for_trace=new_summary,
+        middle_for_trace=[],
+        est_tokens_for_trace=post_est,
     )

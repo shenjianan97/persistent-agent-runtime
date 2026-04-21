@@ -23,6 +23,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from structlog.testing import capture_logs
 
 from executor.compaction.pre_model_hook import (
     HardFloorEvent,
@@ -34,6 +35,14 @@ from executor.compaction.pre_model_hook import (
 )
 from executor.compaction.summarizer import SummarizeResult
 from tests.shape_validator import assert_valid_shape
+
+
+# NOTE: ``capture_logs`` rebinds the structlog logger and bypasses the level
+# filter set by ``core.logging.configure_logging``, so DEBUG assertions here
+# pass regardless of ``WORKER_LOG_LEVEL``. That is the intended behaviour —
+# tests assert emission, not filter-layer suppression. If you're reading this
+# and concluding "DEBUG is on by default," it isn't: production runs are still
+# gated by ``WORKER_LOG_LEVEL`` at the bind layer.
 
 
 # ---------------------------------------------------------------------------
@@ -409,21 +418,117 @@ async def test_no_summarizer_below_threshold():
     state = _fresh_state(msgs)
 
     summarizer = _make_summarizer()
-    result = await compaction_pre_model_hook(
-        raw_messages=msgs,
-        state=state,
-        agent_config=_agent_config(),
-        model_context_window=10_000,
-        task_context=_task_context(),
-        summarizer=summarizer,
-        estimate_tokens_fn=_fixed_estimator(8_499),
-    )
+    with capture_logs() as caps:
+        result = await compaction_pre_model_hook(
+            raw_messages=msgs,
+            state=state,
+            agent_config=_agent_config(),
+            model_context_window=10_000,
+            task_context=_task_context(),
+            summarizer=summarizer,
+            estimate_tokens_fn=_fixed_estimator(8_499),
+        )
     summarizer.assert_not_awaited()
     # No firing means no summary / watermark updates.
     assert "summary" not in result.state_updates
     assert "summarized_through_turn_index" not in result.state_updates
     # Firings count never advances without a firing.
     assert "tier3_firings_count" not in result.state_updates
+    # Exactly one projection trace with the expected outcome + shape.
+    traces = [e for e in caps if e.get("event") == "compaction.projection_built"]
+    assert len(traces) == 1, f"expected one projection trace, got {traces}"
+    (trace,) = traces
+    assert trace["outcome"] == "below_threshold"
+    assert trace["est_tokens"] == 8_499
+    assert trace["trigger_tokens"] == 8_500
+    assert trace["model_context_window"] == 10_000
+    assert trace["task_id"] == "task-1"
+    assert trace["tenant_id"] == "tenant-1"
+    assert trace["agent_id"] == "agent-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    ["below_threshold", "fired", "cap_reached", "fatal_short_circuit", "empty_summary"],
+)
+async def test_projection_trace_emitted_once_per_call(scenario: str) -> None:
+    """Every return path in ``compaction_pre_model_hook`` emits exactly one
+    ``compaction.projection_built`` DEBUG trace, carrying the correct outcome
+    tag. Guards the emit-once invariant across the 9 return sites funnelled
+    through ``_finalize``."""
+    msgs = _build_messages(n_pairs=5)
+    state = _fresh_state(msgs)
+    summarizer = _make_summarizer()
+
+    if scenario == "below_threshold":
+        est = 8_499  # < 0.85 * 10_000
+        expected_outcome = "below_threshold"
+    elif scenario == "fired":
+        est = 9_000  # ≥ trigger; summarizer returns a valid summary
+        expected_outcome = "fired"
+    elif scenario == "cap_reached":
+        est = 9_000
+        state["tier3_firings_count"] = 10  # hit TIER_3_MAX_FIRINGS_PER_TASK
+        expected_outcome = "skipped:cap_reached"
+    elif scenario == "fatal_short_circuit":
+        est = 9_000
+        state["tier3_fatal_short_circuited"] = True
+        expected_outcome = "fatal_short_circuit"
+    elif scenario == "empty_summary":
+        est = 9_000
+        summarizer = _make_summarizer(summary_text="   ")  # whitespace-only
+        expected_outcome = "skipped:empty_summary"
+    else:  # pragma: no cover
+        raise AssertionError(scenario)
+
+    with capture_logs() as caps:
+        await compaction_pre_model_hook(
+            raw_messages=msgs,
+            state=state,
+            agent_config=_agent_config(),
+            model_context_window=10_000,
+            task_context=_task_context(),
+            summarizer=summarizer,
+            estimate_tokens_fn=_fixed_estimator(est),
+        )
+
+    traces = [e for e in caps if e.get("event") == "compaction.projection_built"]
+    assert len(traces) == 1, (
+        f"scenario={scenario}: expected exactly one trace per hook call, got "
+        f"{len(traces)}: {traces}"
+    )
+    (trace,) = traces
+    assert trace["outcome"] == expected_outcome, (
+        f"scenario={scenario}: expected outcome={expected_outcome}, got {trace!r}"
+    )
+    assert trace["log_level"] == "debug"
+
+
+def test_all_returns_funnel_through_finalize() -> None:
+    """Lint-style guard: the only ``return CompactionPassResult(`` in
+    ``pre_model_hook.py`` must be inside ``_finalize`` itself — every caller
+    site must go through ``_finalize(...)`` so the DEBUG trace fires exactly
+    once. If this test fails, a new return site was added without routing it
+    through ``_finalize``.
+    """
+    src_path = (
+        pathlib.Path(__file__).parent.parent
+        / "executor"
+        / "compaction"
+        / "pre_model_hook.py"
+    )
+    src = src_path.read_text()
+    # Count non-``_finalize`` return sites by excluding the one inside the
+    # helper. We don't parse — the structural guard is "at most one raw
+    # return of CompactionPassResult exists in the file, and it lives inside
+    # _finalize". Exact count is 1.
+    raw_returns = src.count("return CompactionPassResult(")
+    assert raw_returns == 1, (
+        f"Expected exactly 1 'return CompactionPassResult(' (inside _finalize); "
+        f"found {raw_returns}. New return sites must call _finalize(...) so "
+        f"the compaction.projection_built DEBUG trace emits once per invocation."
+    )
 
 
 # ---------------------------------------------------------------------------

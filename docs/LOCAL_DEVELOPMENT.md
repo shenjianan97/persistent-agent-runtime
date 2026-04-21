@@ -52,6 +52,123 @@ The checked-in local stack initializes a local Langfuse organization, project, a
 
 On startup, `make start` runs `services/model-discovery/main.py` to auto-discover available LLM providers from configured API keys and populate the `provider_keys` and `models` tables in PostgreSQL. The API service validates task submissions against these tables, and the console model selector is populated from `GET /v1/models`. Set `ANTHROPIC_API_KEY` for Claude models, `OPENAI_API_KEY` for GPT models, or both.
 
+## Tracking a running task
+
+Three surfaces answer "what is this task doing?" — pick by the question you're asking:
+
+| Your question | Surface | How to get there |
+|---|---|---|
+| What did the **agent** do? (turns, tool calls, results) | Conversation API | `GET /v1/tasks/<id>/conversation` |
+| What is the **runtime** deciding? (lifecycle, pause/retry/dead-letter, compaction) | Worker log | `.tmp/worker-<N>.log` |
+| Per-LLM-call traces and token costs | Langfuse UI | See [Local Langfuse Observability](#local-langfuse-observability) above |
+
+**Prerequisites.** `make start` running; `jq` installed (`brew install jq`). The API defaults to `http://localhost:8080` — override with `API_PORT`.
+
+### Quick start — "I submitted a task, now what?"
+
+1. **Find the task ID.** The console prints it on submit; otherwise list the most recent:
+
+   ```bash
+   curl -s http://localhost:8080/v1/tasks | jq '.items[] | {id: .task_id, status, agent: .agent_display_name, created_at}'
+   ```
+
+2. **See what the agent did** — the conversational transcript (turns, tool calls, tool results, HITL resumes):
+
+   ```bash
+   curl -s http://localhost:8080/v1/tasks/<task-id>/conversation \
+     | jq '.entries[] | {seq: .sequence, kind, tool: .content.tool_name, size: .content_size}'
+   ```
+
+3. **See what the runtime decided** — tail the worker log. `<N>` is the worker number (`1..WORKER_COUNT`); `ls .tmp/worker-*.log` to see which exist. The `fromjson?` wrapper is required because the worker log mixes JSON event lines with stdlib text lines — without it `jq` would parse-error on the text lines:
+
+   ```bash
+   tail -f .tmp/worker-1.log | jq -Rc --arg id "<task-id>" 'fromjson? | select(.task_id==$id) | {t: .timestamp, event, level}'
+   ```
+
+4. **If something looks off**, check the task-level status and the structured event feed:
+
+   ```bash
+   curl -s http://localhost:8080/v1/tasks/<task-id> | jq '{status, retry_count, output}'
+   curl -s http://localhost:8080/v1/tasks/<task-id>/events | jq '.events[] | {t: .created_at, event_type, status_after, error_code}'
+   ```
+
+### Top events to know
+
+Watch these in the worker log — each maps to a concrete question you're likely to ask.
+
+| Event | Level | Read when |
+|---|---|---|
+| `TASK_CLAIMED` / `TASK_COMPLETED` | INFO | "Did my task start / finish?" |
+| `Task <id> paused: <reason> (...)` | INFO | "Why is it stuck?" Usual reasons: `hitl_approval`, `hitl_input_requested`, `budget_exceeded` |
+| `Task <id> hit retryable error. Requeued (try N).` | INFO | "It retried — was it transient?" |
+| `Task <id> dead-lettered: <reason> (msg: ...)` | ERROR | **Look here first for terminal failures.** The `reason` code plus the `msg` string is usually enough to triage. |
+| `compaction.tier3_fired` | INFO | "Did context get compacted?" Explains surprising "the agent forgot X" behaviour. |
+
+> **Glossary.** HITL = human-in-the-loop pause (task waiting on approval or user input). Tier‑3 = the aggressive context-compaction pass that summarises older history to stay inside the model's token budget. Hard floor = the token ceiling beyond which compaction refuses to run further.
+
+### Peeking inside compaction
+
+`make start` runs workers at `WORKER_LOG_LEVEL=DEBUG` by default, so the per-turn compaction trace is already in your log — no extra flags. Filter for the `compaction.projection_built` event, emitted once per LLM call:
+
+```bash
+jq -Rc 'fromjson? | select(.event=="compaction.projection_built" and .task_id=="<task-id>")
+                  | {t: .timestamp, est: .est_tokens, trigger: .trigger_tokens, outcome}' \
+   .tmp/worker-1.log
+```
+
+> **Seeing lots of `below_threshold`? That's healthy.** It means the hook is checking every turn and finding nothing to do — current tokens are comfortably under the trigger (0.85 × `model_context_window`).
+
+Outcomes you might see: `below_threshold`, `fired`, `flush_fired`, `skipped:cap_reached`, `skipped:empty_slice`, `skipped:fatal`, `skipped:empty_summary`, `fatal_short_circuit`. Any of them may be suffixed `:hard_floor` when the projection still exceeds the model window.
+
+**Quieting the log.** If DEBUG is too chatty, override for a specific run: `WORKER_LOG_LEVEL=INFO make start-worker`. Accepted values: `DEBUG` (Makefile default), `INFO` (code / production default), `WARNING`, `ERROR`, `CRITICAL` (case-insensitive; invalid values fall back to INFO). `WORKER_LOG_LEVEL` is worker-only; the API service has separate logging.
+
+### Full event reference
+
+The worker log mixes two formats:
+
+- **JSON event lines** (lines starting with `{`) — structured events via structlog. Grep with `jq`.
+- **Text lines** (lines starting with a timestamp like `2026-04-20 15:43:...`) — stdlib `logging` output. Grep with plain `grep`.
+
+To separate them:
+
+```bash
+jq -Rc 'fromjson? | select(.event != null)' .tmp/worker-1.log   # JSON events only
+grep -v '^{' .tmp/worker-1.log                                  # text lines only
+```
+
+Tip: `jq -R 'fromjson?'` reads each line as raw text, tries to parse it as JSON, and silently skips lines that aren't — handy for grepping the mixed log without parse errors.
+
+**Lifecycle (JSON, INFO):** `TASK_CLAIMED`, `TASK_COMPLETED`, `TASK_REQUEUED`, `TASK_DEAD_LETTERED`, `LEASE_REVOKED`, `HEARTBEAT_SENT`, `POLL_EMPTY`, `REAPER_LEASE_EXPIRED`, `REAPER_TASK_TIMEOUT`, `REAPER_DEAD_LETTERED`.
+
+**Compaction (JSON):**
+- `compaction.projection_built` — DEBUG, one per hook invocation (see [Peeking inside compaction](#peeking-inside-compaction-opt-in-debug)).
+- `compaction.tier3_fired` / `compaction.tier3_skipped` / `compaction.hard_floor` — INFO/WARN. Fields include `tokens_in`, `tokens_out`, `summarizer_model_id`.
+- `compaction.model_context_window_unknown` — WARN at task start when the model's context window is unresolved; worker falls back to 128,000 tokens. Usually means a model row is missing its `context_window` value.
+
+**Runtime text lines (stdlib, grep by substring):**
+- `memory.route_after_agent` — per-turn routing for memory-enabled agents (`decision=tools`/`end`).
+- `Task <id> paused: <reason> (cost: ...)` / `Task <id> paused: <reason> (timeout: ...)` — HITL or budget pause.
+- `Task <id> hit retryable error. Requeued (try N).` — retry loop.
+- `Task <id> dead-lettered: <reason> (msg: <detail>)` — terminal failure.
+- `Per-step cost recording failed` / `Execution metadata write failed` — DB write hiccups; the task keeps running.
+- `sandbox_timeout_refresh_failed` — sandbox heartbeat miss at DEBUG; benign unless it recurs.
+- `Langfuse endpoint ... not found` / `Langfuse flush failed` — per-task tracing degraded; task is unaffected.
+
+**Two handy cross-task recipes:**
+
+```bash
+# All lifecycle transitions across every worker
+jq -Rc 'fromjson? | select(.event | IN("TASK_CLAIMED","TASK_COMPLETED","TASK_REQUEUED","TASK_DEAD_LETTERED","LEASE_REVOKED"))' \
+   .tmp/worker-*.log
+
+# All text-format lines for one task
+grep '<task-id>' .tmp/worker-*.log | grep -v '^{'
+```
+
+### Don't ship DEBUG to production
+
+The worker service defaults to `INFO` in code (see `services/worker-service/core/logging.py`). DEBUG is enabled *only* by the Makefile's `WORKER_LOG_LEVEL ?= DEBUG`, which applies to `make start` / `make start-worker` / `make scale-worker`. Production deploys (Helm, CDK) must not set `WORKER_LOG_LEVEL` — at fleet scale DEBUG produces several MB of JSON per hour per worker.
+
 ## Dev-Only Task Controls
 
 The runtime includes dev-only endpoints and tools for testing failure and recovery flows locally:
