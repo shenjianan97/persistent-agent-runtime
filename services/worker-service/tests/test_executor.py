@@ -8,6 +8,7 @@ from core.config import WorkerConfig
 from executor.graph import GraphExecutor, _handle_tool_error
 from executor.mcp_session import McpConnectionError, McpToolCallError
 from executor.schema_converter import MAX_TOOLS_PER_AGENT
+from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool
 from langgraph.errors import GraphRecursionError
 from checkpointer.postgres import LeaseRevokedException
@@ -1449,6 +1450,81 @@ class TestInputFileInjection:
         # would collapse ``agent_decides`` into ``always`` mode.
         assert "opt-in" in msg.lower()
         assert "MUST" not in msg  # no policy-level enforcement on save_memory
+
+    def test_platform_system_message_warns_against_narrating_future_tool_calls(self):
+        """Phase 1 guardrail: the platform prompt tells models to call tools now or answer finally."""
+        executor = _build_test_executor()
+        msg = executor._build_platform_system_message(["web_search", "read_url"])
+        assert "If you intend to use a tool, emit the tool call in the same response." in msg
+        assert "Do not narrate future tool calls in prose" in msg
+        assert "Either call the tool now, or produce the final answer." in msg
+
+
+def test_detects_future_work_promise_in_terminal_ai_message():
+    """Regression guard for prose promises that should have been tool calls."""
+    from executor.graph import _looks_like_future_work_promise
+
+    assert _looks_like_future_work_promise(
+        AIMessage(
+            content=(
+                "Absolutely - I can do a deeper dive. "
+                "To do this properly, I'll review the underlying articles directly."
+            )
+        )
+    ) is True
+
+
+def test_does_not_flag_normal_final_answer_as_future_work_promise():
+    """Plain terminal answers should not emit the promise telemetry event."""
+    from executor.graph import _looks_like_future_work_promise
+
+    assert _looks_like_future_work_promise(
+        AIMessage(content="The timeline is now reconstructed and summarized above.")
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_execute_task_logs_terminated_with_promise_event(mock_worker, task_data):
+    """Completion path emits telemetry when the final AI turn promises future work."""
+    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
+
+    with patch.object(executor, "_build_graph") as mock_build:
+        mock_graph = MagicMock()
+        mock_compiled = AsyncMock()
+        mock_graph.compile.return_value = mock_compiled
+        mock_build.return_value = mock_graph
+
+        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
+            mock_ckpt = AsyncMock()
+            mock_ckpt.aget_tuple.return_value = None
+            MockCheckpointer.return_value = mock_ckpt
+
+            async def mock_astream(*args, **kwargs):
+                yield {"mock": "event"}
+
+            mock_compiled.astream = mock_astream
+
+            terminal_message = AIMessage(
+                content=(
+                    "Absolutely - I can do a deeper dive. "
+                    "To do this properly, I'll review the underlying articles directly."
+                )
+            )
+            mock_state = MagicMock()
+            mock_state.values = {"messages": [terminal_message]}
+            mock_compiled.aget_state.return_value = mock_state
+
+            with patch("executor.graph.logger") as mock_logger:
+                await executor.execute_task(
+                    task_data,
+                    mock_worker.heartbeat.start_heartbeat.return_value.cancel_event,
+                )
+
+    matching_calls = [
+        c for c in mock_logger.warning.call_args_list
+        if c.args and c.args[0] == "agent.terminated_with_promise"
+    ]
+    assert len(matching_calls) == 1
 
 
 # ---------------------------------------------------------------------------
