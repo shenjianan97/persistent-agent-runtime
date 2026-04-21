@@ -337,6 +337,77 @@ describe('ActivityPane', () => {
         expect(row).toHaveTextContent('web_search');
     });
 
+    it('refetches once when task status transitions from running to terminal', async () => {
+        // Reproduces the race where the 3s activity poll happens before
+        // the final checkpoint lands. The parent's status transition to a
+        // terminal value also stops polling, so without a transition-fire
+        // refetch the pane shows stale events missing the final turn.
+        const runningResponse = {
+            events: [
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:00+00:00',
+                    content: 'thinking...',
+                    tool_calls: [{ id: 'c1', name: 'web_search', args: {} }],
+                }),
+            ],
+            next_cursor: null,
+        };
+        const completedResponse = {
+            events: [
+                ...runningResponse.events,
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:10+00:00',
+                    content: 'Final answer.',
+                }),
+            ],
+            next_cursor: null,
+        };
+        listActivityMock.mockImplementation((_taskId: string) =>
+            Promise.resolve(
+                listActivityMock.mock.calls.length === 1
+                    ? runningResponse
+                    : completedResponse,
+            ),
+        );
+
+        const client = new QueryClient({
+            defaultOptions: { queries: { retry: false } },
+        });
+        const { rerender } = render(
+            <QueryClientProvider client={client}>
+                <ActivityPane taskId="task-1" status="running" />
+            </QueryClientProvider>,
+        );
+
+        await waitFor(() =>
+            expect(screen.getByTestId('activity-row-0')).toBeInTheDocument(),
+        );
+        // Initial render has exactly one event — the final turn hasn't
+        // landed yet.
+        expect(screen.queryByTestId('activity-row-1')).not.toBeInTheDocument();
+
+        // Simulate the parent observing status transition to terminal.
+        rerender(
+            <QueryClientProvider client={client}>
+                <ActivityPane taskId="task-1" status="completed" />
+            </QueryClientProvider>,
+        );
+
+        // After the transition the pane must refetch once and pick up the
+        // final turn without a manual page refresh.
+        await waitFor(() =>
+            expect(screen.getByTestId('activity-row-1')).toBeInTheDocument(),
+        );
+        expect(screen.getByTestId('activity-row-1-content')).toHaveTextContent(
+            'Final answer.',
+        );
+        // Exactly two calls — one on mount + one on the transition. No
+        // additional poll cycles.
+        expect(listActivityMock).toHaveBeenCalledTimes(2);
+    });
+
     it('renders the byte-cap notice on tool rows when orig_bytes > content length', async () => {
         listActivityMock.mockResolvedValue({
             events: [

@@ -860,6 +860,22 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
         refetchOnWindowFocus: false,
     });
 
+    // When the task transitions from non-terminal to terminal, the poll
+    // loop stops immediately — but the last actual fetch happened up to
+    // 3s before the final checkpoint landed, so the Activity pane renders
+    // stale events missing the final turn until the user refreshes.
+    // Force one refetch on the transition to pick up the terminal
+    // checkpoint. We track the previous status in a ref to fire exactly
+    // once per transition, not on every re-render.
+    const prevStatusRef = useRef<TaskStatus | undefined>(status);
+    useEffect(() => {
+        const prev = prevStatusRef.current;
+        if (prev && !isTerminalStatus(prev) && isTerminalStatus(status)) {
+            query.refetch();
+        }
+        prevStatusRef.current = status;
+    }, [status, query]);
+
     const events = query.data?.events ?? [];
     const truncated = query.data?.truncated === true;
     const visibleCount = events.length;
