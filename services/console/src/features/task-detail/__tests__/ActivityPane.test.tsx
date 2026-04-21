@@ -106,6 +106,10 @@ describe('ActivityPane', () => {
 
         expect(screen.getByTestId('activity-row-2')).toHaveAttribute('data-kind', 'turn.tool');
         expect(screen.getByTestId('activity-row-2-content')).toHaveTextContent('file1');
+        // Tool results carry their own per-message timestamp (checkpoint
+        // where the ToolMessage first appeared), not the containing
+        // assistant turn's timestamp — surfaced on the fold label.
+        expect(screen.getByTestId('activity-row-2-timestamp')).toBeInTheDocument();
 
         expect(screen.getByTestId('activity-row-3')).toHaveAttribute('data-kind', 'marker.compaction_fired');
         // Summary text body is visible even without the details toggle.

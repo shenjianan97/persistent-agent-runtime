@@ -374,6 +374,14 @@ function ToolTurnRow({ event, index }: RowProps) {
                                 <AlertTriangle className="w-3 h-3" /> error
                             </span>
                         )}
+                        {event.timestamp && (
+                            <span
+                                data-testid={`activity-row-${index}-timestamp`}
+                                className="ml-auto font-mono normal-case tracking-normal text-muted-foreground tabular-nums"
+                            >
+                                {formatTime(event.timestamp)}
+                            </span>
+                        )}
                     </span>
                 }
             >
