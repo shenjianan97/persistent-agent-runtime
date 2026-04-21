@@ -7,7 +7,6 @@ import com.persistentagent.api.model.request.TaskRespondRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.service.ActivityProjectionService;
-import com.persistentagent.api.service.ConversationLogService;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
 import jakarta.validation.ConstraintViolation;
@@ -30,18 +29,15 @@ public class TaskController {
 
     private final TaskService taskService;
     private final TaskEventService taskEventService;
-    private final ConversationLogService conversationLogService;
     private final ActivityProjectionService activityProjectionService;
     private final ObjectMapper objectMapper;
     private final Validator validator;
 
     public TaskController(TaskService taskService, TaskEventService taskEventService,
-                          ConversationLogService conversationLogService,
                           ActivityProjectionService activityProjectionService,
                           ObjectMapper objectMapper, Validator validator) {
         this.taskService = taskService;
         this.taskEventService = taskEventService;
-        this.conversationLogService = conversationLogService;
         this.activityProjectionService = activityProjectionService;
         this.objectMapper = objectMapper;
         this.validator = validator;
@@ -172,27 +168,6 @@ public class TaskController {
         TaskEventListResponse events = taskEventService.listEvents(
                 taskId, ValidationConstants.DEFAULT_TENANT_ID, limit);
         return ResponseEntity.ok(events);
-    }
-
-    /**
-     * Phase 2 Track 7 Task 13 — user-facing conversation log for a task.
-     *
-     * <p>Returns the append-only {@code task_conversation_log} entries
-     * ordered by monotone {@code sequence}. Pagination is exclusive on
-     * {@code after_sequence}; {@code next_sequence} in the response is the
-     * max sequence of the page when full, else null.
-     *
-     * <p>404 is returned when the task doesn't exist OR belongs to another
-     * tenant — indistinguishable by design (no enumeration oracle).
-     */
-    @GetMapping("/{taskId}/conversation")
-    public ResponseEntity<ConversationEntryResponse.Page> getTaskConversation(
-            @PathVariable UUID taskId,
-            @RequestParam(name = "after_sequence", required = false) Long afterSequence,
-            @RequestParam(name = "limit", required = false) Integer limit) {
-        ConversationEntryResponse.Page page =
-                conversationLogService.getConversation(taskId, afterSequence, limit);
-        return ResponseEntity.ok(page);
     }
 
     /**

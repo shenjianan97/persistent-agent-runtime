@@ -9,7 +9,6 @@ import logging
 import os
 import re
 import time
-import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Awaitable
 
@@ -78,10 +77,6 @@ from core.checkpoint_repository import (
     fetch_latest_terminal_checkpoint_id,
     set_cost_and_metadata,
     set_execution_metadata,
-)
-from core.conversation_log_repository import (
-    ConversationLogRepository,
-    compute_idempotency_key as _convlog_key,
 )
 from core.cost_ledger_repository import (
     insert_cost_row,
@@ -196,12 +191,7 @@ def _apply_result_cap(tool_name: str, *, tenant_id: str, agent_id: str, task_id:
 
 
 # ---------------------------------------------------------------------------
-# Track 7 Task 13 — user-facing conversation log dual-write helpers.
-#
-# These helpers keep the append logic out of ``agent_node`` so the node
-# stays readable.  Every function here is best-effort: all DB errors are
-# swallowed inside :class:`ConversationLogRepository` itself (see its
-# failure envelope).  None of these helpers ever raise.
+# Message-ordering helpers used by the unified Activity projection.
 # ---------------------------------------------------------------------------
 
 
@@ -212,9 +202,8 @@ def _stamp_emitted_at(messages: list[BaseMessage]) -> list[BaseMessage]:
     uses ``additional_kwargs.emitted_at`` as the per-message ordering key
     against ``task_events.created_at``. Every time the worker appends to
     ``state["messages"]`` it calls this helper so the stamp lands in state
-    (and therefore in the checkpoint payload) rather than only in the
-    convlog projection. Existing stamps are preserved, so retries leave
-    the ordering key stable.
+    (and therefore in the checkpoint payload) as the ordering key.
+    Existing stamps are preserved, so retries leave the ordering key stable.
 
     LangGraph serialises ``additional_kwargs`` through ``langchain_dumps``
     (see ``checkpointer/postgres.py``), so the stamp round-trips the JSONB
@@ -237,244 +226,6 @@ def _stamp_emitted_at(messages: list[BaseMessage]) -> list[BaseMessage]:
     return messages
 
 
-def _convlog_origin_ref_for_message(msg: BaseMessage) -> str:
-    """Return a stable origin_ref for a LangChain message.
-
-    LangChain messages freshly constructed by the worker (e.g. a new
-    ``HumanMessage(content=...)``) have ``msg.id = None``; we substitute
-    ``f"seed:{uuid4()}"`` so the SHA-256 idempotency key is stable and
-    distinct across messages.  The generated UUID is persisted on the
-    message object (``msg.id``) so a super-step retry reuses the same
-    message instance and therefore the same idempotency key — the
-    ``ON CONFLICT DO NOTHING`` path then deduplicates correctly.
-    """
-    if getattr(msg, "id", None):
-        return str(msg.id)
-    seed = f"seed:{uuid.uuid4()}"
-    try:
-        msg.id = seed  # type: ignore[attr-defined]
-    except Exception:
-        # Defensive: if the underlying pydantic model forbids mutation,
-        # fall through with the generated seed.  Retries will produce a
-        # different key on this one message; ON CONFLICT then leaves the
-        # first write in place as the canonical row.
-        pass
-    return seed
-
-
-async def _convlog_append_pre_llm_turns(
-    repo: ConversationLogRepository,
-    *,
-    task_id: str,
-    tenant_id: str,
-    checkpoint_id: str | None,
-    messages: list[BaseMessage],
-    last_super_step_message_count: int,
-) -> None:
-    """Append one entry per NEW ``HumanMessage`` / ``ToolMessage`` in this super-step.
-
-    ``SystemMessage`` instances are intentionally excluded — they are
-    platform or agent config, not user-facing conversation.  ``AIMessage``
-    is also excluded here; it is appended separately after the LLM call.
-
-    The slice is computed against ``state["messages"]`` (NOT the locally-
-    prepended ``messages`` variable that may carry transient system
-    prompts); the caller guarantees that.
-    """
-    new_slice = messages[last_super_step_message_count:]
-    for msg in new_slice:
-        if isinstance(msg, SystemMessage):
-            continue
-        if isinstance(msg, HumanMessage):
-            origin_ref = _convlog_origin_ref_for_message(msg)
-            key = _convlog_key(
-                task_id=task_id,
-                checkpoint_id=checkpoint_id,
-                origin_ref=origin_ref,
-            )
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            await repo.append_entry(
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=checkpoint_id,
-                idempotency_key=key,
-                kind="user_turn",
-                role="user",
-                content={"text": text},
-            )
-        elif isinstance(msg, ToolMessage):
-            origin_ref = _convlog_origin_ref_for_message(msg)
-            key = _convlog_key(
-                task_id=task_id,
-                checkpoint_id=checkpoint_id,
-                origin_ref=origin_ref,
-            )
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            # v1: we do not preserve the per-tool-result CapEvent on the
-            # ToolMessage, so capped/orig_bytes are reported from the
-            # post-cap text.  Phase 3+ blob-offload will carry cap
-            # metadata explicitly.
-            orig_bytes = len(text.encode("utf-8"))
-            await repo.append_entry(
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=checkpoint_id,
-                idempotency_key=key,
-                kind="tool_result",
-                role="tool",
-                content={
-                    "call_id": getattr(msg, "tool_call_id", "") or "",
-                    "tool_name": getattr(msg, "name", "") or "",
-                    "text": text,
-                    "is_error": bool(getattr(msg, "status", "success") == "error"),
-                },
-                metadata={"orig_bytes": orig_bytes, "capped": False},
-            )
-
-
-async def _convlog_append_llm_response(
-    repo: ConversationLogRepository,
-    *,
-    task_id: str,
-    tenant_id: str,
-    checkpoint_id: str | None,
-    response: AIMessage,
-) -> None:
-    """Append one ``agent_turn`` for the AIMessage text + one ``tool_call`` per tool call."""
-    msg_id = _convlog_origin_ref_for_message(response)
-    text = response.content if isinstance(response.content, str) else ""
-    agent_key = _convlog_key(
-        task_id=task_id,
-        checkpoint_id=checkpoint_id,
-        origin_ref=msg_id,
-    )
-    finish_reason = None
-    try:
-        rm = response.response_metadata or {}
-        finish_reason = (
-            rm.get("finish_reason")
-            or rm.get("stop_reason")
-            or None
-        )
-    except Exception:
-        finish_reason = None
-    await repo.append_entry(
-        task_id=task_id,
-        tenant_id=tenant_id,
-        checkpoint_id=checkpoint_id,
-        idempotency_key=agent_key,
-        kind="agent_turn",
-        role="assistant",
-        content={"text": text or ""},
-        metadata={"message_id": msg_id, "finish_reason": finish_reason},
-    )
-
-    for call in getattr(response, "tool_calls", None) or []:
-        # ``call`` may be a dict (``{"name": ..., "args": ..., "id": ...}``)
-        # or a LangChain ToolCall TypedDict — both expose key access.
-        call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
-        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", "")
-        args = call.get("args") if isinstance(call, dict) else getattr(call, "args", {})
-        origin = call_id or f"{msg_id}:{name}"
-        tc_key = _convlog_key(
-            task_id=task_id,
-            checkpoint_id=checkpoint_id,
-            origin_ref=f"toolcall:{origin}",
-        )
-        # json.dumps with default=str per spec §Content schema, applied
-        # here so the append_entry payload is pure dict already.
-        try:
-            args_safe = json.loads(json.dumps(args, default=str))
-        except Exception:
-            args_safe = {"__unserializable__": str(args)}
-        await repo.append_entry(
-            task_id=task_id,
-            tenant_id=tenant_id,
-            checkpoint_id=checkpoint_id,
-            idempotency_key=tc_key,
-            kind="tool_call",
-            role="assistant",
-            content={
-                "tool_name": name or "",
-                "args": args_safe,
-                "call_id": call_id or "",
-            },
-            metadata={"message_id": msg_id},
-        )
-
-
-async def _convlog_append_compaction_events(
-    repo: ConversationLogRepository,
-    *,
-    task_id: str,
-    tenant_id: str,
-    checkpoint_id: str | None,
-    events: list,
-    summarized_through_before: int,
-    summary_before: str,
-    summary_after: str,
-) -> None:
-    """Append one entry per Tier3Fired / MemoryFlushFired event from the hook.
-
-    Under the Track 7 Follow-up (Task 3) replace-and-rehydrate architecture
-    the summary is REPLACED on each firing rather than appended to, so the
-    conversation-log's ``summary_text`` is simply ``summary_after`` and we
-    no longer compute an append delta. The prior ``summary_before`` is kept
-    on the signature for future diff-style log entries (not used in v1).
-    """
-    # ``summary_before`` is retained in the signature as a forward-looking
-    # hook but is intentionally unused — replace semantics means every firing
-    # renders a fresh summary independent of prior content.
-    _ = summary_before
-    for ev in events:
-        if isinstance(ev, Tier3FiredEvent):
-            # Replace semantics — the entry's summary_text IS the new summary.
-            summary_text = summary_after
-            origin = f"tier3:{summarized_through_before}->{ev.new_summarized_through}"
-            key = _convlog_key(
-                task_id=task_id,
-                checkpoint_id=checkpoint_id,
-                origin_ref=origin,
-            )
-            await repo.append_entry(
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=checkpoint_id,
-                idempotency_key=key,
-                kind="compaction_boundary",
-                role="system",
-                content={
-                    "summary_text": summary_text,
-                    "first_turn_index": int(summarized_through_before),
-                    "last_turn_index": int(ev.new_summarized_through),
-                },
-                metadata={
-                    "summarizer_model": ev.summarizer_model_id,
-                    "turns_summarized": int(ev.new_summarized_through - summarized_through_before),
-                    "summary_bytes": len(summary_text.encode("utf-8")),
-                    "tokens_in": int(ev.tokens_in),
-                    "tokens_out": int(ev.tokens_out),
-                },
-            )
-        elif isinstance(ev, MemoryFlushFiredEvent):
-            origin = f"flush:{checkpoint_id or 'init'}"
-            key = _convlog_key(
-                task_id=task_id,
-                checkpoint_id=checkpoint_id,
-                origin_ref=origin,
-            )
-            await repo.append_entry(
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=checkpoint_id,
-                idempotency_key=key,
-                kind="memory_flush",
-                role="system",
-                content={},
-                metadata={"fired_at_step": int(ev.fired_at_step)},
-            )
-
-
 async def _emit_compaction_task_events(
     *,
     pool,
@@ -490,8 +241,8 @@ async def _emit_compaction_task_events(
 
     Surfaces Tier 3 compaction in the Execution History tab alongside HITL
     markers. Best-effort — compaction itself is already durable via the
-    conversation_log ``compaction_boundary`` row and the watermark; losing
-    the marker only costs the UI indicator, never correctness.
+    compaction watermark; losing the marker only costs the UI indicator,
+    never correctness.
     """
     for ev in events:
         if isinstance(ev, Tier3FiredEvent):
@@ -536,7 +287,7 @@ async def _emit_compaction_task_events(
                                 # Task 8 (A) — carry the summary body in the
                                 # task_event so the Activity projection can
                                 # render the compaction boundary from a
-                                # single store (no convlog lookup needed).
+                                # single store.
                                 "summary_text": summary_after,
                             },
                         )
@@ -598,7 +349,7 @@ async def _emit_offload_task_event(
     events: tuple,
     step_index: int,
 ) -> None:
-    """Task 8 (A) — mirror ``offload_emitted`` convlog entry into task_events.
+    """Task 8 (A) — emit an ``offload_emitted`` marker into task_events.
 
     Best-effort: a failed insert never breaks the task — ingestion offload
     itself is durable through the S3 write; the marker is purely operator
@@ -658,87 +409,13 @@ async def _emit_offload_task_event(
         )
 
 
-async def _convlog_append_offload_emitted(
-    repo: ConversationLogRepository,
-    *,
-    task_id: str,
-    tenant_id: str,
-    checkpoint_id: str | None,
-    events: tuple,
-    step_index: int,
-) -> None:
-    """Emit one ``offload_emitted`` entry per ingestion-offload pass.
-
-    Track 7 Follow-up Task 5 contract: ONE entry per pass that offloaded
-    ≥1 item — not one per item (the per-item form would spam the log on
-    tasks with many small offloads). Payload is the roll-up:
-
-        content  = {"count": N, "total_bytes": B, "step_index": S}
-
-    ``step_index`` is the agent super-step index (approximated via the
-    journal length so we don't need to thread the LangGraph step counter
-    through the tool-node wrapper). All failures are swallowed by the
-    repository's best-effort envelope.
-    """
-    success_events = [ev for ev in events if getattr(ev, "kind", "") == "success"]
-    if not success_events:
-        return
-    total_bytes = sum(
-        int(getattr(ev, "size_bytes", 0) or 0) for ev in success_events
-    )
-    count = len(success_events)
-    # Deterministic idempotency-ref: the set of URIs uniquely identifies
-    # this pass. Hashing inside ``_convlog_key`` (sha256) folds them into
-    # the final key; we just need the material to be stable under retry.
-    uri_material = "|".join(
-        sorted(str(getattr(ev, "uri", "") or "") for ev in success_events)
-    )
-    origin = f"offload:{step_index}:{uri_material}"
-    key = _convlog_key(
-        task_id=task_id,
-        checkpoint_id=checkpoint_id,
-        origin_ref=origin,
-    )
-    await repo.append_entry(
-        task_id=task_id,
-        tenant_id=tenant_id,
-        checkpoint_id=checkpoint_id,
-        idempotency_key=key,
-        kind="offload_emitted",
-        role="system",
-        content={
-            "count": count,
-            "total_bytes": total_bytes,
-            "step_index": int(step_index),
-        },
-    )
-
-
-def _convlog_checkpoint_id_from_config(config: Any) -> str | None:
-    """Best-effort checkpoint-id extraction from a LangGraph RunnableConfig.
-
-    Falls back to ``None`` when the config shape is unexpected — the convlog
-    repo substitutes the literal ``"init"`` for missing checkpoints so the
-    idempotency hash remains stable.
-    """
-    try:
-        if isinstance(config, dict):
-            configurable = config.get("configurable") or {}
-            ckpt = configurable.get("checkpoint_id")
-            return str(ckpt) if ckpt is not None else None
-    except Exception:
-        return None
-    return None
-
-
-def _convlog_step_index_from_state(state: Any) -> int:
+def _offload_step_index_from_state(state: Any) -> int:
     """Return a stable super-step index for the current tool-node invocation.
 
     We use ``len(state["messages"])`` because the LangGraph step counter is
     not exposed in the RunnableConfig shape we receive here. Message-count-
     based indexing is coarser than a true step counter but monotone, stable
-    under retry (idempotent key includes URIs so the retry dedups regardless),
-    and sufficient for operator-facing ordering in the Console.
+    under retry, and sufficient for operator-facing ordering in the Console.
     """
     try:
         if isinstance(state, dict):
@@ -1502,12 +1179,6 @@ class GraphExecutor:
             "pricing_lookup": self._get_model_cost_rates,
         }
 
-        # Track 7 Task 13 — user-facing conversation-log repo.  Appends are
-        # best-effort; all DB errors are swallowed inside the repo so a log
-        # failure never fails the task.
-        conversation_log_repo = ConversationLogRepository(self.pool)
-        self._last_conversation_log_repo = conversation_log_repo
-
         async def agent_node(state: RuntimeState, config: RunnableConfig):
             # Track 7 Follow-up (Task 3) — the pre_model_hook owns system-
             # prompt placement and projection assembly, so we pass the raw
@@ -1516,35 +1187,22 @@ class GraphExecutor:
             # *middle, *keep_window]`` shape.
             _raw_state_messages = state["messages"]
 
-            # Track 7 Task 13 — dual-write BEFORE compaction_pre_model_hook
-            # fires so the conversation log holds the raw view of the super-
-            # step's new turns (not the projection the LLM sees).
-            _last_count = state.get("last_super_step_message_count", 0) or 0
             # Attempt to read a LangGraph-assigned checkpoint id off the
-            # runnable config.  When absent (first turn / pre-Task-10),
-            # append_entry substitutes the literal "init" via the shared
-            # idempotency-key formula.
-            _convlog_ckpt_id = None
+            # runnable config.  When absent (first turn / pre-Task-10) we
+            # fall back to ``None`` and downstream writers (cost ledger
+            # adapter) substitute a deterministic placeholder.
+            _current_ckpt_id: str | None = None
             try:
-                _convlog_ckpt_id = (
+                _current_ckpt_id = (
                     (config.get("configurable") or {}).get("checkpoint_id")
                     if isinstance(config, dict)
                     else None
                 )
             except Exception:
-                _convlog_ckpt_id = None
+                _current_ckpt_id = None
 
-            await _convlog_append_pre_llm_turns(
-                conversation_log_repo,
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=_convlog_ckpt_id,
-                messages=_raw_state_messages,
-                last_super_step_message_count=_last_count,
-            )
-
-            # Capture state values BEFORE compaction so we can compute the
-            # compaction_boundary entry after the hook returns.
+            # Capture state values BEFORE compaction so we can emit the
+            # post-compaction task_event with correct turn-index framing.
             _summary_before = state.get("summary", "") or ""
             _summarized_through_before = int(
                 state.get("summarized_through_turn_index", 0) or 0
@@ -1554,7 +1212,7 @@ class GraphExecutor:
             # so the summariser writes a cost-ledger row tagged to the right
             # checkpoint.  Falls back to None (adapter substitutes a
             # deterministic placeholder so the INSERT still dedups correctly).
-            _per_call_task_context = {**task_context, "checkpoint_id": _convlog_ckpt_id}
+            _per_call_task_context = {**task_context, "checkpoint_id": _current_ckpt_id}
 
             # Track 7 Follow-up (Task 3) — run the pre_model_hook before every
             # LLM call. The hook is pure w.r.t. the journal (never mutates
@@ -1613,23 +1271,11 @@ class GraphExecutor:
                         task_id=task_id,
                     )
 
-            # Track 7 Task 13 — mirror Tier3Fired / MemoryFlushFired events
-            # into the user-facing conversation log.
             _summary_after = (
                 compaction_state_updates.get("summary")
                 if "summary" in compaction_state_updates
                 else _summary_before
             ) or ""
-            await _convlog_append_compaction_events(
-                conversation_log_repo,
-                task_id=task_id,
-                tenant_id=tenant_id,
-                checkpoint_id=_convlog_ckpt_id,
-                events=pass_result.events,
-                summarized_through_before=_summarized_through_before,
-                summary_before=_summary_before,
-                summary_after=_summary_after,
-            )
 
             # Surface Tier3 firings in the Execution History tab via a
             # task_event (reusing the existing task_events feed rather than
@@ -1662,11 +1308,6 @@ class GraphExecutor:
                     # counterpart to the ToolNode wrapper above. When the
                     # ``offload_tool_results`` config flag is off, this is a
                     # passthrough.
-                    #
-                    # Runs BEFORE the conversation-log append so the logged
-                    # tool_call args reflect the reference-replaced view
-                    # (the pre-offload values are still in S3 if Task 5's
-                    # recall tool needs them).
                     if (
                         _offload_enabled
                         and _offload_store is not None
@@ -1682,18 +1323,6 @@ class GraphExecutor:
                             log_context=_offload_log_ctx,
                         )
                         response = _offload_outcome.message  # type: ignore[assignment]
-                        # Track 7 Follow-up Task 5 — one ``offload_emitted``
-                        # convlog entry per AIMessage-arg-offload pass with
-                        # ≥1 success. Aligns with the tool-result side in
-                        # ``tool_node``.
-                        await _convlog_append_offload_emitted(
-                            conversation_log_repo,
-                            task_id=task_id,
-                            tenant_id=tenant_id,
-                            checkpoint_id=_convlog_ckpt_id,
-                            events=_offload_outcome.events,
-                            step_index=len(_raw_state_messages),
-                        )
                         # Task 8 (A) — mirror into task_events.
                         await _emit_offload_task_event(
                             pool=self.pool,
@@ -1704,18 +1333,6 @@ class GraphExecutor:
                             events=_offload_outcome.events,
                             step_index=len(_raw_state_messages),
                         )
-                    # Track 7 Task 13 — append the agent's response and any
-                    # tool-call requests to the user-facing conversation log
-                    # BEFORE returning (and therefore before LangGraph
-                    # commits the super-step's checkpoint).  Idempotency-key
-                    # dedup handles retry-after-crash correctly.
-                    await _convlog_append_llm_response(
-                        conversation_log_repo,
-                        task_id=task_id,
-                        tenant_id=tenant_id,
-                        checkpoint_id=_convlog_ckpt_id,
-                        response=response,
-                    )
                     # Task 8 (A) — stamp ``emitted_at`` on the assistant
                     # response so the unified Activity projection can merge
                     # it with task_events markers on a shared time axis.
@@ -1904,17 +1521,7 @@ class GraphExecutor:
                     log_context=_offload_log_ctx,
                 )
 
-                # Best-effort ``offload_emitted`` convlog entry — one entry
-                # per pass with ≥1 successful offload.
-                await _convlog_append_offload_emitted(
-                    conversation_log_repo,
-                    task_id=task_id,
-                    tenant_id=tenant_id,
-                    checkpoint_id=_convlog_checkpoint_id_from_config(config),
-                    events=_events,
-                    step_index=_convlog_step_index_from_state(state),
-                )
-                # Task 8 (A) — mirror into task_events.
+                # Task 8 (A) — mirror offload passes into task_events.
                 await _emit_offload_task_event(
                     pool=self.pool,
                     task_id=task_id,
@@ -1922,7 +1529,7 @@ class GraphExecutor:
                     agent_id=agent_id,
                     worker_id=self.config.worker_id,
                     events=_events,
-                    step_index=_convlog_step_index_from_state(state),
+                    step_index=_offload_step_index_from_state(state),
                 )
 
                 # Rebuild the list in the same order ``ToolNode`` produced —
@@ -3089,53 +2696,6 @@ class GraphExecutor:
                     )
                     if human_response:
                         payload = json.loads(human_response)
-                        # Track 7 Task 13 — append hitl_resume to the
-                        # user-facing conversation log.  One append per
-                        # resume per checkpoint (idempotency-key scoped).
-                        try:
-                            convlog_repo = ConversationLogRepository(self.pool)
-                            checkpoint_id_for_resume = (
-                                await fetch_latest_checkpoint_id(self.pool, task_id)
-                            )
-                            payload_kind = payload.get("kind", "input")
-                            if payload_kind == "approval":
-                                resolution = (
-                                    "approved"
-                                    if bool(payload.get("approved"))
-                                    else "rejected"
-                                )
-                            elif payload_kind == "follow_up":
-                                resolution = "follow_up"
-                            else:
-                                resolution = "modified" if payload.get("message") else "cancelled"
-                            user_note = payload.get("message") if isinstance(payload.get("message"), str) else None
-                            origin_ref = f"hitl_resume:{checkpoint_id_for_resume or 'init'}"
-                            resume_key = _convlog_key(
-                                task_id=task_id,
-                                checkpoint_id=checkpoint_id_for_resume,
-                                origin_ref=origin_ref,
-                            )
-                            await convlog_repo.append_entry(
-                                task_id=task_id,
-                                tenant_id=tenant_id,
-                                checkpoint_id=checkpoint_id_for_resume,
-                                idempotency_key=resume_key,
-                                kind="hitl_resume",
-                                role="system",
-                                content={
-                                    "resolution": resolution,
-                                    "user_note": user_note,
-                                },
-                                metadata={
-                                    "resolved_by": "user",
-                                    "resolved_at": datetime.now(timezone.utc).isoformat(),
-                                },
-                            )
-                        except Exception:
-                            logger.warning(
-                                "conversation_log hitl_resume append skipped",
-                                exc_info=True,
-                            )
                         # Decode the documented HITL resume payload
                         # {"kind":"follow_up","message":"..."} -> inject new HumanMessage
                         # {"kind":"input","message":"blue"} -> resume value is the message
@@ -4022,10 +3582,9 @@ class GraphExecutor:
                     # Track 3: Decrement running_task_count on HITL pause
                     await decrement_running_count(conn, tenant_id, agent_id)
                     # Insert event in same transaction only if the UPDATE affected a row.
-                    # Task 8 (A) — enrich HITL pause details with the
-                    # convlog-equivalent fields (reason, prompt_to_user,
-                    # tool_name) so the Activity projection can render
-                    # HITL markers without a convlog lookup.
+                    # Task 8 (A) — enrich HITL pause details with reason,
+                    # prompt_to_user, and tool_name so the Activity projection
+                    # can render HITL markers directly from task_events.
                     _tool_name_for_event = None
                     if isinstance(interrupt_data, dict):
                         _tool_name_for_event = (
@@ -4065,56 +3624,6 @@ class GraphExecutor:
             logger.warning("Task %s interrupt handling skipped: lease no longer owned by this worker.", task_id)
         else:
             logger.info("Task %s paused: %s (timeout: %s)", task_id, new_status, timeout_at)
-            # Track 7 Task 13 — append hitl_pause to the user-facing
-            # conversation log.  Idempotency key is scoped to the
-            # checkpoint id (pause per checkpoint fires exactly once).
-            try:
-                convlog_repo = ConversationLogRepository(self.pool)
-                checkpoint_id = await fetch_latest_checkpoint_id(self.pool, task_id)
-                prompt_for_log = (
-                    original_tool_prompt
-                    if original_tool_prompt is not None
-                    else interrupt_data.get("prompt", "") or ""
-                )
-                reason_for_log = (
-                    "tool_requires_approval"
-                    if interrupt_type == "approval"
-                    else interrupt_data.get("reason", "agent_requested")
-                )
-                tool_name_for_log = None
-                if isinstance(interrupt_data, dict):
-                    tool_name_for_log = (
-                        interrupt_data.get("tool_name")
-                        or (interrupt_data.get("action") or {}).get("tool_name")
-                    )
-                origin_ref = f"hitl_pause:{checkpoint_id or 'init'}"
-                key = _convlog_key(
-                    task_id=task_id,
-                    checkpoint_id=checkpoint_id,
-                    origin_ref=origin_ref,
-                )
-                await convlog_repo.append_entry(
-                    task_id=task_id,
-                    tenant_id=tenant_id,
-                    checkpoint_id=checkpoint_id,
-                    idempotency_key=key,
-                    kind="hitl_pause",
-                    role="system",
-                    content={
-                        "reason": reason_for_log,
-                        "prompt_to_user": prompt_for_log if prompt_for_log else None,
-                    },
-                    metadata={
-                        "checkpoint_id": checkpoint_id or "",
-                        "tool_name": tool_name_for_log,
-                    },
-                )
-            except Exception:
-                # Best-effort — never fail the pause path.
-                logger.warning(
-                    "conversation_log hitl_pause append skipped",
-                    exc_info=True,
-                )
 
     async def _handle_retryable_error(
         self,
