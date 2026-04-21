@@ -184,4 +184,138 @@ describe('ActivityPane', () => {
         expect(row).toHaveTextContent('bad_tool');
         expect(row).toHaveTextContent('error');
     });
+
+    it('renders per-turn duration on assistant and tool rows', async () => {
+        listActivityMock.mockResolvedValue(FIXTURE);
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        await waitFor(() =>
+            expect(screen.getByTestId('activity-row-1')).toBeInTheDocument(),
+        );
+        // Row 0 has no predecessor → no duration. Rows 1 + 2 do.
+        expect(screen.getByTestId('activity-row-1-duration')).toHaveTextContent('Δ');
+        expect(screen.getByTestId('activity-row-2-duration')).toHaveTextContent('Δ');
+    });
+
+    it('renders cumulative assistant cost once there is more than one assistant turn', async () => {
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:00+00:00',
+                    content: 'first',
+                    cost_microdollars: 120_000,
+                }),
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:10+00:00',
+                    content: 'second',
+                    cost_microdollars: 330_000,
+                }),
+            ],
+            next_cursor: null,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        await waitFor(() =>
+            expect(screen.getByTestId('activity-row-1')).toBeInTheDocument(),
+        );
+        // First assistant turn has cumulative == per-turn cost → no chip.
+        expect(
+            screen.queryByTestId('activity-row-0-cumulative-cost'),
+        ).not.toBeInTheDocument();
+        // Second assistant turn has cumulative > current → chip appears.
+        const chip = screen.getByTestId('activity-row-1-cumulative-cost');
+        expect(chip).toHaveTextContent('so far');
+    });
+
+    it('renders a handoff banner when consecutive turns have different worker_ids', async () => {
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:00+00:00',
+                    content: 'first',
+                    worker_id: 'worker-aaaaaaaa-1',
+                }),
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:05+00:00',
+                    content: 'second',
+                    worker_id: 'worker-bbbbbbbb-2',
+                }),
+            ],
+            next_cursor: null,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        await waitFor(() =>
+            expect(screen.getByTestId('activity-handoff-1')).toBeInTheDocument(),
+        );
+        expect(screen.getByTestId('activity-handoff-1')).toHaveTextContent('Handoff');
+        // Worker ids truncated to first 8 chars.
+        expect(screen.getByTestId('activity-handoff-1')).toHaveTextContent('worker-a');
+        expect(screen.getByTestId('activity-handoff-1')).toHaveTextContent('worker-b');
+    });
+
+    it('promotes dead_lettered lifecycle events with destructive styling', async () => {
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'marker.lifecycle',
+                    timestamp: '2026-04-20T00:00:00+00:00',
+                    event_type: 'task_dead_lettered',
+                    details: {
+                        reason: 'tier3_tokens_out_exceeded',
+                        error_code: 'TIER3_TOKENS_OUT_EXCEEDED',
+                    },
+                }),
+            ],
+            next_cursor: null,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="dead_letter" />);
+
+        const row = await screen.findByTestId('activity-row-0');
+        expect(row).toHaveTextContent('Task failed');
+        expect(row).toHaveTextContent('tier3_tokens_out_exceeded');
+        // Destructive border class applied.
+        expect(row.className).toMatch(/destructive/);
+    });
+
+    it('renders the truncation notice when the page is capped', async () => {
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'turn.user',
+                    content: 'hello',
+                }),
+            ],
+            next_cursor: null,
+            truncated: true,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        const notice = await screen.findByTestId('activity-truncation-notice');
+        expect(notice).toHaveTextContent('Showing first 2000 of many events');
+    });
+
+    it('renders the byte-cap notice on tool rows when orig_bytes > content length', async () => {
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'turn.tool',
+                    tool_name: 'read_file',
+                    tool_call_id: 'c1',
+                    content: 'shortoutput',
+                    orig_bytes: 99999,
+                }),
+            ],
+            next_cursor: null,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        const notice = await screen.findByTestId('activity-row-0-byte-cap-notice');
+        expect(notice).toHaveTextContent('99999');
+        expect(notice).toHaveTextContent('head+tail capped view');
+    });
 });

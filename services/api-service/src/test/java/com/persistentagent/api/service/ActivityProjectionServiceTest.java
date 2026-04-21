@@ -254,4 +254,191 @@ class ActivityProjectionServiceTest {
         assertEquals("marker.compaction_fired", events.get(1).kind());
         assertEquals("turn.assistant", events.get(2).kind());
     }
+
+    // --- worker_id attribution ---
+
+    @Test
+    void getActivity_surfacesWorkerIdFromCheckpointRow() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{"messages":[
+                  {"lc":1,"type":"constructor","id":["x","HumanMessage"],
+                   "kwargs":{"type":"human","content":"hi","id":"m_user",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:00+00:00"}}},
+                  {"lc":1,"type":"constructor","id":["x","AIMessage"],
+                   "kwargs":{"type":"ai","content":"hello","id":"m_ai",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:01+00:00"}}},
+                  {"lc":1,"type":"constructor","id":["x","ToolMessage"],
+                   "kwargs":{"type":"tool","content":"out","name":"ls",
+                             "tool_call_id":"call_1","id":"m_tool",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:02+00:00"}}}
+                ]}}
+                """;
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        Map<String, Object> row = new java.util.HashMap<>();
+        row.put("checkpoint_id", "ckpt_1");
+        row.put("worker_id", "worker-abc");
+        row.put("cost_microdollars", 0L);
+        row.put("checkpoint_payload", payload);
+        row.put("created_at", created);
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(row));
+        when(taskRepository.getCheckpoints(taskId, tenantId)).thenReturn(Optional.of(List.of(row)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(3, events.size());
+        assertEquals("worker-abc", events.get(0).workerId());
+        assertEquals("worker-abc", events.get(1).workerId());
+        assertEquals("worker-abc", events.get(2).workerId());
+    }
+
+    @Test
+    void getActivity_nullWorkerIdRow_leavesWorkerIdNull() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{"messages":[
+                  {"lc":1,"type":"constructor","id":["x","HumanMessage"],
+                   "kwargs":{"type":"human","content":"hi","id":"m_user",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:00+00:00"}}}
+                ]}}
+                """;
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        Map<String, Object> row = new java.util.HashMap<>();
+        row.put("checkpoint_id", "ckpt_1");
+        row.put("worker_id", null); // nullable TEXT column
+        row.put("cost_microdollars", 0L);
+        row.put("checkpoint_payload", payload);
+        row.put("created_at", created);
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(row));
+        when(taskRepository.getCheckpoints(taskId, tenantId)).thenReturn(Optional.of(List.of(row)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertNull(events.get(0).workerId());
+    }
+
+    // --- orig_bytes on tool messages ---
+
+    @Test
+    void getActivity_toolTurn_surfacesOrigBytesFromAdditionalKwargs() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{"messages":[
+                  {"lc":1,"type":"constructor","id":["x","ToolMessage"],
+                   "kwargs":{"type":"tool","content":"head...tail","name":"grep",
+                             "tool_call_id":"call_x","status":"success",
+                             "additional_kwargs":{
+                                "emitted_at":"2026-04-20T00:00:00+00:00",
+                                "orig_bytes":98765}}}
+                ]}}
+                """;
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertEquals("turn.tool", events.get(0).kind());
+        assertEquals(98765L, events.get(0).origBytes());
+    }
+
+    @Test
+    void getActivity_toolTurn_noOrigBytes_leavesFieldNull() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{"messages":[
+                  {"lc":1,"type":"constructor","id":["x","ToolMessage"],
+                   "kwargs":{"type":"tool","content":"short","name":"grep",
+                             "tool_call_id":"call_x","status":"success",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:00+00:00"}}}
+                ]}}
+                """;
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertNull(events.get(0).origBytes());
+    }
+
+    // --- Page.truncated flag ---
+
+    @Test
+    void getActivity_underMaxEvents_truncatedIsNullOrFalse() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{"messages":[
+                  {"lc":1,"type":"constructor","id":["x","HumanMessage"],
+                   "kwargs":{"type":"human","content":"hi",
+                             "additional_kwargs":{"emitted_at":"2026-04-20T00:00:00+00:00"}}}
+                ]}}
+                """;
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        ActivityEventResponse.Page page = service.getActivity(taskId, false);
+        // Either null (omitted by @JsonInclude(NON_NULL)) or explicit false.
+        assertTrue(page.truncated() == null || !page.truncated());
+    }
+
+    @Test
+    void getActivity_overMaxEvents_truncatedIsTrueAndTrimmed() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // Synthesize MAX_EVENTS + 1 HumanMessages so the projection exceeds
+        // the hard cap and we can assert both the truncation flag and the
+        // trimmed list size.
+        int count = ActivityProjectionService.MAX_EVENTS + 1;
+        StringBuilder messages = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (i > 0) messages.append(",");
+            // Each message gets a unique emitted_at so sort is deterministic.
+            String ts = String.format("2026-04-20T00:00:00.%06d+00:00", i);
+            messages.append("{\"lc\":1,\"type\":\"constructor\",\"id\":[\"x\",\"HumanMessage\"],")
+                    .append("\"kwargs\":{\"type\":\"human\",\"content\":\"m").append(i).append("\",")
+                    .append("\"id\":\"m_").append(i).append("\",")
+                    .append("\"additional_kwargs\":{\"emitted_at\":\"").append(ts).append("\"}}}");
+        }
+        String payload = "{\"channel_values\":{\"messages\":[" + messages + "]}}";
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        ActivityEventResponse.Page page = service.getActivity(taskId, false);
+        assertEquals(Boolean.TRUE, page.truncated());
+        assertEquals(ActivityProjectionService.MAX_EVENTS, page.events().size());
+    }
 }

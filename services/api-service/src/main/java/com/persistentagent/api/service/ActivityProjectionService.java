@@ -131,11 +131,12 @@ public class ActivityProjectionService {
         events.sort(Comparator.comparing(ActivityEventResponse::timestamp,
                 Comparator.nullsLast(Comparator.naturalOrder())));
 
-        if (events.size() > MAX_EVENTS) {
+        boolean truncated = events.size() > MAX_EVENTS;
+        if (truncated) {
             events = events.subList(0, MAX_EVENTS);
         }
 
-        return new ActivityEventResponse.Page(events, null);
+        return new ActivityEventResponse.Page(events, null, truncated ? Boolean.TRUE : null);
     }
 
     // ---------------------------------------------------------------------
@@ -150,9 +151,13 @@ public class ActivityProjectionService {
     /** Attribution map keyed on message id. Never contains null values. */
     private record TurnAttribution(
             Map<String, OffsetDateTime> firstSeenAt,
-            Map<String, Long> costByAiMessageId) {
+            Map<String, Long> costByAiMessageId,
+            Map<String, String> workerByMessageId) {
         static TurnAttribution empty() {
-            return new TurnAttribution(Collections.emptyMap(), Collections.emptyMap());
+            return new TurnAttribution(
+                    Collections.emptyMap(),
+                    Collections.emptyMap(),
+                    Collections.emptyMap());
         }
     }
 
@@ -164,6 +169,7 @@ public class ActivityProjectionService {
         }
         Map<String, OffsetDateTime> firstSeenAt = new HashMap<>();
         Map<String, Long> costByAiMessageId = new HashMap<>();
+        Map<String, String> workerByMessageId = new HashMap<>();
         Set<String> seen = new HashSet<>();
         for (Map<String, Object> row : all) {
             Object costObj = row.get("cost_microdollars");
@@ -176,6 +182,7 @@ public class ActivityProjectionService {
             if (createdAtObj instanceof Timestamp ts) {
                 rowCreatedAt = DateTimeUtil.toOffsetDateTime(ts);
             }
+            String rowWorkerId = asString(row.get("worker_id"));
             Object payload = row.get("checkpoint_payload");
             Map<String, Object> parsed = parsePayload(payload);
             if (parsed == null) {
@@ -209,6 +216,9 @@ public class ActivityProjectionService {
                     if (rowCreatedAt != null) {
                         firstSeenAt.putIfAbsent(id, rowCreatedAt);
                     }
+                    if (rowWorkerId != null && !rowWorkerId.isBlank()) {
+                        workerByMessageId.putIfAbsent(id, rowWorkerId);
+                    }
                     if ("ai".equals(type) && firstNewAiId == null) {
                         firstNewAiId = id;
                     }
@@ -218,7 +228,7 @@ public class ActivityProjectionService {
                 costByAiMessageId.merge(firstNewAiId, cost, Long::sum);
             }
         }
-        return new TurnAttribution(firstSeenAt, costByAiMessageId);
+        return new TurnAttribution(firstSeenAt, costByAiMessageId, workerByMessageId);
     }
 
     // ---------------------------------------------------------------------
@@ -277,6 +287,10 @@ public class ActivityProjectionService {
                 timestamp = fallbackTs;
             }
 
+            String workerId = messageId != null
+                    ? attribution.workerByMessageId().get(messageId)
+                    : null;
+
             switch (type) {
                 case "human" -> turns.add(new ActivityEventResponse(
                         "turn.user",
@@ -285,8 +299,10 @@ public class ActivityProjectionService {
                         asString(kwargs.get("content")),
                         null, null, null, null,
                         null, null, null, null, null,
-                        null, null));
-                case "ai" -> turns.add(buildAssistantTurn(kwargs, timestamp, attribution.costByAiMessageId()));
+                        null, null,
+                        workerId, null));
+                case "ai" -> turns.add(buildAssistantTurn(
+                        kwargs, timestamp, attribution.costByAiMessageId(), workerId));
                 case "tool" -> turns.add(new ActivityEventResponse(
                         "turn.tool",
                         timestamp,
@@ -297,7 +313,9 @@ public class ActivityProjectionService {
                         null,
                         "error".equalsIgnoreCase(asString(kwargs.get("status"))),
                         null, null, null, null, null,
-                        null, null));
+                        null, null,
+                        workerId,
+                        readOrigBytes(kwargs)));
                 case "system" -> {
                     // SystemMessages in state["messages"] are platform
                     // directives the worker put there intentionally
@@ -312,6 +330,7 @@ public class ActivityProjectionService {
                             asString(kwargs.get("content")),
                             null, null, null, null,
                             "system_note", null, null, null, null,
+                            null, null,
                             null, null));
                 }
                 default -> { /* unknown type — skip */ }
@@ -324,7 +343,8 @@ public class ActivityProjectionService {
     private ActivityEventResponse buildAssistantTurn(
             Map<String, Object> kwargs,
             OffsetDateTime ts,
-            Map<String, Long> costByAiMessageId) {
+            Map<String, Long> costByAiMessageId,
+            String workerId) {
         List<ActivityEventResponse.ToolCall> toolCalls = null;
         Object rawToolCalls = kwargs.get("tool_calls");
         if (rawToolCalls instanceof List<?> rawList && !rawList.isEmpty()) {
@@ -359,7 +379,9 @@ public class ActivityProjectionService {
                 null,
                 null, null, null, null, null,
                 usage,
-                cost);
+                cost,
+                workerId,
+                null);
     }
 
     /**
@@ -486,7 +508,29 @@ public class ActivityProjectionService {
                 summaryText,
                 event.details(),
                 null,
+                null,
+                null,
                 null);
+    }
+
+    /**
+     * Walks {@code kwargs.additional_kwargs.orig_bytes} and returns the
+     * pre-truncation byte count the worker stashed when it truncated a
+     * large tool output. Returns {@code null} when either the
+     * {@code additional_kwargs} map is absent (legacy ToolMessages) or the
+     * {@code orig_bytes} key is missing.
+     */
+    @SuppressWarnings("unchecked")
+    private Long readOrigBytes(Map<String, Object> kwargs) {
+        Object additional = kwargs.get("additional_kwargs");
+        if (!(additional instanceof Map<?, ?> additionalMap)) {
+            return null;
+        }
+        Object raw = ((Map<String, Object>) additionalMap).get("orig_bytes");
+        if (raw instanceof Number n) {
+            return n.longValue();
+        }
+        return null;
     }
 
     private static String asString(Object value) {

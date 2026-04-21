@@ -576,7 +576,7 @@ class TaskControllerTest {
         void getActivity_existingTask_returns200() throws Exception {
                 UUID taskId = UUID.randomUUID();
                 ActivityEventResponse.Page page = new ActivityEventResponse.Page(
-                                java.util.List.of(), null);
+                                java.util.List.of(), null, null);
                 when(activityProjectionService.getActivity(eq(taskId), eq(false)))
                                 .thenReturn(page);
 
@@ -600,7 +600,7 @@ class TaskControllerTest {
         void getActivity_includeDetails_passesThroughToService() throws Exception {
                 UUID taskId = UUID.randomUUID();
                 ActivityEventResponse.Page page = new ActivityEventResponse.Page(
-                                java.util.List.of(), null);
+                                java.util.List.of(), null, null);
                 when(activityProjectionService.getActivity(eq(taskId), eq(true)))
                                 .thenReturn(page);
 

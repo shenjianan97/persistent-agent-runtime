@@ -482,9 +482,18 @@ export interface ActivityEvent {
     // `cost_microdollars` attributed to this AI message by the server.
     usage?: ActivityUsage | null;
     cost_microdollars?: number | null;
+    // Worker id set on turn kinds (user/assistant/tool), from the checkpoint
+    // where the message first appeared. Used to render handoff banners.
+    worker_id?: string | null;
+    // Pre-truncation byte count. Set on `turn.tool` only — when present and
+    // greater than the length of `content`, the server capped the tool output
+    // to a head+tail view (same view the model saw).
+    orig_bytes?: number | null;
 }
 
 export interface ActivityListResponse {
     events: ActivityEvent[];
     next_cursor: string | null;
+    // True when the server cut events at MAX_EVENTS=2000.
+    truncated?: boolean | null;
 }

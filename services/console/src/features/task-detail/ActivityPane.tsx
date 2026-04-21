@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
     User as UserIcon,
@@ -83,6 +83,16 @@ function formatMicroUsd(microdollars: number | undefined | null): string | null 
     if (usd < 0.01) return `$${usd.toFixed(4)}`;
     if (usd < 1) return `$${usd.toFixed(3)}`;
     return `$${usd.toFixed(2)}`;
+}
+
+function formatDuration(ms: number | null): string | null {
+    if (ms == null || !Number.isFinite(ms) || ms < 0) return null;
+    if (ms < 1000) return `Δ ${Math.round(ms)}ms`;
+    if (ms < 60_000) return `Δ ${(ms / 1000).toFixed(1)}s`;
+    const totalSec = Math.round(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `Δ ${m}m ${s}s`;
 }
 
 // The Activity API stringifies Anthropic content-block lists as Python reprs:
@@ -220,6 +230,10 @@ function DetailsAffordance({ event, index }: { event: ActivityEvent; index: numb
 interface RowProps {
     event: ActivityEvent;
     index: number;
+    durationMs?: number | null;
+    cumulativeCostMicrodollars?: number | null;
+    highlightedToolCallId?: string | null;
+    setHighlightedToolCallId?: (id: string | null) => void;
 }
 
 function UserTurnRow({ event, index }: RowProps) {
@@ -253,7 +267,14 @@ function UserTurnRow({ event, index }: RowProps) {
     );
 }
 
-function AssistantTurnRow({ event, index }: RowProps) {
+function AssistantTurnRow({
+    event,
+    index,
+    durationMs,
+    cumulativeCostMicrodollars,
+    highlightedToolCallId,
+    setHighlightedToolCallId,
+}: RowProps) {
     const text = extractAssistantText(event.content);
     const toolCalls: ActivityToolCall[] = event.tool_calls ?? [];
     const hasText = !!text;
@@ -261,6 +282,16 @@ function AssistantTurnRow({ event, index }: RowProps) {
     const usage = event.usage ?? undefined;
     const cost = formatMicroUsd(event.cost_microdollars);
     const showUsage = !!usage && (usage.input_tokens != null || usage.output_tokens != null);
+    const duration = formatDuration(durationMs ?? null);
+    // Cumulative-cost "so far" — only render when cumulative strictly exceeds
+    // the current turn's cost (i.e. skip the first assistant turn where both
+    // values are identical).
+    const cumulative =
+        cumulativeCostMicrodollars != null &&
+        event.cost_microdollars != null &&
+        cumulativeCostMicrodollars > (event.cost_microdollars ?? 0)
+            ? formatMicroUsd(cumulativeCostMicrodollars)
+            : null;
 
     // Tool-call folds render full-width (alongside the TOOL RESULT folds
     // that follow), while the pill + prose bubble stay constrained to the
@@ -305,6 +336,22 @@ function AssistantTurnRow({ event, index }: RowProps) {
                                 · {cost}
                             </span>
                         )}
+                        {cumulative && (
+                            <span
+                                data-testid={`activity-row-${index}-cumulative-cost`}
+                                className="font-mono normal-case tracking-normal text-success/60"
+                            >
+                                ({cumulative} so far)
+                            </span>
+                        )}
+                        {duration && (
+                            <span
+                                data-testid={`activity-row-${index}-duration`}
+                                className="font-mono normal-case tracking-normal text-muted-foreground/70"
+                            >
+                                · {duration}
+                            </span>
+                        )}
                     </div>
                     {hasText && (
                         <div className="bg-muted/5 border border-border/30 rounded-2xl rounded-bl-sm px-4 py-3">
@@ -331,46 +378,90 @@ function AssistantTurnRow({ event, index }: RowProps) {
             </div>
             {hasToolCalls && (
                 <div className="space-y-2">
-                    {toolCalls.map((tc, i) => (
-                        <Fold
-                            key={tc.id ?? `${tc.name}-${i}`}
-                            tone="warning"
-                            label={
-                                <span className="flex items-center gap-2">
-                                    Tool call → <span className="font-mono normal-case tracking-normal">{tc.name || '(tool)'}</span>
-                                    {event.timestamp && (
-                                        <span
-                                            data-testid={`activity-row-${index}-tool-call-${i}-timestamp`}
-                                            className="ml-auto font-mono normal-case tracking-normal text-muted-foreground tabular-nums"
-                                        >
-                                            {formatTime(event.timestamp)}
+                    {toolCalls.map((tc, i) => {
+                        const highlighted =
+                            !!tc.id && !!highlightedToolCallId && tc.id === highlightedToolCallId;
+                        return (
+                            <div
+                                key={tc.id ?? `${tc.name}-${i}`}
+                                data-tool-call-id={tc.id ?? undefined}
+                                onMouseEnter={
+                                    tc.id && setHighlightedToolCallId
+                                        ? () => setHighlightedToolCallId(tc.id ?? null)
+                                        : undefined
+                                }
+                                onMouseLeave={
+                                    setHighlightedToolCallId
+                                        ? () => setHighlightedToolCallId(null)
+                                        : undefined
+                                }
+                                className={`transition-shadow rounded ${highlighted ? 'ring-2 ring-primary/60' : ''}`}
+                            >
+                                <Fold
+                                    tone="warning"
+                                    label={
+                                        <span className="flex items-center gap-2">
+                                            Tool call → <span className="font-mono normal-case tracking-normal">{tc.name || '(tool)'}</span>
+                                            {event.timestamp && (
+                                                <span
+                                                    data-testid={`activity-row-${index}-tool-call-${i}-timestamp`}
+                                                    className="ml-auto font-mono normal-case tracking-normal text-muted-foreground tabular-nums"
+                                                >
+                                                    {formatTime(event.timestamp)}
+                                                </span>
+                                            )}
                                         </span>
-                                    )}
-                                </span>
-                            }
-                        >
-                            <pre className="text-xs font-mono text-warning whitespace-pre-wrap break-all">
-                                {formatJson(tc.args ?? {})}
-                            </pre>
-                        </Fold>
-                    ))}
+                                    }
+                                >
+                                    <pre className="text-xs font-mono text-warning whitespace-pre-wrap break-all">
+                                        {formatJson(tc.args ?? {})}
+                                    </pre>
+                                </Fold>
+                            </div>
+                        );
+                    })}
                 </div>
             )}
         </li>
     );
 }
 
-function ToolTurnRow({ event, index }: RowProps) {
+function ToolTurnRow({
+    event,
+    index,
+    durationMs,
+    highlightedToolCallId,
+    setHighlightedToolCallId,
+}: RowProps) {
     const text = event.content ?? '';
     const err = !!event.is_error;
     const toolName = event.tool_name || '(tool)';
+    const duration = formatDuration(durationMs ?? null);
+    const origBytes = event.orig_bytes;
+    const contentLen = text.length;
+    const showByteCapNotice =
+        origBytes != null && Number.isFinite(origBytes) && origBytes > contentLen;
+    const toolCallId = event.tool_call_id ?? null;
+    const highlighted =
+        !!toolCallId && !!highlightedToolCallId && toolCallId === highlightedToolCallId;
 
     return (
         <li
             role="listitem"
             data-testid={`activity-row-${index}`}
             data-kind={event.kind}
-            className="list-none animate-in fade-in duration-300"
+            data-tool-call-id={toolCallId ?? undefined}
+            onMouseEnter={
+                toolCallId && setHighlightedToolCallId
+                    ? () => setHighlightedToolCallId(toolCallId)
+                    : undefined
+            }
+            onMouseLeave={
+                setHighlightedToolCallId
+                    ? () => setHighlightedToolCallId(null)
+                    : undefined
+            }
+            className={`list-none animate-in fade-in duration-300 rounded transition-shadow ${highlighted ? 'ring-2 ring-primary/60' : ''}`}
         >
             <Fold
                 tone={err ? 'destructive' : 'success'}
@@ -380,6 +471,14 @@ function ToolTurnRow({ event, index }: RowProps) {
                         {err && (
                             <span className="inline-flex items-center gap-1 text-destructive normal-case tracking-normal font-semibold">
                                 <AlertTriangle className="w-3 h-3" /> error
+                            </span>
+                        )}
+                        {duration && (
+                            <span
+                                data-testid={`activity-row-${index}-duration`}
+                                className="font-mono normal-case tracking-normal text-muted-foreground/70"
+                            >
+                                {duration}
                             </span>
                         )}
                         {event.timestamp && (
@@ -393,6 +492,15 @@ function ToolTurnRow({ event, index }: RowProps) {
                     </span>
                 }
             >
+                {showByteCapNotice && (
+                    <div
+                        data-testid={`activity-row-${index}-byte-cap-notice`}
+                        className="mb-2 text-[11px] font-mono text-muted-foreground bg-muted/10 border border-border/30 rounded px-2 py-1"
+                    >
+                        <Info className="w-3 h-3 inline-block mr-1 align-[-2px]" />
+                        Tool returned {origBytes} B; showing head+tail capped view (same view the model saw)
+                    </div>
+                )}
                 <pre
                     data-testid={`activity-row-${index}-content`}
                     className={`text-xs font-mono whitespace-pre-wrap break-all ${err ? 'text-destructive' : 'text-success'}`}
@@ -543,6 +651,62 @@ function SystemNoteMarkerRow({ event, index }: RowProps) {
 }
 
 function LifecycleMarkerRow({ event, index }: RowProps) {
+    const et = event.event_type;
+    if (et === 'task_dead_lettered') {
+        const reason = event.details?.reason as string | undefined;
+        const errorCode = event.details?.error_code as string | undefined;
+        return (
+            <li
+                role="listitem"
+                data-testid={`activity-row-${index}`}
+                data-kind={event.kind}
+                className="list-none animate-in fade-in duration-300 border border-destructive/40 bg-destructive/10 rounded-lg px-4 py-3 space-y-2"
+            >
+                <div className="flex items-center gap-2 text-sm font-semibold text-destructive">
+                    <AlertTriangle className="w-4 h-4 shrink-0" />
+                    <span data-testid={`activity-row-${index}-content`} className="flex-1">
+                        Task failed
+                        {reason ? ` — ${reason}` : ''}
+                        {errorCode ? ` (${errorCode})` : ''}
+                    </span>
+                    {event.timestamp && (
+                        <span className="ml-auto text-xs font-mono font-normal text-destructive/70 tabular-nums">
+                            {formatTime(event.timestamp)}
+                        </span>
+                    )}
+                </div>
+                <DetailsAffordance event={event} index={index} />
+            </li>
+        );
+    }
+    if (et === 'task_redriven') {
+        const resumedFrom = event.details?.resumed_from_step as
+            | number
+            | string
+            | undefined;
+        return (
+            <li
+                role="listitem"
+                data-testid={`activity-row-${index}`}
+                data-kind={event.kind}
+                className="list-none animate-in fade-in duration-300 border border-green-500/30 bg-green-500/10 rounded-lg px-4 py-3 space-y-2"
+            >
+                <div className="flex items-center gap-2 text-sm font-semibold text-green-300">
+                    <PlayCircle className="w-4 h-4 shrink-0" />
+                    <span data-testid={`activity-row-${index}-content`} className="flex-1">
+                        Resumed from checkpoint
+                        {resumedFrom != null ? ` — step ${resumedFrom}` : ''}
+                    </span>
+                    {event.timestamp && (
+                        <span className="ml-auto text-xs font-mono font-normal text-green-200/70 tabular-nums">
+                            {formatTime(event.timestamp)}
+                        </span>
+                    )}
+                </div>
+                <DetailsAffordance event={event} index={index} />
+            </li>
+        );
+    }
     return (
         <li
             role="listitem"
@@ -576,6 +740,22 @@ function HitlPauseMarkerRow({ event, index }: RowProps) {
         event.summary_text ??
         'awaiting operator';
     const tool = event.details?.tool_name as string | undefined;
+    const budgetPerTask = event.details?.budget_limit_per_task_microdollars as
+        | number
+        | undefined;
+    const budgetPerHour = event.details?.budget_limit_per_hour_microdollars as
+        | number
+        | undefined;
+    const observedCost = event.details?.observed_cost_microdollars as
+        | number
+        | undefined;
+    const perTask = formatMicroUsd(budgetPerTask);
+    const perHour = formatMicroUsd(budgetPerHour);
+    const observed = formatMicroUsd(observedCost);
+    const chips: { k: string; v: string }[] = [];
+    if (perTask) chips.push({ k: 'Budget', v: `${perTask}/task` });
+    if (perHour) chips.push({ k: '', v: `${perHour}/hr` });
+    if (observed) chips.push({ k: 'Observed', v: observed });
     return (
         <li
             role="listitem"
@@ -595,6 +775,19 @@ function HitlPauseMarkerRow({ event, index }: RowProps) {
                     </span>
                 )}
             </div>
+            {chips.length > 0 && (
+                <dl className="flex flex-wrap gap-2 text-[11px] font-mono text-amber-200/80">
+                    {chips.map((c, i) => (
+                        <div
+                            key={i}
+                            className="inline-flex items-center gap-1 bg-amber-500/10 border border-amber-500/20 rounded px-2 py-0.5"
+                        >
+                            {c.k && <dt className="font-semibold">{c.k}:</dt>}
+                            <dd>{c.v}</dd>
+                        </div>
+                    ))}
+                </dl>
+            )}
             <DetailsAffordance event={event} index={index} />
         </li>
     );
@@ -605,6 +798,7 @@ function HitlResumeMarkerRow({ event, index }: RowProps) {
         (event.details?.resolution as string | undefined) ??
         event.summary_text ??
         'resumed';
+    const resumeTrigger = event.details?.resume_trigger as string | undefined;
     return (
         <li
             role="listitem"
@@ -623,37 +817,46 @@ function HitlResumeMarkerRow({ event, index }: RowProps) {
                     </span>
                 )}
             </div>
+            {resumeTrigger && (
+                <dl className="flex flex-wrap gap-2 text-[11px] font-mono text-green-200/80">
+                    <div className="inline-flex items-center gap-1 bg-green-500/10 border border-green-500/20 rounded px-2 py-0.5">
+                        <dt className="font-semibold">Resume:</dt>
+                        <dd>{resumeTrigger}</dd>
+                    </div>
+                </dl>
+            )}
             <DetailsAffordance event={event} index={index} />
         </li>
     );
 }
 
-function ActivityRow({ event, index }: RowProps) {
+function ActivityRow(props: RowProps) {
+    const { event } = props;
     switch (event.kind) {
         case 'turn.user':
-            return <UserTurnRow event={event} index={index} />;
+            return <UserTurnRow {...props} />;
         case 'turn.assistant':
-            return <AssistantTurnRow event={event} index={index} />;
+            return <AssistantTurnRow {...props} />;
         case 'turn.tool':
-            return <ToolTurnRow event={event} index={index} />;
+            return <ToolTurnRow {...props} />;
         case 'marker.compaction_fired':
-            return <CompactionMarkerRow event={event} index={index} />;
+            return <CompactionMarkerRow {...props} />;
         case 'marker.memory_flush':
-            return <MemoryFlushMarkerRow event={event} index={index} />;
+            return <MemoryFlushMarkerRow {...props} />;
         case 'marker.offload_emitted':
-            return <OffloadMarkerRow event={event} index={index} />;
+            return <OffloadMarkerRow {...props} />;
         case 'marker.system_note':
-            return <SystemNoteMarkerRow event={event} index={index} />;
+            return <SystemNoteMarkerRow {...props} />;
         case 'marker.lifecycle':
-            return <LifecycleMarkerRow event={event} index={index} />;
+            return <LifecycleMarkerRow {...props} />;
         default:
             if (isHitlPause(event.kind)) {
-                return <HitlPauseMarkerRow event={event} index={index} />;
+                return <HitlPauseMarkerRow {...props} />;
             }
             if (isHitlResume(event.kind)) {
-                return <HitlResumeMarkerRow event={event} index={index} />;
+                return <HitlResumeMarkerRow {...props} />;
             }
-            return <SystemNoteMarkerRow event={event} index={index} />;
+            return <SystemNoteMarkerRow {...props} />;
     }
 }
 
@@ -666,6 +869,9 @@ interface ActivityPaneProps {
 
 export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     const [showDetails, setShowDetails] = useState(false);
+    const [highlightedToolCallId, setHighlightedToolCallId] = useState<string | null>(
+        null,
+    );
 
     const query = useQuery({
         queryKey: ['task-activity', taskId, showDetails],
@@ -676,6 +882,7 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     });
 
     const events = query.data?.events ?? [];
+    const truncated = query.data?.truncated === true;
     const visibleCount = events.length;
     const isEmpty = !query.isLoading && visibleCount === 0;
 
@@ -683,6 +890,101 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
         () => events.reduce((n, e) => (isTurn(e.kind) ? n + 1 : n), 0),
         [events],
     );
+
+    // ─── Per-index memos for duration, cumulative cost, handoff ──────
+    const durationByIndex = useMemo<(number | null)[]>(() => {
+        return events.map((e, i) => {
+            if (i === 0) return null;
+            const prev = events[i - 1];
+            if (!e.timestamp || !prev.timestamp) return null;
+            const cur = new Date(e.timestamp).getTime();
+            const prv = new Date(prev.timestamp).getTime();
+            if (!Number.isFinite(cur) || !Number.isFinite(prv)) return null;
+            const delta = cur - prv;
+            return delta >= 0 ? delta : null;
+        });
+    }, [events]);
+
+    const cumulativeCostByIndex = useMemo<(number | null)[]>(() => {
+        let running = 0;
+        return events.map((e) => {
+            if (e.kind === 'turn.assistant' && e.cost_microdollars != null) {
+                running += e.cost_microdollars;
+                return running;
+            }
+            return null;
+        });
+    }, [events]);
+
+    const handoffByIndex = useMemo<(string | null)[]>(() => {
+        return events.map((e, i) => {
+            if (i === 0) return null;
+            const prev = events[i - 1];
+            const cur = e.worker_id;
+            const prv = prev.worker_id;
+            if (!cur || !prv) return null;
+            if (cur === prv) return null;
+            const shortPrev = prv.slice(0, 8);
+            const shortCur = cur.slice(0, 8);
+            return `${shortPrev} → ${shortCur}`;
+        });
+    }, [events]);
+
+    // ─── Scroll tracking: auto-scroll to bottom when at bottom; pause
+    //     + show "jump to latest" pill when user scrolls up.
+    const scrollRef = useRef<HTMLDivElement | null>(null);
+    const [atBottom, setAtBottom] = useState(true);
+    const [lastSeenCount, setLastSeenCount] = useState(0);
+
+    const onScroll = () => {
+        const el = scrollRef.current;
+        if (!el) return;
+        const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        setAtBottom(bottom);
+        if (bottom) {
+            setLastSeenCount(visibleCount);
+        }
+    };
+
+    // Auto-scroll on event growth when user is at bottom. useLayoutEffect so
+    // the scroll happens synchronously after DOM updates — avoids visible
+    // jank from a frame where the new content is below the viewport.
+    useLayoutEffect(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        if (atBottom) {
+            el.scrollTop = el.scrollHeight;
+            setLastSeenCount(visibleCount);
+        }
+    }, [visibleCount, atBottom]);
+
+    // Reset "seen" counter when scrolled-to-bottom transitions to true.
+    useEffect(() => {
+        if (atBottom) setLastSeenCount(visibleCount);
+    }, [atBottom, visibleCount]);
+
+    const newCount = atBottom ? 0 : Math.max(0, visibleCount - lastSeenCount);
+
+    const jumpToLatest = () => {
+        const el = scrollRef.current;
+        if (!el) return;
+        el.scrollTop = el.scrollHeight;
+        setAtBottom(true);
+        setLastSeenCount(visibleCount);
+    };
+
+    // ─── Running / awaiting indicator ────────────────────────────────
+    const showRunningIndicator = !isTerminalStatus(status) && visibleCount > 0;
+    const lastEvent = visibleCount > 0 ? events[visibleCount - 1] : null;
+    let runningLabel = 'Running compute…';
+    let runningDotClass = 'bg-primary';
+    if (lastEvent?.kind === 'marker.hitl.paused') {
+        runningLabel = 'Awaiting approval…';
+        runningDotClass = 'bg-amber-400';
+    } else if (lastEvent?.kind === 'marker.hitl.input_requested') {
+        runningLabel = 'Awaiting input…';
+        runningDotClass = 'bg-amber-400';
+    }
 
     return (
         <div
@@ -721,7 +1023,23 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto px-6 py-4 space-y-3">
+            <div
+                ref={scrollRef}
+                onScroll={onScroll}
+                className="flex-1 overflow-auto px-6 py-4 space-y-3"
+            >
+                {truncated && (
+                    <div
+                        data-testid="activity-truncation-notice"
+                        className="flex items-start gap-2 text-xs font-mono text-amber-300 border border-amber-500/40 bg-amber-500/10 rounded-lg px-3 py-2"
+                    >
+                        <Info className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>
+                            Showing first 2000 of many events. Pagination coming soon.
+                        </span>
+                    </div>
+                )}
+
                 {query.isLoading && (
                     <div
                         data-testid="activity-loading"
@@ -764,16 +1082,64 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
 
                 {visibleCount > 0 && (
                     <ul role="list" className="space-y-3">
-                        {events.map((event, index) => (
-                            <ActivityRow
-                                key={`${event.kind}-${event.timestamp ?? 'null'}-${index}`}
-                                event={event}
-                                index={index}
-                            />
-                        ))}
+                        {events.map((event, index) => {
+                            const handoff = handoffByIndex[index];
+                            return (
+                                <Fragment
+                                    key={`${event.kind}-${event.timestamp ?? 'null'}-${index}`}
+                                >
+                                    {handoff && (
+                                        <li
+                                            role="listitem"
+                                            data-testid={`activity-handoff-${index}`}
+                                            className="list-none flex items-center gap-2 text-[10px] font-mono uppercase tracking-[0.2em] text-muted-foreground/80 py-1 px-2 border-y border-dashed border-border/30"
+                                        >
+                                            <ActivityIcon className="w-3 h-3 shrink-0" />
+                                            <span>Handoff: {handoff}</span>
+                                        </li>
+                                    )}
+                                    <ActivityRow
+                                        event={event}
+                                        index={index}
+                                        durationMs={durationByIndex[index]}
+                                        cumulativeCostMicrodollars={
+                                            cumulativeCostByIndex[index]
+                                        }
+                                        highlightedToolCallId={highlightedToolCallId}
+                                        setHighlightedToolCallId={
+                                            setHighlightedToolCallId
+                                        }
+                                    />
+                                </Fragment>
+                            );
+                        })}
                     </ul>
                 )}
+
+                {showRunningIndicator && (
+                    <div
+                        data-testid="activity-running-indicator"
+                        className="flex items-center gap-2 text-xs font-mono text-muted-foreground py-2 px-2"
+                    >
+                        <span
+                            className={`inline-block w-2 h-2 rounded-full animate-pulse ${runningDotClass}`}
+                        />
+                        <span>{runningLabel}</span>
+                    </div>
+                )}
             </div>
+
+            {newCount > 0 && (
+                <button
+                    type="button"
+                    data-testid="activity-jump-to-latest"
+                    onClick={jumpToLatest}
+                    className="absolute bottom-4 left-1/2 -translate-x-1/2 inline-flex items-center gap-2 text-xs font-mono bg-primary text-primary-foreground rounded-full px-3 py-1.5 shadow-lg hover:bg-primary/90 transition-colors"
+                >
+                    {newCount} new
+                    <ChevronDown className="w-3 h-3" />
+                </button>
+            )}
         </div>
     );
 }
