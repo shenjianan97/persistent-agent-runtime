@@ -22,14 +22,10 @@ import type { ActivityEvent, TaskStatus } from '@/types';
 /**
  * Phase 2 Track 7 Follow-up Task 8 (C) — unified Activity pane.
  *
- * <p>Replaces the dual "Conversation" + "Execution Timeline" split with a
- * single view sourced from `GET /v1/tasks/{taskId}/activity`. Turns (user /
- * assistant / tool) render chat-style; markers (compaction, HITL, offload,
- * memory flush, lifecycle) render as inline chips.
- *
- * <p>Header toggle "Show details" requests the server with
- * {@code include_details=true}, un-filtering infrastructure markers. Per-
- * row expander (chevron) reveals the raw payload + timestamps.
+ * Single view over `GET /v1/tasks/{taskId}/activity`. Turns render chat-bubble
+ * style; infrastructure markers render as dashed dividers / banners. Mirrors
+ * the legacy ConversationPane visual language so operators can switch tasks
+ * without re-learning the page.
  */
 
 const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
@@ -52,177 +48,475 @@ function formatJson(value: unknown): string {
     }
 }
 
-function formatTs(raw?: string | null): string {
+function formatTime(raw?: string | null): string {
     if (!raw) return '';
     try {
         const d = new Date(raw);
         if (Number.isNaN(d.getTime())) return raw;
-        return d.toLocaleString();
+        return d.toLocaleTimeString();
     } catch {
         return raw;
     }
 }
 
-function truncate(value: string, max = 400): string {
+function truncate(value: string, max = 4000): string {
     if (value.length <= max) return value;
     return `${value.slice(0, max)}…`;
-}
-
-function kindLabel(kind: string): string {
-    switch (kind) {
-        case 'turn.user': return 'User';
-        case 'turn.assistant': return 'Assistant';
-        case 'turn.tool': return 'Tool Result';
-        case 'marker.compaction_fired': return 'Compaction';
-        case 'marker.memory_flush': return 'Memory Flush';
-        case 'marker.offload_emitted': return 'Offload';
-        case 'marker.system_note': return 'System Note';
-        case 'marker.lifecycle': return 'Lifecycle';
-        case 'marker.hitl.paused':
-        case 'marker.hitl.approval_requested':
-        case 'marker.hitl.input_requested':
-            return 'HITL Pause';
-        case 'marker.hitl.approved':
-        case 'marker.hitl.rejected':
-        case 'marker.hitl.input_received':
-        case 'marker.hitl.resumed':
-            return 'HITL Resume';
-        default:
-            return kind.startsWith('marker.') ? 'Marker' : 'Turn';
-    }
-}
-
-function kindIcon(kind: string) {
-    if (kind === 'turn.user') return UserIcon;
-    if (kind === 'turn.assistant') return Sparkles;
-    if (kind === 'turn.tool') return Wrench;
-    if (kind === 'marker.compaction_fired') return Scissors;
-    if (kind === 'marker.memory_flush') return StickyNote;
-    if (kind === 'marker.offload_emitted') return Archive;
-    if (kind === 'marker.system_note') return Info;
-    if (kind.startsWith('marker.hitl.paused') || kind.endsWith('_requested')) return PauseCircle;
-    if (kind.startsWith('marker.hitl.') && (kind.endsWith('_received') || kind.endsWith('_resumed') || kind.endsWith('_approved') || kind.endsWith('_rejected'))) return PlayCircle;
-    if (kind === 'marker.lifecycle') return ActivityIcon;
-    return Info;
 }
 
 function isTurn(kind: string): boolean {
     return kind.startsWith('turn.');
 }
 
-interface ActivityRowProps {
+function isHitlResume(kind: string): boolean {
+    return (
+        kind === 'marker.hitl.approved' ||
+        kind === 'marker.hitl.rejected' ||
+        kind === 'marker.hitl.input_received' ||
+        kind === 'marker.hitl.resumed'
+    );
+}
+
+function isHitlPause(kind: string): boolean {
+    return (
+        kind === 'marker.hitl.paused' ||
+        kind === 'marker.hitl.approval_requested' ||
+        kind === 'marker.hitl.input_requested'
+    );
+}
+
+function hasDetailsPayload(event: ActivityEvent): boolean {
+    return (
+        !!(event.details && Object.keys(event.details).length > 0) ||
+        !!(event.tool_calls && event.tool_calls.length > 0)
+    );
+}
+
+function detailsBlockJson(event: ActivityEvent): string {
+    return formatJson({
+        tool_calls: event.tool_calls ?? undefined,
+        details: event.details ?? undefined,
+    });
+}
+
+// ─── Row renderers ─────────────────────────────────────────────────
+
+interface RowProps {
     event: ActivityEvent;
     index: number;
 }
 
-function ActivityRow({ event, index }: ActivityRowProps) {
-    const [expanded, setExpanded] = useState(false);
-    const Icon = kindIcon(event.kind);
-    const turn = isTurn(event.kind);
-
-    const header = (
-        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider">
-            <Icon className="w-3.5 h-3.5" aria-hidden />
-            <span>{kindLabel(event.kind)}</span>
-            {event.timestamp && (
-                <span className="font-normal normal-case tracking-normal text-muted-foreground">
-                    {formatTs(event.timestamp)}
-                </span>
-            )}
-        </div>
-    );
-
-    const body = turn ? (
-        <div className="space-y-1">
-            {event.tool_name && (
-                <div className="text-xs text-muted-foreground">
-                    <span className="font-semibold">{event.tool_name}</span>
-                    {event.is_error ? (
-                        <span className="ml-2 inline-flex items-center gap-1 text-red-400">
-                            <AlertTriangle className="w-3 h-3" aria-hidden /> error
-                        </span>
-                    ) : null}
-                </div>
-            )}
-            {event.content && (
+/**
+ * Shared chevron + details `<pre>` that every row with a payload exposes,
+ * so `activity-row-<i>-expand` / `activity-row-<i>-details` stay a stable
+ * Playwright contract regardless of role-specific visual chrome above.
+ */
+function ExpandAffordance({
+    event,
+    index,
+    className = '',
+}: RowProps & { className?: string }) {
+    const [open, setOpen] = useState(false);
+    if (!hasDetailsPayload(event)) return null;
+    return (
+        <div className={className}>
+            <button
+                type="button"
+                data-testid={`activity-row-${index}-expand`}
+                aria-expanded={open}
+                aria-label={open ? 'Hide details' : 'Show details'}
+                onClick={() => setOpen((v) => !v)}
+                className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground hover:text-foreground transition-colors"
+            >
+                {open ? (
+                    <ChevronDown className="w-3 h-3" />
+                ) : (
+                    <ChevronRight className="w-3 h-3" />
+                )}
+                {open ? 'Hide payload' : 'Show payload'}
+            </button>
+            {open && (
                 <pre
-                    className="whitespace-pre-wrap font-normal text-sm"
-                    data-testid={`activity-row-${index}-content`}
+                    data-testid={`activity-row-${index}-details`}
+                    className="mt-2 text-[11px] font-mono bg-black/40 border border-border/30 rounded p-2 overflow-auto max-h-72 whitespace-pre-wrap break-all"
                 >
-                    {truncate(event.content)}
+                    {detailsBlockJson(event)}
                 </pre>
             )}
-            {event.tool_calls && event.tool_calls.length > 0 && (
-                <div className="text-xs text-muted-foreground">
-                    Requested: {event.tool_calls.map(c => c.name || 'tool').join(', ')}
-                </div>
-            )}
-        </div>
-    ) : (
-        <div className="space-y-1">
-            {event.summary_text && (
-                <div className="text-sm">{truncate(event.summary_text, 600)}</div>
-            )}
-            {!event.summary_text && event.content && (
-                <div className="text-sm">{truncate(event.content)}</div>
-            )}
-            {event.event_type && (
-                <div className="text-[11px] text-muted-foreground">
-                    {event.event_type}
-                    {event.status_before && event.status_after && (
-                        <span> · {event.status_before} → {event.status_after}</span>
-                    )}
-                </div>
-            )}
         </div>
     );
+}
 
-    const hasDetailsToExpand = !!(event.details && Object.keys(event.details).length > 0) || !!event.tool_calls;
-
+function UserTurnRow({ event, index }: RowProps) {
+    const text = event.content ?? '';
     return (
         <li
             role="listitem"
             data-testid={`activity-row-${index}`}
             data-kind={event.kind}
-            className={
-                'rounded border border-white/10 p-3 space-y-2 ' +
-                (turn ? 'bg-white/2' : 'bg-white/4')
-            }
+            className="list-none flex justify-end animate-in fade-in duration-300"
         >
-            <div className="flex items-start justify-between gap-3">
-                <div className="flex-1 min-w-0 space-y-2">
-                    {header}
-                    {body}
+            <div className="max-w-[85%] bg-primary/15 border border-primary/30 rounded-2xl rounded-br-sm px-4 py-3 space-y-1">
+                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-primary">
+                    <UserIcon className="w-3 h-3" /> You
+                    {event.timestamp && (
+                        <span className="ml-2 text-muted-foreground font-normal normal-case tracking-normal">
+                            {formatTime(event.timestamp)}
+                        </span>
+                    )}
                 </div>
-                {hasDetailsToExpand && (
-                    <button
-                        type="button"
-                        data-testid={`activity-row-${index}-expand`}
-                        onClick={() => setExpanded(v => !v)}
-                        aria-expanded={expanded}
-                        aria-label={expanded ? 'Hide details' : 'Show details'}
-                        className="shrink-0 text-muted-foreground hover:text-foreground"
-                    >
-                        {expanded
-                            ? <ChevronDown className="w-4 h-4" />
-                            : <ChevronRight className="w-4 h-4" />}
-                    </button>
-                )}
-            </div>
-            {expanded && (
-                <pre
-                    data-testid={`activity-row-${index}-details`}
-                    className="text-[11px] bg-black/20 rounded p-2 overflow-auto max-h-72 whitespace-pre-wrap"
+                <div
+                    data-testid={`activity-row-${index}-content`}
+                    className="text-sm text-foreground whitespace-pre-wrap break-words leading-6"
                 >
-                    {formatJson({
-                        tool_calls: event.tool_calls ?? undefined,
-                        details: event.details ?? undefined,
-                    })}
-                </pre>
-            )}
+                    {truncate(text) || <span className="text-muted-foreground">(empty)</span>}
+                </div>
+                <ExpandAffordance event={event} index={index} className="pt-1" />
+            </div>
         </li>
     );
 }
+
+function AssistantTurnRow({ event, index }: RowProps) {
+    const text = event.content ?? '';
+    const requested = (event.tool_calls ?? [])
+        .map((c) => c.name || 'tool')
+        .join(', ');
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none flex justify-start animate-in fade-in duration-300"
+        >
+            <div className="max-w-[85%] bg-muted/5 border border-border/30 rounded-2xl rounded-bl-sm px-4 py-3 space-y-1">
+                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground">
+                    <Sparkles className="w-3 h-3" /> Agent
+                    {event.timestamp && (
+                        <span className="ml-2 font-normal normal-case tracking-normal">
+                            {formatTime(event.timestamp)}
+                        </span>
+                    )}
+                </div>
+                <div
+                    data-testid={`activity-row-${index}-content`}
+                    className="text-sm text-foreground whitespace-pre-wrap break-words leading-6"
+                >
+                    {truncate(text) || (
+                        <span className="text-muted-foreground italic">
+                            (no text — see tool calls)
+                        </span>
+                    )}
+                </div>
+                {requested && (
+                    <div className="text-[11px] font-mono text-warning/80">
+                        → requested: {requested}
+                    </div>
+                )}
+                <ExpandAffordance event={event} index={index} className="pt-1" />
+            </div>
+        </li>
+    );
+}
+
+function ToolTurnRow({ event, index }: RowProps) {
+    const text = event.content ?? '';
+    const err = !!event.is_error;
+    const toneBorder = err ? 'border-destructive/40' : 'border-success/30';
+    const toneBg = err ? 'bg-destructive/5' : 'bg-success/5';
+    const toneLabel = err ? 'text-destructive' : 'text-success';
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className={`list-none animate-in fade-in duration-300 border ${toneBorder} ${toneBg} rounded-lg px-4 py-3 space-y-2`}
+        >
+            <div
+                className={`flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] ${toneLabel}`}
+            >
+                <Wrench className="w-3 h-3" />
+                <span>Tool result</span>
+                {event.tool_name && (
+                    <span className="font-mono normal-case tracking-normal text-foreground">
+                        ← {event.tool_name}
+                    </span>
+                )}
+                {err && (
+                    <span className="ml-2 inline-flex items-center gap-1 text-destructive normal-case tracking-normal font-semibold">
+                        <AlertTriangle className="w-3 h-3" /> error
+                    </span>
+                )}
+                {event.timestamp && (
+                    <span className="ml-auto text-muted-foreground font-normal normal-case tracking-normal tabular-nums">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <pre
+                data-testid={`activity-row-${index}-content`}
+                className={`text-xs font-mono whitespace-pre-wrap break-all ${err ? 'text-destructive' : 'text-success'}`}
+            >
+                {truncate(text)}
+            </pre>
+            <ExpandAffordance event={event} index={index} />
+        </li>
+    );
+}
+
+function CompactionMarkerRow({ event, index }: RowProps) {
+    const first = (event.details?.first_turn_index as unknown) ?? '?';
+    const last = (event.details?.last_turn_index as unknown) ?? '?';
+    const turns = (event.details?.turns_summarized as unknown) ?? '?';
+    const summary = event.summary_text ?? '';
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300 space-y-2"
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground py-3 border-y border-dashed border-border/40">
+                <Scissors className="w-3 h-3 shrink-0" />
+                <span className="flex-1 text-left tracking-wide">
+                    — Context summarized (turns {String(first)}–{String(last)},{' '}
+                    {String(turns)} turns) —
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums">{formatTime(event.timestamp)}</span>
+                )}
+            </div>
+            {summary && (
+                <div
+                    data-testid={`activity-row-${index}-content`}
+                    className="mx-4 text-sm text-foreground whitespace-pre-wrap break-words leading-6 border border-border/30 bg-black/30 p-3 rounded"
+                >
+                    {truncate(summary, 1600)}
+                </div>
+            )}
+            <div className="mx-4">
+                <ExpandAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function MemoryFlushMarkerRow({ event, index }: RowProps) {
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300"
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground py-2 border-y border-dashed border-border/40">
+                <StickyNote className="w-3 h-3 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1"
+                >
+                    — Memory note injected{event.summary_text ? `: ${event.summary_text}` : ''} —
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums">{formatTime(event.timestamp)}</span>
+                )}
+            </div>
+            <div className="mx-4 pt-1">
+                <ExpandAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function OffloadMarkerRow({ event, index }: RowProps) {
+    const count = (event.details?.count as number | undefined) ?? null;
+    const bytes = (event.details?.total_bytes as number | undefined) ?? null;
+    const summary =
+        event.summary_text ??
+        (count != null
+            ? `${count} tool output${count === 1 ? '' : 's'} archived${bytes ? ` (${bytes} B)` : ''}`
+            : 'tool outputs archived');
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300"
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground/80 py-1.5 px-2">
+                <Archive className="w-3 h-3 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1 truncate"
+                >
+                    — {summary} —
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums">{formatTime(event.timestamp)}</span>
+                )}
+            </div>
+            <div className="mx-4">
+                <ExpandAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function SystemNoteMarkerRow({ event, index }: RowProps) {
+    const text = event.summary_text ?? event.content ?? '';
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300"
+        >
+            <div className="border border-border/40 bg-muted/5 px-4 py-2 text-xs text-muted-foreground font-mono flex items-start gap-2 rounded">
+                <Info className="w-3 h-3 shrink-0 mt-0.5" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="whitespace-pre-wrap break-words flex-1"
+                >
+                    {truncate(text, 600) || '(system note)'}
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums text-muted-foreground/70">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <div className="mx-4 pt-1">
+                <ExpandAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function LifecycleMarkerRow({ event, index }: RowProps) {
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300"
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-muted-foreground py-2 border-y border-dashed border-border/40">
+                <ActivityIcon className="w-3 h-3 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1"
+                >
+                    — {event.event_type ?? 'lifecycle'}
+                    {event.status_before && event.status_after
+                        ? ` · ${event.status_before} → ${event.status_after}`
+                        : ''}
+                    {event.summary_text ? ` — ${event.summary_text}` : ''} —
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums">{formatTime(event.timestamp)}</span>
+                )}
+            </div>
+            <div className="mx-4 pt-1">
+                <ExpandAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function HitlPauseMarkerRow({ event, index }: RowProps) {
+    const reason =
+        (event.details?.reason as string | undefined) ??
+        event.summary_text ??
+        'awaiting operator';
+    const tool = event.details?.tool_name as string | undefined;
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300 border border-amber-500/30 bg-amber-500/10 rounded-lg px-4 py-3 space-y-2"
+        >
+            <div className="flex items-center gap-2 text-sm font-semibold text-amber-300">
+                <PauseCircle className="w-4 h-4 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1"
+                >
+                    ⏸ Paused — {reason}
+                    {tool ? ` (tool: ${tool})` : ''}
+                </span>
+                {event.timestamp && (
+                    <span className="ml-auto text-xs font-mono font-normal text-amber-200/70 tabular-nums">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <ExpandAffordance event={event} index={index} />
+        </li>
+    );
+}
+
+function HitlResumeMarkerRow({ event, index }: RowProps) {
+    const resolution =
+        (event.details?.resolution as string | undefined) ??
+        event.summary_text ??
+        'resumed';
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300 border border-green-500/30 bg-green-500/10 rounded-lg px-4 py-3 space-y-2"
+        >
+            <div className="flex items-center gap-2 text-sm font-semibold text-green-300">
+                <PlayCircle className="w-4 h-4 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1"
+                >
+                    ▶ Resumed — {resolution}
+                </span>
+                {event.timestamp && (
+                    <span className="ml-auto text-xs font-mono font-normal text-green-200/70 tabular-nums">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <ExpandAffordance event={event} index={index} />
+        </li>
+    );
+}
+
+function ActivityRow({ event, index }: RowProps) {
+    switch (event.kind) {
+        case 'turn.user':
+            return <UserTurnRow event={event} index={index} />;
+        case 'turn.assistant':
+            return <AssistantTurnRow event={event} index={index} />;
+        case 'turn.tool':
+            return <ToolTurnRow event={event} index={index} />;
+        case 'marker.compaction_fired':
+            return <CompactionMarkerRow event={event} index={index} />;
+        case 'marker.memory_flush':
+            return <MemoryFlushMarkerRow event={event} index={index} />;
+        case 'marker.offload_emitted':
+            return <OffloadMarkerRow event={event} index={index} />;
+        case 'marker.system_note':
+            return <SystemNoteMarkerRow event={event} index={index} />;
+        case 'marker.lifecycle':
+            return <LifecycleMarkerRow event={event} index={index} />;
+        default:
+            if (isHitlPause(event.kind)) {
+                return <HitlPauseMarkerRow event={event} index={index} />;
+            }
+            if (isHitlResume(event.kind)) {
+                return <HitlResumeMarkerRow event={event} index={index} />;
+            }
+            return <SystemNoteMarkerRow event={event} index={index} />;
+    }
+}
+
+// ─── Pane ──────────────────────────────────────────────────────────
 
 interface ActivityPaneProps {
     taskId: string;
@@ -236,18 +530,16 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
         queryKey: ['task-activity', taskId, showDetails],
         queryFn: () => api.listActivity(taskId, showDetails),
         enabled: !!taskId,
-        // Poll while running; stop once terminal.
         refetchInterval: isTerminalStatus(status) ? false : 3_000,
         refetchOnWindowFocus: false,
     });
 
     const events = query.data?.events ?? [];
     const visibleCount = events.length;
-
     const isEmpty = !query.isLoading && visibleCount === 0;
 
     const summary = useMemo(() => {
-        const counts: Record<string, number> = {};
+        const counts: Record<string, number> = { turns: 0, markers: 0 };
         for (const e of events) {
             const bucket = isTurn(e.kind) ? 'turns' : 'markers';
             counts[bucket] = (counts[bucket] ?? 0) + 1;
@@ -258,64 +550,93 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     return (
         <div
             data-testid="activity-pane"
-            className="space-y-3"
+            className="console-surface border-white/10 rounded-[24px] flex flex-col h-[560px] relative"
         >
-            <div className="flex items-center justify-between">
-                <div className="text-xs text-muted-foreground">
-                    <span data-testid="activity-summary">
+            <div className="border-b border-white/8 px-6 py-4 shrink-0 flex items-start justify-between gap-4">
+                <div>
+                    <h3 className="text-sm font-display uppercase tracking-widest text-muted-foreground">
+                        Activity
+                    </h3>
+                    <p className="text-xs text-muted-foreground/70 mt-1">
+                        What the agent did
+                    </p>
+                </div>
+                <div className="flex items-center gap-4 pt-1">
+                    <span
+                        data-testid="activity-summary"
+                        className="text-[11px] font-mono text-muted-foreground tabular-nums"
+                    >
                         {summary.turns ?? 0} turns · {summary.markers ?? 0} markers
                     </span>
+                    <label
+                        className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground cursor-pointer select-none hover:text-foreground transition-colors"
+                        data-testid="activity-details-toggle-label"
+                    >
+                        <input
+                            type="checkbox"
+                            data-testid="activity-details-toggle"
+                            checked={showDetails}
+                            onChange={(e) => setShowDetails(e.target.checked)}
+                            className="accent-primary"
+                        />
+                        Show details
+                    </label>
                 </div>
-                <label
-                    className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer select-none"
-                    data-testid="activity-details-toggle-label"
-                >
-                    <input
-                        type="checkbox"
-                        data-testid="activity-details-toggle"
-                        checked={showDetails}
-                        onChange={e => setShowDetails(e.target.checked)}
-                    />
-                    Show details
-                </label>
             </div>
 
-            {query.isLoading && (
-                <div data-testid="activity-loading" className="text-sm text-muted-foreground">
-                    Loading activity…
-                </div>
-            )}
+            <div className="flex-1 overflow-auto px-6 py-4 space-y-3">
+                {query.isLoading && (
+                    <div
+                        data-testid="activity-loading"
+                        className="h-full flex items-center justify-center pt-20"
+                    >
+                        <span className="text-muted-foreground text-sm tracking-widest uppercase animate-pulse">
+                            Loading activity...
+                        </span>
+                    </div>
+                )}
 
-            {query.isError && (
-                <div
-                    data-testid="activity-error"
-                    role="alert"
-                    className="text-sm text-red-400"
-                >
-                    Failed to load activity: {(query.error as Error)?.message ?? 'unknown error'}
-                </div>
-            )}
+                {query.isError && (
+                    <div
+                        data-testid="activity-error"
+                        role="alert"
+                        className="flex items-start gap-3 text-destructive border border-destructive/40 bg-destructive/5 rounded-lg px-4 py-3"
+                    >
+                        <AlertTriangle className="w-5 h-5 shrink-0 mt-0.5" />
+                        <div className="space-y-1">
+                            <div className="text-sm font-bold uppercase tracking-widest">
+                                Failed to load activity
+                            </div>
+                            <div className="text-xs font-mono opacity-80 break-all">
+                                {(query.error as Error)?.message ?? 'unknown error'}
+                            </div>
+                        </div>
+                    </div>
+                )}
 
-            {isEmpty && !query.isError && (
-                <div
-                    data-testid="activity-empty"
-                    className="text-sm text-muted-foreground"
-                >
-                    No activity yet.
-                </div>
-            )}
+                {isEmpty && !query.isError && (
+                    <div
+                        data-testid="activity-empty"
+                        className="h-full flex items-center justify-center pt-20"
+                    >
+                        <span className="text-muted-foreground text-sm tracking-widest uppercase">
+                            No activity yet.
+                        </span>
+                    </div>
+                )}
 
-            {visibleCount > 0 && (
-                <ul role="list" className="space-y-2">
-                    {events.map((event, index) => (
-                        <ActivityRow
-                            key={`${event.kind}-${event.timestamp ?? 'null'}-${index}`}
-                            event={event}
-                            index={index}
-                        />
-                    ))}
-                </ul>
-            )}
+                {visibleCount > 0 && (
+                    <ul role="list" className="space-y-3">
+                        {events.map((event, index) => (
+                            <ActivityRow
+                                key={`${event.kind}-${event.timestamp ?? 'null'}-${index}`}
+                                event={event}
+                                index={index}
+                            />
+                        ))}
+                    </ul>
+                )}
+            </div>
         </div>
     );
 }
