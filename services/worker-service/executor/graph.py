@@ -158,6 +158,14 @@ logger = logging.getLogger(__name__)
 from core.logging import get_logger as _get_structlog_logger
 _compaction_logger = _get_structlog_logger(worker_id="graph")
 
+_FUTURE_WORK_PROMISE_RE = re.compile(
+    r"\b(?:i(?:'| wi)ll|let me|next i(?:'| wi)ll|now i(?:'| wi)ll)\s+"
+    r"(?:review|look(?:\s+up)?|search|check|inspect|open|read|analy[sz]e|"
+    r"dig|investigate|reconstruct|gather|pull|fetch|use|call|start|"
+    r"continue|compare|trace|verify)\b",
+    re.IGNORECASE,
+)
+
 
 def _finalize_output_content(messages: list) -> Any:
     """Flatten the final message's content for persistence as ``output.result``.
@@ -191,6 +199,33 @@ def _finalize_output_content(messages: list) -> Any:
     if isinstance(raw, list):
         return _extract_message_text(raw, separator="\n\n")
     return raw
+
+
+def _message_content_to_text(message: BaseMessage) -> str:
+    """Flatten provider-shaped message content to plain text for heuristics."""
+    raw = getattr(message, "content", "")
+    if isinstance(raw, list):
+        return _extract_message_text(raw, separator="\n\n")
+    return raw if isinstance(raw, str) else str(raw)
+
+
+def _looks_like_future_work_promise(message: BaseMessage) -> bool:
+    """Best-effort detector for terminal AI turns that promise more work.
+
+    Phase 1 is intentionally non-invasive: we use this only for telemetry so
+    operators can measure residual cases after the prompt nudge lands. The
+    heuristic therefore prefers a narrow allowlist of future-tense
+    "I'm about to investigate/search/review" verbs over broader intent
+    detection that could fire on legitimate final answers.
+    """
+    if not isinstance(message, AIMessage):
+        return False
+    if getattr(message, "tool_calls", None):
+        return False
+    text = _message_content_to_text(message).strip()
+    if not text:
+        return False
+    return bool(_FUTURE_WORK_PROMISE_RE.search(text))
 
 
 class _ContextExceededIrrecoverableError(Exception):
@@ -2256,6 +2291,13 @@ class GraphExecutor:
                 "You can read web pages using the `read_url` tool to fetch content from URLs."
             )
 
+        if allowed_tools:
+            sections.append(
+                "If you intend to use a tool, emit the tool call in the same response. "
+                "Do not narrate future tool calls in prose ('I'll look up...', 'Next I'll...'). "
+                "Either call the tool now, or produce the final answer."
+            )
+
         if injected_files:
             file_list = "\n".join(f"  - /home/user/{f}" for f in injected_files)
             sections.append(
@@ -2995,6 +3037,18 @@ class GraphExecutor:
                 # Checkpoint persistence is unchanged — this normalizes only
                 # the terminal output.result artifact.
                 output_content = _finalize_output_content(messages)
+                last_message = messages[-1] if messages else None
+                if last_message is not None and _looks_like_future_work_promise(last_message):
+                    logger.warning(
+                        "agent.terminated_with_promise",
+                        extra={
+                            "task_id": task_id,
+                            "tenant_id": tenant_id,
+                            "agent_id": agent_id,
+                            "model": agent_config.get("model"),
+                            "message_preview": output_content[:200],
+                        },
+                    )
 
                 # Per-checkpoint cost tracking replaces end-of-task aggregation.
                 # Costs are now written incrementally in the streaming loop above.

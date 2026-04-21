@@ -139,6 +139,19 @@ describe('CreateAgentDialog', () => {
         expect(optionValues).not.toContain('gpt-4o-mini');
     });
 
+    it('auto-selects the first available model so the display matches form state (no stale hardcoded default)', async () => {
+        render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+
+        fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Default Model Agent' } });
+        fireEvent.click(screen.getByRole('button', { name: /create/i }));
+
+        await waitFor(() => expect(createMock).toHaveBeenCalled());
+
+        const payload = createMock.mock.calls[0][0];
+        expect(payload.agent_config.provider).toBe('anthropic');
+        expect(payload.agent_config.model).toBe('claude-3-5-sonnet-latest');
+    });
+
     it('includes memory config in the create payload when memory is enabled', async () => {
         render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
 
