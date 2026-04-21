@@ -663,14 +663,10 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     const visibleCount = events.length;
     const isEmpty = !query.isLoading && visibleCount === 0;
 
-    const summary = useMemo(() => {
-        const counts: Record<string, number> = { turns: 0, markers: 0 };
-        for (const e of events) {
-            const bucket = isTurn(e.kind) ? 'turns' : 'markers';
-            counts[bucket] = (counts[bucket] ?? 0) + 1;
-        }
-        return counts;
-    }, [events]);
+    const turnCount = useMemo(
+        () => events.reduce((n, e) => (isTurn(e.kind) ? n + 1 : n), 0),
+        [events],
+    );
 
     return (
         <div
@@ -691,7 +687,7 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
                         data-testid="activity-summary"
                         className="text-[11px] font-mono text-muted-foreground tabular-nums"
                     >
-                        {summary.turns ?? 0} turns · {summary.markers ?? 0} markers
+                        {turnCount} {turnCount === 1 ? 'turn' : 'turns'}
                     </span>
                     <label
                         className="flex items-center gap-2 text-[11px] font-mono text-muted-foreground cursor-pointer select-none hover:text-foreground transition-colors"
