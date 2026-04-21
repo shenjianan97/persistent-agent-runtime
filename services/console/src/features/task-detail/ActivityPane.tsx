@@ -262,85 +262,92 @@ function AssistantTurnRow({ event, index }: RowProps) {
     const cost = formatMicroUsd(event.cost_microdollars);
     const showUsage = !!usage && (usage.input_tokens != null || usage.output_tokens != null);
 
+    // Tool-call folds render full-width (alongside the TOOL RESULT folds
+    // that follow), while the pill + prose bubble stay constrained to the
+    // 85% reading column that distinguishes "agent speech" from "tool
+    // invocations". Wrapping them in the same <li> keeps them semantically
+    // bound to one turn.
     return (
         <li
             role="listitem"
             data-testid={`activity-row-${index}`}
             data-kind={event.kind}
-            className="list-none flex justify-start animate-in fade-in duration-300"
+            className="list-none animate-in fade-in duration-300 space-y-2"
         >
-            <div className="max-w-[85%] w-full space-y-2">
-                <div
-                    data-testid={`activity-row-${index}-pill`}
-                    className="inline-flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground bg-muted/5 border border-border/30 rounded-full px-3 py-1"
-                >
-                    <Sparkles className="w-3 h-3" /> Agent
-                    {event.timestamp && (
-                        <span className="ml-1 text-muted-foreground/80 font-normal normal-case tracking-normal">
-                            {formatTime(event.timestamp)}
-                        </span>
+            <div className="flex justify-start">
+                <div className="max-w-[85%] w-full space-y-2">
+                    <div
+                        data-testid={`activity-row-${index}-pill`}
+                        className="inline-flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.2em] text-muted-foreground bg-muted/5 border border-border/30 rounded-full px-3 py-1"
+                    >
+                        <Sparkles className="w-3 h-3" /> Agent
+                        {event.timestamp && (
+                            <span className="ml-1 text-muted-foreground/80 font-normal normal-case tracking-normal">
+                                {formatTime(event.timestamp)}
+                            </span>
+                        )}
+                        {showUsage && (
+                            <span
+                                data-testid={`activity-row-${index}-usage`}
+                                className="ml-1 font-mono normal-case tracking-normal text-primary/80"
+                                title={`input_tokens=${usage!.input_tokens ?? '?'}, output_tokens=${usage!.output_tokens ?? '?'}, total_tokens=${usage!.total_tokens ?? '?'}`}
+                            >
+                                {formatTokenCount(usage!.input_tokens)} in
+                                {' → '}
+                                {formatTokenCount(usage!.output_tokens)} out
+                            </span>
+                        )}
+                        {cost && (
+                            <span
+                                data-testid={`activity-row-${index}-cost`}
+                                className="font-mono normal-case tracking-normal text-success/80"
+                            >
+                                · {cost}
+                            </span>
+                        )}
+                    </div>
+                    {hasText && (
+                        <div className="bg-muted/5 border border-border/30 rounded-2xl rounded-bl-sm px-4 py-3">
+                            <div
+                                data-testid={`activity-row-${index}-content`}
+                                className="text-sm text-foreground whitespace-pre-wrap break-words leading-6"
+                            >
+                                {truncate(text)}
+                            </div>
+                        </div>
                     )}
-                    {showUsage && (
-                        <span
-                            data-testid={`activity-row-${index}-usage`}
-                            className="ml-1 font-mono normal-case tracking-normal text-primary/80"
-                            title={`input_tokens=${usage!.input_tokens ?? '?'}, output_tokens=${usage!.output_tokens ?? '?'}, total_tokens=${usage!.total_tokens ?? '?'}`}
-                        >
-                            {formatTokenCount(usage!.input_tokens)} in
-                            {' → '}
-                            {formatTokenCount(usage!.output_tokens)} out
-                        </span>
-                    )}
-                    {cost && (
-                        <span
-                            data-testid={`activity-row-${index}-cost`}
-                            className="font-mono normal-case tracking-normal text-success/80"
-                        >
-                            · {cost}
-                        </span>
-                    )}
-                </div>
-                {hasText && (
-                    <div className="bg-muted/5 border border-border/30 rounded-2xl rounded-bl-sm px-4 py-3">
+                    {!hasText && (
+                        // Still expose the testid so tests / a11y consumers
+                        // can locate the turn even when the assistant produced
+                        // only tool_use blocks (empty prose).
                         <div
                             data-testid={`activity-row-${index}-content`}
-                            className="text-sm text-foreground whitespace-pre-wrap break-words leading-6"
+                            className="sr-only"
                         >
-                            {truncate(text)}
+                            {event.content ?? ''}
                         </div>
-                    </div>
-                )}
-                {!hasText && (
-                    // Still expose the testid so tests / a11y consumers can
-                    // locate the turn even when the assistant produced only
-                    // tool_use blocks (empty prose).
-                    <div
-                        data-testid={`activity-row-${index}-content`}
-                        className="sr-only"
-                    >
-                        {event.content ?? ''}
-                    </div>
-                )}
-                {hasToolCalls && (
-                    <div className="space-y-2">
-                        {toolCalls.map((tc, i) => (
-                            <Fold
-                                key={tc.id ?? `${tc.name}-${i}`}
-                                tone="warning"
-                                label={
-                                    <>
-                                        Tool call → <span className="font-mono normal-case tracking-normal">{tc.name || '(tool)'}</span>
-                                    </>
-                                }
-                            >
-                                <pre className="text-xs font-mono text-warning whitespace-pre-wrap break-all">
-                                    {formatJson(tc.args ?? {})}
-                                </pre>
-                            </Fold>
-                        ))}
-                    </div>
-                )}
+                    )}
+                </div>
             </div>
+            {hasToolCalls && (
+                <div className="space-y-2">
+                    {toolCalls.map((tc, i) => (
+                        <Fold
+                            key={tc.id ?? `${tc.name}-${i}`}
+                            tone="warning"
+                            label={
+                                <>
+                                    Tool call → <span className="font-mono normal-case tracking-normal">{tc.name || '(tool)'}</span>
+                                </>
+                            }
+                        >
+                            <pre className="text-xs font-mono text-warning whitespace-pre-wrap break-all">
+                                {formatJson(tc.args ?? {})}
+                            </pre>
+                        </Fold>
+                    ))}
+                </div>
+            )}
         </li>
     );
 }

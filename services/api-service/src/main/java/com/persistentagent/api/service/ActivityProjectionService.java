@@ -92,11 +92,13 @@ public class ActivityProjectionService {
             }
         }
 
-        // Build cost-attribution map up-front by walking every checkpoint for
-        // the task. The map is ai_message_id → cost_microdollars; only
-        // checkpoints whose cost is >0 produce entries, and only for AI
-        // messages that weren't present in any earlier checkpoint.
-        Map<String, Long> costByAiMessageId = buildCostAttributionMap(taskId, tenantId);
+        // Walk every checkpoint up-front to build (a) the per-AI-message cost
+        // attribution and (b) the real created_at of every message (the
+        // checkpoint where it first appeared). The second map is what keeps
+        // turns sorted correctly relative to task_events markers — without it
+        // every turn inherits the *final* checkpoint's created_at and all
+        // lifecycle markers end up stacked at the top of the stream.
+        TurnAttribution attribution = walkCheckpoints(taskId, tenantId);
 
         List<ActivityEventResponse> events = new ArrayList<>();
 
@@ -108,7 +110,7 @@ public class ActivityProjectionService {
                 checkpointCreatedAt = DateTimeUtil.toOffsetDateTime(ts);
             }
             Object payload = row.get("checkpoint_payload");
-            events.addAll(extractTurns(payload, checkpointCreatedAt, costByAiMessageId));
+            events.addAll(extractTurns(payload, checkpointCreatedAt, attribution));
         }
 
         for (TaskEventResponse marker : markerRows) {
@@ -137,27 +139,42 @@ public class ActivityProjectionService {
     }
 
     // ---------------------------------------------------------------------
-    // Per-turn cost attribution — walks all checkpoints in order, threads a
-    // running "already-seen AI message IDs" set across them, and assigns each
-    // checkpoint's cost to the first AI message that appears. Checkpoints
-    // with cost_microdollars == 0 are skipped entirely. Parsing every
-    // payload is not cheap but the checkpoint count per task stays O(100s)
-    // in practice; we revisit this when tasks routinely exceed that.
+    // Per-turn attribution — walks all checkpoints in order and records, for
+    // every message id it sees, (a) the created_at of the checkpoint where
+    // it first appeared (real timestamp, vs the final-checkpoint fallback)
+    // and (b) on AI messages only, the sum of cost_microdollars for the
+    // checkpoint that minted it. Parsing every payload is not free but the
+    // checkpoint count per task stays O(100s) in practice.
     // ---------------------------------------------------------------------
 
+    /** Attribution map keyed on message id. Never contains null values. */
+    private record TurnAttribution(
+            Map<String, OffsetDateTime> firstSeenAt,
+            Map<String, Long> costByAiMessageId) {
+        static TurnAttribution empty() {
+            return new TurnAttribution(Collections.emptyMap(), Collections.emptyMap());
+        }
+    }
+
     @SuppressWarnings("unchecked")
-    private Map<String, Long> buildCostAttributionMap(UUID taskId, String tenantId) {
+    private TurnAttribution walkCheckpoints(UUID taskId, String tenantId) {
         var all = taskRepository.getCheckpoints(taskId, tenantId).orElse(Collections.emptyList());
         if (all.isEmpty()) {
-            return Collections.emptyMap();
+            return TurnAttribution.empty();
         }
-        Map<String, Long> out = new HashMap<>();
+        Map<String, OffsetDateTime> firstSeenAt = new HashMap<>();
+        Map<String, Long> costByAiMessageId = new HashMap<>();
         Set<String> seen = new HashSet<>();
         for (Map<String, Object> row : all) {
             Object costObj = row.get("cost_microdollars");
             long cost = 0;
             if (costObj instanceof Number n) {
                 cost = n.longValue();
+            }
+            OffsetDateTime rowCreatedAt = null;
+            Object createdAtObj = row.get("created_at");
+            if (createdAtObj instanceof Timestamp ts) {
+                rowCreatedAt = DateTimeUtil.toOffsetDateTime(ts);
             }
             Object payload = row.get("checkpoint_payload");
             Map<String, Object> parsed = parsePayload(payload);
@@ -187,18 +204,21 @@ public class ActivityProjectionService {
                 if (id == null || id.isBlank()) {
                     continue;
                 }
-                if ("ai".equals(type) && !seen.contains(id)) {
-                    if (firstNewAiId == null) {
+                if (!seen.contains(id)) {
+                    seen.add(id);
+                    if (rowCreatedAt != null) {
+                        firstSeenAt.putIfAbsent(id, rowCreatedAt);
+                    }
+                    if ("ai".equals(type) && firstNewAiId == null) {
                         firstNewAiId = id;
                     }
-                    seen.add(id);
                 }
             }
             if (cost > 0 && firstNewAiId != null) {
-                out.merge(firstNewAiId, cost, Long::sum);
+                costByAiMessageId.merge(firstNewAiId, cost, Long::sum);
             }
         }
-        return out;
+        return new TurnAttribution(firstSeenAt, costByAiMessageId);
     }
 
     // ---------------------------------------------------------------------
@@ -209,7 +229,7 @@ public class ActivityProjectionService {
     private List<ActivityEventResponse> extractTurns(
             Object payload,
             OffsetDateTime fallbackTs,
-            Map<String, Long> costByAiMessageId) {
+            TurnAttribution attribution) {
         List<ActivityEventResponse> turns = new ArrayList<>();
         Map<String, Object> parsed = parsePayload(payload);
         if (parsed == null) {
@@ -240,7 +260,19 @@ public class ActivityProjectionService {
                 continue;
             }
 
-            OffsetDateTime timestamp = readEmittedAt(kwargs);
+            // Timestamp precedence: the checkpoint where the message first
+            // appeared > `additional_kwargs.emitted_at` (only set on newer
+            // messages) > the final checkpoint's created_at (coarse fallback
+            // that preserves ordering within the message list for historical
+            // tasks lacking both other signals).
+            String messageId = asString(kwargs.get("id"));
+            OffsetDateTime timestamp = null;
+            if (messageId != null) {
+                timestamp = attribution.firstSeenAt().get(messageId);
+            }
+            if (timestamp == null) {
+                timestamp = readEmittedAt(kwargs);
+            }
             if (timestamp == null) {
                 timestamp = fallbackTs;
             }
@@ -254,7 +286,7 @@ public class ActivityProjectionService {
                         null, null, null, null,
                         null, null, null, null, null,
                         null, null));
-                case "ai" -> turns.add(buildAssistantTurn(kwargs, timestamp, costByAiMessageId));
+                case "ai" -> turns.add(buildAssistantTurn(kwargs, timestamp, attribution.costByAiMessageId()));
                 case "tool" -> turns.add(new ActivityEventResponse(
                         "turn.tool",
                         timestamp,
