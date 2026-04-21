@@ -11,6 +11,7 @@ import { TaskStatusBadge } from './TaskStatusBadge';
 import { CostSummary } from './CostSummary';
 import { CheckpointTimeline } from './CheckpointTimeline';
 import { ConversationPane } from './ConversationPane';
+import { ActivityPane } from './ActivityPane';
 import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
 import { ArtifactsTab } from './ArtifactsTab';
@@ -30,9 +31,21 @@ export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
     const navigate = useNavigate();
     const [searchParams, setSearchParams] = useSearchParams();
-    const activeTab: 'conversation' | 'timeline' =
-        searchParams.get('tab') === 'timeline' ? 'timeline' : 'conversation';
-    const setActiveTab = (tab: 'conversation' | 'timeline') => {
+    // Phase 2 Track 7 Follow-up Task 8 — feature-flag the unified Activity
+    // tab. When `VITE_UNIFIED_ACTIVITY_VIEW=true`, the new Activity tab
+    // appears alongside the legacy Conversation/Timeline tabs. Default:
+    // flag off → Conversation + Timeline only (current behavior). Flip the
+    // flag on per-deploy to progressively roll out. Tabs are URL-scoped.
+    const unifiedActivityEnabled =
+        import.meta.env.VITE_UNIFIED_ACTIVITY_VIEW === 'true';
+    type TaskDetailTab = 'conversation' | 'timeline' | 'activity';
+    const requestedTab = searchParams.get('tab');
+    const activeTab: TaskDetailTab = (() => {
+        if (unifiedActivityEnabled && requestedTab === 'activity') return 'activity';
+        if (requestedTab === 'timeline') return 'timeline';
+        return 'conversation';
+    })();
+    const setActiveTab = (tab: TaskDetailTab) => {
         const next = new URLSearchParams(searchParams);
         if (tab === 'conversation') {
             next.delete('tab');
@@ -368,9 +381,41 @@ export function TaskDetailPage() {
                                     Infrastructure events
                                 </div>
                             </button>
+                            {unifiedActivityEnabled && (
+                                <button
+                                    type="button"
+                                    role="tab"
+                                    id="tab-activity"
+                                    data-testid="tab-activity"
+                                    aria-controls="tabpanel-activity"
+                                    aria-selected={activeTab === 'activity'}
+                                    onClick={() => setActiveTab('activity')}
+                                    className={`pb-2 -mb-[1px] border-b-2 transition-colors text-xs font-bold uppercase tracking-[0.2em] ${
+                                        activeTab === 'activity'
+                                            ? 'border-primary text-primary'
+                                            : 'border-transparent text-muted-foreground hover:text-foreground'
+                                    }`}
+                                >
+                                    <div>Activity</div>
+                                    <div className="text-[10px] font-normal tracking-normal normal-case text-muted-foreground mt-0.5">
+                                        Unified view
+                                    </div>
+                                </button>
+                            )}
                         </div>
 
-                        {activeTab === 'conversation' ? (
+                        {activeTab === 'activity' ? (
+                            <div
+                                role="tabpanel"
+                                id="tabpanel-activity"
+                                aria-labelledby="tab-activity"
+                            >
+                                <ActivityPane
+                                    taskId={taskId!}
+                                    status={task.status}
+                                />
+                            </div>
+                        ) : activeTab === 'conversation' ? (
                             <div
                                 role="tabpanel"
                                 id="tabpanel-conversation"

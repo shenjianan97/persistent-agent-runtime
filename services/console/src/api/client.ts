@@ -27,6 +27,7 @@ import {
     MemorySearchResponse,
     MemoryEntryResponse,
     ConversationListResponse,
+    ActivityListResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -254,6 +255,22 @@ export const api = {
         const query = params.toString();
         return fetchApi<ConversationListResponse>(
             `/v1/tasks/${encodeURIComponent(taskId)}/conversation${query ? `?${query}` : ''}`,
+        );
+    },
+
+    /**
+     * Phase 2 Track 7 Follow-up Task 8 — unified Activity projection.
+     * Returns the merged turn + marker stream for the task-detail Activity tab.
+     * `includeDetails=true` un-filters infrastructure markers.
+     */
+    listActivity: (taskId: string, includeDetails = false) => {
+        const params = new URLSearchParams();
+        if (includeDetails) {
+            params.set('include_details', 'true');
+        }
+        const query = params.toString();
+        return fetchApi<ActivityListResponse>(
+            `/v1/tasks/${encodeURIComponent(taskId)}/activity${query ? `?${query}` : ''}`,
         );
     },
 

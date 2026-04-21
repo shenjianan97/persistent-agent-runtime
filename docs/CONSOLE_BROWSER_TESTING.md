@@ -391,6 +391,25 @@ Steps:
 6. **Ingestion-offload inline notice (`offload_emitted`).** Once the task has produced at least one oversized tool result (the `read_url` or `read_file` calls against `/tmp/large_log.txt` cross `OFFLOAD_THRESHOLD_BYTES=20000`), assert `[data-testid="conversation-entry-offload_emitted"]` is present in the conversation stream. The inline notice text matches `/\d+ older tool outputs? archived \([0-9.]+ (B|KB|MB)\)/` and the entry is visually lighter than the `conversation-compaction-divider` (compact one-line banner, no full dashed border spanning the column). The notice MUST sit inline between the `tool_result` that triggered it and the next `agent_turn`, not at the top of the pane.
 7. **Timeline-tab regression check.** Navigate to `/tasks/:taskId?tab=timeline`. Confirm `[data-testid="tab-timeline"]` is now `aria-selected="true"`, the checkpoint timeline renders exactly as before (`Execution Timeline` heading, step cards, HITL markers, cost/duration footer), and the Conversation pane is unmounted. Switch back to the Conversation tab via the tab button; confirm the URL drops the `?tab=timeline` parameter. `browser_console_messages` shows zero uncaught exceptions across the tab switches.
 
+### Scenario 19: Unified Activity View (Task 8 — Conversation+Timeline unification)
+
+Covers Phase 2 Track 7 Follow-up Task 8 — the unified "Activity" tab backed by `GET /v1/tasks/:taskId/activity`. Collapses the legacy "Conversation" + "Execution Timeline" split onto a single projection over `checkpoints` + `task_events`. The Activity tab is gated on `VITE_UNIFIED_ACTIVITY_VIEW=true`; legacy tabs remain visible during rollout (Phases A–C) and are removed in Phase D.
+
+Preconditions:
+
+- `VITE_UNIFIED_ACTIVITY_VIEW=true` in the Console's `.env.local` (or equivalent build-time env), Console restart applied.
+- `make start` stack running; API at `:8080`, Console at `:5173`.
+- One in-flight or completed task with at least one tool-call turn AND at least one marker in `task_events` (`task_compaction_fired`, `memory_flush`, `offload_emitted`, `task_paused`, or a lifecycle event). If no task meets both, seed one by running the Scenario 18 fixture task against an agent with low `tier3_trigger_fraction`.
+
+Steps:
+
+1. **Flag-gated tab visibility.** Navigate to `/tasks/:taskId`. Confirm `[data-testid="tab-activity"]` is present alongside the existing `[data-testid="tab-conversation"]` and `[data-testid="tab-timeline"]` tabs. The Activity tab's subtitle reads "Unified view". `browser_snapshot` shows three tab buttons total, none auto-selected to Activity on first load (default remains Conversation).
+2. **Activity tab renders merged stream.** Click `[data-testid="tab-activity"]`. URL changes to `?tab=activity`. Confirm `[data-testid="activity-pane"]` is present and `[data-testid="activity-summary"]` text matches `/\d+ turns · \d+ markers/`. At least one `[data-testid^="activity-row-"]` element is present. Each visible row carries a `data-kind` attribute — assert the set includes at minimum `turn.user` and either `turn.assistant` or `turn.tool` for a task that ran tool calls.
+3. **Role-anchored rendering.** For a `turn.user` row, `[data-testid="activity-row-0-content"]` (or whichever index corresponds) contains the user's prompt text verbatim. For a `turn.tool` row, the row text contains the tool name (e.g. `read_url`, `read_file`). Assistant turns that issued tool calls show a "Requested: <tool_name>" line.
+4. **Details toggle filters infra markers.** By default, infrastructure markers (`marker.memory_flush`, `marker.offload_emitted`, `marker.lifecycle`) are hidden. Click `[data-testid="activity-details-toggle"]`. The request fires with `include_details=true` (verifiable via `browser_network_requests`). Previously-hidden marker kinds now appear as rows. Uncheck; markers collapse back to the user-visible set (`marker.compaction_fired` and `marker.hitl.*` remain visible regardless of the toggle — those are user-relevant).
+5. **Per-row expander reveals raw payload.** Locate a `marker.compaction_fired` row (it should always be visible, toggle independent). Click `[data-testid^="activity-row-"][data-testid$="-expand"]` within that row. `[data-testid^="activity-row-"][data-testid$="-details"]` appears inline with a JSON blob containing `tokens_in`, `tokens_out`, and `turns_summarized`. Click the expander again; the details block disappears.
+6. **Legacy tab regression check.** Click `[data-testid="tab-conversation"]` — URL drops `?tab=activity`, `[data-testid="conversation-pane"]` mounts, Activity pane unmounts. Click `[data-testid="tab-timeline"]` — URL becomes `?tab=timeline`, checkpoint timeline renders as before. `browser_console_messages` shows zero uncaught exceptions across all three tab switches. Coverage parity for sub-objects `memory`, `context_management`, and `hitl` on the Activity pane (Template D): the same compaction-fired event visible here is also visible on the Timeline tab with consistent summary metadata.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -412,6 +431,7 @@ Steps:
 | Agent context management section feature | 1, 2, 15, 16 |
 | Context window management / compaction observability | 1, 17 |
 | Task detail conversation log feature | 1, 18 |
+| Task detail unified Activity view | 1, 4, 18, 19 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
