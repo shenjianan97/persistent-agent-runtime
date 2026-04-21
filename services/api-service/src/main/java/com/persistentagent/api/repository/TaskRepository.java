@@ -141,6 +141,32 @@ public class TaskRepository {
     }
 
     /**
+     * Phase 2 Track 7 Follow-up Task 8 — fetch the latest root-namespace
+     * checkpoint row for a task. Used by the Activity projection service
+     * to read {@code state["messages"]} without paging the full checkpoint
+     * history. Returns {@code Optional.empty()} when the task does not exist
+     * for the given tenant, or no root-namespace checkpoint has been written
+     * yet. The primary-key index
+     * {@code (task_id, checkpoint_ns, created_at)} keeps this query on a
+     * single B-tree descent.
+     */
+    public Optional<Map<String, Object>> getLatestRootCheckpoint(UUID taskId, String tenantId) {
+        String checkSql = "SELECT 1 FROM tasks WHERE task_id = ? AND tenant_id = ?";
+        if (jdbcTemplate.queryForList(checkSql, taskId, tenantId).isEmpty()) {
+            return Optional.empty();
+        }
+        String sql = """
+                SELECT checkpoint_id, checkpoint_payload, created_at
+                FROM checkpoints
+                WHERE task_id = ? AND checkpoint_ns = ''
+                ORDER BY created_at DESC
+                LIMIT 1
+                """;
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql, taskId);
+        return rows.isEmpty() ? Optional.empty() : Optional.of(rows.get(0));
+    }
+
+    /**
      * Gets root-namespace checkpoints ordered by creation time.
      * Returns Optional.empty() if the task does not exist for the given tenant.
      */

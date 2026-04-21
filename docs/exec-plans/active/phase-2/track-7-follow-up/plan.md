@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Follow-up Task 8 (added 2026-04-20):** Unify the Console's Conversation + Execution Timeline tabs onto `checkpoints` + `task_events`, deprecating `task_conversation_log`. See [`task-8-unify-conversation-timeline-design.md`](./task-8-unify-conversation-timeline-design.md). Decomposes into 5 sub-tasks that `writing-plans` will author separately. Depends on Tasks 3–5 (replace-and-rehydrate invariants + offload rules) already being in place.
+
 **Goal:** Replace Track 7's strict-append, in-place "mutate `state.messages` with placeholders and append to `summary_marker`" compaction with a clean **replace-and-rehydrate** architecture built on LangGraph's `pre_model_hook`. The durable journal (`state["messages"]`) is kept nearly append-only and large payloads are offloaded at ingestion; the agent-visible context window is a lightweight projection assembled fresh on every turn from three regions (`summary`, `middle`, `keep window`). When the projection approaches the model's context budget we *replace* the summary rather than append to it. This closes the three production-observed issues on Track 7 (poor summary quality, irrecoverable tool results, uncaught provider-contract regressions) and simplifies the invariants: one summary string, one monotone watermark, one S3-backed recall path.
 
 **Architecture:** Three distinct entities, each with a single well-defined job.

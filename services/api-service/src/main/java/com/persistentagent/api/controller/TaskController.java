@@ -6,6 +6,7 @@ import com.persistentagent.api.model.request.TaskRejectRequest;
 import com.persistentagent.api.model.request.TaskRespondRequest;
 import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
+import com.persistentagent.api.service.ActivityProjectionService;
 import com.persistentagent.api.service.ConversationLogService;
 import com.persistentagent.api.service.TaskEventService;
 import com.persistentagent.api.service.TaskService;
@@ -30,15 +31,18 @@ public class TaskController {
     private final TaskService taskService;
     private final TaskEventService taskEventService;
     private final ConversationLogService conversationLogService;
+    private final ActivityProjectionService activityProjectionService;
     private final ObjectMapper objectMapper;
     private final Validator validator;
 
     public TaskController(TaskService taskService, TaskEventService taskEventService,
                           ConversationLogService conversationLogService,
+                          ActivityProjectionService activityProjectionService,
                           ObjectMapper objectMapper, Validator validator) {
         this.taskService = taskService;
         this.taskEventService = taskEventService;
         this.conversationLogService = conversationLogService;
+        this.activityProjectionService = activityProjectionService;
         this.objectMapper = objectMapper;
         this.validator = validator;
     }
@@ -188,6 +192,33 @@ public class TaskController {
             @RequestParam(name = "limit", required = false) Integer limit) {
         ConversationEntryResponse.Page page =
                 conversationLogService.getConversation(taskId, afterSequence, limit);
+        return ResponseEntity.ok(page);
+    }
+
+    /**
+     * Phase 2 Track 7 Follow-up Task 8 — unified Activity projection.
+     *
+     * <p>Merges the LangGraph journal ({@code checkpoints} → {@code state["messages"]})
+     * with task-level markers ({@code task_events}) into a single
+     * discriminated-union stream for the Console's unified Activity tab.
+     *
+     * <p>Query params:
+     * <ul>
+     *   <li>{@code include_details} (default {@code false}) — when false,
+     *       infrastructure markers (compaction metadata, offload rollup,
+     *       memory flush, lifecycle) are filtered out; only user-meaningful
+     *       events remain.</li>
+     * </ul>
+     *
+     * <p>404 when the task doesn't exist OR belongs to another tenant.
+     */
+    @GetMapping("/{taskId}/activity")
+    public ResponseEntity<ActivityEventResponse.Page> getTaskActivity(
+            @PathVariable UUID taskId,
+            @RequestParam(name = "include_details", required = false, defaultValue = "false")
+            boolean includeDetails) {
+        ActivityEventResponse.Page page =
+                activityProjectionService.getActivity(taskId, includeDetails);
         return ResponseEntity.ok(page);
     }
 }

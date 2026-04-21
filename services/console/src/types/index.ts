@@ -491,3 +491,52 @@ export interface ConversationListResponse {
     /** Present when more entries exist past the requested window. */
     next_sequence?: number;
 }
+
+// ─── Phase 2 Track 7 Follow-up Task 8 — Unified Activity projection ───
+//
+// Discriminated-union shape returned by `GET /v1/tasks/{taskId}/activity`.
+// Consumers switch on `kind` and ignore fields they don't recognise.
+
+export type ActivityEventKind =
+    | 'turn.user'
+    | 'turn.assistant'
+    | 'turn.tool'
+    | 'marker.compaction_fired'
+    | 'marker.memory_flush'
+    | 'marker.offload_emitted'
+    | 'marker.system_note'
+    | 'marker.lifecycle'
+    | 'marker.hitl.paused'
+    | 'marker.hitl.approval_requested'
+    | 'marker.hitl.input_requested'
+    | 'marker.hitl.approved'
+    | 'marker.hitl.rejected'
+    | 'marker.hitl.input_received'
+    | 'marker.hitl.resumed';
+
+export interface ActivityToolCall {
+    id?: string;
+    name?: string;
+    args?: unknown;
+}
+
+export interface ActivityEvent {
+    kind: ActivityEventKind | string;
+    timestamp: string | null;
+    role?: string | null;
+    content?: string | null;
+    tool_name?: string | null;
+    tool_call_id?: string | null;
+    tool_calls?: ActivityToolCall[] | null;
+    is_error?: boolean | null;
+    event_type?: string | null;
+    status_before?: string | null;
+    status_after?: string | null;
+    summary_text?: string | null;
+    details?: Record<string, unknown> | null;
+}
+
+export interface ActivityListResponse {
+    events: ActivityEvent[];
+    next_cursor: string | null;
+}
