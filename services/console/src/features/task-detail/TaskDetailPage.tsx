@@ -9,8 +9,6 @@ import { useRedriveTask } from '@/features/dead-letter/useDeadLetter';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { TaskStatusBadge } from './TaskStatusBadge';
 import { CostSummary } from './CostSummary';
-import { CheckpointTimeline } from './CheckpointTimeline';
-import { ConversationPane } from './ConversationPane';
 import { ActivityPane } from './ActivityPane';
 import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
@@ -22,7 +20,6 @@ import { Textarea } from '@/components/ui/textarea';
 import { AlertCircle, Terminal, Ban, RotateCcw, PlayCircle, MessageSquare } from 'lucide-react';
 import { toast } from 'sonner';
 import { api, ApiError } from '@/api/client';
-import { CheckpointResponse } from '@/types';
 import { formatUsd } from '@/lib/utils';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -30,30 +27,8 @@ import remarkGfm from 'remark-gfm';
 export function TaskDetailPage() {
     const { taskId } = useParams<{ taskId: string }>();
     const navigate = useNavigate();
-    const [searchParams, setSearchParams] = useSearchParams();
-    // Phase 2 Track 7 Follow-up Task 8 — feature-flag the unified Activity
-    // tab. When `VITE_UNIFIED_ACTIVITY_VIEW=true`, the new Activity tab
-    // appears alongside the legacy Conversation/Timeline tabs. Default:
-    // flag off → Conversation + Timeline only (current behavior). Flip the
-    // flag on per-deploy to progressively roll out. Tabs are URL-scoped.
-    const unifiedActivityEnabled =
-        import.meta.env.VITE_UNIFIED_ACTIVITY_VIEW === 'true';
-    type TaskDetailTab = 'conversation' | 'timeline' | 'activity';
-    const requestedTab = searchParams.get('tab');
-    const activeTab: TaskDetailTab = (() => {
-        if (unifiedActivityEnabled && requestedTab === 'activity') return 'activity';
-        if (requestedTab === 'timeline') return 'timeline';
-        return 'conversation';
-    })();
-    const setActiveTab = (tab: TaskDetailTab) => {
-        const next = new URLSearchParams(searchParams);
-        if (tab === 'conversation') {
-            next.delete('tab');
-        } else {
-            next.set('tab', tab);
-        }
-        setSearchParams(next, { replace: true });
-    };
+    const [searchParams] = useSearchParams();
+    void searchParams; // reserved for future tab additions
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
     const { data: observability } = useTaskObservability(taskId!, task?.status);
     const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
@@ -147,7 +122,7 @@ export function TaskDetailPage() {
         );
     }
 
-    const checkpoints: CheckpointResponse[] = checkpointsData?.checkpoints || [];
+    void checkpointsData; // used elsewhere in the page; no longer needed by tabs
     const isRunning = task.status === 'running' || task.status === 'queued';
     const isWaitingForApproval = task.status === 'waiting_for_approval';
     const isWaitingForInput = task.status === 'waiting_for_input';
@@ -338,113 +313,10 @@ export function TaskDetailPage() {
                     )}
 
                     <div data-testid="task-detail-tabs" className="space-y-3">
-                        <div
-                            role="tablist"
-                            aria-label="Task detail views"
-                            className="flex items-end gap-6 border-b border-white/8"
-                        >
-                            <button
-                                type="button"
-                                role="tab"
-                                id="tab-conversation"
-                                data-testid="tab-conversation"
-                                aria-controls="tabpanel-conversation"
-                                aria-selected={activeTab === 'conversation'}
-                                onClick={() => setActiveTab('conversation')}
-                                className={`pb-2 -mb-[1px] border-b-2 transition-colors text-xs font-bold uppercase tracking-[0.2em] ${
-                                    activeTab === 'conversation'
-                                        ? 'border-primary text-primary'
-                                        : 'border-transparent text-muted-foreground hover:text-foreground'
-                                }`}
-                            >
-                                <div>Conversation</div>
-                                <div className="text-[10px] font-normal tracking-normal normal-case text-muted-foreground mt-0.5">
-                                    What the agent did
-                                </div>
-                            </button>
-                            <button
-                                type="button"
-                                role="tab"
-                                id="tab-timeline"
-                                data-testid="tab-timeline"
-                                aria-controls="tabpanel-timeline"
-                                aria-selected={activeTab === 'timeline'}
-                                onClick={() => setActiveTab('timeline')}
-                                className={`pb-2 -mb-[1px] border-b-2 transition-colors text-xs font-bold uppercase tracking-[0.2em] ${
-                                    activeTab === 'timeline'
-                                        ? 'border-primary text-primary'
-                                        : 'border-transparent text-muted-foreground hover:text-foreground'
-                                }`}
-                            >
-                                <div>Timeline</div>
-                                <div className="text-[10px] font-normal tracking-normal normal-case text-muted-foreground mt-0.5">
-                                    Infrastructure events
-                                </div>
-                            </button>
-                            {unifiedActivityEnabled && (
-                                <button
-                                    type="button"
-                                    role="tab"
-                                    id="tab-activity"
-                                    data-testid="tab-activity"
-                                    aria-controls="tabpanel-activity"
-                                    aria-selected={activeTab === 'activity'}
-                                    onClick={() => setActiveTab('activity')}
-                                    className={`pb-2 -mb-[1px] border-b-2 transition-colors text-xs font-bold uppercase tracking-[0.2em] ${
-                                        activeTab === 'activity'
-                                            ? 'border-primary text-primary'
-                                            : 'border-transparent text-muted-foreground hover:text-foreground'
-                                    }`}
-                                >
-                                    <div>Activity</div>
-                                    <div className="text-[10px] font-normal tracking-normal normal-case text-muted-foreground mt-0.5">
-                                        Unified view
-                                    </div>
-                                </button>
-                            )}
-                        </div>
-
-                        {activeTab === 'activity' ? (
-                            <div
-                                role="tabpanel"
-                                id="tabpanel-activity"
-                                aria-labelledby="tab-activity"
-                            >
-                                <ActivityPane
-                                    taskId={taskId!}
-                                    status={task.status}
-                                />
-                            </div>
-                        ) : activeTab === 'conversation' ? (
-                            <div
-                                role="tabpanel"
-                                id="tabpanel-conversation"
-                                aria-labelledby="tab-conversation"
-                            >
-                                <ConversationPane
-                                    taskId={taskId!}
-                                    status={task.status}
-                                />
-                            </div>
-                        ) : (
-                            <div
-                                role="tabpanel"
-                                id="tabpanel-timeline"
-                                aria-labelledby="tab-timeline"
-                            >
-                                <CheckpointTimeline
-                                    checkpoints={checkpoints}
-                                    hitlEvents={eventsData?.events ?? []}
-                                    isRunning={isRunning}
-                                    retryHistory={task.retry_history}
-                                    status={task.status}
-                                    deadLetterReason={task.dead_letter_reason}
-                                    lastErrorCode={task.last_error_code}
-                                    lastErrorMessage={task.last_error_message}
-                                    deadLetteredAt={task.dead_lettered_at}
-                                />
-                            </div>
-                        )}
+                        <ActivityPane
+                            taskId={taskId!}
+                            status={task.status}
+                        />
                     </div>
 
                     {isDeadLetter && (
