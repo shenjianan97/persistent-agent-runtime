@@ -103,6 +103,10 @@ describe('ActivityPane', () => {
 
         expect(screen.getByTestId('activity-row-1')).toHaveAttribute('data-kind', 'turn.assistant');
         expect(screen.getByTestId('activity-row-1-content')).toHaveTextContent('Sure');
+        // Tool-call folds share the containing assistant turn's
+        // timestamp (they were emitted in the same AIMessage), but we
+        // surface it regardless for visual parity with tool-result folds.
+        expect(screen.getByTestId('activity-row-1-tool-call-0-timestamp')).toBeInTheDocument();
 
         expect(screen.getByTestId('activity-row-2')).toHaveAttribute('data-kind', 'turn.tool');
         expect(screen.getByTestId('activity-row-2-content')).toHaveTextContent('file1');

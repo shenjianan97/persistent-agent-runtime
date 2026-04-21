@@ -336,9 +336,17 @@ function AssistantTurnRow({ event, index }: RowProps) {
                             key={tc.id ?? `${tc.name}-${i}`}
                             tone="warning"
                             label={
-                                <>
+                                <span className="flex items-center gap-2">
                                     Tool call → <span className="font-mono normal-case tracking-normal">{tc.name || '(tool)'}</span>
-                                </>
+                                    {event.timestamp && (
+                                        <span
+                                            data-testid={`activity-row-${index}-tool-call-${i}-timestamp`}
+                                            className="ml-auto font-mono normal-case tracking-normal text-muted-foreground tabular-nums"
+                                        >
+                                            {formatTime(event.timestamp)}
+                                        </span>
+                                    )}
+                                </span>
                             }
                         >
                             <pre className="text-xs font-mono text-warning whitespace-pre-wrap break-all">
