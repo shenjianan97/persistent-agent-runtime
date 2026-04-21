@@ -31,6 +31,20 @@ re-assignment).  Using an explicit allow-list guarantees that
 checkpoint round-trip, so the compaction trigger boundary does not drift
 across resume and the KV-cache prefix is never invalidated by a phantom
 threshold crossing.
+
+langchain-core upgrade caveat
+-----------------------------
+``extract_text_content`` delegates to ``AIMessage.content_blocks``, whose
+provider translator set is still documented as "alpha" upstream. A minor
+langchain-core bump that adds a translator (e.g., folds ``thinking`` into
+a standard ``text`` block, or unwraps the OpenAI Responses ``message``
+wrapper natively) will change what the helper extracts for the same
+logical message. During a rolling deploy this means a task resumed on a
+newer worker can estimate a different token count than its pre-checkpoint
+self, shifting the compaction trigger boundary across the restart. This
+is not a correctness bug for a single run — but pin ``langchain-core``
+tightly in ``pyproject.toml`` and coordinate the bump fleet-wide. The
+allow-listed scalar fields above remain deterministic regardless.
 """
 
 from __future__ import annotations
@@ -41,6 +55,9 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
+# Re-exported under its legacy underscore name to keep intra-module callers
+# (summarizer.py) stable, but the public surface is `extract_text_content`.
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,25 +66,122 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _extract_text_content(content: Any) -> str:
-    """Flatten message content to a plain string (handles block-list format).
+def extract_text_content(content: Any, *, separator: str = "") -> str:
+    """Flatten provider-shaped message content to plain text.
 
-    Only ``text`` blocks are extracted from block-list content.  Non-text
-    blocks (``tool_use``, ``image``, etc.) are silently skipped — they have
-    negligible impact on token estimates and would introduce non-determinism
-    if their internal structure changes across checkpoint cycles.
+    Provider gap (verified against ``langchain-core==1.3.0``, 2026-04-17):
+
+    * ``BaseMessage.text`` is NOT a canonical cross-provider flattener. It
+      reads ``self.content`` directly and only picks ``{"type": "text",
+      "text": ...}`` blocks — it does not dispatch to provider translators,
+      does not consult ``content_blocks``, and returns ``""`` for OpenAI
+      Responses ``output_text``, nested ``message.content[output_text]``,
+      Gemini / Bedrock Converse bare-dict, and anything else provider-shaped.
+    * ``AIMessage.content_blocks`` DOES dispatch to per-provider translators
+      (when ``response_metadata["model_provider"]`` is set) and runs a
+      best-effort pass otherwise, which normalizes Anthropic text, Gemini
+      bare-dict, and Bedrock Converse bare-dict into standard
+      ``{"type": "text"}`` blocks. OpenAI Responses shapes are still left as
+      ``"non_standard"``-wrapped blocks (open gap tracked upstream — see the
+      forum thread "Why open ai reasoning content is not parsed into
+      standard content blocks" and issues #9072 / #9895).
+
+    Strategy:
+
+    1. Call ``AIMessage(content=content).content_blocks`` so every provider
+       translator LangChain ships with runs.
+    2. Extract text from standard ``"text"`` blocks.
+    3. Peek one level into ``"non_standard"`` wrappers for the shapes we
+       know LangChain doesn't yet normalize: ``output_text`` (OpenAI
+       Responses), nested ``message.content[...]`` (OpenAI Responses wrap),
+       and ``thinking`` (Claude extended thinking). Narrow allowlist, not a
+       reimplementation of the translator stack.
+
+    When a new provider ships or the ``content_blocks`` alpha stabilizes and
+    folds a shape into standard ``"text"`` blocks, the ``non_standard`` pass
+    here becomes a no-op and can be trimmed.
+
+    Non-text blocks (``tool_use``, ``function_call``, ``reasoning``,
+    ``image``, ...) are intentionally dropped from the text view — they do
+    not contribute to the summarizer prompt or the token-count heuristic.
+
+    Separator — programmatic vs user-facing
+    ---------------------------------------
+    ``separator`` defaults to ``""`` because the historical / token-count
+    / summarizer-input callers treat sibling text blocks as programmatic
+    concatenation (not paragraph breaks). For user-facing artifacts —
+    specifically ``task.output.result`` written at graph completion —
+    callers should pass ``separator="\\n\\n"`` so Anthropic multi-block
+    responses render with paragraph spacing, matching the Java read-time
+    normalizer (``MessageContentExtractor`` in the API service) and
+    preserving markdown structure (adjacent ``## Heading`` blocks don't
+    collapse into the previous block's last line).
+
+    Exception handling: a failure inside ``content_blocks`` (e.g., a future
+    LangChain shape raising during best-effort parsing) is logged at
+    WARNING and degrades to ``""``. Silent swallowing would make a prod
+    regression invisible — the WARNING-level log is the signal.
     """
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    return str(content)
+    try:
+        blocks = AIMessage(content=content).content_blocks
+    except Exception:
+        logger.warning(
+            "extract_text_content: content_blocks raised; degrading to empty",
+            exc_info=True,
+        )
+        return ""
+    parts: list[str] = []
+    for block in blocks:
+        part = _extract_block_text(block)
+        if part:
+            parts.append(part)
+    return separator.join(parts)
+
+
+# Legacy alias — kept so `summarizer.py` and other in-tree callers importing
+# the underscore name don't need an atomic rewrite. New callers use
+# ``extract_text_content`` directly.
+_extract_text_content = extract_text_content
+
+
+def _extract_block_text(block: Any) -> str:
+    """Pull prose text out of a single ``content_blocks`` entry.
+
+    Standard ``"text"`` blocks yield their ``"text"`` field. ``"non_standard"``
+    wrappers are unpacked one level for shapes LangChain's v1 content_blocks
+    pipeline leaves as opaque envelopes today — namely OpenAI Responses
+    ``output_text``, the nested ``message.content[...]`` wrapper, and
+    Claude extended thinking. Everything else yields ``""`` (including
+    ``tool_call``, ``reasoning``, ``image``, etc., which are surfaced via
+    their own channels, not prose).
+    """
+    if isinstance(block, str):
+        return block
+    if not isinstance(block, dict):
+        return ""
+    block_type = block.get("type")
+    if block_type == "text":
+        text = block.get("text")
+        return text if isinstance(text, str) else ""
+    if block_type == "non_standard":
+        inner = block.get("value")
+        if isinstance(inner, dict):
+            inner_type = inner.get("type")
+            if inner_type == "output_text":
+                text = inner.get("text")
+                return text if isinstance(text, str) else ""
+            if inner_type == "message":
+                nested = inner.get("content")
+                if isinstance(nested, list):
+                    return _extract_text_content(nested)
+            if inner_type == "thinking":
+                thinking = inner.get("thinking")
+                return thinking if isinstance(thinking, str) else ""
+    return ""
 
 
 def _serialize_for_token_count(messages: list[BaseMessage]) -> str:

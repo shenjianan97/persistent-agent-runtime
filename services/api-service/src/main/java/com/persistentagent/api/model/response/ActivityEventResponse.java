@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Phase 2 Track 7 Follow-up Task 8 — unified Activity projection entry.
@@ -28,6 +29,15 @@ import java.util.List;
  *
  * <p>Fields not applicable to a given kind are omitted from the JSON via
  * {@link JsonInclude}.
+ *
+ * <p>Two diagnostic fields restored from the legacy panes:
+ * <ul>
+ *   <li>{@code worker_id} — id of the worker that produced the checkpoint
+ *       where this message first appeared. Successive turns with differing
+ *       worker ids mark a lease-expiry reclaim / handoff.</li>
+ *   <li>{@code orig_bytes} — pre-truncation byte count on {@code turn.tool}
+ *       events, set when the worker truncated a large tool output.</li>
+ * </ul>
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public record ActivityEventResponse(
@@ -43,7 +53,18 @@ public record ActivityEventResponse(
         @JsonProperty("status_before") String statusBefore,
         @JsonProperty("status_after") String statusAfter,
         @JsonProperty("summary_text") String summaryText,
-        @JsonProperty("details") Object details
+        @JsonProperty("details") Object details,
+        // Per-turn cost & token usage on `turn.assistant` events — sourced
+        // from the AIMessage's `usage_metadata` (tokens) and the checkpoint
+        // that first materialised the message (cost). Null on other kinds.
+        @JsonProperty("usage") Map<String, Integer> usage,
+        @JsonProperty("cost_microdollars") Long costMicrodollars,
+        // Worker that produced the checkpoint where this message first
+        // materialised. Used by the Console to render worker-handoff banners.
+        @JsonProperty("worker_id") String workerId,
+        // Pre-truncation byte count on `turn.tool` events when the worker
+        // truncated a large tool output. Null on other kinds / untruncated.
+        @JsonProperty("orig_bytes") Long origBytes
 ) {
 
     /** Inline tool-call descriptor on an assistant turn. */
@@ -56,9 +77,14 @@ public record ActivityEventResponse(
     /**
      * Paged envelope. v1 returns the entire merged stream in one shot — the
      * {@code next_cursor} field is reserved for future pagination.
+     *
+     * <p>{@code truncated} is {@code true} when the server hard-capped the
+     * events list (at {@code MAX_EVENTS}) because the underlying stream had
+     * more events; {@code null}/{@code false} when the full stream fit.
      */
     public record Page(
             @JsonProperty("events") List<ActivityEventResponse> events,
-            @JsonProperty("next_cursor") String nextCursor
+            @JsonProperty("next_cursor") String nextCursor,
+            @JsonProperty("truncated") Boolean truncated
     ) {}
 }

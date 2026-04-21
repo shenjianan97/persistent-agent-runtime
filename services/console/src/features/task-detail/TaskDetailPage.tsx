@@ -4,7 +4,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTaskStatus, useCancelTask } from './useTaskStatus';
 import { useAgent } from '@/features/agents/useAgents';
 import { useTaskObservability } from './useTaskObservability';
-import { useCheckpoints } from './useCheckpoints';
 import { useRedriveTask } from '@/features/dead-letter/useDeadLetter';
 import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { TaskStatusBadge } from './TaskStatusBadge';
@@ -31,7 +30,6 @@ export function TaskDetailPage() {
     void searchParams; // reserved for future tab additions
     const { data: task, isLoading, isError } = useTaskStatus(taskId!);
     const { data: observability } = useTaskObservability(taskId!, task?.status);
-    const { data: checkpointsData } = useCheckpoints(taskId!, task?.status, task?.checkpoint_count);
     const { data: artifactsData } = useTaskArtifacts(taskId!, task?.status);
 
     const { data: langfuseEndpoints = [] } = useLangfuseEndpoints();
@@ -122,7 +120,6 @@ export function TaskDetailPage() {
         );
     }
 
-    void checkpointsData; // used elsewhere in the page; no longer needed by tabs
     const isRunning = task.status === 'running' || task.status === 'queued';
     const isWaitingForApproval = task.status === 'waiting_for_approval';
     const isWaitingForInput = task.status === 'waiting_for_input';
@@ -358,7 +355,7 @@ export function TaskDetailPage() {
 
                         {task.status === 'completed' && !!task.output && (
                             <Card className="console-surface border-success/30 flex flex-col max-h-[400px]">
-                                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5">
+                                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2 border-b border-success/30 shrink-0 bg-success/5 rounded-t-3xl">
                                     <CardTitle className="text-sm font-display uppercase tracking-widest flex items-center gap-2 text-success">
                                         <Terminal className="w-4 h-4" /> Output
                                     </CardTitle>

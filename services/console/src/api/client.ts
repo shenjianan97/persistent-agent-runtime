@@ -26,7 +26,6 @@ import {
     MemoryListResponse,
     MemorySearchResponse,
     MemoryEntryResponse,
-    ConversationListResponse,
     ActivityListResponse,
 } from '@/types';
 
@@ -241,22 +240,6 @@ export const api = {
     // Task Events
     getTaskEvents: (taskId: string, limit = 100) =>
         fetchApi<TaskEventListResponse>(`/v1/tasks/${taskId}/events?limit=${limit}`),
-
-    /**
-     * Phase 2 Track 7 Task 13 — user-facing conversation log.
-     * Returns the rendered entry stream a user sees in the Conversation tab.
-     * Pass `afterSequence` to page past entries already loaded.
-     */
-    listConversation: (taskId: string, afterSequence?: number) => {
-        const params = new URLSearchParams();
-        if (typeof afterSequence === 'number') {
-            params.set('after_sequence', afterSequence.toString());
-        }
-        const query = params.toString();
-        return fetchApi<ConversationListResponse>(
-            `/v1/tasks/${encodeURIComponent(taskId)}/conversation${query ? `?${query}` : ''}`,
-        );
-    },
 
     /**
      * Phase 2 Track 7 Follow-up Task 8 — unified Activity projection.

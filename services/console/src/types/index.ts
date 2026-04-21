@@ -429,69 +429,6 @@ export interface ArtifactMetadata {
     createdAt: string;
 }
 
-// ──────────────────────────────────────────────────────────────────
-// User-facing Conversation log (Phase 2 Track 7 Task 13)
-// ──────────────────────────────────────────────────────────────────
-
-export type ConversationEntryKind =
-    | 'user_turn'
-    | 'agent_turn'
-    | 'tool_call'
-    | 'tool_result'
-    | 'compaction_boundary'
-    | 'memory_flush'
-    | 'hitl_pause'
-    | 'hitl_resume'
-    | 'system_note'
-    // Phase 2 Track 7 Follow-up Task 5 — one entry per ingestion-offload
-    // pass that moved ≥1 tool result / arg to S3. Compact inline notice
-    // (smaller than a Tier 3 boundary, not a full divider).
-    | 'offload_emitted';
-
-/**
- * Metadata attached to a conversation entry. Shape is intentionally permissive:
- * the pane renders only fields it recognises for a given `kind`, and falls back
- * to a debug-fold banner when a field is missing or `content_version > 1`.
- */
-export interface ConversationEntryMetadata {
-    capped?: boolean;
-    orig_bytes?: number;
-    turns_summarized?: number;
-    summarizer_model?: string;
-    summary_bytes?: number;
-    cost_microdollars?: number;
-    tier3_firing_index?: number;
-    first_turn_index?: number;
-    last_turn_index?: number;
-    // offload_emitted — the content is the authoritative payload; metadata
-    // stays empty in v1. Declared here so render sites can opt into a
-    // roll-up summary without a type cast.
-    offload_count?: number;
-    offload_total_bytes?: number;
-    [key: string]: unknown;
-}
-
-export interface ConversationEntry {
-    /** Stable monotonically-increasing sequence within a task. */
-    sequence: number;
-    /** One of the 9 public kinds; clients must handle unknown values gracefully. */
-    kind: ConversationEntryKind | string;
-    /** Schema version; clients fall back to a debug-fold banner when > 1. */
-    content_version: number;
-    /** Free-form content object keyed by `kind`; see the task spec §Content schema. */
-    content: Record<string, unknown>;
-    /** Render hints (capping info, compaction provenance, etc.). */
-    metadata?: ConversationEntryMetadata;
-    /** ISO timestamp the entry was produced. */
-    created_at: string;
-}
-
-export interface ConversationListResponse {
-    entries: ConversationEntry[];
-    /** Present when more entries exist past the requested window. */
-    next_sequence?: number;
-}
-
 // ─── Phase 2 Track 7 Follow-up Task 8 — Unified Activity projection ───
 //
 // Discriminated-union shape returned by `GET /v1/tasks/{taskId}/activity`.
@@ -520,6 +457,12 @@ export interface ActivityToolCall {
     args?: unknown;
 }
 
+export interface ActivityUsage {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+}
+
 export interface ActivityEvent {
     kind: ActivityEventKind | string;
     timestamp: string | null;
@@ -534,9 +477,23 @@ export interface ActivityEvent {
     status_after?: string | null;
     summary_text?: string | null;
     details?: Record<string, unknown> | null;
+    // Populated on `turn.assistant` events. `usage` is pulled from the
+    // AIMessage's `usage_metadata`; `cost_microdollars` is the checkpoint
+    // `cost_microdollars` attributed to this AI message by the server.
+    usage?: ActivityUsage | null;
+    cost_microdollars?: number | null;
+    // Worker id set on turn kinds (user/assistant/tool), from the checkpoint
+    // where the message first appeared. Used to render handoff banners.
+    worker_id?: string | null;
+    // Pre-truncation byte count. Set on `turn.tool` only — when present and
+    // greater than the length of `content`, the server capped the tool output
+    // to a head+tail view (same view the model saw).
+    orig_bytes?: number | null;
 }
 
 export interface ActivityListResponse {
     events: ActivityEvent[];
     next_cursor: string | null;
+    // True when the server cut events at MAX_EVENTS=2000.
+    truncated?: boolean | null;
 }

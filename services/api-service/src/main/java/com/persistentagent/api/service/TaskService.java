@@ -19,6 +19,7 @@ import com.persistentagent.api.service.observability.CheckpointCostTotals;
 import com.persistentagent.api.service.observability.TaskObservabilityService;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
+import com.persistentagent.api.util.MessageContentExtractor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -267,8 +268,13 @@ public class TaskService {
         // Parse retry_history from JSONB
         List<Object> retryHistory = parseJsonList(task.get("retry_history"));
 
-        // Parse output from JSONB
-        Object output = parseJson(task.get("output"));
+        // Parse output from JSONB. Legacy tasks persisted provider-shaped
+        // block lists under output.result (worker wrote the AIMessage's raw
+        // ``content`` without flattening). Normalize to a plain string at
+        // the API boundary so the Console renders markdown without
+        // provider-aware branching. Write-time normalization in the worker
+        // (executor/graph.py) handles new tasks.
+        Object output = normalizeOutputResult(parseJson(task.get("output")));
 
         String agentDisplayName = (String) task.get("agent_display_name_snapshot");
 
@@ -850,6 +856,36 @@ public class TaskService {
 
     private Object parseJson(Object value) {
         return JsonParseUtil.parseJson(objectMapper, value, "field", "n/a");
+    }
+
+    /**
+     * Normalizes {@code output.result} to a plain string when the worker
+     * persisted it as a provider-shaped block list. String and null values
+     * pass through unchanged; other shapes (non-map output, missing result
+     * key) are returned as-is so the response contract stays stable.
+     *
+     * <p>Applied at read-time for backward compatibility with legacy tasks.
+     * New tasks receive the flattened string at write-time from the worker.
+     */
+    @SuppressWarnings("unchecked")
+    private Object normalizeOutputResult(Object output) {
+        if (!(output instanceof Map<?, ?> rawMap)) {
+            return output;
+        }
+        Map<String, Object> map = (Map<String, Object>) rawMap;
+        if (!map.containsKey("result")) {
+            return map;
+        }
+        Object result = map.get("result");
+        if (result == null || result instanceof String) {
+            return map;
+        }
+        if (result instanceof List<?>) {
+            Map<String, Object> copy = new LinkedHashMap<>(map);
+            copy.put("result", MessageContentExtractor.extractText(result));
+            return copy;
+        }
+        return map;
     }
 
     private List<Object> parseJsonList(Object value) {
