@@ -50,7 +50,10 @@ from executor.compaction.pre_model_hook import (
     Tier3SkippedEvent,
     compaction_pre_model_hook,
 )
-from executor.compaction.tokens import estimate_tokens as _estimate_tokens
+from executor.compaction.tokens import (
+    estimate_tokens as _estimate_tokens,
+    extract_text_content as _extract_message_text,
+)
 from executor.compaction.summarizer import summarize_slice
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
@@ -154,6 +157,40 @@ logger = logging.getLogger(__name__)
 # task_id) are bound at emit time via kwargs.
 from core.logging import get_logger as _get_structlog_logger
 _compaction_logger = _get_structlog_logger(worker_id="graph")
+
+
+def _finalize_output_content(messages: list) -> Any:
+    """Flatten the final message's content for persistence as ``output.result``.
+
+    Checkpoint persistence (`langchain_dumps`) keeps provider-shaped block
+    lists unchanged so prompt-cache keys and reasoning continuation state
+    round-trip. The terminal ``output.result`` artifact is different — it
+    powers the Console's markdown render and the user-visible "Output" card,
+    so it must be a plain string regardless of provider. Legacy list-shaped
+    rows are normalized at read-time by the API
+    (``TaskService.normalizeOutputResult``); this write-site handles new
+    tasks.
+
+    The final message is whichever message tailed the state — usually an
+    ``AIMessage`` on the happy path, but can be a ``ToolMessage`` or
+    ``HumanMessage`` after HITL / follow-up / tool-last shapes. This matches
+    the prior behaviour (``messages[-1].content``); the contract of
+    ``output.result`` is "the terminal message's prose", not "the last
+    assistant's prose". Non-list scalars pass through unchanged so a string
+    ToolMessage content survives as-is.
+
+    Separator is ``"\\n\\n"`` to match the Java read-time normalizer
+    (``MessageContentExtractor``): Anthropic-style multi-block responses
+    render as proper paragraphs instead of concatenating headings and body
+    into a single line.
+    """
+    if not messages:
+        return ""
+    final_message = messages[-1]
+    raw = getattr(final_message, "content", "")
+    if isinstance(raw, list):
+        return _extract_message_text(raw, separator="\n\n")
+    return raw
 
 
 class _ContextExceededIrrecoverableError(Exception):
@@ -2952,7 +2989,12 @@ class GraphExecutor:
 
                 # Execution Finished successfully. Compute final output.
                 messages = final_state.values.get("messages", [])
-                output_content = messages[-1].content if messages else ""
+                # Flatten provider-shaped block-list content (OpenAI Responses,
+                # Anthropic multi-block, Gemini, etc.) to plain text so the
+                # Console can render markdown without provider-aware branching.
+                # Checkpoint persistence is unchanged — this normalizes only
+                # the terminal output.result artifact.
+                output_content = _finalize_output_content(messages)
 
                 # Per-checkpoint cost tracking replaces end-of-task aggregation.
                 # Costs are now written incrementally in the streaming loop above.

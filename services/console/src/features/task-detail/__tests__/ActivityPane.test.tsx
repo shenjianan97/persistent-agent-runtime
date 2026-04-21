@@ -299,6 +299,44 @@ describe('ActivityPane', () => {
         expect(notice).toHaveTextContent('Showing first 2000 of many events');
     });
 
+    it('renders a tool-only assistant turn without prose (empty content + tool_calls)', async () => {
+        // Server now pre-normalizes message content, so a tool-only turn
+        // arrives with `content: ''` and non-empty `tool_calls[]`. The row
+        // must still expose the `activity-row-<i>-content` testid (sr-only)
+        // for a11y consumers, and the tool-call fold must render.
+        listActivityMock.mockResolvedValue({
+            events: [
+                event({
+                    kind: 'turn.assistant',
+                    timestamp: '2026-04-20T00:00:00+00:00',
+                    role: 'assistant',
+                    content: '',
+                    tool_calls: [
+                        { id: 'call_1', name: 'web_search', args: { q: 'x' } },
+                    ],
+                }),
+            ],
+            next_cursor: null,
+        });
+        renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+        const row = await screen.findByTestId('activity-row-0');
+        expect(row).toHaveAttribute('data-kind', 'turn.assistant');
+        // sr-only content element is present + has no child text (the prose
+        // bubble must NOT render for a tool-only turn).
+        const contentEl = screen.getByTestId('activity-row-0-content');
+        expect(contentEl).toBeInTheDocument();
+        expect(contentEl).toHaveClass('sr-only');
+        expect(contentEl).toBeEmptyDOMElement();
+        // Nor should the visible prose bubble container appear — asserting
+        // the sr-only element exists without this check would pass against
+        // an implementation that rendered both an sr-only hook AND a
+        // visible empty bubble.
+        expect(row.querySelector('.rounded-2xl')).toBeNull();
+        // The tool-call fold renders (label contains the tool name).
+        expect(row).toHaveTextContent('web_search');
+    });
+
     it('renders the byte-cap notice on tool rows when orig_bytes > content length', async () => {
         listActivityMock.mockResolvedValue({
             events: [

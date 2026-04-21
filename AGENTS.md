@@ -72,6 +72,9 @@ Priority: user instructions > skills > default behavior.
 - Link to PRs in third-party repos from commits or PR descriptions (§External Pull Request References)
 - Commit or open a PR with unverified Console UI (§Browser Verification (Console Changes))
 - Merge without running the narrowest-scope tests that cover your change (§Testing (Mandatory))
+- Normalize provider-shaped message content at persist-time in the worker — it breaks Anthropic prompt caching and OpenAI reasoning continuation (§LLM Provider Support)
+- Reimplement LangChain's full block-translator stack in Java — the API walker is an allowlist, not a translator (§LLM Provider Support)
+- Add provider-aware branches in the Console — it renders pre-normalized strings only (§LLM Provider Support)
 
 **Ask first:**
 - Force-push to `main`/`master`, destructive DB operations, shared CI/infra changes, anything that deletes data
@@ -94,6 +97,16 @@ When orchestrating parallel subagents via the Agent tool, **always use `isolatio
 
 - **Subagent:** ship code + unit tests (`make console-test`) + a new scenario in `CONSOLE_BROWSER_TESTING.md`. Never call `make start`/`make stop` or Playwright MCP tools.
 - **Orchestrator:** after merge, run the Playwright scenarios once, serially. The §Browser Verification blocking gate lives here.
+
+## LLM Provider Support
+
+LangChain's `BaseMessage.content` is a union type (`str | List[block]`). Block shapes are provider-specific by design — they carry prompt-caching keys (Anthropic), reasoning continuation state (OpenAI Responses), and multi-modal refs that must round-trip unchanged to the LLM. **Persist content unchanged in checkpoints via `langchain_dumps`. Normalize only at read/artifact boundaries:**
+
+- **Python paths** (compaction summarizer, `task.output.result` flattening at write-time) — delegate to `AIMessage.content_blocks` from `langchain-core ≥ 1.2`, then extract text from standard `"text"` blocks and unpack a narrow allowlist of `"non_standard"` wrappers (`output_text`, nested `message.content`, `thinking`). **Don't use `BaseMessage.text` directly** — verified against `langchain-core==1.3.0` (2026-04-17), `.text` only picks pre-normalized `{type: text, text: ...}` blocks and returns `""` for OpenAI Responses, Gemini, Bedrock, and every other provider-shaped list. Coverage of those shapes lives on `content_blocks`, and OpenAI Responses is still marked alpha (forum: *Why open ai reasoning content is not parsed into standard content blocks* — gap tracked upstream as of 1.3.0). Separator policy: the summarizer / token-count path joins sibling text blocks with `""` (programmatic concatenation — adjacent text blocks in a single AIMessage aren't paragraph boundaries for prompt-budget math); `task.output.result` passes `separator="\n\n"` so multi-block markdown (Anthropic multi-paragraph, `thinking` + prose) renders with paragraph breaks on the Console, matching the Java read-time normalizer.
+- **Java API projection** (`ActivityProjectionService.extractMessageContent` / shared utility) — narrow allowlist walker covering text-bearing block shapes: `type: text`, `type: output_text`, nested `type: message → content`, `type: thinking`, and bare `{text: "..."}` dicts. When a new provider ships a novel text-bearing shape, extend the walker plus its fixture test.
+- **Console** — renders the server's pre-normalized string directly. Never parses block shapes.
+
+Adding a new LLM provider: install its `langchain-<provider>` package, verify the Python helper and the Java walker both flatten a representative message, and extend the `"non_standard"` unpack list / Java walker only for shapes not yet covered. Bedrock Converse (bare-dict) and OpenRouter (plain string) are covered by existing rules; Anthropic text, Gemini bare-dict, and OpenAI chat-completions flow through LangChain's translator stack.
 
 ## External Pull Request References
 

@@ -586,6 +586,128 @@ class TaskServiceTest {
         assertEquals("agent_decides", response.memoryMode());
     }
 
+    private Map<String, Object> buildStatusTaskRow(UUID taskId, Object output) {
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("task_id", taskId);
+        row.put("agent_id", "agent1");
+        row.put("agent_display_name_snapshot", "Agent One");
+        row.put("status", "completed");
+        row.put("input", "test input");
+        row.put("output", output);
+        row.put("retry_count", 0);
+        row.put("retry_history", "[]");
+        row.put("lease_owner", null);
+        row.put("last_error_code", null);
+        row.put("last_error_message", null);
+        row.put("last_worker_id", null);
+        row.put("dead_letter_reason", null);
+        row.put("dead_lettered_at", null);
+        row.put("created_at", now);
+        row.put("updated_at", now);
+        row.put("checkpoint_count", 0L);
+        row.put("total_cost_microdollars", 0L);
+        row.put("langfuse_endpoint_id", null);
+        row.put("pending_input_prompt", null);
+        row.put("pending_approval_action", null);
+        row.put("human_input_timeout_at", null);
+        row.put("pause_reason", null);
+        row.put("pause_details", null);
+        row.put("resume_eligible_at", null);
+        row.put("memory_mode", "always");
+        return row;
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getTaskStatus_output_resultListShaped_normalizedToString() {
+        UUID taskId = UUID.randomUUID();
+        // Worker-shaped output JSON with an OpenAI Responses content list
+        // under result. Mirrors what a legacy completed task row holds.
+        String outputJson = "{\"result\":["
+                + "{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]},"
+                + "{\"id\":\"msg_1\",\"type\":\"message\",\"content\":["
+                + "{\"type\":\"output_text\",\"text\":\"Below is a summary\"}]},"
+                + "{\"id\":\"fc_1\",\"type\":\"function_call\",\"name\":\"web_search\",\"arguments\":\"{}\"}"
+                + "],\"langfuse_status\":\"sent\"}";
+        when(taskRepository.findByIdWithAggregates(taskId, "default"))
+                .thenReturn(Optional.of(buildStatusTaskRow(taskId, outputJson)));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(0L, 0, 0, 0, 0L));
+
+        TaskStatusResponse response = taskService.getTaskStatus(taskId);
+        assertTrue(response.output() instanceof Map, "output should parse to a map");
+        Map<String, Object> outMap = (Map<String, Object>) response.output();
+        assertEquals("Below is a summary", outMap.get("result"));
+        assertEquals("sent", outMap.get("langfuse_status"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getTaskStatus_output_resultAsString_passesThrough() {
+        UUID taskId = UUID.randomUUID();
+        String outputJson = "{\"result\":\"plain prose answer\"}";
+        when(taskRepository.findByIdWithAggregates(taskId, "default"))
+                .thenReturn(Optional.of(buildStatusTaskRow(taskId, outputJson)));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(0L, 0, 0, 0, 0L));
+
+        TaskStatusResponse response = taskService.getTaskStatus(taskId);
+        Map<String, Object> outMap = (Map<String, Object>) response.output();
+        assertEquals("plain prose answer", outMap.get("result"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getTaskStatus_output_noResultKey_passesThrough() {
+        // Output without a "result" key (e.g., older tasks with langfuse-only
+        // payload) must pass through the normalizer untouched — no
+        // reallocation, no added key.
+        UUID taskId = UUID.randomUUID();
+        String outputJson = "{\"langfuse_status\":\"sent\"}";
+        when(taskRepository.findByIdWithAggregates(taskId, "default"))
+                .thenReturn(Optional.of(buildStatusTaskRow(taskId, outputJson)));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(0L, 0, 0, 0, 0L));
+
+        TaskStatusResponse response = taskService.getTaskStatus(taskId);
+        Map<String, Object> outMap = (Map<String, Object>) response.output();
+        assertFalse(outMap.containsKey("result"));
+        assertEquals("sent", outMap.get("langfuse_status"));
+    }
+
+    @Test
+    void getTaskStatus_output_nonMapShape_preserved() {
+        // JSON that parses to a non-map (e.g., bare string or list) must
+        // round-trip untouched — the normalizer only rewrites list-shaped
+        // result fields nested under a map.
+        UUID taskId = UUID.randomUUID();
+        String outputJson = "\"plain scalar output\"";
+        when(taskRepository.findByIdWithAggregates(taskId, "default"))
+                .thenReturn(Optional.of(buildStatusTaskRow(taskId, outputJson)));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(0L, 0, 0, 0, 0L));
+
+        TaskStatusResponse response = taskService.getTaskStatus(taskId);
+        assertEquals("plain scalar output", response.output());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void getTaskStatus_output_resultNull_preserved() {
+        UUID taskId = UUID.randomUUID();
+        String outputJson = "{\"result\":null}";
+        when(taskRepository.findByIdWithAggregates(taskId, "default"))
+                .thenReturn(Optional.of(buildStatusTaskRow(taskId, outputJson)));
+        when(taskObservabilityService.getTaskCostTotals(taskId, "default"))
+                .thenReturn(new CheckpointCostTotals(0L, 0, 0, 0, 0L));
+
+        TaskStatusResponse response = taskService.getTaskStatus(taskId);
+        Map<String, Object> outMap = (Map<String, Object>) response.output();
+        assertTrue(outMap.containsKey("result"));
+        assertNull(outMap.get("result"));
+    }
+
     @Test
     void getTaskObservability_existingTask_returnsCheckpointBasedResponse() {
         UUID taskId = UUID.randomUUID();

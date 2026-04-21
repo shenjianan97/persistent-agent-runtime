@@ -8,6 +8,7 @@ import com.persistentagent.api.model.response.TaskEventResponse;
 import com.persistentagent.api.repository.TaskEventRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.util.DateTimeUtil;
+import com.persistentagent.api.util.MessageContentExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -296,7 +297,7 @@ public class ActivityProjectionService {
                         "turn.user",
                         timestamp,
                         "user",
-                        asString(kwargs.get("content")),
+                        MessageContentExtractor.extractText(kwargs.get("content")),
                         null, null, null, null,
                         null, null, null, null, null,
                         null, null,
@@ -307,7 +308,7 @@ public class ActivityProjectionService {
                         "turn.tool",
                         timestamp,
                         "tool",
-                        asString(kwargs.get("content")),
+                        MessageContentExtractor.extractText(kwargs.get("content")),
                         asString(kwargs.get("name")),
                         asString(kwargs.get("tool_call_id")),
                         null,
@@ -327,7 +328,7 @@ public class ActivityProjectionService {
                             "marker.system_note",
                             timestamp,
                             null,
-                            asString(kwargs.get("content")),
+                            MessageContentExtractor.extractText(kwargs.get("content")),
                             null, null, null, null,
                             "system_note", null, null, null, null,
                             null, null,
@@ -373,7 +374,7 @@ public class ActivityProjectionService {
                 "turn.assistant",
                 ts,
                 "assistant",
-                asString(kwargs.get("content")),
+                MessageContentExtractor.extractText(kwargs.get("content")),
                 null, null,
                 toolCalls,
                 null,

@@ -11,6 +11,9 @@ import com.persistentagent.api.repository.TaskRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -22,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -440,5 +444,169 @@ class ActivityProjectionServiceTest {
         ActivityEventResponse.Page page = service.getActivity(taskId, false);
         assertEquals(Boolean.TRUE, page.truncated());
         assertEquals(ActivityProjectionService.MAX_EVENTS, page.events().size());
+    }
+
+    // --- Provider-shape normalization (fixture-driven) ---
+    //
+    // Each fixture drives an AIMessage whose ``content`` is the provider
+    // shape under test; the projection must surface the expected prose on
+    // ``turn.assistant.content``. Fixture IDs mirror the Python shared set.
+
+    private static Stream<Arguments> providerContentFixtures() {
+        return Stream.of(
+                Arguments.of("F-STR-SIMPLE", "Hello world", "Hello world"),
+                Arguments.of("F-STR-EMPTY", "", ""),
+                Arguments.of("F-NULL", null, ""),
+                Arguments.of("F-ANTHROPIC-PROSE",
+                        List.of(Map.of("type", "text", "text", "Let me search for that")),
+                        "Let me search for that"),
+                Arguments.of("F-ANTHROPIC-MIXED",
+                        List.of(
+                                Map.of("type", "text", "text", "Sure, I'll check"),
+                                Map.of("type", "tool_use", "id", "tu_1",
+                                        "name", "web_search",
+                                        "input", Map.of("q", "x"))),
+                        "Sure, I'll check"),
+                Arguments.of("F-ANTHROPIC-TOOLS-ONLY",
+                        List.of(Map.of("type", "tool_use", "id", "tu_1",
+                                "name", "web_search",
+                                "input", Map.of("q", "x"))),
+                        ""),
+                Arguments.of("F-ANTHROPIC-THINKING",
+                        List.of(
+                                Map.of("type", "thinking",
+                                        "thinking", "Deliberating...",
+                                        "signature", "..."),
+                                Map.of("type", "text", "text", "Here is the answer")),
+                        "Deliberating...\n\nHere is the answer"),
+                Arguments.of("F-OPENAI-NATIVE-OUTPUT-TEXT",
+                        List.of(Map.of("type", "output_text", "text", "Here is the report")),
+                        "Here is the report"),
+                Arguments.of("F-OPENAI-NESTED-MESSAGE",
+                        List.of(
+                                Map.of("id", "rs_1", "type", "reasoning", "summary", List.of()),
+                                Map.of("id", "msg_1", "type", "message",
+                                        "content", List.of(Map.of(
+                                                "type", "output_text",
+                                                "text", "Below is a summary"))),
+                                Map.of("id", "fc_1", "type", "function_call",
+                                        "name", "web_search",
+                                        "arguments", "{}")),
+                        "Below is a summary"),
+                Arguments.of("F-OPENAI-REASONING-ONLY",
+                        List.of(
+                                Map.of("id", "rs_1", "type", "reasoning", "summary", List.of()),
+                                Map.of("id", "fc_1", "type", "function_call",
+                                        "name", "web_search",
+                                        "arguments", "{}")),
+                        ""),
+                Arguments.of("F-GEMINI-BARE-DICT",
+                        List.of(Map.of("text", "Response from Gemini")),
+                        "Response from Gemini"),
+                Arguments.of("F-BEDROCK-CONVERSE-TEXT",
+                        List.of(
+                                Map.of("text", "Response via Bedrock"),
+                                Map.of("toolUse", Map.of(
+                                        "name", "search",
+                                        "input", Map.of(),
+                                        "toolUseId", "tu_1"))),
+                        "Response via Bedrock"),
+                Arguments.of("F-MULTI-TEXT-JOIN",
+                        List.of(
+                                Map.of("type", "text", "text", "First para"),
+                                Map.of("type", "text", "text", "Second para")),
+                        "First para\n\nSecond para")
+        );
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("providerContentFixtures")
+    void getActivity_normalizesAssistantContentForProviderShape(
+            String fixtureId, Object aiContent, String expectedContent) {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        Map<String, Object> aiKwargs = new java.util.HashMap<>();
+        aiKwargs.put("type", "ai");
+        aiKwargs.put("content", aiContent);
+        aiKwargs.put("id", "ai_1");
+
+        Map<String, Object> aiMessage = Map.of(
+                "lc", 1,
+                "type", "constructor",
+                "id", List.of("x", "y", "z", "AIMessage"),
+                "kwargs", aiKwargs);
+        Map<String, Object> payload = Map.of(
+                "channel_values", Map.of("messages", List.of(aiMessage)));
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        Map<String, Object> row = new java.util.HashMap<>();
+        row.put("checkpoint_id", "ckpt_1");
+        row.put("checkpoint_payload", payload);
+        row.put("created_at", created);
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId))
+                .thenReturn(Optional.of(row));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertEquals("turn.assistant", events.get(0).kind());
+        assertEquals(expectedContent, events.get(0).content(),
+                "fixture " + fixtureId);
+    }
+
+    @Test
+    void getActivity_endToEnd_openAiReasoningPlusFunctionCallPlusNestedOutputText() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // Mirror a real OpenAI Responses turn: a reasoning block, a
+        // function_call block, and a nested message with an output_text
+        // child. Only the nested output_text prose should surface on
+        // turn.assistant.content.
+        List<Map<String, Object>> openAiContent = List.of(
+                Map.of("id", "rs_1", "type", "reasoning", "summary", List.of()),
+                Map.of("id", "fc_1", "type", "function_call",
+                        "name", "web_search", "arguments", "{}"),
+                Map.of("id", "msg_1", "type", "message",
+                        "content", List.of(Map.of(
+                                "type", "output_text",
+                                "text", "Below is a summary"))));
+
+        Map<String, Object> aiKwargs = new java.util.HashMap<>();
+        aiKwargs.put("type", "ai");
+        aiKwargs.put("content", openAiContent);
+        aiKwargs.put("id", "ai_1");
+        aiKwargs.put("tool_calls", List.of(Map.of(
+                "id", "fc_1",
+                "name", "web_search",
+                "args", Map.of())));
+
+        Map<String, Object> payload = Map.of(
+                "channel_values", Map.of("messages", List.of(Map.of(
+                        "lc", 1,
+                        "type", "constructor",
+                        "id", List.of("x", "y", "z", "AIMessage"),
+                        "kwargs", aiKwargs))));
+
+        Timestamp created = Timestamp.from(Instant.parse("2026-04-20T00:00:00Z"));
+        Map<String, Object> row = new java.util.HashMap<>();
+        row.put("checkpoint_id", "ckpt_1");
+        row.put("checkpoint_payload", payload);
+        row.put("created_at", created);
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId))
+                .thenReturn(Optional.of(row));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        ActivityEventResponse turn = events.get(0);
+        assertEquals("turn.assistant", turn.kind());
+        assertEquals("Below is a summary", turn.content());
+        assertNotNull(turn.toolCalls());
+        assertEquals(1, turn.toolCalls().size());
+        assertEquals("web_search", turn.toolCalls().get(0).name());
     }
 }

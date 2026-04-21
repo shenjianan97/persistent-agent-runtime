@@ -25,7 +25,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
-from executor.compaction.tokens import estimate_tokens, _serialize_for_token_count
+from executor.compaction.tokens import (
+    _extract_text_content,
+    _serialize_for_token_count,
+    estimate_tokens,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +283,193 @@ class TestDeterminismAcrossRoundTrip:
             f"Token count changed across checkpoint round-trip: "
             f"{count_before} != {count_after}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Shared provider-shape fixtures — kept in lock-step with the Java
+#    MessageContentExtractor test set (F-* IDs). ``BaseMessage.text`` joins
+#    sibling text blocks with ``""`` by design (consecutive text blocks are
+#    programmatic concatenations, not paragraphs). We therefore assert
+#    substring presence of each expected text part rather than equality
+#    against the Java separator-joined string.
+# ---------------------------------------------------------------------------
+
+
+_SHARED_FIXTURES = [
+    ("F-STR-SIMPLE", "Hello world", ["Hello world"], []),
+    ("F-STR-EMPTY", "", [], []),
+    ("F-NULL", None, [], []),
+    (
+        "F-ANTHROPIC-PROSE",
+        [{"type": "text", "text": "Let me search for that"}],
+        ["Let me search for that"],
+        [],
+    ),
+    (
+        "F-ANTHROPIC-MIXED",
+        [
+            {"type": "text", "text": "Sure, I'll check"},
+            {"type": "tool_use", "id": "tu_1", "name": "web_search", "input": {"q": "x"}},
+        ],
+        ["Sure, I'll check"],
+        ["web_search"],
+    ),
+    (
+        "F-ANTHROPIC-TOOLS-ONLY",
+        [{"type": "tool_use", "id": "tu_1", "name": "web_search", "input": {"q": "x"}}],
+        [],
+        ["web_search"],
+    ),
+    (
+        "F-ANTHROPIC-THINKING",
+        [
+            {"type": "thinking", "thinking": "Deliberating...", "signature": "..."},
+            {"type": "text", "text": "Here is the answer"},
+        ],
+        ["Deliberating...", "Here is the answer"],
+        [],
+    ),
+    (
+        "F-OPENAI-NATIVE-OUTPUT-TEXT",
+        [{"type": "output_text", "text": "Here is the report"}],
+        ["Here is the report"],
+        [],
+    ),
+    (
+        "F-OPENAI-NESTED-MESSAGE",
+        [
+            {"id": "rs_1", "type": "reasoning", "summary": []},
+            {
+                "id": "msg_1",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Below is a summary"}],
+            },
+            {"id": "fc_1", "type": "function_call", "name": "web_search", "arguments": "{}"},
+        ],
+        ["Below is a summary"],
+        [],
+    ),
+    (
+        "F-OPENAI-REASONING-ONLY",
+        [
+            {"id": "rs_1", "type": "reasoning", "summary": []},
+            {"id": "fc_1", "type": "function_call", "name": "web_search", "arguments": "{}"},
+        ],
+        [],
+        [],
+    ),
+    (
+        "F-GEMINI-BARE-DICT",
+        [{"text": "Response from Gemini"}],
+        ["Response from Gemini"],
+        [],
+    ),
+    (
+        "F-BEDROCK-CONVERSE-TEXT",
+        [
+            {"text": "Response via Bedrock"},
+            {"toolUse": {"name": "search", "input": {}, "toolUseId": "tu_1"}},
+        ],
+        ["Response via Bedrock"],
+        [],
+    ),
+    (
+        "F-MULTI-TEXT-JOIN",
+        [
+            {"type": "text", "text": "First para"},
+            {"type": "text", "text": "Second para"},
+        ],
+        ["First para", "Second para"],
+        [],
+    ),
+]
+
+
+class TestExtractTextContentSharedFixtures:
+    @pytest.mark.parametrize(
+        "fixture_id,content,expected_parts,forbidden_parts",
+        _SHARED_FIXTURES,
+        ids=[f[0] for f in _SHARED_FIXTURES],
+    )
+    def test_extract_text_matches_fixture(
+        self, fixture_id, content, expected_parts, forbidden_parts
+    ):
+        out = _extract_text_content(content)
+        assert isinstance(out, str), f"{fixture_id}: expected str, got {type(out)}"
+        for part in expected_parts:
+            assert part in out, (
+                f"{fixture_id}: expected substring '{part}' not found in {out!r}"
+            )
+        for part in forbidden_parts:
+            assert part not in out, (
+                f"{fixture_id}: forbidden substring '{part}' leaked into text "
+                f"view {out!r}"
+            )
+        if not expected_parts:
+            # tools-only / reasoning-only / empty / null: the text view must
+            # be empty — no prose, no tool_use / function_call leakage.
+            assert out == "", f"{fixture_id}: expected empty text, got {out!r}"
+
+
+class TestExtractTextContentSeparator:
+    """The separator parameter lets callers opt into paragraph-spaced joins
+    for user-facing artifacts (``output.result``) while keeping the
+    token-estimation / summarizer path's ``""`` default — consecutive text
+    blocks are programmatic concatenation for those callers, not paragraphs.
+    """
+
+    def test_default_separator_is_empty(self):
+        blocks = [
+            {"type": "text", "text": "First"},
+            {"type": "text", "text": "Second"},
+        ]
+        assert _extract_text_content(blocks) == "FirstSecond"
+
+    def test_explicit_paragraph_separator_joins_with_blank_line(self):
+        blocks = [
+            {"type": "text", "text": "First"},
+            {"type": "text", "text": "Second"},
+        ]
+        assert _extract_text_content(blocks, separator="\n\n") == "First\n\nSecond"
+
+    def test_separator_does_not_leak_when_only_one_block_has_text(self):
+        # Separator is applied only between non-empty parts — a single
+        # surviving text block must not get a trailing separator.
+        blocks = [
+            {"type": "tool_use", "id": "tu_1", "name": "x", "input": {}},
+            {"type": "text", "text": "only prose"},
+        ]
+        assert _extract_text_content(blocks, separator="\n\n") == "only prose"
+
+
+class TestFormatMessagesIntegration:
+    """Regression guard: ``format_messages_for_summary`` must surface assistant
+    prose from OpenAI-shaped block lists. Before the ``BaseMessage.text``
+    delegation landed, only ``type: text`` blocks were extracted and OpenAI
+    Responses assistants rendered as empty.
+    """
+
+    def test_openai_shaped_ai_content_flattened(self):
+        from executor.compaction.summarizer import format_messages_for_summary
+
+        openai_content = [
+            {"id": "rs_1", "type": "reasoning", "summary": []},
+            {
+                "id": "msg_1",
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Below is a summary"}],
+            },
+            {"id": "fc_1", "type": "function_call", "name": "web_search", "arguments": "{}"},
+        ]
+        msgs = [
+            HumanMessage(content="please summarize"),
+            AIMessage(content=openai_content),
+        ]
+        out = format_messages_for_summary(msgs)
+        # Positive: the nested output_text prose must surface in the summary
+        # input (previously dropped by the type=="text" filter).
+        assert "Below is a summary" in out
+        # Negative: the raw dict repr of the OpenAI content list must not
+        # leak into the text view. BaseMessage.text strips metadata blocks.
+        assert "'type': 'reasoning'" not in out
+        assert "'summary': []" not in out
