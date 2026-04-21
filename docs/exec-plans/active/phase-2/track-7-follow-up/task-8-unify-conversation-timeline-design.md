@@ -1,9 +1,10 @@
-# Unify Conversation + Timeline onto Checkpoints — Design
+# Task 8 — Unify Conversation + Timeline onto Checkpoints (Design)
 
 **Issue:** [#89](https://github.com/shenjianan97/persistent-agent-runtime/issues/89)
 **Date:** 2026-04-20
-**Target landing:** multiple new tasks under `docs/exec-plans/active/phase-2/track-7-follow-up/` (decomposition in §Task decomposition below)
-**Status:** Draft design spec — feeds `writing-plans` to produce per-task specs
+**Track:** Phase 2 Track 7 Follow-up
+**Shape:** design spec for a multi-task body of work. `writing-plans` will produce per-task specs under `agent_tasks/` from §Task decomposition below (likely `task-8`..`task-12`).
+**Status:** Draft — awaiting user sign-off, then hand off to `writing-plans`.
 
 ## Problem
 
