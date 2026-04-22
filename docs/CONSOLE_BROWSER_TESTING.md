@@ -97,7 +97,7 @@ What to verify:
 - Budget fields show dollar conversion below the microdollar input
 - **Sandbox sub-section** renders with an enable toggle; enabling reveals template, vCPU, memory (MB), and timeout (seconds) inputs. Each input has a stable `data-testid`.
 - **Memory sub-section** renders with an enable toggle; enabling reveals summarizer-model selector and max-entries input.
-- **Context-management sub-section** renders (always visible — no enable toggle) with summarizer-model dropdown (`data-testid="context-management-summarizer-model"`), exclude-tools chip input (`data-testid="context-management-exclude-tools"`), and pre-Tier-3 memory-flush toggle (`data-testid="context-management-pre-tier3-flush"`, disabled when memory is off).
+- **Context-management sub-section** renders (always visible — no enable toggle) with summarizer-model dropdown (`data-testid="context-management-summarizer-model"`), exclude-tools chip input (`data-testid="context-management-exclude-tools"`), and save-important-facts checkbox (`data-testid="context-management-pre-tier3-flush"`, disabled when memory is off).
 - After creating, the agent appears in the list; values set in the sandbox / memory / context-management sub-sections are present on the detail page
 - Clicking the agent name navigates to `/agents/:agentId`
 - The detail page shows read-only mode by default
@@ -296,17 +296,17 @@ Preconditions: two agents seeded — `agent-memory-on` (`agent_config.memory.ena
 
 ### Scenario 15: Context Management Section
 
-Covers Track 7 Task 11 — the new "Context management" section on the Agent edit form. Verifies all three tuning fields persist end-to-end, the 50-entry cap is enforced, and the `pre_tier3_memory_flush` toggle correctly reflects memory-enabled state.
+Covers Track 7 Task 11 — the new "Long-Running Task Context" section on the Agent edit form. Verifies all three tuning fields persist end-to-end, the 50-entry cap is enforced, and the `pre_tier3_memory_flush` toggle correctly reflects memory-enabled state.
 
 Preconditions: at least one agent exists. Both a memory-enabled agent (`agent_config.memory.enabled = true`) and a memory-disabled agent (or absent) are helpful for the disabled-toggle branch.
 
-1. Navigate to `/agents/:agentId` and click `Edit`. Assert the `Context management` section renders after the `Memory` section, contains a `Summarizer Model` dropdown, an `Exclude Tools` chip input, and a `Pre-Tier-3 Memory Flush` checkbox. Assert there is NO `enabled` toggle for context management. The section header reads "Context management is always-on platform infrastructure; the fields below are tuning knobs, not an enable toggle."
+1. Navigate to `/agents/:agentId` and click `Edit`. Assert the `Long-Running Task Context` section renders after the `Memory` section, contains a `Summarizer Model` dropdown with a visible chevron affordance, an `Always Keep Outputs From` chip input, and a `Save Important Facts Before Summarizing` checkbox. Assert there is NO `enabled` toggle for context management. The section intro reads "When tasks run for a long time, the platform may summarize older context to keep the agent effective. These are advanced settings."
 
 2. Select a model from the `Summarizer Model` dropdown (`data-testid="context-management-summarizer-model"`). Type a tool name (e.g., `web_search`) into the chip input (`data-testid="context-management-exclude-tools"`) and press Enter. Confirm the chip appears. Toggle `pre_tier3_memory_flush` on (`data-testid="context-management-pre-tier3-flush"`). Click `Save Changes`. Navigate away and return to the agent. Re-enter edit mode and assert all three fields retain their saved values.
 
 3. With 50 chips already entered in `exclude_tools`, type a 51st tool name and press Enter. Assert the inline error "Maximum 50 entries" appears. Assert the chip count stays at 50. Assert `Save Changes` is not blocked by this client-side error — the user can still save (the 51st entry was rejected, not added).
 
-4. With a memory-disabled agent (or disable memory for the test agent), open edit mode. Assert the `Pre-Tier-3 Memory Flush` checkbox is visually disabled and a note reads "Requires memory to be enabled." Enable memory in the Memory section. Assert the `Pre-Tier-3 Memory Flush` checkbox becomes enabled.
+4. With a memory-disabled agent (or disable memory for the test agent), open edit mode. Assert the `Save Important Facts Before Summarizing` checkbox is visually disabled and a note reads "Requires memory to be enabled." Enable memory in the Memory section. Assert the checkbox becomes enabled.
 
 5. Open edit mode without touching any context management field. Click `Save Changes`. Inspect the PUT request body via `browser_network_requests`. Assert the `agent_config` does NOT contain a `context_management` key (don't-send-defaults).
 
@@ -319,17 +319,17 @@ What it validates: The Create Agent dialog exposes the same context-management t
 What to verify:
 
 1. Navigate to `/agents` and click `Create Agent`. Assert the dialog opens as a modal and is scrollable.
-2. In the create dialog, confirm a `Context Management` section renders after the `Memory` section. Assert it contains:
+2. In the create dialog, confirm a `Long-Running Task Context` section renders after the `Memory` section. Assert it contains:
    - the `Summarizer Model` dropdown (`data-testid="context-management-summarizer-model"`)
-   - the `Exclude Tools from Compaction` chip input (`data-testid="context-management-exclude-tools"`)
-   - the `Pre-Tier-3 Memory Flush` checkbox (`data-testid="context-management-pre-tier3-flush"`)
+   - the `Always Keep Outputs From` chip input (`data-testid="context-management-exclude-tools"`)
+   - the `Save Important Facts Before Summarizing` checkbox (`data-testid="context-management-pre-tier3-flush"`)
    - no `Enable Context Management` toggle
-3. With memory disabled, assert `Pre-Tier-3 Memory Flush` is disabled and the helper text reads `Requires memory to be enabled.`
-4. Enable memory in the same dialog. Assert `Pre-Tier-3 Memory Flush` becomes enabled.
-5. Select a context summarizer model, add at least one excluded tool chip, enable `Pre-Tier-3 Memory Flush`, then submit the form. Inspect the POST request body via `browser_network_requests` and assert `agent_config.context_management` contains the selected `summarizer_model`, `exclude_tools`, and `pre_tier3_memory_flush: true`.
-6. **Partial-input faithfulness (P1 regression guard):** open a second create dialog. Set ONLY the `Summarizer Model`; leave the `Pre-Tier-3 Memory Flush` checkbox unchecked and do not add any excluded tools. Submit. Inspect the POST body and assert `agent_config.context_management.pre_tier3_memory_flush === false` — the key MUST be present and explicitly `false` (not missing, not `true`). Rationale: the worker defaults a missing value to `true`, so an absent key would silently override the UI's unchecked state.
-7. **Summarizer × provider parity (P2 regression guard):** in a third create dialog, keep the default `provider = anthropic` and open the `Summarizer Model` dropdown. Assert every option belongs to the `anthropic` provider (no OpenAI / other-provider options visible). Then change the primary model to an OpenAI entry. Assert the summarizer dropdown re-renders with only OpenAI options; if a summarizer was previously selected on `anthropic`, it is cleared (the dropdown reverts to `Platform default`).
-8. Re-open the created agent in `/agents/:agentId`, enter edit mode, and confirm the same context-management values are present there. Also confirm the edit form applies the same summarizer × provider filtering (only options for the agent's provider are visible).
+3. With memory disabled, assert `Save Important Facts Before Summarizing` is disabled and the helper text reads `Requires memory to be enabled.`
+4. Enable memory in the same dialog. Assert the checkbox becomes enabled.
+5. Select a context summarizer model, add at least one excluded tool chip, enable `Save Important Facts Before Summarizing`, then submit the form. Inspect the POST request body via `browser_network_requests` and assert `agent_config.context_management` contains the selected `summarizer_model`, `exclude_tools`, and `pre_tier3_memory_flush: true`.
+6. **Partial-input faithfulness (P1 regression guard):** open a second create dialog. Set ONLY the `Summarizer Model`; leave the checkbox unchecked and do not add any excluded tools. Submit. Inspect the POST body and assert `agent_config.context_management.pre_tier3_memory_flush === false` — the key MUST be present and explicitly `false` (not missing, not `true`). Rationale: the worker defaults a missing value to `true`, so an absent key would silently override the UI's unchecked state.
+7. **Cross-provider summarizer support (P2 regression guard):** in a third create dialog, keep the default agent provider/model on an Anthropic entry and open the `Summarizer Model` dropdown. Assert options from multiple providers are visible in the same list. Select a non-Anthropic summarizer option, submit the form, and inspect the POST body via `browser_network_requests`. Assert `agent_config.context_management` contains both `summarizer_model` and `summarizer_provider`, and that the provider matches the selected summarizer rather than the primary agent provider.
+8. Re-open the created agent in `/agents/:agentId`, enter edit mode, and confirm the same context-management values are present there. Change the primary agent model/provider to a different provider and assert the cross-provider summarizer selection remains intact instead of being cleared. Also confirm the read-only detail view renders the summarizer as `Model Name (Provider)`.
 9. `browser_console_messages` shows no uncaught exceptions during the flow.
 
 ### Scenario 17: Langfuse Trace — Context Window Management (Track 7 AC 14 manual)

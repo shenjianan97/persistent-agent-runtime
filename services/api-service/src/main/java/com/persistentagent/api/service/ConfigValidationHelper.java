@@ -219,7 +219,9 @@ public class ConfigValidationHelper {
      *
      * <ul>
      *   <li>{@code summarizerModel}, when non-blank, must resolve against the
-     *       {@code models} table for the agent's provider (same lookup as
+     *       {@code models} table for the chosen summarizer provider. When
+     *       {@code summarizerProvider} is absent, legacy behaviour applies and
+     *       the agent's provider is used (same lookup as
      *       {@link #validateModel(String, String)}). Additionally, when the DB
      *       exposes {@code context_window} for both the summarizer and the primary
      *       model, the summarizer's context window must be ≥ the primary model's
@@ -247,12 +249,17 @@ public class ConfigValidationHelper {
         }
 
         // summarizer_model: optional; when present and non-blank, must be active
-        // for the agent's provider. Reject blank strings — ambiguous with absence.
+        // for the chosen summarizer provider (legacy fallback: agent provider).
+        // Reject blank strings — ambiguous with absence.
         if (cm.summarizerModel() != null && !cm.summarizerModel().isBlank()) {
-            if (!modelRepository.isModelActive(provider, cm.summarizerModel())) {
+            String summarizerProvider = (cm.summarizerProvider() != null && !cm.summarizerProvider().isBlank())
+                    ? cm.summarizerProvider()
+                    : provider;
+
+            if (!modelRepository.isModelActive(summarizerProvider, cm.summarizerModel())) {
                 throw new ValidationException(
-                        "Unsupported context_management.summarizer_model or provider: "
-                                + provider + "/" + cm.summarizerModel()
+                        "Unsupported context_management summarizer selection: "
+                                + summarizerProvider + "/" + cm.summarizerModel()
                                 + ". Check GET /v1/models for supported ones.");
             }
 
@@ -264,7 +271,7 @@ public class ConfigValidationHelper {
             // When either window is NULL / missing from DB, we skip the check (graceful
             // degradation: older model seeds do not carry context_window yet; the
             // migration 0014_model_context_window.sql adds the column with DEFAULT NULL).
-            modelRepository.getContextWindow(provider, cm.summarizerModel())
+            modelRepository.getContextWindow(summarizerProvider, cm.summarizerModel())
                     .ifPresent(summarizerWindow -> {
                         modelRepository.getContextWindow(provider, model).ifPresent(primaryWindow -> {
                             // Mirror Task 3 resolve_thresholds formula.

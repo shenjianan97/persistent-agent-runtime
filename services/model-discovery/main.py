@@ -11,39 +11,82 @@ from typing import Any, Mapping
 
 import psycopg
 
+
+def _with_anthropic_cache(input_rate: int, output_rate: int) -> dict:
+    """Anthropic published rates: cache_creation ≈ 1.25x input, cache_read
+    ≈ 0.1x input. Applies to both native Anthropic and Claude-on-Bedrock.
+    Integer math rounds toward zero; acceptable for microdollar precision.
+    """
+    return {
+        "input": input_rate,
+        "output": output_rate,
+        "cache_creation": (input_rate * 125) // 100,
+        "cache_read": input_rate // 10,
+    }
+
+
 # Prices in microdollars per million tokens (e.g. 3,000,000 = $3.00)
+# ``cache_creation`` / ``cache_read`` rates are optional — when absent the
+# worker falls back to the input rate (conservative: over-estimates cache
+# spend rather than under-reporting it).
 PRICING_DEFAULTS = {
     # Anthropic
-    "claude-3-7-sonnet-20250219": {"input": 3_000_000, "output": 15_000_000},
-    "claude-3-5-sonnet-20241022": {"input": 3_000_000, "output": 15_000_000},
-    "claude-3-5-haiku-20241022": {"input": 1_000_000, "output": 5_000_000},
+    "claude-3-7-sonnet-20250219": _with_anthropic_cache(3_000_000, 15_000_000),
+    "claude-3-5-sonnet-20241022": _with_anthropic_cache(3_000_000, 15_000_000),
+    "claude-3-5-haiku-20241022": _with_anthropic_cache(1_000_000, 5_000_000),
     # Claude Haiku 4.5 — published Bedrock/Anthropic rates are $0.80 / $4.00
     # per million input / output tokens.  Listed under both the bare family
     # alias (which is the platform default for the compaction summariser)
     # and the dated on-demand ID used by direct Anthropic API callers.
-    "claude-haiku-4-5": {"input": 800_000, "output": 4_000_000},
-    "claude-haiku-4-5-20251001": {"input": 800_000, "output": 4_000_000},
-    "claude-3-opus-20240229": {"input": 15_000_000, "output": 75_000_000},
-    # OpenAI
-    "gpt-4o": {"input": 2_500_000, "output": 10_000_000},
-    "gpt-4o-mini": {"input": 150_000, "output": 600_000},
-    "o1": {"input": 15_000_000, "output": 60_000_000},
-    "o1-mini": {"input": 3_000_000, "output": 12_000_000},
-    "o3-mini": {"input": 1_100_000, "output": 4_400_000},
+    "claude-haiku-4-5": _with_anthropic_cache(800_000, 4_000_000),
+    "claude-haiku-4-5-20251001": _with_anthropic_cache(800_000, 4_000_000),
+    "claude-3-opus-20240229": _with_anthropic_cache(15_000_000, 75_000_000),
+    # OpenAI — caching is automatic; cache_creation is always 0 for OpenAI,
+    # cache_read is ~0.5x input for GPT-4o family, ~0.5x for o-series.
+    "gpt-4o": {
+        "input": 2_500_000,
+        "output": 10_000_000,
+        "cache_creation": 0,
+        "cache_read": 1_250_000,
+    },
+    "gpt-4o-mini": {
+        "input": 150_000,
+        "output": 600_000,
+        "cache_creation": 0,
+        "cache_read": 75_000,
+    },
+    "o1": {
+        "input": 15_000_000,
+        "output": 60_000_000,
+        "cache_creation": 0,
+        "cache_read": 7_500_000,
+    },
+    "o1-mini": {
+        "input": 3_000_000,
+        "output": 12_000_000,
+        "cache_creation": 0,
+        "cache_read": 1_500_000,
+    },
+    "o3-mini": {
+        "input": 1_100_000,
+        "output": 4_400_000,
+        "cache_creation": 0,
+        "cache_read": 550_000,
+    },
     # Bedrock (Anthropic models via Bedrock use the same pricing)
-    "anthropic.claude-3-5-sonnet-20241022-v2:0": {"input": 3_000_000, "output": 15_000_000},
-    "anthropic.claude-3-5-haiku-20241022-v1:0": {"input": 1_000_000, "output": 5_000_000},
-    "anthropic.claude-3-opus-20240229-v1:0": {"input": 15_000_000, "output": 75_000_000},
-    "anthropic.claude-3-7-sonnet-20250219-v1:0": {"input": 3_000_000, "output": 15_000_000},
-    "anthropic.claude-sonnet-4-20250514-v1:0": {"input": 3_000_000, "output": 15_000_000},
-    "anthropic.claude-sonnet-4-5-20250929-v1:0": {"input": 3_000_000, "output": 15_000_000},
-    "anthropic.claude-sonnet-4-6": {"input": 3_000_000, "output": 15_000_000},
+    "anthropic.claude-3-5-sonnet-20241022-v2:0": _with_anthropic_cache(3_000_000, 15_000_000),
+    "anthropic.claude-3-5-haiku-20241022-v1:0": _with_anthropic_cache(1_000_000, 5_000_000),
+    "anthropic.claude-3-opus-20240229-v1:0": _with_anthropic_cache(15_000_000, 75_000_000),
+    "anthropic.claude-3-7-sonnet-20250219-v1:0": _with_anthropic_cache(3_000_000, 15_000_000),
+    "anthropic.claude-sonnet-4-20250514-v1:0": _with_anthropic_cache(3_000_000, 15_000_000),
+    "anthropic.claude-sonnet-4-5-20250929-v1:0": _with_anthropic_cache(3_000_000, 15_000_000),
+    "anthropic.claude-sonnet-4-6": _with_anthropic_cache(3_000_000, 15_000_000),
     # Claude Haiku 4.5 via Bedrock — $0.80 / $4.00 per million tokens.
-    "anthropic.claude-haiku-4-5-20251001-v1:0": {"input": 800_000, "output": 4_000_000},
-    "anthropic.claude-opus-4-20250514-v1:0": {"input": 15_000_000, "output": 75_000_000},
-    "anthropic.claude-opus-4-1-20250805-v1:0": {"input": 15_000_000, "output": 75_000_000},
-    "anthropic.claude-opus-4-5-20251101-v1:0": {"input": 15_000_000, "output": 75_000_000},
-    "anthropic.claude-opus-4-6-v1": {"input": 15_000_000, "output": 75_000_000},
+    "anthropic.claude-haiku-4-5-20251001-v1:0": _with_anthropic_cache(800_000, 4_000_000),
+    "anthropic.claude-opus-4-20250514-v1:0": _with_anthropic_cache(15_000_000, 75_000_000),
+    "anthropic.claude-opus-4-1-20250805-v1:0": _with_anthropic_cache(15_000_000, 75_000_000),
+    "anthropic.claude-opus-4-5-20251101-v1:0": _with_anthropic_cache(15_000_000, 75_000_000),
+    "anthropic.claude-opus-4-6-v1": _with_anthropic_cache(15_000_000, 75_000_000),
     "amazon.nova-pro-v1:0": {"input": 800_000, "output": 3_200_000},
     "amazon.nova-lite-v1:0": {"input": 60_000, "output": 240_000},
     "amazon.nova-micro-v1:0": {"input": 35_000, "output": 140_000},
@@ -582,16 +625,20 @@ def upsert_models(conn, provider_keys):
                             display_name,
                             input_microdollars_per_million,
                             output_microdollars_per_million,
+                            cache_creation_microdollars_per_million,
+                            cache_read_microdollars_per_million,
                             context_window,
                             is_active,
                             created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, true, NOW())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, true, NOW())
                         ON CONFLICT (provider_id, model_id) DO UPDATE SET
                             is_active = true,
                             display_name = EXCLUDED.display_name,
                             input_microdollars_per_million = EXCLUDED.input_microdollars_per_million,
                             output_microdollars_per_million = EXCLUDED.output_microdollars_per_million,
+                            cache_creation_microdollars_per_million = EXCLUDED.cache_creation_microdollars_per_million,
+                            cache_read_microdollars_per_million = EXCLUDED.cache_read_microdollars_per_million,
                             context_window = EXCLUDED.context_window
                         """,
                         (
@@ -600,6 +647,8 @@ def upsert_models(conn, provider_keys):
                             m["display_name"],
                             pricing["input"],
                             pricing["output"],
+                            pricing.get("cache_creation"),
+                            pricing.get("cache_read"),
                             context_window,
                         ),
                     )

@@ -34,6 +34,14 @@ public record ContextManagementConfigRequest(
         String summarizerModel,
 
         /**
+         * Optional provider for {@code summarizer_model}. When absent, the API
+         * preserves legacy behaviour and treats the agent's primary provider as
+         * the summarizer provider.
+         */
+        @JsonProperty("summarizer_provider")
+        String summarizerProvider,
+
+        /**
          * Optional list of tool names whose results must never be masked by Tier 1
          * observation-clearing. Additive to the platform's built-in exclude list
          * ({@code memory_note}, {@code save_memory}, {@code request_human_input},

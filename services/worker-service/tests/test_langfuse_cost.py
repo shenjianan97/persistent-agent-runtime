@@ -20,32 +20,73 @@ def _make_executor() -> GraphExecutor:
 
 
 # ---------------------------------------------------------------------------
-# _extract_tokens
+# _extract_token_usage
 # ---------------------------------------------------------------------------
+
+def _basic(metadata: dict, provider: str = "noop"):
+    usage = GraphExecutor._extract_token_usage(metadata, provider)
+    return (usage.input_tokens, usage.output_tokens)
+
 
 def test_extract_tokens_anthropic():
     metadata = {"usage": {"input_tokens": 100, "output_tokens": 50}}
-    assert GraphExecutor._extract_tokens(metadata) == (100, 50)
+    # The anthropic strategy reads the native ``usage`` shape directly.
+    assert _basic(metadata, "anthropic") == (100, 50)
 
 
 def test_extract_tokens_openai():
     metadata = {"token_usage": {"prompt_tokens": 100, "completion_tokens": 50}}
-    assert GraphExecutor._extract_tokens(metadata) == (100, 50)
+    assert _basic(metadata, "openai") == (100, 50)
 
 
 def test_extract_tokens_bedrock():
     metadata = {"usage_metadata": {"input_tokens": 100, "output_tokens": 50}}
-    assert GraphExecutor._extract_tokens(metadata) == (100, 50)
+    assert _basic(metadata, "bedrock") == (100, 50)
 
 
 def test_extract_tokens_empty():
-    assert GraphExecutor._extract_tokens({}) == (0, 0)
+    assert _basic({}, "noop") == (0, 0)
 
 
 def test_extract_tokens_partial():
     """Only input_tokens present, no output key — output should fall back to 0."""
     metadata = {"usage": {"input_tokens": 100}}
-    assert GraphExecutor._extract_tokens(metadata) == (100, 0)
+    assert _basic(metadata, "noop") == (100, 0)
+
+
+def test_extract_tokens_anthropic_cache_counters():
+    """Anthropic cache hit → cache_read_input_tokens populated; cost path
+    sees the non-cached portion of input as ``input_tokens``."""
+    metadata = {
+        "usage": {
+            "input_tokens": 20,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 5,
+            "cache_read_input_tokens": 1000,
+        }
+    }
+    usage = GraphExecutor._extract_token_usage(metadata, "anthropic")
+    assert usage.input_tokens == 20
+    assert usage.output_tokens == 50
+    assert usage.cache_creation_input_tokens == 5
+    assert usage.cache_read_input_tokens == 1000
+    assert usage.total_prompt_tokens == 1025
+
+
+def test_extract_tokens_openai_cached_tokens():
+    """OpenAI reports cached hits via prompt_tokens_details.cached_tokens;
+    the strategy normalises ``input_tokens`` to the non-cached portion."""
+    metadata = {
+        "token_usage": {
+            "prompt_tokens": 1200,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 1000},
+        }
+    }
+    usage = GraphExecutor._extract_token_usage(metadata, "openai")
+    assert usage.input_tokens == 200
+    assert usage.cache_read_input_tokens == 1000
+    assert usage.output_tokens == 50
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +101,8 @@ async def test_calculate_cost_known_model():
     executor.pool.fetchrow = AsyncMock(return_value={
         "input_microdollars_per_million": input_rate,
         "output_microdollars_per_million": output_rate,
+        "cache_creation_microdollars_per_million": None,
+        "cache_read_microdollars_per_million": None,
     })
 
     input_tokens = 200
@@ -89,6 +132,8 @@ async def test_calculate_cost_returns_metadata():
     executor.pool.fetchrow = AsyncMock(return_value={
         "input_microdollars_per_million": 1_000,
         "output_microdollars_per_million": 2_000,
+        "cache_creation_microdollars_per_million": None,
+        "cache_read_microdollars_per_million": None,
     })
 
     model = "test-model"
@@ -99,6 +144,114 @@ async def test_calculate_cost_returns_metadata():
     assert exec_meta["input_tokens"] == 42
     assert exec_meta["output_tokens"] == 17
     assert exec_meta["model"] == model
+
+
+@pytest.mark.asyncio
+async def test_calculate_cost_null_cache_rates_default_to_zero():
+    """A row predating migration 0022 (or any model not yet re-seeded by
+    model-discovery) has NULL cache rates. The previous fallback charged
+    cache reads at the full input rate — which is 10× Anthropic's real
+    rate and would silently over-bill tenants on every cache hit. New
+    contract: NULL → 0, and emit a single warning per (model, bucket).
+    """
+    executor = _make_executor()
+    executor.pool.fetchrow = AsyncMock(return_value={
+        "input_microdollars_per_million": 3_000_000,
+        "output_microdollars_per_million": 15_000_000,
+        "cache_creation_microdollars_per_million": None,
+        "cache_read_microdollars_per_million": None,
+    })
+
+    metadata = {
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 5_000,
+        }
+    }
+    cost, exec_meta = await executor._calculate_step_cost(
+        metadata, "claude-haiku-4-5", provider="anthropic"
+    )
+
+    # cache_creation + cache_read contribute $0 when rates are NULL; only
+    # the uncached input and output portions bill. Previously this would
+    # have been (100 + 200 + 5000) * 3_000_000 → 10x over-charge on the
+    # cache bucket.
+    expected = (100 * 3_000_000 + 50 * 15_000_000) // 1_000_000
+    assert cost == expected
+    # Counters still surface in execution_metadata for observability.
+    assert exec_meta["cache_creation_input_tokens"] == 200
+    assert exec_meta["cache_read_input_tokens"] == 5_000
+
+
+@pytest.mark.asyncio
+async def test_calculate_cost_honors_populated_cache_rates():
+    """When the row has real cache pricing, the four buckets price
+    independently — regression guard against the NULL fix also zeroing
+    out seeded rates."""
+    executor = _make_executor()
+    executor.pool.fetchrow = AsyncMock(return_value={
+        "input_microdollars_per_million": 3_000_000,
+        "output_microdollars_per_million": 15_000_000,
+        "cache_creation_microdollars_per_million": 3_750_000,  # 1.25x
+        "cache_read_microdollars_per_million": 300_000,         # 0.10x
+    })
+
+    metadata = {
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 200,
+            "cache_read_input_tokens": 5_000,
+        }
+    }
+    cost, _ = await executor._calculate_step_cost(
+        metadata, "claude-haiku-4-5", provider="anthropic"
+    )
+    expected = (
+        100 * 3_000_000
+        + 50 * 15_000_000
+        + 200 * 3_750_000
+        + 5_000 * 300_000
+    ) // 1_000_000
+    assert cost == expected
+
+
+@pytest.mark.asyncio
+async def test_missing_cache_rate_warning_deduped_per_model_bucket(caplog):
+    """The missing-cache-rate log fires at most once per (model, bucket)
+    within the executor's lifetime. Agents looping with NULL rates would
+    otherwise bury the log."""
+    import logging
+    executor = _make_executor()
+    executor.pool.fetchrow = AsyncMock(return_value={
+        "input_microdollars_per_million": 3_000_000,
+        "output_microdollars_per_million": 15_000_000,
+        "cache_creation_microdollars_per_million": None,
+        "cache_read_microdollars_per_million": None,
+    })
+
+    metadata = {
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 100,
+        }
+    }
+
+    with caplog.at_level(logging.WARNING, logger="executor.graph"):
+        for _ in range(5):
+            await executor._calculate_step_cost(
+                metadata, "claude-haiku-4-5", provider="anthropic"
+            )
+
+    matched = [
+        r for r in caplog.records
+        if "prompt_cache.missing_rate" in r.getMessage()
+        and "cache_read" in r.getMessage()
+    ]
+    assert len(matched) == 1
 
 
 # ---------------------------------------------------------------------------

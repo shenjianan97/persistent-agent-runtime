@@ -600,7 +600,7 @@ class AgentServiceTest {
     void createAgent_contextManagementEmptyObject_roundTripsIntact() throws Exception {
         // Empty context_management sub-object (all fields null) — persisted JSON has the
         // context_management key with null fields, but the sub-object itself is present.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null, null, null);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
@@ -635,7 +635,7 @@ class AgentServiceTest {
         // All three fields set — persisted JSON preserves them exactly with snake_case keys.
         List<String> excludeTools = List.of("web_search", "custom_tool_x");
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(
-                "claude-haiku-4-5", excludeTools, true, false);
+                "claude-haiku-4-5", null, excludeTools, true, false);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
@@ -677,7 +677,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_contextManagement_roundTripsIntact() throws Exception {
         // PUT path must canonicalize context_management identically to POST.
-        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, List.of("custom_tool"), false, null);
+        ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, List.of("custom_tool"), false, null);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);

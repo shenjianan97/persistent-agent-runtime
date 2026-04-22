@@ -78,10 +78,17 @@ describe('CreateAgentDialog', () => {
     it('renders context management controls and includes them in the create payload', async () => {
         render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
 
+        expect(screen.getByText('Long-Running Task Context')).toBeInTheDocument();
+        expect(
+            screen.getByText(/When tasks run for a long time, the platform may summarize older context/i)
+        ).toBeInTheDocument();
+        expect(screen.getByText('Always Keep Outputs From')).toBeInTheDocument();
+        expect(screen.getByText('Save Important Facts Before Summarizing')).toBeInTheDocument();
+
         fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Context Agent' } });
         fireEvent.click(screen.getByText('Enable Memory'));
         fireEvent.change(screen.getByTestId('context-management-summarizer-model'), {
-            target: { value: 'claude-3-5-haiku-latest' },
+            target: { value: 'openai|gpt-4o-mini' },
         });
         fireEvent.change(screen.getByPlaceholderText(/add tool name and press enter/i), {
             target: { value: 'web_search' },
@@ -98,7 +105,8 @@ describe('CreateAgentDialog', () => {
             expect.objectContaining({
                 agent_config: expect.objectContaining({
                     context_management: {
-                        summarizer_model: 'claude-3-5-haiku-latest',
+                        summarizer_model: 'gpt-4o-mini',
+                        summarizer_provider: 'openai',
                         exclude_tools: ['web_search'],
                         pre_tier3_memory_flush: true,
                     },
@@ -113,7 +121,7 @@ describe('CreateAgentDialog', () => {
 
         fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Partial Ctx Agent' } });
         fireEvent.change(screen.getByTestId('context-management-summarizer-model'), {
-            target: { value: 'claude-3-5-haiku-latest' },
+            target: { value: 'openai|gpt-4o-mini' },
         });
 
         fireEvent.click(screen.getByRole('button', { name: /create/i }));
@@ -122,21 +130,22 @@ describe('CreateAgentDialog', () => {
 
         const payload = createMock.mock.calls[0][0];
         expect(payload.agent_config.context_management).toEqual({
-            summarizer_model: 'claude-3-5-haiku-latest',
+            summarizer_model: 'gpt-4o-mini',
+            summarizer_provider: 'openai',
             pre_tier3_memory_flush: false,
         });
     });
 
-    it('filters summarizer-model options to the currently selected provider (P2 fix)', () => {
+    it('shows summarizer-model options across providers so customers can choose a cross-provider summarizer', () => {
         render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
 
         const summarizerSelect = screen.getByTestId('context-management-summarizer-model') as HTMLSelectElement;
         const optionValues = Array.from(summarizerSelect.querySelectorAll('option')).map((o) => o.value);
 
-        expect(optionValues).toContain('claude-3-5-sonnet-latest');
-        expect(optionValues).toContain('claude-3-5-haiku-latest');
-        expect(optionValues).not.toContain('gpt-4o');
-        expect(optionValues).not.toContain('gpt-4o-mini');
+        expect(optionValues).toContain('anthropic|claude-3-5-sonnet-latest');
+        expect(optionValues).toContain('anthropic|claude-3-5-haiku-latest');
+        expect(optionValues).toContain('openai|gpt-4o');
+        expect(optionValues).toContain('openai|gpt-4o-mini');
     });
 
     it('auto-selects the first available model so the display matches form state (no stale hardcoded default)', async () => {

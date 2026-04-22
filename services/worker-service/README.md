@@ -53,6 +53,7 @@ Create a `.env` file in `services/worker-service/` or export directly:
 | `MODEL_PRICING_FILE` | Custom model pricing map | `config/model_pricing.json` |
 | `MEMORY_DEFAULT_SUMMARIZER_MODEL` | Platform-default summarizer model for memory-enabled agents that don't set `agent_config.memory.summarizer_model` | `claude-haiku-4-5` |
 | `APP_DEV_TASK_CONTROLS_ENABLED` | Dev-only task controls and `dev_sleep` tool | `false` |
+| `WORKER_PROMPT_CACHE_DISABLED` | **Operator kill switch** for prompt-cache marker injection (Anthropic `cache_control`, Bedrock `cachePoint`). Set to `1` / `true` / `yes` / `on` to suppress markers fleet-wide. Token-usage extraction continues regardless so OpenAI's automatic caching still reports correctly. | unset (caching enabled) |
 
 > **Memory-enabled agents (Phase 2 Track 5).** Memory writes compute embeddings via
 > OpenAI's `text-embedding-3-small`. The worker reads the API key from the same
