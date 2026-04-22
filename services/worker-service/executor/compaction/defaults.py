@@ -71,6 +71,10 @@ PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
     # ToolMessages from in-flight checkpoints the same way. Remove after
     # the alias is retired (2 releases).
     "memory_note",
+    # Canonical terminal-commit tool (issue #102).
+    "commit_memory",
+    # Backward-compat alias for ``commit_memory``. Same retention reason
+    # as ``memory_note`` above.
     "save_memory",
     "request_human_input",
     # Memory-retrieval results: the agent *just explicitly fetched* these to

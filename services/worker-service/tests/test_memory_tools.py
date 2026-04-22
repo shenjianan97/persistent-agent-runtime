@@ -202,8 +202,10 @@ class TestMemoryNoteTool:
         assert messages[0].tool_call_id == "call_xyz"
         # Informative return — gives the agent direct evidence the call
         # landed, which fixes the hedging behaviour documented in #102.
-        assert "1 finding" in messages[0].content
-        assert "captured" in messages[0].content
+        # Informative return in the new "#N, including this call" shape so
+        # parallel-super-step siblings don't look like a stuck counter.
+        assert "#1" in messages[0].content
+        assert "including this call" in messages[0].content
 
     def test_note_finding_count_reflects_pre_update_state(self) -> None:
         """Count in the ToolMessage is ``len(observations) + 1``."""
@@ -214,7 +216,7 @@ class TestMemoryNoteTool:
         result = _invoke_with_tool_call(
             tool, {"text": "third"}, observations=["first", "second"]
         )
-        assert "3 finding" in result.update["messages"][0].content
+        assert "#3" in result.update["messages"][0].content
 
     def test_memory_note_alias_logs_deprecation(self, caplog) -> None:
         """The deprecated alias routes to the same handler but emits a
@@ -231,7 +233,8 @@ class TestMemoryNoteTool:
         # Behaviour identical to the canonical tool — observation appended,
         # informative ToolMessage content returned.
         assert result.update["observations"] == ["hi"]
-        assert "1 finding" in result.update["messages"][0].content
+        assert "#1" in result.update["messages"][0].content
+        assert "including this call" in result.update["messages"][0].content
         # Exactly one deprecation warning emitted for this call.
         matched = [
             r for r in caplog.records
@@ -294,10 +297,11 @@ class TestCommitMemoryTool:
         messages = result.update["messages"]
         assert len(messages) == 1
         assert messages[0].tool_call_id == "call_commit_1"
-        # Informative return — tells the agent the opt-in landed and how
-        # many findings will flow through to the memory entry. Issue #102.
+        # Informative return — tells the agent the opt-in landed and reassures
+        # that an empty-findings commit still produces a useful memory entry
+        # (composed from transcript + rationale). Issue #102.
         assert "Commit confirmed" in messages[0].content
-        assert "0 finding" in messages[0].content
+        assert "No findings captured" in messages[0].content
 
     def test_return_counts_findings_from_observations_only(self) -> None:
         """The count in commit_memory's return is simply

@@ -80,10 +80,10 @@ class TestPlatformExcludeTools:
     """PLATFORM_EXCLUDE_TOOLS must be a frozenset containing every tool
     whose ToolMessages Tier 1 must never age out.
 
-    After issue #102 the set contains six names: the canonical
-    ``note_finding`` plus its deprecated alias ``memory_note`` (remove once
-    the alias retires), ``save_memory``, ``request_human_input``,
-    ``memory_search``, ``task_history_get``.
+    After issue #102 the set contains seven names: the two canonical memory
+    tools ``note_finding`` and ``commit_memory``, their deprecated aliases
+    ``memory_note`` / ``save_memory`` (remove once the aliases retire),
+    ``request_human_input``, ``memory_search``, ``task_history_get``.
     """
 
     def test_is_frozenset(self):
@@ -102,7 +102,16 @@ class TestPlatformExcludeTools:
 
         assert "memory_note" in PLATFORM_EXCLUDE_TOOLS
 
-    def test_contains_save_memory(self):
+    def test_contains_commit_memory(self):
+        """Canonical terminal-commit tool (issue #102). Its confirmation
+        ToolMessage must survive Tier 1 clearing so the agent retains
+        evidence it opted in."""
+        from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
+
+        assert "commit_memory" in PLATFORM_EXCLUDE_TOOLS
+
+    def test_contains_save_memory_alias(self):
+        """Legacy alias kept until the alias tool is retired (issue #102)."""
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
 
         assert "save_memory" in PLATFORM_EXCLUDE_TOOLS
@@ -122,12 +131,13 @@ class TestPlatformExcludeTools:
 
         assert "task_history_get" in PLATFORM_EXCLUDE_TOOLS
 
-    def test_exactly_six_tools(self):
+    def test_exactly_seven_tools(self):
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
 
-        # Six: note_finding, memory_note (alias), save_memory,
-        # request_human_input, memory_search, task_history_get.
-        assert len(PLATFORM_EXCLUDE_TOOLS) == 6
+        # Seven: note_finding, memory_note (alias), commit_memory,
+        # save_memory (alias), request_human_input, memory_search,
+        # task_history_get.
+        assert len(PLATFORM_EXCLUDE_TOOLS) == 7
 
     def test_immutable(self):
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS

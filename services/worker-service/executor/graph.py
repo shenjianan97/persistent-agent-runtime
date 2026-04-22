@@ -92,6 +92,7 @@ from core.memory_repository import (
     count_entries_for_agent,
     max_entries_for_agent,
     pending_memory_log_preview,
+    read_memory_commit_rationales_by_task_id,
     read_memory_observations_by_task_id,
     read_pending_memory_from_state_values,
     resolve_attached_memories_for_task,
@@ -2531,14 +2532,15 @@ class GraphExecutor:
 
         # Phase 2 Track 5 Task 12 / Issue #102 — memory-tool framing. Gated
         # on what is actually registered: ``note_finding`` / ``memory_search``
-        # whenever the stack is on; ``save_memory`` only in ``agent_decides``.
+        # whenever the stack is on; ``commit_memory`` only in ``agent_decides``.
         # Tool descriptions alone underspecify behavior — LLMs reliably forget
         # optional retrieval tools without a platform nudge, and the two
         # memory-writing tools need sequencing guidance or agents hedge by
         # calling both for every finding (the failure mode that issue #102
         # tracks). The prose here explicitly names the distinct roles:
-        # ``note_finding`` = scratchpad during the run, ``save_memory`` =
-        # terminal commit switch.
+        # ``note_finding`` = scratchpad during the run, ``commit_memory`` =
+        # terminal commit trigger (NOT the save itself — a dedicated
+        # summarizer composes the body).
         if memory_decision is not None and memory_decision.stack_enabled:
             sections.append(
                 "This agent has persistent memory. Before starting non-trivial "
@@ -2895,11 +2897,22 @@ class GraphExecutor:
                 # super-step checkpoint and implicit for subsequent resumes.
                 attached_preamble: str | None = None
                 seeded_observations: list[str] | None = None
+                # Issue #102 — redrive / follow-up needs to re-seed both the
+                # findings channel AND the new commit_rationales channel so
+                # the UPSERT's ``ON CONFLICT DO UPDATE`` doesn't clobber a
+                # prior run's rationales with the current run's (possibly
+                # empty) list.
+                seeded_commit_rationales: list[str] | None = None
                 if first_execution:
                     async with self.pool.acquire() as _attach_conn:
                         if memory_enabled_for_task:
                             seeded_observations = (
                                 await read_memory_observations_by_task_id(
+                                    _attach_conn, tenant_id, agent_id, task_id,
+                                )
+                            )
+                            seeded_commit_rationales = (
+                                await read_memory_commit_rationales_by_task_id(
                                     _attach_conn, tenant_id, agent_id, task_id,
                                 )
                             )
@@ -2973,14 +2986,19 @@ class GraphExecutor:
                         if memory_enabled_for_task and seeded_observations
                         else []
                     )
+                    # Issue #102 — seed commit_rationales from the prior-run
+                    # DB row on redrive so the UPSERT's UPDATE branch doesn't
+                    # overwrite prior rationales with an empty list when the
+                    # redriven run doesn't call commit_memory.
+                    _commit_rationales: list[str] = (
+                        list(seeded_commit_rationales)
+                        if memory_enabled_for_task and seeded_commit_rationales
+                        else []
+                    )
                     _payload: dict[str, Any] = {
                         "messages": initial_messages,
                         "observations": _observations,
-                        # Issue #102 — commit_rationales is the new parallel
-                        # channel for save_memory/commit_memory reasons. Empty
-                        # list seeds the ``operator.add`` reducer the same way
-                        # ``observations`` is seeded.
-                        "commit_rationales": [],
+                        "commit_rationales": _commit_rationales,
                         "pending_memory": {},
                         # Phase 2 Track 5 Task 12 — per-run reset of the
                         # ``agent_decides`` opt-in flag. The field has no
@@ -3034,6 +3052,15 @@ class GraphExecutor:
                             follow_up_payload: dict[str, Any] = {
                                 "messages": [_follow_up_message],
                                 "memory_opt_in": False,
+                                # Issue #102 — seed commit_rationales: []
+                                # defensively for resumes from pre-migration
+                                # checkpoints whose state may lack the
+                                # channel entirely. ``operator.add`` on
+                                # ``None + [...]`` would TypeError; an
+                                # explicit [] is a belt-and-suspenders
+                                # guarantee that a legacy checkpoint's next
+                                # commit_memory call merges cleanly.
+                                "commit_rationales": [],
                             }
                             initial_input = follow_up_payload
                         elif payload.get("kind") == "input":

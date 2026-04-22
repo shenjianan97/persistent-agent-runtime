@@ -317,7 +317,7 @@ NOTE_FINDING_DESCRIPTION = (
     "each call appends to your findings list, which survives context "
     "compaction and feeds the post-task summary. This is a scratchpad, NOT "
     "a durable save: in `agent_decides` memory mode, findings only persist "
-    "across runs if you also call `save_memory` at task end. "
+    "across runs if you also call `commit_memory` at task end. "
     f"Max {MEMORY_NOTE_MAX_LEN} characters per call. Zero cost."
 )
 
@@ -369,18 +369,25 @@ def _make_note_finding_handler(
         )
         # ``observations`` is the pre-update list (InjectedState reads state
         # before this super-step's reducer runs). The post-update count is
-        # one higher. Surfacing the count in the ToolMessage gives the agent
-        # direct evidence that its call landed, which stops the hedging
-        # behavior where it re-invokes the sibling ``save_memory`` just to
-        # "be sure" (see issue #102).
+        # one higher. Surfacing the count gives the agent direct evidence
+        # that its call landed, which stops the hedging behavior where it
+        # re-invokes the sibling memory tool just to "be sure" (issue #102).
+        #
+        # Concurrency caveat: three parallel ``note_finding`` calls in the
+        # same super-step each see the same pre-reducer state and each
+        # would report the same ``new_count``. Hedge the wording so
+        # parallel-call outputs don't look like a stuck counter that would
+        # push the agent to retry — we qualify the count with "including
+        # this one" and drop the "so far in this run" framing.
         current_count = len(observations or [])
         new_count = current_count + 1
         return Command(update={
             "messages": [
                 ToolMessage(
                     content=(
-                        f"Noted. {new_count} finding(s) captured so far "
-                        f"in this run."
+                        f"Noted (#{new_count}, including this call). Your "
+                        "findings list is preserved across compaction and "
+                        "feeds the post-task summary."
                     ),
                     tool_call_id=tool_call_id,
                 )
@@ -522,6 +529,22 @@ def _make_commit_memory_handler(
         # memory entry", disambiguating commit_memory from note_finding —
         # the fix for the hedging behavior documented in issue #102.
         findings_count = len(observations or [])
+        # Zero-findings branch: the literal "0 finding(s) will persist" reads
+        # as an error to most models and triggers a retry / panic flow.
+        # Reassure the agent that the memory write still composes usefully
+        # from the final transcript + rationale even with no note_finding
+        # calls — that's what the summarizer does at ``memory_graph.py`` anyway.
+        if findings_count == 0:
+            tool_content = (
+                "Commit confirmed. No findings captured this run — the "
+                "memory entry will be composed from the transcript and "
+                "your rationale."
+            )
+        else:
+            tool_content = (
+                f"Commit confirmed. {findings_count} finding(s) will "
+                "persist with this task's memory entry at completion."
+            )
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — every LLM tool call needs a paired
         # reply or the next agent step rejects the orphan as a fatal graph
@@ -531,11 +554,7 @@ def _make_commit_memory_handler(
             update={
                 "messages": [
                     ToolMessage(
-                        content=(
-                            f"Commit confirmed. {findings_count} finding(s) "
-                            f"will persist with this task's memory entry "
-                            f"at completion."
-                        ),
+                        content=tool_content,
                         tool_call_id=tool_call_id,
                     ),
                 ],

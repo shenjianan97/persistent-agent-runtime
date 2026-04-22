@@ -147,6 +147,7 @@ public class MemoryRepository {
                         + "  pg_column_size(title)"
                         + " + pg_column_size(summary)"
                         + " + pg_column_size(observations)"
+                        + " + COALESCE(pg_column_size(commit_rationales), 0)"
                         + " + pg_column_size(tags)"
                         + " + 1536 * 4"
                         + "), 0) FROM agent_memory_entries"
