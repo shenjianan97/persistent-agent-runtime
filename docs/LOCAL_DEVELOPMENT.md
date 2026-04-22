@@ -27,7 +27,7 @@ make start
 - loads local overrides from `.env.localdev`
 - uses sensible local defaults for `DB_DSN` and `VITE_API_BASE_URL`
 - starts the local Langfuse Docker stack automatically
-- forwards `APP_DEV_TASK_CONTROLS_ENABLED` to the API, worker, and console when set
+- forwards `APP_DEV_TASK_CONTROLS_ENABLED` (default `true` for local dev) to the API, worker, and console, and `VITE_DEV_TASK_CONTROLS_ENABLED` (derived from it) to the console
 - checks the existing `persistent-agent-runtime-postgres` container and starts it if needed
 - expects dependencies to already be installed via `make install`
 - runs model discovery before starting services
@@ -169,6 +169,26 @@ grep '<task-id>' .tmp/worker-*.log | grep -v '^{'
 
 The worker service defaults to `INFO` in code (see `services/worker-service/core/logging.py`). DEBUG is enabled *only* by the Makefile's `WORKER_LOG_LEVEL ?= DEBUG`, which applies to `make start` / `make start-worker` / `make scale-worker`. Production deploys (Helm, CDK) must not set `WORKER_LOG_LEVEL` — at fleet scale DEBUG produces several MB of JSON per hour per worker.
 
+### Disabling prompt-cache markers (operator kill switch)
+
+Prompt caching is on by default — the worker adds provider-specific cache markers (`cache_control` for Anthropic, `cachePoint` for Bedrock Converse) to every LLM request so multi-turn agent loops cache their stable prefix. There is **no per-agent toggle** by design: disabling caching only raises costs, so the knob is deliberately not exposed as customer config.
+
+The `WORKER_PROMPT_CACHE_DISABLED` env var is an **operator-only emergency lever** — use it when a provider caching regression, a suspected SDK bug, or a debugging need requires suppressing markers without touching the database. The Makefile forwards it:
+
+```bash
+# Kill switch for this session — all workers start with markers suppressed
+WORKER_PROMPT_CACHE_DISABLED=1 make start
+
+# Restart just the workers with caching off, keeping the rest of the stack up
+WORKER_PROMPT_CACHE_DISABLED=1 make restart
+```
+
+Accepted truthy values (case-insensitive): `1`, `true`, `yes`, `on`. Anything else (including unset, empty, `0`, `false`) keeps caching enabled.
+
+Token-usage extraction is intentionally **not** gated on this flag — OpenAI caches prefixes automatically regardless of whether we inject markers, and we must keep extracting `cached_tokens` from their response metadata to avoid mis-reporting cached reads as regular input tokens (which would over-attribute spend by ~10× on cached turns).
+
+When the kill switch is active, the worker emits a single `prompt_cache.markers_disabled_via_env` warning at startup so it's clear in logs that markers are off on purpose.
+
 ## Dev-Only Task Controls
 
 The runtime includes dev-only endpoints and tools for testing failure and recovery flows locally:
@@ -177,18 +197,19 @@ The runtime includes dev-only endpoints and tools for testing failure and recove
 - `POST /v1/dev/tasks/{taskId}/force-dead-letter` — forces a task into the dead-letter path
 - `dev_sleep` tool — an agent tool that sleeps for a configurable duration, useful for exercising timeout and long-running-task behavior deterministically
 
-These are disabled by default. To enable them:
+**These are enabled by default under `make start`** — the Makefile sets `APP_DEV_TASK_CONTROLS_ENABLED ?= true` because local development is the Makefile's only audience. Production deploys (Helm, CDK, Lambda) don't invoke the Makefile and therefore see each service's code-level default of `false` when the env var is unset.
+
+To explicitly opt out for a local run:
 
 ```bash
-APP_DEV_TASK_CONTROLS_ENABLED=true make start
+APP_DEV_TASK_CONTROLS_ENABLED=false make start
 ```
 
 ## Timing Configuration
 
-For faster local recovery testing, you can shorten the lease, heartbeat, and reaper timings:
+For faster local recovery testing, you can shorten the lease, heartbeat, and reaper timings (dev task controls are already on under `make start`):
 
 ```bash
-APP_DEV_TASK_CONTROLS_ENABLED=true \
 LEASE_DURATION_SECONDS=10 \
 HEARTBEAT_INTERVAL_SECONDS=2 \
 REAPER_INTERVAL_SECONDS=5 \

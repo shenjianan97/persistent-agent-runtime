@@ -55,6 +55,7 @@ from executor.compaction.tokens import (
     extract_text_content as _extract_message_text,
 )
 from executor.compaction.summarizer import summarize_slice
+from executor.prompt_cache import TokenUsage, get_strategy as _get_cache_strategy
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
     DEAD_LETTER_REASON_CONTEXT_EXCEEDED_IRRECOVERABLE,
@@ -157,6 +158,33 @@ logger = logging.getLogger(__name__)
 # task_id) are bound at emit time via kwargs.
 from core.logging import get_logger as _get_structlog_logger
 _compaction_logger = _get_structlog_logger(worker_id="graph")
+
+def _prompt_cache_markers_disabled_by_env() -> bool:
+    """Operator kill switch for prompt-cache marker injection.
+
+    Set ``WORKER_PROMPT_CACHE_DISABLED`` to ``1`` / ``true`` / ``yes`` / ``on``
+    (case-insensitive) to suppress provider-specific cache marker injection
+    (Anthropic ``cache_control`` blocks, Bedrock ``cachePoint`` blocks) across
+    the entire worker. Intended as an emergency lever — a provider caching
+    regression, a suspected SDK bug — not a per-agent tuning knob. Per-agent
+    overrides are deliberately out of scope: toggling caching off never helps
+    a workload, so we don't expose it as customer-facing config.
+
+    Token-usage extraction is intentionally NOT gated on this flag. OpenAI
+    caches prefixes automatically regardless of whether we set markers; if
+    extraction were skipped, cached reads would be attributed as regular
+    input tokens and cost reporting would silently inflate by ~10×.
+    """
+    raw = os.environ.get("WORKER_PROMPT_CACHE_DISABLED", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+# Evaluated once at module load — env vars are immutable for a worker's
+# lifetime.  The Makefile's ``start-worker`` target forwards this variable,
+# so ``WORKER_PROMPT_CACHE_DISABLED=1 make start`` is sufficient to disable
+# caching fleet-wide in local dev without touching code or config.
+_PROMPT_CACHE_MARKERS_ENABLED: bool = not _prompt_cache_markers_disabled_by_env()
+
 
 _FUTURE_WORK_PROMISE_RE = re.compile(
     r"\b(?:i(?:'| wi)ll|let me|next i(?:'| wi)ll|now i(?:'| wi)ll)\s+"
@@ -652,8 +680,34 @@ class GraphExecutor:
         self.config = config
         self.pool = pool
         self.deps = deps or create_default_dependencies()
-        # Per-model cost rate cache: {model_name: (input_rate, output_rate)}
-        self._cost_rate_cache: dict[str, tuple[int, int]] = {}
+        if not _PROMPT_CACHE_MARKERS_ENABLED:
+            # One structured log at worker init — operators who set the kill
+            # switch want confirmation it took effect without tailing every
+            # task.  Fires once per GraphExecutor (i.e. once per worker).
+            logger.warning(
+                "prompt_cache.markers_disabled_via_env "
+                "worker_id=%s env=WORKER_PROMPT_CACHE_DISABLED",
+                getattr(config, "worker_id", "unknown"),
+            )
+        # Per-model cost rate cache:
+        # {model_name: (input_rate, output_rate,
+        #               cache_creation_rate, cache_read_rate)}
+        # ``cache_creation_rate`` / ``cache_read_rate`` are ``None`` when the
+        # model row doesn't specify them — callers fall back to 0 so the
+        # ledger under-reports rather than 10x over-charging on Anthropic
+        # cache reads.
+        self._cost_rate_cache: dict[
+            str, tuple[int, int, int | None, int | None]
+        ] = {}
+        # One-shot dedup for missing-cache-rate warnings: ``(model, bucket)``
+        # pairs already warned about within this executor's lifetime. Keeps
+        # a noisy agent loop from burying the log while still surfacing the
+        # first occurrence loudly.
+        self._missing_cache_rate_warned: set[tuple[str, str]] = set()
+        # Same dedup for the "markers skipped on unsupported model" path —
+        # fleets mixing GLM/Llama with Claude/Nova would otherwise log it
+        # on every task. ``(provider, model)`` pairs already reported.
+        self._cache_skip_logged: set[tuple[str, str]] = set()
         if s3_client is not None:
             self.s3_client = s3_client
         else:
@@ -1065,6 +1119,39 @@ class GraphExecutor:
 
         llm = await providers.create_llm(self.pool, provider, model_name, temperature)
 
+        # Prompt caching is a strategy plug-in keyed by provider. The agent
+        # loop below does not branch on provider — ``_cache_strategy``
+        # handles marker placement for Anthropic-family providers,
+        # passes through unchanged for OpenAI (automatic caching), and is
+        # a no-op for anything else. Adding a provider = register in
+        # ``executor.prompt_cache.__init__``; the agent loop never grows.
+        _cache_strategy = _get_cache_strategy(provider)
+        # Model-level gate: Bedrock hosts third-party families (GLM, Llama,
+        # Mistral, Cohere) that reject ``cachePoint`` with
+        # ``AccessDeniedException``. Skip marker injection for them — usage
+        # extraction still runs so any provider-side automatic caching is
+        # attributed correctly.
+        _model_supports_caching = _cache_strategy.supports_caching(model_name)
+        _apply_cache_markers = (
+            _PROMPT_CACHE_MARKERS_ENABLED and _model_supports_caching
+        )
+        # Log once per (provider, model) per executor lifetime. Fleets
+        # running a mix of cache-capable and cache-incapable models would
+        # otherwise emit this line on every task.
+        if (
+            _PROMPT_CACHE_MARKERS_ENABLED
+            and not _model_supports_caching
+        ):
+            skip_key = (provider, model_name)
+            if skip_key not in self._cache_skip_logged:
+                self._cache_skip_logged.add(skip_key)
+                logger.info(
+                    "prompt_cache.markers_skipped_unsupported_model "
+                    "provider=%s model=%s",
+                    provider,
+                    model_name,
+                )
+
         # Register built-in tools (pass sandbox and s3_client for sandbox tools)
         tools = self._get_tools(
             allowed_tools,
@@ -1245,10 +1332,12 @@ class GraphExecutor:
             "callbacks": [],
             # Follow-up fix: expose the same pricing lookup used by the main-
             # agent cost path so compaction.tier3 ledger rows record real
-            # cost_microdollars instead of always being 0. Bound-method
-            # reference — the LRU cache inside GraphExecutor persists across
-            # compaction firings within one task.
-            "pricing_lookup": self._get_model_cost_rates,
+            # cost_microdollars instead of always being 0.  The summariser
+            # contract expects ``(input_rate, output_rate)`` — we drop the
+            # cache-rate tail (summariser is a one-shot call, never cached)
+            # rather than threading a wider pricing shape through that code
+            # path just for compaction telemetry.
+            "pricing_lookup": self._summarizer_pricing_lookup,
         }
 
         async def agent_node(state: RuntimeState, config: RunnableConfig):
@@ -1302,7 +1391,21 @@ class GraphExecutor:
                 platform_system_message=platform_system_msg if platform_system_msg else None,
                 summarizer_context_window=_summarizer_context_window,
             )
-            messages_for_llm = pass_result.messages
+            # The compaction hook produced the final projection; layer
+            # provider-specific prompt-cache markers on top before the LLM
+            # call. The strategy returns a new list so the pre-marker shape
+            # stays available for logging / replay diagnostics.
+            #
+            # ``WORKER_PROMPT_CACHE_DISABLED=1`` short-circuits marker
+            # injection worker-wide. Token-usage extraction stays on so
+            # providers that cache automatically (OpenAI) still report
+            # correctly.
+            if _apply_cache_markers:
+                messages_for_llm = _cache_strategy.apply_cache_markers(
+                    pass_result.messages
+                )
+            else:
+                messages_for_llm = list(pass_result.messages)
             compaction_state_updates = pass_result.state_updates
 
             # Emit structured-log events from the hook and raise immediately
@@ -1649,31 +1752,74 @@ class GraphExecutor:
         workflow.add_edge(START, "agent")
         return workflow
 
-    async def _get_model_cost_rates(self, model_name: str) -> tuple[int, int]:
-        """Fetch input/output cost rates (microdollars per million tokens) from DB.
-        Returns (input_rate, output_rate). Caches per model within a task execution."""
+    async def _get_model_cost_rates(
+        self, model_name: str
+    ) -> tuple[int, int, int | None, int | None]:
+        """Fetch cost rates (microdollars per million tokens) from DB.
+
+        Returns ``(input_rate, output_rate, cache_creation_rate,
+        cache_read_rate)``. The trailing two values are ``None`` when the
+        model row omits them — :func:`_calculate_step_cost` then falls back
+        to ``0`` and logs once per model so the ledger under-reports rather
+        than silently over-charging (Anthropic cache reads are 10% of input
+        rate; defaulting a NULL to the full input rate would 10x the
+        customer's cache-read spend). Model-discovery re-seeding is the
+        fix path; the logged warning tells operators which row needs it.
+        Cached per-model for the lifetime of this GraphExecutor.
+
+        The legacy two-tuple signature used by some callers (notably the
+        Tier-3 summariser pricing lookup) is preserved at the call site by
+        unpacking only the first two values; this method is the source of
+        truth and returns the full quadruple.
+        """
         if model_name in self._cost_rate_cache:
             return self._cost_rate_cache[model_name]
 
         try:
             row = await self.pool.fetchrow(
-                "SELECT input_microdollars_per_million, output_microdollars_per_million FROM models WHERE model_id = $1",
+                """SELECT input_microdollars_per_million,
+                          output_microdollars_per_million,
+                          cache_creation_microdollars_per_million,
+                          cache_read_microdollars_per_million
+                     FROM models WHERE model_id = $1""",
                 model_name,
             )
             if row is None:
                 logger.warning("Model %s not found in models table; using zero cost rates", model_name)
-                rates = (0, 0)
+                rates: tuple[int, int, int | None, int | None] = (0, 0, None, None)
             else:
+                cache_creation = row["cache_creation_microdollars_per_million"]
+                cache_read = row["cache_read_microdollars_per_million"]
                 rates = (
                     int(row["input_microdollars_per_million"] or 0),
                     int(row["output_microdollars_per_million"] or 0),
+                    int(cache_creation) if cache_creation is not None else None,
+                    int(cache_read) if cache_read is not None else None,
                 )
         except Exception:
             logger.warning("Failed to fetch cost rates for model %s; using zero cost rates", model_name, exc_info=True)
-            rates = (0, 0)
+            rates = (0, 0, None, None)
 
         self._cost_rate_cache[model_name] = rates
         return rates
+
+    def _warn_missing_cache_rate(self, model_name: str, bucket: str) -> None:
+        """Emit a single warning per (model, bucket) when cache pricing is NULL.
+
+        Caller only invokes this on turns where the bucket actually
+        accumulated tokens, so a model whose cache is never hit stays
+        silent. Model-discovery re-seeding clears the condition.
+        """
+        key = (model_name, bucket)
+        if key in self._missing_cache_rate_warned:
+            return
+        self._missing_cache_rate_warned.add(key)
+        logger.warning(
+            "prompt_cache.missing_rate model=%s bucket=%s "
+            "(defaulting to 0; re-run model-discovery to seed)",
+            model_name,
+            bucket,
+        )
 
     async def _get_model_context_window(self, model_name: str) -> int:
         """Fetch the context window token count for a model from the models table.
@@ -1716,18 +1862,33 @@ class GraphExecutor:
             )
             return self._DEFAULT_MODEL_CONTEXT_WINDOW
 
+    async def _summarizer_pricing_lookup(
+        self, model_name: str
+    ) -> tuple[int, int]:
+        """Two-tuple adapter for the compaction summariser.
+
+        ``summarize_slice`` unpacks ``(input_rate, output_rate)`` directly;
+        it has no concept of cache tokens (the summariser is a single
+        non-cached call per firing). This shim preserves the legacy shape
+        while :meth:`_get_model_cost_rates` returns the full quadruple for
+        the main agent cost path.
+        """
+        rates = await self._get_model_cost_rates(model_name)
+        return (rates[0], rates[1])
+
     @staticmethod
-    def _extract_tokens(metadata: dict) -> tuple[int, int]:
-        """Returns (input_tokens, output_tokens). Falls back to (0, 0) if not found."""
-        usage = (
-            metadata.get("usage")              # Anthropic, Google
-            or metadata.get("token_usage")     # OpenAI via LangChain
-            or metadata.get("usage_metadata")  # Bedrock
-            or {}
-        )
-        input_t = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
-        output_t = usage.get("output_tokens") or usage.get("completion_tokens") or 0
-        return (int(input_t), int(output_t))
+    def _extract_token_usage(
+        metadata: dict, provider: str
+    ) -> TokenUsage:
+        """Delegate to the provider's :class:`PromptCacheStrategy`.
+
+        Centralising this keeps ``_calculate_step_cost`` provider-neutral —
+        any provider-specific metadata-key handling lives inside the
+        strategy, which is the single place callers add branches when
+        onboarding a new LLM.
+        """
+        strategy = _get_cache_strategy(provider)
+        return strategy.extract_token_usage(metadata)
 
     async def _record_step_cost(
         self, conn, task_id: str, tenant_id: str, agent_id: str,
@@ -1799,17 +1960,71 @@ class GraphExecutor:
 
         return (int(cumulative_task_cost), int(hourly_cost or 0))
 
-    async def _calculate_step_cost(self, response_metadata: dict, model_name: str) -> tuple[int, dict]:
+    async def _calculate_step_cost(
+        self,
+        response_metadata: dict,
+        model_name: str,
+        *,
+        provider: str | None = None,
+    ) -> tuple[int, dict]:
         """Extract tokens from response metadata and calculate cost in microdollars.
-        Returns (cost_microdollars, execution_metadata_dict)."""
-        input_tokens, output_tokens = self._extract_tokens(response_metadata)
-        input_rate, output_rate = await self._get_model_cost_rates(model_name)
-        cost_microdollars = (input_tokens * input_rate + output_tokens * output_rate) // 1_000_000
-        execution_metadata = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
+
+        ``provider`` drives which :class:`PromptCacheStrategy` parses the
+        response. When omitted (legacy call sites — compaction summariser,
+        tests) we default to the no-op strategy, which still correctly
+        extracts ``input_tokens`` / ``output_tokens`` from the shapes this
+        project encounters but reports zero cache tokens. The main agent
+        cost path threads the real provider through.
+
+        Cache rates default to ``0`` when the model row omits them (NULL
+        in ``models.cache_creation_microdollars_per_million`` /
+        ``cache_read_microdollars_per_million``). Falling back to the input
+        rate would 10x cache-read cost on Anthropic (whose real rate is
+        10% of input); under-reporting is the safer default until
+        model-discovery re-seeds the row. ``_warn_missing_cache_rate``
+        emits a single warning per model so operators can act.
+        """
+        usage = self._extract_token_usage(
+            response_metadata, provider or "noop"
+        )
+        (
+            input_rate,
+            output_rate,
+            cache_creation_rate,
+            cache_read_rate,
+        ) = await self._get_model_cost_rates(model_name)
+
+        if cache_creation_rate is None and usage.cache_creation_input_tokens:
+            self._warn_missing_cache_rate(model_name, "cache_creation")
+        if cache_read_rate is None and usage.cache_read_input_tokens:
+            self._warn_missing_cache_rate(model_name, "cache_read")
+
+        effective_cache_creation_rate = cache_creation_rate or 0
+        effective_cache_read_rate = cache_read_rate or 0
+
+        cost_microdollars = (
+            usage.input_tokens * input_rate
+            + usage.output_tokens * output_rate
+            + usage.cache_creation_input_tokens * effective_cache_creation_rate
+            + usage.cache_read_input_tokens * effective_cache_read_rate
+        ) // 1_000_000
+
+        execution_metadata: dict[str, Any] = {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
             "model": model_name,
         }
+        # Surface cache counters only when non-zero — keeps the metadata
+        # shape stable for non-caching providers (OpenAI automatic caching
+        # still surfaces the counters when a hit occurs).
+        if usage.cache_creation_input_tokens:
+            execution_metadata["cache_creation_input_tokens"] = (
+                usage.cache_creation_input_tokens
+            )
+        if usage.cache_read_input_tokens:
+            execution_metadata["cache_read_input_tokens"] = (
+                usage.cache_read_input_tokens
+            )
         return (cost_microdollars, execution_metadata)
 
     async def _inject_input_files(self, sandbox, task_id: str, tenant_id: str) -> list[str]:
@@ -2805,8 +3020,12 @@ class GraphExecutor:
                             resume_value = payload  # approval payload passed through
                             initial_input = Command(resume=resume_value)
 
-                # Track model name for per-step cost calculation
+                # Track model + provider for per-step cost calculation. The
+                # provider threads into ``_calculate_step_cost`` so the
+                # prompt-cache strategy can parse cache-token counters out
+                # of the response metadata in a provider-specific way.
                 model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
+                provider = agent_config.get("provider", "anthropic")
                 # Track cumulative costs for Task 4 budget enforcement (added later)
                 cumulative_task_cost = 0
                 hourly_cost = 0
@@ -2865,7 +3084,7 @@ class GraphExecutor:
                                     if hasattr(ai_msg, 'usage_metadata') and ai_msg.usage_metadata:
                                         resp_meta.setdefault("usage_metadata", ai_msg.usage_metadata)
                                     step_cost, execution_metadata = await self._calculate_step_cost(
-                                        resp_meta, model_name
+                                        resp_meta, model_name, provider=provider,
                                     )
                                     async with self.pool.acquire() as cost_conn:
                                         checkpoint_id = await fetch_latest_checkpoint_id(

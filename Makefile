@@ -50,7 +50,15 @@ DB_USER ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse im
 DB_PASSWORD ?= $(if $(PYTHON),$(shell $(PYTHON) -c 'import sys; from urllib.parse import urlparse, unquote; print(unquote(urlparse(sys.argv[1]).password or "postgres"))' "$(DB_DSN)"),postgres)
 SERVER_PORT ?= 8080
 VITE_API_BASE_URL ?= http://localhost:8080
-APP_DEV_TASK_CONTROLS_ENABLED ?= false
+# Local-dev default: ON. The Makefile is the local-development entry point;
+# dev task controls (``/v1/dev/tasks/*`` endpoints, ``dev_sleep`` tool, short
+# task timeouts) are what developers actually want when iterating. All three
+# services (API / Worker / Console) default to OFF in their own code when
+# the env var is unset, so this Makefile default does NOT leak into
+# production — production deploys (Helm / CDK / Lambda) don't invoke the
+# Makefile and therefore see the in-code ``false`` default.
+# Override for this session with: ``APP_DEV_TASK_CONTROLS_ENABLED=false make start``
+APP_DEV_TASK_CONTROLS_ENABLED ?= true
 VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
 
 # Local-dev default: emit the per-turn compaction.projection_built DEBUG trace
@@ -60,6 +68,17 @@ VITE_DEV_TASK_CONTROLS_ENABLED ?= $(APP_DEV_TASK_CONTROLS_ENABLED)
 # override is Makefile-local. Override for a quieter log with:
 #   WORKER_LOG_LEVEL=INFO make start-worker
 WORKER_LOG_LEVEL ?= DEBUG
+
+# Prompt-cache marker injection is ON by default (managed-platform default;
+# caching always helps multi-turn agent loops and is provider-neutral). Flip
+# this to a truthy value (1 / true / yes / on) to suppress marker injection
+# fleet-wide — an operator kill switch for provider-side caching regressions
+# or debugging, NOT a per-agent tuning knob.
+#   WORKER_PROMPT_CACHE_DISABLED=1 make start-worker
+# Token-usage extraction continues regardless so OpenAI's automatic caching
+# still reports correctly. Per-agent toggling is deliberately not exposed —
+# disabling caching only raises costs, so we don't surface it as config.
+WORKER_PROMPT_CACHE_DISABLED ?=
 # Langfuse is now configured per-agent via the Console Settings page.
 # These defaults are only used by test-langfuse-up / dev-langfuse-up.
 LANGFUSE_HOST ?= http://127.0.0.1:3300
@@ -158,7 +177,8 @@ help:
 	@echo ""
 	@echo "$(CYAN)[Tips]$(NC)"
 	@echo "  $(YELLOW)make -n start N=3$(NC)   - 👀 Preview commands without executing them"
-	@echo "  $(YELLOW)APP_DEV_TASK_CONTROLS_ENABLED=true make start$(NC) - 🧪 Enable dev-only task controls locally"
+	@echo "  $(YELLOW)APP_DEV_TASK_CONTROLS_ENABLED=false make start$(NC) - 🔒 Disable dev-only task controls (default: enabled for local dev)"
+	@echo "  $(YELLOW)WORKER_PROMPT_CACHE_DISABLED=1 make start$(NC)     - 🔇 Operator kill switch: suppress prompt-cache markers fleet-wide"
 	@echo ""
 	@echo "$(CYAN)[Other Tools]$(NC)"
 	@echo "  $(YELLOW)make clean$(NC)          - 🧹 Clean temporary/cache files"
@@ -373,7 +393,7 @@ start-console:
 	else \
 		rm -f $(TMP_DIR)/console.pid; \
 		echo "$(CYAN)Starting Console...$(NC)"; \
-		nohup bash -lc "cd '$(CONSOLE_DIR)' && export PATH='$(CONSOLE_DIR)/node_modules/.bin':\$$PATH && exec node '$(CONSOLE_DIR)/scripts/dev.mjs'" > $(TMP_DIR)/console.log 2>&1 & echo $$! > $(TMP_DIR)/console.pid; \
+		nohup bash -lc "cd '$(CONSOLE_DIR)' && export PATH='$(CONSOLE_DIR)/node_modules/.bin':\$$PATH && VITE_DEV_TASK_CONTROLS_ENABLED='$(VITE_DEV_TASK_CONTROLS_ENABLED)' exec node '$(CONSOLE_DIR)/scripts/dev.mjs'" > $(TMP_DIR)/console.log 2>&1 & echo $$! > $(TMP_DIR)/console.pid; \
 		echo "$(GREEN)✅ Console started (Frontend bound to http://localhost:5173)$(NC)"; \
 	fi
 
@@ -398,7 +418,7 @@ start-api:
 	else \
 		rm -f $(TMP_DIR)/api.pid; \
 		echo "$(CYAN)Starting API...$(NC)"; \
-		nohup bash -lc "cd '$(API_DIR)' && exec '$(API_DIR)/gradlew' bootRun" > $(TMP_DIR)/api.log 2>&1 & echo $$! > $(TMP_DIR)/api.pid; \
+		nohup bash -lc "cd '$(API_DIR)' && APP_DEV_TASK_CONTROLS_ENABLED='$(APP_DEV_TASK_CONTROLS_ENABLED)' exec '$(API_DIR)/gradlew' bootRun" > $(TMP_DIR)/api.log 2>&1 & echo $$! > $(TMP_DIR)/api.pid; \
 		echo "$(GREEN)✅ API Service started$(NC)"; \
 	fi
 
@@ -417,7 +437,7 @@ start-worker:
 			skipped=$$((skipped + 1)); \
 		else \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' WORKER_PROMPT_CACHE_DISABLED='$(WORKER_PROMPT_CACHE_DISABLED)' APP_DEV_TASK_CONTROLS_ENABLED='$(APP_DEV_TASK_CONTROLS_ENABLED)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$i.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); \
 		fi; \
 		i=$$((i + 1)); \
@@ -475,7 +495,7 @@ scale-worker:
 				slot=$$((slot + 1)); continue; \
 			fi; \
 			rm -f $$pidfile; \
-			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
+			nohup bash -c "cd $(WORKER_DIR) && source .venv/bin/activate && WORKER_LOG_LEVEL='$(WORKER_LOG_LEVEL)' WORKER_PROMPT_CACHE_DISABLED='$(WORKER_PROMPT_CACHE_DISABLED)' APP_DEV_TASK_CONTROLS_ENABLED='$(APP_DEV_TASK_CONTROLS_ENABLED)' exec python '$(WORKER_DIR)/main.py'" > $(TMP_DIR)/worker-$$slot.log 2>&1 & echo $$! > $$pidfile; \
 			started=$$((started + 1)); slot=$$((slot + 1)); \
 		done; \
 		echo "$(GREEN)✅ Scaled to $$target worker(s)$(NC)"; \
