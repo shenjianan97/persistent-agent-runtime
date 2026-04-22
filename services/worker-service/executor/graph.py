@@ -1169,10 +1169,10 @@ class GraphExecutor:
         # Scope is captured by closure; the LLM cannot override it via
         # arguments.
         #
-        # - ``memory_note`` and ``memory_search`` are gated on
+        # - ``note_finding`` and ``memory_search`` are gated on
         #   ``decision.stack_enabled`` (agent.memory.enabled AND memory_mode
         #   ∈ {always, agent_decides}).
-        # - ``save_memory`` (Task 12) is registered only in
+        # - ``remember_this_run`` (Task 12 opt-in) is registered only in
         #   ``agent_decides`` mode (``stack_enabled=True AND auto_write=False``)
         #   — the agent's lever to opt this run in to writing a memory.
         # - ``task_history_get`` is always registered — diagnostic drill-down
@@ -2532,40 +2532,40 @@ class GraphExecutor:
 
         # Phase 2 Track 5 Task 12 / Issue #102 — memory-tool framing. Gated
         # on what is actually registered: ``note_finding`` / ``memory_search``
-        # whenever the stack is on; ``commit_memory`` only in ``agent_decides``.
-        # Tool descriptions alone underspecify behavior — LLMs reliably forget
-        # optional retrieval tools without a platform nudge, and the two
-        # memory-writing tools need sequencing guidance or agents hedge by
-        # calling both for every finding (the failure mode that issue #102
-        # tracks). The prose here explicitly names the distinct roles:
-        # ``note_finding`` = scratchpad during the run, ``commit_memory`` =
-        # terminal commit trigger (NOT the save itself — a dedicated
-        # summarizer composes the body).
+        # whenever the stack is on; ``remember_this_run`` only in
+        # ``agent_decides``. Tool descriptions alone underspecify behavior
+        # — LLMs reliably forget optional retrieval tools without a platform
+        # nudge, and the two memory-writing tools need sequencing guidance
+        # or agents hedge by calling both for every finding (the failure
+        # mode that issue #102 tracks). The prose here explicitly names
+        # the distinct roles: ``note_finding`` = scratchpad during the run,
+        # ``remember_this_run`` = terminal trigger (NOT the save itself —
+        # a dedicated summarizer composes the body afterward).
         if memory_decision is not None and memory_decision.stack_enabled:
             sections.append(
                 "This agent has persistent memory. Before starting non-trivial "
                 "work, call `memory_search` to recall relevant past runs. "
                 "During the run, call `note_finding(text=...)` whenever you "
                 "discover something worth preserving — each call captures one "
-                "finding, and your findings list survives context compaction. "
-                "Call it freely; the tool's return value tells you how many "
-                "findings are captured so far."
+                "finding, and your findings list survives context compaction "
+                "and feeds the post-task summarizer."
             )
             if not memory_decision.auto_write:
                 sections.append(
                     "Memory writes are opt-in for this run. At task end, "
-                    "call `commit_memory(reason=...)` if this run produced "
-                    "something worth remembering (non-trivial findings, "
-                    "customer decisions, recurring patterns). `commit_memory` "
-                    "is the TRIGGER — it does NOT compose the memory entry "
-                    "itself; a dedicated summarizer distills your "
-                    "`note_finding` bullets into the stored summary after "
-                    "you return. Do NOT use `commit_memory` to record a "
-                    "finding — findings go through `note_finding`. Repeat "
-                    "calls do not trigger additional writes; the memory "
-                    "entry is composed and persisted once at the terminal "
-                    "branch. Skip the call for routine runs — the absence "
-                    "of a call means no memory entry is written."
+                    "call `remember_this_run(reason=...)` if this run "
+                    "produced something worth remembering (non-trivial "
+                    "findings, customer decisions, recurring patterns). "
+                    "`remember_this_run` is the TRIGGER — it does NOT "
+                    "compose the memory entry itself; a dedicated "
+                    "summarizer distills your `note_finding` bullets into "
+                    "the stored summary after you return. Do NOT use "
+                    "`remember_this_run` to record a finding — findings go "
+                    "through `note_finding`. Repeat calls do not trigger "
+                    "additional writes; the memory entry is composed and "
+                    "persisted once at the terminal branch. Skip the call "
+                    "for routine runs — the absence of a call means no "
+                    "memory entry is written."
                 )
 
         # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended

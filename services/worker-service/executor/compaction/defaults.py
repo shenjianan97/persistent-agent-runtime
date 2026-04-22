@@ -65,17 +65,10 @@ ARG_TRUNCATION_CAP_BYTES: int = 1_000
 # age. These are load-bearing across many turns. Customer agents can extend
 # this list via agent_config.context_management.exclude_tools.
 PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
-    # Canonical findings-capture tool (issue #102).
+    # Findings-capture tool (issue #102).
     "note_finding",
-    # Backward-compat alias for ``note_finding`` — kept so Tier 1 treats
-    # ToolMessages from in-flight checkpoints the same way. Remove after
-    # the alias is retired (2 releases).
-    "memory_note",
-    # Canonical terminal-commit tool (issue #102).
-    "commit_memory",
-    # Backward-compat alias for ``commit_memory``. Same retention reason
-    # as ``memory_note`` above.
-    "save_memory",
+    # Terminal-commit opt-in tool (issue #102).
+    "remember_this_run",
     "request_human_input",
     # Memory-retrieval results: the agent *just explicitly fetched* these to
     # inform the current task. Clearing them once they age out of the keep

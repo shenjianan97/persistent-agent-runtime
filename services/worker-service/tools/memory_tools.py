@@ -80,7 +80,7 @@ TASK_HISTORY_PREVIEW_BYTES = 512
 _ALLOWED_MODES = ("hybrid", "text", "vector")
 
 
-class MemoryNoteArguments(BaseModel):
+class NoteFindingArguments(BaseModel):
     text: Annotated[
         str,
         Field(
@@ -113,18 +113,13 @@ class MemoryNoteArguments(BaseModel):
     ] = None
 
 
-# Canonical schema alias — the class name is kept for backward compat with
-# any importer, but new code should read the argument shape as
-# ``NoteFindingArguments``. See issue #102.
-NoteFindingArguments = MemoryNoteArguments
-
-
-# Phase 2 Track 5 Task 12 — ``save_memory`` mirror shape. Same 1..2048 char
-# bound as ``memory_note`` so a reason fits in the observations channel too.
+# Hard cap on the ``reason`` argument to ``remember_this_run``. Matches the
+# ``note_finding`` content cap so a commit rationale fits in the
+# ``commit_rationales`` channel alongside findings.
 SAVE_MEMORY_REASON_MAX_LEN = 2048
 
 
-class SaveMemoryArguments(BaseModel):
+class RememberThisRunArguments(BaseModel):
     reason: Annotated[
         str,
         Field(
@@ -139,9 +134,9 @@ class SaveMemoryArguments(BaseModel):
         ),
     ]
     # Injected by ToolNode at runtime; hidden from the LLM schema. See
-    # ``MemoryNoteArguments.tool_call_id`` for rationale.
+    # ``NoteFindingArguments.tool_call_id`` for rationale.
     tool_call_id: Annotated[str, InjectedToolCallId]
-    # Injected by ToolNode — see ``MemoryNoteArguments.observations`` for
+    # Injected by ToolNode — see ``NoteFindingArguments.observations`` for
     # the full rationale on why this lives on the schema.
     observations: Annotated[
         list[str] | None, InjectedState("observations")
@@ -155,12 +150,6 @@ class SaveMemoryArguments(BaseModel):
     messages: Annotated[
         list | None, InjectedState("messages")
     ] = None
-
-
-# Canonical schema alias — the class name is kept for backward compat with
-# any importer referencing SaveMemoryArguments, but new code reads the
-# argument shape as ``CommitMemoryArguments``. See issue #102.
-CommitMemoryArguments = SaveMemoryArguments
 
 
 class MemorySearchArguments(BaseModel):
@@ -312,13 +301,10 @@ def _maybe_await_or_cancel(
 
 
 # ---------------------------------------------------------------------------
-# note_finding (canonical) + memory_note (deprecated alias)
+# note_finding
 # ---------------------------------------------------------------------------
-# Prior to 2026-04 this tool was named ``memory_note``. The name is retained
-# as a backward-compat alias (``_build_memory_note_alias_tool``) so
-# in-flight checkpoints resume cleanly, but fresh sessions should only see
-# the canonical ``note_finding`` name — the alias's description explicitly
-# steers the LLM away from calling it.
+# Previously named ``memory_note``. Renamed in issue #102; the old name is
+# NOT retained as an alias — this PR ships the canonical name only.
 
 
 NOTE_FINDING_DESCRIPTION = (
@@ -326,19 +312,8 @@ NOTE_FINDING_DESCRIPTION = (
     "each call appends to your findings list, which survives context "
     "compaction and feeds the post-task summary. This is a scratchpad, NOT "
     "a durable save: in `agent_decides` memory mode, findings only persist "
-    "across runs if you also call `commit_memory` at task end. "
+    "across runs if you also call `remember_this_run` at task end. "
     f"Max {MEMORY_NOTE_MAX_LEN} characters per call. Zero cost."
-)
-
-# Back-compat alias — existing importers that read ``MEMORY_NOTE_DESCRIPTION``
-# continue to work. Deprecated; remove after 2 releases.
-MEMORY_NOTE_DESCRIPTION = NOTE_FINDING_DESCRIPTION
-
-
-_MEMORY_NOTE_ALIAS_DESCRIPTION = (
-    "DEPRECATED alias for `note_finding`. Do NOT call this — use "
-    "`note_finding` instead. Registered only for backward compatibility "
-    "with tasks started before this worker upgrade; will be removed."
 )
 
 
@@ -347,30 +322,19 @@ def _make_note_finding_handler(
     bound_tenant: str,
     bound_agent: str,
     bound_task: str,
-    log_alias: bool = False,
 ) -> Callable[..., Command]:
-    """Build the shared handler used by both ``note_finding`` and its
-    ``memory_note`` alias. ``log_alias=True`` emits one deprecation log
-    per call so operators can track in-flight checkpoint usage and time
-    the alias removal.
-    """
+    """Build the ``note_finding`` handler."""
 
     def _handler(
         text: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         observations: Annotated[list[str] | None, InjectedState("observations")] = None,
     ) -> Command:
-        # Argument validation is enforced by ``MemoryNoteArguments`` — if we
+        # Argument validation is enforced by ``NoteFindingArguments`` — if we
         # reach here, ``text`` already satisfies length 1..MEMORY_NOTE_MAX_LEN.
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — without it the next agent step
         # rejects the orphan tool call as a fatal graph error.
-        if log_alias:
-            logger.warning(
-                "memory.deprecated_tool_name used=memory_note "
-                "canonical=note_finding tenant_id=%s agent_id=%s task_id=%s",
-                bound_tenant, bound_agent, bound_task,
-            )
         logger.debug(
             "memory.note.appended tenant_id=%s agent_id=%s task_id=%s "
             "note_chars=%d",
@@ -407,7 +371,6 @@ def _build_note_finding_tool(ctx: MemoryToolContext) -> StructuredTool:
         bound_tenant=ctx.tenant_id,
         bound_agent=ctx.agent_id,
         bound_task=ctx.task_id,
-        log_alias=False,
     )
     return StructuredTool.from_function(
         func=handler,
@@ -417,59 +380,24 @@ def _build_note_finding_tool(ctx: MemoryToolContext) -> StructuredTool:
     )
 
 
-def _build_memory_note_alias_tool(ctx: MemoryToolContext) -> StructuredTool:
-    """Deprecated alias — same handler under the legacy ``memory_note`` name.
-
-    In-flight checkpoints whose committed ``AIMessage.tool_calls[*].name`` is
-    ``"memory_note"`` need a callable tool of that name on resume or the
-    ToolNode raises. The alias is intentionally given a DEPRECATED-flavoured
-    description so fresh LLM sessions skip it; if one does call it, behavior
-    is identical to ``note_finding`` plus a warning log.
-    """
-    handler = _make_note_finding_handler(
-        bound_tenant=ctx.tenant_id,
-        bound_agent=ctx.agent_id,
-        bound_task=ctx.task_id,
-        log_alias=True,
-    )
-    return StructuredTool.from_function(
-        func=handler,
-        name="memory_note",
-        description=_MEMORY_NOTE_ALIAS_DESCRIPTION,
-        args_schema=MemoryNoteArguments,
-    )
-
-
-# Back-compat name for any importer still referencing the old builder.
-_build_memory_note_tool = _build_note_finding_tool
-
-
 # ---------------------------------------------------------------------------
-# save_memory (Phase 2 Track 5 Task 12)
+# remember_this_run (Phase 2 Track 5 Task 12; renamed in issue #102)
 # ---------------------------------------------------------------------------
+# Previously named ``save_memory``. Renamed in issue #102; the old name is
+# NOT retained as an alias — this PR ships the canonical name only.
 
 
-COMMIT_MEMORY_DESCRIPTION = (
-    "Commit this run's findings to persistent memory at task completion. "
-    "Call when the run has produced something worth remembering (non-trivial "
-    "findings, customer decisions, recurring patterns). This is the trigger, "
-    "NOT the save itself — a dedicated summarizer runs after you return and "
-    "distills your `note_finding` bullets into the stored memory entry. "
-    "Repeat calls append to the rationale but do not trigger additional "
-    "writes; the entry is composed and persisted ONCE at the terminal "
-    "branch. Do NOT use this to capture a finding — findings go through "
-    "`note_finding`. "
+REMEMBER_THIS_RUN_DESCRIPTION = (
+    "Ask the runtime to remember this run. Call at task completion when "
+    "the run has produced something worth remembering across future runs "
+    "(non-trivial findings, customer decisions, recurring patterns). This "
+    "is the TRIGGER — it does NOT compose the memory entry itself; a "
+    "dedicated summarizer runs after you return and distills your "
+    "`note_finding` bullets into the stored entry. Repeat calls append to "
+    "the rationale but do not trigger additional writes; the entry is "
+    "composed and persisted ONCE at the terminal branch. Do NOT use this "
+    "to capture a finding — findings go through `note_finding`. "
     f"Max {SAVE_MEMORY_REASON_MAX_LEN} characters for `reason`. Zero cost."
-)
-
-# Back-compat alias — existing importers referencing the old constant
-# continue to work. Deprecated; remove after 2 releases.
-SAVE_MEMORY_DESCRIPTION = COMMIT_MEMORY_DESCRIPTION
-
-_SAVE_MEMORY_ALIAS_DESCRIPTION = (
-    "DEPRECATED alias for `commit_memory`. Do NOT call this — use "
-    "`commit_memory` instead. Registered only for backward compatibility "
-    "with tasks started before this worker upgrade; will be removed."
 )
 
 
@@ -512,23 +440,22 @@ def _count_pending_sibling_note_findings(
     return count
 
 
-def _make_commit_memory_handler(
+def _make_remember_this_run_handler(
     *,
     bound_tenant: str,
     bound_agent: str,
     bound_task: str,
-    log_alias: bool = False,
 ) -> Callable[..., Command]:
-    """Build the shared handler used by ``commit_memory`` and the legacy
-    ``save_memory`` alias. ``log_alias=True`` emits one deprecation log
-    per call so operators can track in-flight checkpoint usage and time
-    the alias removal.
+    """Build the ``remember_this_run`` handler.
 
     Sets ``memory_opt_in=True`` (last-write-wins) and appends the
-    rationale to ``commit_rationales`` (``operator.add`` reducer).
-    Issue #102 — the rationale used to land in ``observations`` alongside
+    rationale to ``commit_rationales`` (``operator.add`` reducer). Issue
+    #102 — the rationale used to land in ``observations`` alongside
     ``note_finding`` entries, muddling the memory-detail UI and search
-    corpus; commit_rationales is the new dedicated channel.
+    corpus; ``commit_rationales`` is the dedicated channel. The state /
+    DB field name stays ``commit_rationales`` because renaming it would
+    mean another migration and a DB column rewrite on a populated table
+    — a tool rename shouldn't force that.
     """
 
     def _handler(
@@ -544,8 +471,8 @@ def _make_commit_memory_handler(
             # agent can self-correct in-loop rather than silently opting in
             # with a blank rationale.
             raise MemoryToolError(
-                "commit_memory requires a non-empty reason after whitespace is "
-                "stripped."
+                "remember_this_run requires a non-empty reason after "
+                "whitespace is stripped."
             )
         if len(stripped) > SAVE_MEMORY_REASON_MAX_LEN:
             # Defense in depth — normally caught by the Pydantic max_length
@@ -553,24 +480,18 @@ def _make_commit_memory_handler(
             # branch is unreachable in practice. Keep the guard so the
             # invariant is obvious.
             raise MemoryToolError(
-                f"commit_memory reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
-            )
-        if log_alias:
-            logger.warning(
-                "memory.deprecated_tool_name used=save_memory "
-                "canonical=commit_memory tenant_id=%s agent_id=%s task_id=%s",
-                bound_tenant, bound_agent, bound_task,
+                f"remember_this_run reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
             )
         logger.info(
-            "memory.commit_memory.opt_in tenant_id=%s agent_id=%s task_id=%s "
-            "reason_chars=%d",
+            "memory.remember_this_run.opt_in tenant_id=%s agent_id=%s "
+            "task_id=%s reason_chars=%d",
             bound_tenant, bound_agent, bound_task, len(stripped),
         )
         # ``observations`` is the pre-update finding list (no ``[save_memory]``
         # entries now that rationales live on their own channel).  The count
         # in the return tells the agent "N findings will persist with the
-        # memory entry", disambiguating commit_memory from note_finding —
-        # the fix for the hedging behavior documented in issue #102.
+        # memory entry", disambiguating remember_this_run from note_finding
+        # — the fix for the hedging behavior documented in issue #102.
         #
         # Super-step concurrency correction: when the agent emits this call
         # in the SAME AIMessage as one or more ``note_finding`` calls (batch
@@ -590,13 +511,13 @@ def _make_commit_memory_handler(
         # calls — that's what the summarizer does at ``memory_graph.py`` anyway.
         if findings_count == 0:
             tool_content = (
-                "Commit confirmed. No findings captured this run — the "
+                "Remember confirmed. No findings captured this run — the "
                 "memory entry will be composed from the transcript and "
                 "your rationale."
             )
         else:
             tool_content = (
-                f"Commit confirmed. {findings_count} finding(s) will "
+                f"Remember confirmed. {findings_count} finding(s) will "
                 "persist with this task's memory entry at completion."
             )
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
@@ -620,47 +541,21 @@ def _make_commit_memory_handler(
     return _handler
 
 
-def _build_commit_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
-    """Canonical ``commit_memory`` tool — the agent-decides opt-in trigger."""
-    handler = _make_commit_memory_handler(
+def _build_remember_this_run_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Canonical ``remember_this_run`` tool — the agent-decides opt-in
+    trigger. Sets ``memory_opt_in=True`` so the terminal ``memory_write``
+    node fires at task completion."""
+    handler = _make_remember_this_run_handler(
         bound_tenant=ctx.tenant_id,
         bound_agent=ctx.agent_id,
         bound_task=ctx.task_id,
-        log_alias=False,
     )
     return StructuredTool.from_function(
         func=handler,
-        name="commit_memory",
-        description=COMMIT_MEMORY_DESCRIPTION,
-        args_schema=CommitMemoryArguments,
+        name="remember_this_run",
+        description=REMEMBER_THIS_RUN_DESCRIPTION,
+        args_schema=RememberThisRunArguments,
     )
-
-
-def _build_save_memory_alias_tool(ctx: MemoryToolContext) -> StructuredTool:
-    """Deprecated alias — same handler under the legacy ``save_memory`` name.
-
-    Mirrors the ``memory_note`` alias registered for backward compat with
-    in-flight checkpoints (issue #102). Fresh sessions should see only
-    ``commit_memory``; this exists so a resumed task whose committed
-    ``AIMessage.tool_calls[*].name`` is ``"save_memory"`` still resolves
-    to a registered tool.
-    """
-    handler = _make_commit_memory_handler(
-        bound_tenant=ctx.tenant_id,
-        bound_agent=ctx.agent_id,
-        bound_task=ctx.task_id,
-        log_alias=True,
-    )
-    return StructuredTool.from_function(
-        func=handler,
-        name="save_memory",
-        description=_SAVE_MEMORY_ALIAS_DESCRIPTION,
-        args_schema=SaveMemoryArguments,
-    )
-
-
-# Back-compat name for any importer referencing the old builder symbol.
-_build_save_memory_tool = _build_commit_memory_tool
 
 
 # ---------------------------------------------------------------------------
@@ -970,12 +865,13 @@ def build_memory_tools(
 
     Gating:
 
-    - ``memory_note`` and ``memory_search`` are returned whenever
+    - ``note_finding`` and ``memory_search`` are returned whenever
       ``stack_enabled`` is True.
-    - ``save_memory`` (Task 12) is returned only when ``stack_enabled`` is
-      True AND ``auto_write`` is False — i.e., the ``agent_decides`` mode.
-      In ``always`` mode the run writes unconditionally so the tool would be
-      a no-op; in ``skip`` / memory-disabled mode the stack is off entirely.
+    - ``remember_this_run`` (Task 12 opt-in) is returned only when
+      ``stack_enabled`` is True AND ``auto_write`` is False — i.e., the
+      ``agent_decides`` mode.  In ``always`` mode the run writes
+      unconditionally so the tool would be a no-op; in ``skip`` /
+      memory-disabled mode the stack is off entirely.
     - ``task_history_get`` is returned unconditionally — diagnostic drill-
       down, scope-bound, safe even for memory-disabled agents.
 
@@ -985,33 +881,19 @@ def build_memory_tools(
     """
     tools: list[StructuredTool] = []
     if stack_enabled:
-        # ``note_finding`` is the canonical findings-capture tool; the
-        # ``memory_note`` alias is registered for backward compat with
-        # in-flight checkpoints that committed tool calls under the old
-        # name (see ``_build_memory_note_alias_tool`` for the rationale).
         tools.append(_build_note_finding_tool(ctx))
-        tools.append(_build_memory_note_alias_tool(ctx))
         tools.append(_build_memory_search_tool(ctx))
         if not auto_write:
-            # ``commit_memory`` is the canonical terminal-commit trigger;
-            # the ``save_memory`` alias matches the same backward-compat
-            # pattern as ``memory_note`` above.  Both forward to the same
-            # handler; the alias logs deprecation on each call.
-            tools.append(_build_commit_memory_tool(ctx))
-            tools.append(_build_save_memory_alias_tool(ctx))
+            tools.append(_build_remember_this_run_tool(ctx))
     tools.append(_build_task_history_get_tool(ctx))
     return tools
 
 
 __all__ = [
-    "COMMIT_MEMORY_DESCRIPTION",
-    "CommitMemoryArguments",
-    "MEMORY_NOTE_DESCRIPTION",  # deprecated alias — use NOTE_FINDING_DESCRIPTION
     "MEMORY_NOTE_MAX_LEN",
     "MEMORY_SEARCH_DEFAULT_LIMIT",
     "MEMORY_SEARCH_DESCRIPTION",
     "MEMORY_SEARCH_TOOL_LIMIT_MAX",
-    "MemoryNoteArguments",
     "MemorySearchArguments",
     "MemorySearchVectorUnavailableError",
     "MemoryToolContext",
@@ -1019,9 +901,9 @@ __all__ = [
     "MemoryToolNotFoundError",
     "NOTE_FINDING_DESCRIPTION",
     "NoteFindingArguments",
-    "SAVE_MEMORY_DESCRIPTION",  # deprecated alias — use COMMIT_MEMORY_DESCRIPTION
+    "REMEMBER_THIS_RUN_DESCRIPTION",
+    "RememberThisRunArguments",
     "SAVE_MEMORY_REASON_MAX_LEN",
-    "SaveMemoryArguments",
     "TASK_HISTORY_GET_DESCRIPTION",
     "TaskHistoryGetArguments",
     "build_memory_tools",

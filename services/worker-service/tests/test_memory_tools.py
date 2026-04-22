@@ -2,7 +2,7 @@
 
 Covered contracts:
 
-- ``memory_note`` validates its argument (1..2048 chars), returns a
+- ``note_finding`` validates its argument (1..2048 chars), returns a
   ``Command(update={"observations": [text]})`` so LangGraph's
   ``operator.add`` reducer appends durably. No DB / network calls.
 - ``memory_search`` delegates to ``GET /v1/agents/{bound_agent}/memory/search``;
@@ -14,8 +14,9 @@ Covered contracts:
   malformed UUID → ``MemoryToolNotFoundError``; happy path returns a
   bounded structured view with truncation.
 - ``build_memory_tools`` gating:
-    * memory-enabled → all three tools returned (``memory_note``,
-      ``memory_search``, ``task_history_get``).
+    * memory-enabled always → ``note_finding`` + ``memory_search`` +
+      ``task_history_get``.
+    * memory-enabled agent_decides → above plus ``remember_this_run``.
     * memory-disabled → only ``task_history_get``.
 
 These tests cover the Task 7 acceptance criteria without touching Postgres
@@ -41,13 +42,13 @@ from tools.memory_tools import (
     MEMORY_NOTE_MAX_LEN,
     MEMORY_SEARCH_TOOL_LIMIT_MAX,
     SAVE_MEMORY_REASON_MAX_LEN,
-    MemoryNoteArguments,
     MemorySearchArguments,
     MemorySearchVectorUnavailableError,
     MemoryToolContext,
     MemoryToolError,
     MemoryToolNotFoundError,
-    SaveMemoryArguments,
+    NoteFindingArguments,
+    RememberThisRunArguments,
     TaskHistoryGetArguments,
     build_memory_tools,
 )
@@ -128,24 +129,24 @@ def _tool_by_name(tools: list[Any], name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# memory_note
+# note_finding (renamed from memory_note in issue #102)
 # ---------------------------------------------------------------------------
 
 
-class TestMemoryNoteArguments:
+class TestNoteFindingArguments:
     def test_accepts_normal_text(self) -> None:
-        parsed = MemoryNoteArguments(
+        parsed = NoteFindingArguments(
             text="Observed that X correlates with Y", tool_call_id="call_x"
         )
         assert parsed.text.startswith("Observed")
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(text="", tool_call_id="call_x")
+            NoteFindingArguments(text="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(
+            NoteFindingArguments(
                 text="a" * (MEMORY_NOTE_MAX_LEN + 1), tool_call_id="call_x"
             )
 
@@ -172,9 +173,9 @@ def _invoke_with_tool_call(
     """
     kwargs = dict(args)
     kwargs["tool_call_id"] = tool_call_id
-    # note_finding / save_memory both take ``observations`` via InjectedState.
-    # memory_search / task_history_get do not; only pass it when the handler
-    # signature accepts it.
+    # note_finding / remember_this_run both take ``observations`` via
+    # InjectedState. memory_search / task_history_get do not; only pass it
+    # when the handler signature accepts it.
     import inspect
 
     params = inspect.signature(tool.func).parameters
@@ -183,10 +184,9 @@ def _invoke_with_tool_call(
     return tool.func(**kwargs)
 
 
-class TestMemoryNoteTool:
-    """Coverage for the canonical ``note_finding`` tool plus the
-    ``memory_note`` alias retained for backward compatibility (issue #102).
-    """
+class TestNoteFindingTool:
+    """Coverage for ``note_finding`` (renamed from ``memory_note`` in
+    issue #102)."""
 
     def test_note_finding_returns_command_with_tool_message_and_observation(self) -> None:
         ctx = _make_ctx()
@@ -225,73 +225,47 @@ class TestMemoryNoteTool:
         r2 = _invoke_with_tool_call(tool, {"text": "b"}, "c2", observations=[])
         assert r1.update["messages"][0].content == r2.update["messages"][0].content
 
-    def test_memory_note_alias_logs_deprecation(self, caplog) -> None:
-        """The deprecated alias routes to the same handler but emits a
-        warning so operators can track residual usage."""
-        import logging
-
-        ctx = _make_ctx()
-        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
-        alias = _tool_by_name(tools, "memory_note")
-
-        with caplog.at_level(logging.WARNING, logger="tools.memory_tools"):
-            result = _invoke_with_tool_call(alias, {"text": "hi"}, "c1")
-
-        # Behaviour identical to the canonical tool — observation appended,
-        # informative ToolMessage content returned (no count, per the
-        # concurrency-correctness follow-up in issue #102).
-        assert result.update["observations"] == ["hi"]
-        assert "Noted" in result.update["messages"][0].content
-        assert "queued" in result.update["messages"][0].content
-        # Exactly one deprecation warning emitted for this call.
-        matched = [
-            r for r in caplog.records
-            if "memory.deprecated_tool_name" in r.getMessage()
-        ]
-        assert len(matched) == 1
-
     def test_not_registered_when_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
         assert "note_finding" not in names
+        # Legacy name also absent — the PR shipped the canonical name only.
         assert "memory_note" not in names
 
 
 # ---------------------------------------------------------------------------
-# save_memory (Task 12)
+# remember_this_run (Task 12; renamed from save_memory in issue #102)
 # ---------------------------------------------------------------------------
 
 
-class TestSaveMemoryArguments:
+class TestRememberThisRunArguments:
     def test_accepts_normal_reason(self) -> None:
-        parsed = SaveMemoryArguments(
+        parsed = RememberThisRunArguments(
             reason="this run shipped the fix", tool_call_id="call_x"
         )
         assert parsed.reason.startswith("this run")
 
     def test_rejects_empty_reason(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(reason="", tool_call_id="call_x")
+            RememberThisRunArguments(reason="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(
+            RememberThisRunArguments(
                 reason="a" * (SAVE_MEMORY_REASON_MAX_LEN + 1),
                 tool_call_id="call_x",
             )
 
 
-class TestCommitMemoryTool:
-    """Coverage for the canonical ``commit_memory`` tool plus the
-    ``save_memory`` alias retained for backward compatibility (issue #102).
-    Both route to the same handler; the alias emits a deprecation warning.
-    """
+class TestRememberThisRunTool:
+    """Coverage for ``remember_this_run`` (renamed from ``save_memory`` in
+    issue #102). The PR ships the canonical name only — no alias."""
 
-    def test_commit_memory_opts_in_and_writes_to_commit_rationales(self) -> None:
+    def test_remember_this_run_opts_in_and_writes_to_commit_rationales(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         result = _invoke_with_tool_call(
             tool, {"reason": "shipped the fix"}, "call_commit_1"
@@ -308,16 +282,17 @@ class TestCommitMemoryTool:
         # Informative return — tells the agent the opt-in landed and reassures
         # that an empty-findings commit still produces a useful memory entry
         # (composed from transcript + rationale). Issue #102.
-        assert "Commit confirmed" in messages[0].content
+        assert "Remember confirmed" in messages[0].content
         assert "No findings captured" in messages[0].content
 
     def test_return_counts_findings_from_observations_only(self) -> None:
-        """The count in commit_memory's return is simply
-        ``len(observations)`` — rationales no longer pollute observations so
-        the old ``[save_memory]`` filter is unnecessary."""
+        """The count in remember_this_run's return is simply
+        ``len(observations)`` — rationales live on their own
+        ``commit_rationales`` channel (no need for the old
+        ``[save_memory]`` prefix filter)."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         result = _invoke_with_tool_call(
             tool,
@@ -328,26 +303,27 @@ class TestCommitMemoryTool:
 
     def test_return_counts_in_flight_sibling_note_findings(self) -> None:
         """Super-step concurrency correction (issue #102): when the agent
-        emits ``commit_memory`` in the same AIMessage as ``note_finding``
-        siblings, ``InjectedState("observations")`` still shows the
-        pre-reducer list. The handler inspects the current AIMessage's
-        tool_calls and adds pending note_finding calls to the reported
-        count so the "N finding(s) will persist" return is accurate.
+        emits ``remember_this_run`` in the same AIMessage as
+        ``note_finding`` siblings, ``InjectedState("observations")`` still
+        shows the pre-reducer list. The handler inspects the current
+        AIMessage's tool_calls and adds pending note_finding calls to the
+        reported count so the "N finding(s) will persist" return is
+        accurate.
         """
         from langchain_core.messages import AIMessage
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         # Simulate the super-step state: observations is empty (reducer
         # hasn't merged sibling updates yet), but the current AIMessage
-        # has two note_finding calls alongside the commit_memory call.
+        # has two note_finding calls alongside the remember_this_run call.
         ai = AIMessage(
             content="",
             tool_calls=[
                 {"name": "note_finding", "args": {"text": "f1"}, "id": "tf1"},
                 {"name": "note_finding", "args": {"text": "f2"}, "id": "tf2"},
-                {"name": "commit_memory", "args": {"reason": "x"}, "id": "c1"},
+                {"name": "remember_this_run", "args": {"reason": "x"}, "id": "c1"},
             ],
         )
         result = tool.func(
@@ -365,16 +341,16 @@ class TestCommitMemoryTool:
 
     def test_return_zero_findings_branch_when_no_siblings_and_empty_state(self) -> None:
         """When observations is empty AND there are no sibling
-        note_finding tool_calls, the commit_memory return falls into the
-        reassurance branch (composed from transcript + rationale)."""
+        note_finding tool_calls, the remember_this_run return falls into
+        the reassurance branch (composed from transcript + rationale)."""
         from langchain_core.messages import AIMessage
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         ai = AIMessage(
             content="",
-            tool_calls=[{"name": "commit_memory", "args": {"reason": "x"}, "id": "c1"}],
+            tool_calls=[{"name": "remember_this_run", "args": {"reason": "x"}, "id": "c1"}],
         )
         result = tool.func(
             reason="because",
@@ -384,34 +360,10 @@ class TestCommitMemoryTool:
         )
         assert "No findings captured" in result.update["messages"][0].content
 
-    def test_save_memory_alias_logs_deprecation(self, caplog) -> None:
-        """The deprecated ``save_memory`` alias routes to the same handler
-        but emits a warning so operators can track residual usage. Mirrors
-        the ``memory_note`` alias coverage in ``TestMemoryNoteTool``."""
-        import logging
-
-        ctx = _make_ctx()
-        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        alias = _tool_by_name(tools, "save_memory")
-
-        with caplog.at_level(logging.WARNING, logger="tools.memory_tools"):
-            result = _invoke_with_tool_call(
-                alias, {"reason": "shipped"}, "call_save_1"
-            )
-
-        assert result.update["memory_opt_in"] is True
-        assert result.update["commit_rationales"] == ["shipped"]
-        matched = [
-            r for r in caplog.records
-            if "memory.deprecated_tool_name" in r.getMessage()
-            and "used=save_memory" in r.getMessage()
-        ]
-        assert len(matched) == 1
-
     def test_strips_whitespace_around_reason(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         result = _invoke_with_tool_call(tool, {"reason": "   trimmed    "})
         assert result.update["commit_rationales"] == ["trimmed"]
@@ -419,33 +371,27 @@ class TestCommitMemoryTool:
     def test_whitespace_only_reason_raises_tool_error(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "commit_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         with pytest.raises(MemoryToolError):
             _invoke_with_tool_call(tool, {"reason": "     "})
 
     def test_not_registered_in_always_mode(self) -> None:
-        """Neither ``commit_memory`` nor the ``save_memory`` alias is
-        necessary when the run will write unconditionally — keep the tool
-        list lean."""
+        """``remember_this_run`` is unnecessary when the run will write
+        unconditionally — keep the tool list lean."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         names = [t.name for t in tools]
-        assert "commit_memory" not in names
+        assert "remember_this_run" not in names
+        # Legacy name also absent — the PR shipped the canonical name only.
         assert "save_memory" not in names
 
     def test_not_registered_in_skip_or_memory_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
-        assert "commit_memory" not in names
+        assert "remember_this_run" not in names
         assert "save_memory" not in names
-
-
-# Keep the legacy class name as a back-compat alias for any external test
-# runners that filter by class name; the tests live on the renamed class
-# above. Remove when the ``save_memory`` alias tool is retired.
-TestSaveMemoryTool = TestCommitMemoryTool
 
 
 # ---------------------------------------------------------------------------
@@ -763,34 +709,28 @@ class TestTaskHistoryGetTool:
 
 
 class TestBuildMemoryToolsGating:
-    def test_always_mode_registers_note_finding_alias_search_and_history(self) -> None:
+    def test_always_mode_registers_note_finding_search_and_history(self) -> None:
+        """``always`` mode skips ``remember_this_run`` — the run writes
+        unconditionally, so the opt-in trigger would be a no-op."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         names = sorted(t.name for t in tools)
-        # ``save_memory`` is NOT registered in ``always`` mode — the run
-        # writes unconditionally, so the tool would be a no-op.
-        # ``memory_note`` alias is registered alongside ``note_finding``
-        # for backward compat with in-flight checkpoints (issue #102).
         assert names == [
-            "memory_note",
             "memory_search",
             "note_finding",
             "task_history_get",
         ]
 
-    def test_agent_decides_mode_also_registers_commit_memory(self) -> None:
-        """``agent_decides`` mode registers both the canonical
-        ``commit_memory`` tool AND the legacy ``save_memory`` alias for
-        backward compat with in-flight checkpoints (issue #102)."""
+    def test_agent_decides_mode_also_registers_remember_this_run(self) -> None:
+        """``agent_decides`` mode adds ``remember_this_run`` — the
+        terminal-commit opt-in trigger."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
         names = sorted(t.name for t in tools)
         assert names == [
-            "commit_memory",
-            "memory_note",
             "memory_search",
             "note_finding",
-            "save_memory",
+            "remember_this_run",
             "task_history_get",
         ]
 

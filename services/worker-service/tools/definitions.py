@@ -13,11 +13,9 @@ from langgraph.types import interrupt
 
 from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
 from tools.memory_tools import (
-    MemoryNoteArguments,
     MemorySearchArguments,
     NoteFindingArguments,
     TaskHistoryGetArguments,
-    MEMORY_NOTE_DESCRIPTION,
     MEMORY_SEARCH_DESCRIPTION,
     NOTE_FINDING_DESCRIPTION,
     TASK_HISTORY_GET_DESCRIPTION,
@@ -225,20 +223,16 @@ EXPORT_SANDBOX_FILE_TOOL = ToolDefinition(
 )
 
 
-class MemoryNoteResult(BaseModel):
-    """Placeholder schema for the ``note_finding`` (and legacy ``memory_note``)
-    catalog entries.
+class NoteFindingResult(BaseModel):
+    """Placeholder schema for the ``note_finding`` catalog entry.
 
-    These are state-mutating tools: their runtime return is a LangGraph
-    ``Command(update={"observations": [text]})`` consumed by the graph's
-    ``operator.add`` reducer, not a JSON payload. This model exists only to
-    satisfy :class:`ToolDefinition.output_model`'s non-optional contract and
-    give catalog consumers a stable (empty) shape.
+    ``note_finding`` is a state-mutating tool: its runtime return is a
+    LangGraph ``Command(update={"observations": [text]})`` consumed by the
+    graph's ``operator.add`` reducer, not a JSON payload. This model
+    exists only to satisfy :class:`ToolDefinition.output_model`'s
+    non-optional contract and give catalog consumers a stable (empty)
+    shape.
     """
-
-
-# Kept as an alias for catalog consumers that referenced the old name.
-NoteFindingResult = MemoryNoteResult
 
 
 class MemorySearchResultSummary(BaseModel):
@@ -296,16 +290,7 @@ NOTE_FINDING_TOOL = ToolDefinition(
     name="note_finding",
     description=NOTE_FINDING_DESCRIPTION,
     input_model=NoteFindingArguments,
-    output_model=MemoryNoteResult,
-)
-# Deprecated alias — kept so catalog consumers and
-# ``context_management.exclude_tools`` validation accept the legacy name.
-# Remove after 2 releases (track in follow-up).
-MEMORY_NOTE_TOOL = ToolDefinition(
-    name="memory_note",
-    description=MEMORY_NOTE_DESCRIPTION,
-    input_model=MemoryNoteArguments,
-    output_model=MemoryNoteResult,
+    output_model=NoteFindingResult,
 )
 MEMORY_SEARCH_TOOL = ToolDefinition(
     name="memory_search",

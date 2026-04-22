@@ -1458,19 +1458,21 @@ class TestInputFileInjection:
         )
         assert "memory_search" in msg
         assert "note_finding" in msg
-        assert "memory_note" not in msg  # legacy alias hidden from fresh sessions
-        # Issue #102 — canonical terminal-commit tool is ``commit_memory``.
-        # Fresh sessions should NOT be told about the ``save_memory`` alias.
-        assert "commit_memory" in msg
+        # Issue #102 — canonical terminal-commit tool is
+        # ``remember_this_run``. Legacy names are no longer named in the
+        # prompt (this PR dropped the backward-compat aliases).
+        assert "remember_this_run" in msg
+        assert "memory_note" not in msg
         assert "save_memory" not in msg
-        # The commit_memory framing must preserve agent-decision semantics:
+        assert "commit_memory" not in msg
+        # The remember_this_run framing must preserve agent-decision semantics:
         # the prompt should say writes are opt-in, not a MUST directive.
         # A MUST would collapse ``agent_decides`` into ``always`` mode.
         assert "opt-in" in msg.lower()
         assert "MUST" not in msg
-        # Issue #102 guard — the prose must tell the agent that commit_memory
-        # is NOT a way to record findings, so it doesn't hedge by calling
-        # both tools for the same finding.
+        # Issue #102 guard — the prose must tell the agent that
+        # remember_this_run is NOT a way to record findings, so it doesn't
+        # hedge by calling both tools for the same finding.
         assert "findings go through `note_finding`" in msg
 
     def test_platform_system_message_warns_against_narrating_future_tool_calls(self):
