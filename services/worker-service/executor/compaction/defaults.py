@@ -65,6 +65,11 @@ ARG_TRUNCATION_CAP_BYTES: int = 1_000
 # age. These are load-bearing across many turns. Customer agents can extend
 # this list via agent_config.context_management.exclude_tools.
 PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
+    # Canonical findings-capture tool (issue #102).
+    "note_finding",
+    # Backward-compat alias for ``note_finding`` — kept so Tier 1 treats
+    # ToolMessages from in-flight checkpoints the same way. Remove after
+    # the alias is retired (2 releases).
     "memory_note",
     "save_memory",
     "request_human_input",

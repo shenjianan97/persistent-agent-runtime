@@ -2522,30 +2522,38 @@ class GraphExecutor:
                 f"with sandbox_exec commands."
             )
 
-        # Phase 2 Track 5 Task 12 — memory-tool framing. Gated on what is
-        # actually registered: ``memory_note`` / ``memory_search`` whenever
-        # the stack is on; ``save_memory`` only in ``agent_decides``. Tool
-        # descriptions alone underspecify behavior — Anthropic / OpenAI /
-        # Bedrock LLMs reliably forget optional retrieval tools without a
-        # platform nudge, and ``save_memory`` in particular needs the
-        # opt-in framing to preserve ``agent_decides`` semantics (a MUST
-        # directive would collapse it into ``always`` mode).
+        # Phase 2 Track 5 Task 12 / Issue #102 — memory-tool framing. Gated
+        # on what is actually registered: ``note_finding`` / ``memory_search``
+        # whenever the stack is on; ``save_memory`` only in ``agent_decides``.
+        # Tool descriptions alone underspecify behavior — LLMs reliably forget
+        # optional retrieval tools without a platform nudge, and the two
+        # memory-writing tools need sequencing guidance or agents hedge by
+        # calling both for every finding (the failure mode that issue #102
+        # tracks). The prose here explicitly names the distinct roles:
+        # ``note_finding`` = scratchpad during the run, ``save_memory`` =
+        # terminal commit switch.
         if memory_decision is not None and memory_decision.stack_enabled:
             sections.append(
                 "This agent has persistent memory. Before starting non-trivial "
-                "work, consider calling `memory_search` to recall relevant past "
-                "runs. During the run, use `memory_note` to capture salient "
-                "intermediate findings that should survive into the final "
-                "memory entry."
+                "work, call `memory_search` to recall relevant past runs. "
+                "During the run, call `note_finding(text=...)` whenever you "
+                "discover something worth preserving — each call captures one "
+                "finding, and your findings list survives context compaction. "
+                "Call it freely; the tool's return value tells you how many "
+                "findings are captured so far."
             )
             if not memory_decision.auto_write:
                 sections.append(
-                    "Memory writes are opt-in for this run: call "
-                    "`save_memory(reason=...)` exactly when the run has "
-                    "produced something worth remembering (non-trivial "
-                    "findings, customer decisions, recurring patterns). "
-                    "Skip the call for routine or trivial runs — the absence "
-                    "of a call means no memory entry is written."
+                    "Memory writes are opt-in for this run. At task end, "
+                    "call `save_memory(reason=...)` if this run produced "
+                    "something worth remembering (non-trivial findings, "
+                    "customer decisions, recurring patterns). `save_memory` "
+                    "is the commit switch — it does NOT record findings; "
+                    "findings go through `note_finding`. Repeat calls do not "
+                    "trigger additional writes; the memory entry is composed "
+                    "and persisted once at the terminal branch. Skip the "
+                    "call for routine runs — the absence of a call means no "
+                    "memory entry is written."
                 )
 
         # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended

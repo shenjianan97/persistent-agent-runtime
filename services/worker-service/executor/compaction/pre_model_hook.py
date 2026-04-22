@@ -470,6 +470,73 @@ def find_keep_window_start(
 # ---------------------------------------------------------------------------
 
 
+# Budget guards for the observations block appended to the compaction summary
+# SystemMessage (issue #102). An agent calling ``note_finding`` dozens of
+# times with 2KB payloads would otherwise inflate the system region by >100KB
+# on every turn, worsening cache economics and crowding the keep window.
+#
+# The full observation list stays on ``state["observations"]`` for the
+# terminal summarizer and the dead-letter path — these caps only bound what
+# appears in the live projection shown to the agent.
+_OBSERVATION_BULLET_CAP: int = 20
+_OBSERVATION_BLOCK_CHAR_CAP: int = 4_000
+
+_OBSERVATION_HEADER: str = "AGENT FINDINGS (preserved across compaction):"
+
+
+def _sanitize_observation_bullet(text: str) -> str:
+    """Collapse embedded newlines so an adversarial observation cannot inject
+    synthetic ``SYSTEM:`` headers into the combined SystemMessage."""
+    return text.replace("\n", " ").strip()
+
+
+def _format_observations_block(observations: list[str]) -> str:
+    """Render observations as a bulleted block suitable for prepending or
+    appending to a SystemMessage's content.
+
+    Honours :data:`_OBSERVATION_BULLET_CAP` and
+    :data:`_OBSERVATION_BLOCK_CHAR_CAP`. When either cap kicks in, drop the
+    oldest findings (keep the most recent) and prepend a synthetic
+    ``- ... {N} older finding(s) omitted`` marker so the agent knows
+    something was truncated. Returns ``""`` when ``observations`` is empty,
+    which the caller treats as "do not emit a findings block."
+    """
+    if not observations:
+        return ""
+    # Keep the most recent ``_OBSERVATION_BULLET_CAP`` findings — tail is
+    # where the agent's latest reasoning lives, and older findings are
+    # still visible through the summarizer's body on the terminal write.
+    total_count = len(observations)
+    kept_tail = observations[-_OBSERVATION_BULLET_CAP:]
+    omitted_count = total_count - len(kept_tail)
+    bullets = [
+        "- " + _sanitize_observation_bullet(o)
+        for o in kept_tail
+        if _sanitize_observation_bullet(o)
+    ]
+    # Char budget — strip oldest kept bullets until we fit. Decrement into
+    # the tail from the front (oldest kept first) so the most recent findings
+    # are guaranteed in the block.
+    header_len = len(_OBSERVATION_HEADER) + 1  # newline after header
+    budget = _OBSERVATION_BLOCK_CHAR_CAP - header_len
+    # +1 per bullet for the joining newline.
+    while bullets and sum(len(b) + 1 for b in bullets) > budget:
+        bullets.pop(0)
+        omitted_count += 1
+    if not bullets:
+        # Pathological case: even one bullet blows the budget. Surface a
+        # single truncation marker so the agent at least knows findings exist.
+        return (
+            _OBSERVATION_HEADER
+            + "\n- ... "
+            + str(total_count)
+            + " finding(s) omitted (each exceeds block budget)"
+        )
+    if omitted_count > 0:
+        bullets.insert(0, f"- ... {omitted_count} older finding(s) omitted")
+    return _OBSERVATION_HEADER + "\n" + "\n".join(bullets)
+
+
 def _build_projection(
     *,
     system_prompt: str | None,
@@ -477,15 +544,27 @@ def _build_projection(
     summary: str,
     middle: list[BaseMessage],
     keep_window: list[BaseMessage],
+    observations: list[str] | None = None,
 ) -> list[BaseMessage]:
     """Assemble the three-region projection.
 
     Final shape: ``[SystemMessage(system_prompt), SystemMessage(platform_msg)?,
-    SystemMessage(summary)?, *middle, *keep_window]``.
+    SystemMessage(combined_summary_and_findings)?, *middle, *keep_window]``.
 
-    The platform SystemMessage (auto-synthesised by the worker when
-    memory is enabled) sits between the user's system prompt and the
-    summary region to preserve today's behaviour — see ``agent_node`` in
+    The combined summary SystemMessage holds both the Tier-3 summary text
+    (when one has been written) AND an ``AGENT FINDINGS`` block rendered
+    from ``observations`` (issue #102). This is the only path through which
+    agent-written findings become visible to the agent after compaction:
+    Tier-3 replaces the original reasoning messages, so without this fold
+    the agent has no way to see its own notes on subsequent turns.
+
+    The combined SystemMessage carries
+    ``additional_kwargs={"compaction": True}`` as before — downstream
+    cache-marker logic and tests key on that flag.
+
+    The platform SystemMessage (auto-synthesised by the worker when memory
+    is enabled) sits between the user's system prompt and the combined
+    region to preserve today's behaviour — see ``agent_node`` in
     ``executor/graph.py``.
     """
     projection: list[BaseMessage] = []
@@ -493,10 +572,21 @@ def _build_projection(
         projection.append(SystemMessage(content=system_prompt))
     if platform_system_message:
         projection.append(SystemMessage(content=platform_system_message))
-    if summary:
+
+    # Build the combined summary + findings content. Emit the SystemMessage
+    # only when there is something to show. When both are empty (fresh task
+    # before any Tier-3 firing and no note_finding calls), behaviour matches
+    # the pre-issue-#102 projection exactly.
+    findings_block = _format_observations_block(list(observations or []))
+    summary_text = summary or ""
+    if summary_text and findings_block:
+        combined = summary_text + "\n\n" + findings_block
+    else:
+        combined = summary_text or findings_block
+    if combined:
         projection.append(
             SystemMessage(
-                content=summary,
+                content=combined,
                 additional_kwargs={"compaction": True},
             )
         )
@@ -660,6 +750,10 @@ async def compaction_pre_model_hook(
     # and the hard-floor safety net takes over as before. Evaluated up
     # front (before the token-estimate) so we don't waste cycles on the
     # common case where middle is non-empty already.
+    # Observations surfaced into the combined summary SystemMessage. Issue
+    # #102 — see ``_build_projection`` / ``_format_observations_block``.
+    observations = list(state.get("observations") or [])
+
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
         _probe_est = estimate_tokens_fn(
@@ -669,6 +763,7 @@ async def compaction_pre_model_hook(
                 summary=summary,
                 middle=[],
                 keep_window=keep_window,
+                observations=observations,
             )
         )
         if _probe_est > model_context_window and _tool_count >= 2:
@@ -700,6 +795,7 @@ async def compaction_pre_model_hook(
         summary=summary,
         middle=middle,
         keep_window=keep_window,
+        observations=observations,
     )
     est_tokens = estimate_tokens_fn(projection)
 
@@ -1091,6 +1187,7 @@ async def compaction_pre_model_hook(
         summary=new_summary,
         middle=[],
         keep_window=keep_window,
+        observations=observations,
     )
     post_est = estimate_tokens_fn(post_projection)
     if post_est > model_context_window:

@@ -54,6 +54,7 @@ import asyncpg
 import httpx
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, StructuredTool
+from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -86,8 +87,9 @@ class MemoryNoteArguments(BaseModel):
             min_length=1,
             max_length=MEMORY_NOTE_MAX_LEN,
             description=(
-                "A short, durable note to append to this task's draft memory "
-                "entry. Persisted across worker restarts. "
+                "A short finding you want to preserve for this task. Appended "
+                "to your findings list, which survives context compaction and "
+                "feeds the post-task summary. "
                 f"Max {MEMORY_NOTE_MAX_LEN} characters."
             ),
         ),
@@ -97,6 +99,24 @@ class MemoryNoteArguments(BaseModel):
     # ``ToolMessage`` paired to the agent's tool call — LangGraph's ``ToolNode``
     # rejects a ``Command`` update that lacks the pairing.
     tool_call_id: Annotated[str, InjectedToolCallId]
+    # Injected by ToolNode — reads ``state["observations"]`` before the tool
+    # runs. Required on the schema (not just the function signature) so
+    # ``StructuredTool`` includes it in the kwargs routed to the handler;
+    # without this, LangGraph's ToolNode doesn't pass it through and the
+    # handler fails with ``missing 1 required positional argument``.
+    # ``default=None`` lets :class:`BaseModel` construct successfully during
+    # schema-level validation (the injected value always overrides at
+    # runtime). Kept off the LLM-facing JSON schema by the ``InjectedState``
+    # marker, same pattern as ``tool_call_id`` above.
+    observations: Annotated[
+        list[str] | None, InjectedState("observations")
+    ] = None
+
+
+# Canonical schema alias — the class name is kept for backward compat with
+# any importer, but new code should read the argument shape as
+# ``NoteFindingArguments``. See issue #102.
+NoteFindingArguments = MemoryNoteArguments
 
 
 # Phase 2 Track 5 Task 12 — ``save_memory`` mirror shape. Same 1..2048 char
@@ -120,6 +140,11 @@ class SaveMemoryArguments(BaseModel):
     # Injected by ToolNode at runtime; hidden from the LLM schema. See
     # ``MemoryNoteArguments.tool_call_id`` for rationale.
     tool_call_id: Annotated[str, InjectedToolCallId]
+    # Injected by ToolNode — see ``MemoryNoteArguments.observations`` for
+    # the full rationale on why this lives on the schema.
+    observations: Annotated[
+        list[str] | None, InjectedState("observations")
+    ] = None
 
 
 class MemorySearchArguments(BaseModel):
@@ -271,51 +296,135 @@ def _maybe_await_or_cancel(
 
 
 # ---------------------------------------------------------------------------
-# memory_note
+# note_finding (canonical) + memory_note (deprecated alias)
 # ---------------------------------------------------------------------------
+# Prior to 2026-04 this tool was named ``memory_note``. The name is retained
+# as a backward-compat alias (``_build_memory_note_alias_tool``) so
+# in-flight checkpoints resume cleanly, but fresh sessions should only see
+# the canonical ``note_finding`` name — the alias's description explicitly
+# steers the LLM away from calling it.
 
 
-MEMORY_NOTE_DESCRIPTION = (
-    "Append a short observation to this task's draft memory entry. "
-    "Use this to capture salient intermediate findings that should survive "
-    "into the final retrospective memory. Returns {ok, count}. "
-    f"Max {MEMORY_NOTE_MAX_LEN} characters per note. Zero cost."
+NOTE_FINDING_DESCRIPTION = (
+    "Jot down a finding you want to preserve. Call freely during the run — "
+    "each call appends to your findings list, which survives context "
+    "compaction and feeds the post-task summary. This is a scratchpad, NOT "
+    "a durable save: in `agent_decides` memory mode, findings only persist "
+    "across runs if you also call `save_memory` at task end. "
+    f"Max {MEMORY_NOTE_MAX_LEN} characters per call. Zero cost."
+)
+
+# Back-compat alias — existing importers that read ``MEMORY_NOTE_DESCRIPTION``
+# continue to work. Deprecated; remove after 2 releases.
+MEMORY_NOTE_DESCRIPTION = NOTE_FINDING_DESCRIPTION
+
+
+_MEMORY_NOTE_ALIAS_DESCRIPTION = (
+    "DEPRECATED alias for `note_finding`. Do NOT call this — use "
+    "`note_finding` instead. Registered only for backward compatibility "
+    "with tasks started before this worker upgrade; will be removed."
 )
 
 
-def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
-    # ``tenant_id`` / ``agent_id`` are captured for logging. The tool does
-    # NOT touch the DB — the ``operator.add`` reducer on the
-    # ``observations`` state field merges the append at super-step commit.
-    bound_tenant = ctx.tenant_id
-    bound_agent = ctx.agent_id
-    bound_task = ctx.task_id
+def _make_note_finding_handler(
+    *,
+    bound_tenant: str,
+    bound_agent: str,
+    bound_task: str,
+    log_alias: bool = False,
+) -> Callable[..., Command]:
+    """Build the shared handler used by both ``note_finding`` and its
+    ``memory_note`` alias. ``log_alias=True`` emits one deprecation log
+    per call so operators can track in-flight checkpoint usage and time
+    the alias removal.
+    """
 
-    def memory_note(
+    def _handler(
         text: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        observations: Annotated[list[str] | None, InjectedState("observations")] = None,
     ) -> Command:
         # Argument validation is enforced by ``MemoryNoteArguments`` — if we
         # reach here, ``text`` already satisfies length 1..MEMORY_NOTE_MAX_LEN.
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — without it the next agent step
         # rejects the orphan tool call as a fatal graph error.
+        if log_alias:
+            logger.warning(
+                "memory.deprecated_tool_name used=memory_note "
+                "canonical=note_finding tenant_id=%s agent_id=%s task_id=%s",
+                bound_tenant, bound_agent, bound_task,
+            )
         logger.debug(
             "memory.note.appended tenant_id=%s agent_id=%s task_id=%s "
             "note_chars=%d",
             bound_tenant, bound_agent, bound_task, len(text),
         )
+        # ``observations`` is the pre-update list (InjectedState reads state
+        # before this super-step's reducer runs). The post-update count is
+        # one higher. Surfacing the count in the ToolMessage gives the agent
+        # direct evidence that its call landed, which stops the hedging
+        # behavior where it re-invokes the sibling ``save_memory`` just to
+        # "be sure" (see issue #102).
+        current_count = len(observations or [])
+        new_count = current_count + 1
         return Command(update={
-            "messages": [ToolMessage(content="ok", tool_call_id=tool_call_id)],
+            "messages": [
+                ToolMessage(
+                    content=(
+                        f"Noted. {new_count} finding(s) captured so far "
+                        f"in this run."
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            ],
             "observations": [text],
         })
 
+    return _handler
+
+
+def _build_note_finding_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Canonical findings scratchpad tool."""
+    handler = _make_note_finding_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+        log_alias=False,
+    )
     return StructuredTool.from_function(
-        func=memory_note,
+        func=handler,
+        name="note_finding",
+        description=NOTE_FINDING_DESCRIPTION,
+        args_schema=NoteFindingArguments,
+    )
+
+
+def _build_memory_note_alias_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Deprecated alias — same handler under the legacy ``memory_note`` name.
+
+    In-flight checkpoints whose committed ``AIMessage.tool_calls[*].name`` is
+    ``"memory_note"`` need a callable tool of that name on resume or the
+    ToolNode raises. The alias is intentionally given a DEPRECATED-flavoured
+    description so fresh LLM sessions skip it; if one does call it, behavior
+    is identical to ``note_finding`` plus a warning log.
+    """
+    handler = _make_note_finding_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+        log_alias=True,
+    )
+    return StructuredTool.from_function(
+        func=handler,
         name="memory_note",
-        description=MEMORY_NOTE_DESCRIPTION,
+        description=_MEMORY_NOTE_ALIAS_DESCRIPTION,
         args_schema=MemoryNoteArguments,
     )
+
+
+# Back-compat name for any importer still referencing the old builder.
+_build_memory_note_tool = _build_note_finding_tool
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +433,15 @@ def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
 
 
 SAVE_MEMORY_DESCRIPTION = (
-    "Opt this task in to writing a durable retrospective memory entry. "
-    "Call this exactly when the run has produced something worth "
-    "remembering (non-trivial findings, customer decisions, recurring "
-    "patterns). Silently no-ops when called more than once. Argument: "
-    "reason (1-2048 chars) — a short justification that will appear in "
-    "the task timeline and feed the summarizer. Zero cost; the write "
-    "itself happens once at the terminal branch."
+    "Opt this task in to writing a durable memory entry at task completion. "
+    "Call when the run has produced something worth remembering (non-trivial "
+    "findings, customer decisions, recurring patterns). Repeat calls append "
+    "to the justification but do not trigger additional writes — the memory "
+    "entry is composed and persisted ONCE at the terminal branch, built "
+    "from your `note_finding` bullets plus any `save_memory` reasons. "
+    "Do NOT use this to capture a finding — findings go through "
+    "`note_finding`. "
+    f"Max {SAVE_MEMORY_REASON_MAX_LEN} characters for `reason`. Zero cost."
 )
 
 
@@ -358,6 +469,7 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
     def save_memory(
         reason: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        observations: Annotated[list[str] | None, InjectedState("observations")] = None,
     ) -> Command:
         stripped = reason.strip()
         if not stripped:
@@ -382,6 +494,17 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             "reason_chars=%d",
             bound_tenant, bound_agent, bound_task, len(stripped),
         )
+        # ``observations`` here is the pre-update list — findings captured so
+        # far by note_finding (and any prior save_memory reasons). The count
+        # in the returned ToolMessage tells the agent "this many findings
+        # will persist with the memory entry", which disambiguates the opt-in
+        # from the finding-capture tool. Without this context the agent can't
+        # tell whether its note_finding calls landed and tends to hedge by
+        # calling both (see issue #102).
+        findings_count = sum(
+            1 for o in (observations or [])
+            if not o.startswith("[save_memory]")
+        )
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — every LLM tool call needs a paired
         # reply or the next agent step rejects the orphan as a fatal graph
@@ -390,7 +513,14 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
         return Command(
             update={
                 "messages": [
-                    ToolMessage(content="ok", tool_call_id=tool_call_id),
+                    ToolMessage(
+                        content=(
+                            f"Opt-in confirmed. {findings_count} finding(s) "
+                            f"will persist with this task's memory entry "
+                            f"at completion."
+                        ),
+                        tool_call_id=tool_call_id,
+                    ),
                 ],
                 "memory_opt_in": True,
                 "observations": [f"[save_memory] {stripped}"],
@@ -727,7 +857,12 @@ def build_memory_tools(
     """
     tools: list[StructuredTool] = []
     if stack_enabled:
-        tools.append(_build_memory_note_tool(ctx))
+        # ``note_finding`` is the canonical findings-capture tool; the
+        # ``memory_note`` alias is registered for backward compat with
+        # in-flight checkpoints that committed tool calls under the old
+        # name (see ``_build_memory_note_alias_tool`` for the rationale).
+        tools.append(_build_note_finding_tool(ctx))
+        tools.append(_build_memory_note_alias_tool(ctx))
         tools.append(_build_memory_search_tool(ctx))
         if not auto_write:
             tools.append(_build_save_memory_tool(ctx))
@@ -736,7 +871,7 @@ def build_memory_tools(
 
 
 __all__ = [
-    "MEMORY_NOTE_DESCRIPTION",
+    "MEMORY_NOTE_DESCRIPTION",  # deprecated alias — use NOTE_FINDING_DESCRIPTION
     "MEMORY_NOTE_MAX_LEN",
     "MEMORY_SEARCH_DEFAULT_LIMIT",
     "MEMORY_SEARCH_DESCRIPTION",
@@ -747,6 +882,8 @@ __all__ = [
     "MemoryToolContext",
     "MemoryToolError",
     "MemoryToolNotFoundError",
+    "NOTE_FINDING_DESCRIPTION",
+    "NoteFindingArguments",
     "SAVE_MEMORY_DESCRIPTION",
     "SAVE_MEMORY_REASON_MAX_LEN",
     "SaveMemoryArguments",

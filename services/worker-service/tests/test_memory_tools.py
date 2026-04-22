@@ -150,23 +150,48 @@ class TestMemoryNoteArguments:
             )
 
 
-def _invoke_with_tool_call(tool, args: dict, tool_call_id: str = "call_test"):
-    """Invoke a StructuredTool via the full tool_call envelope so
-    ``InjectedToolCallId``-annotated parameters get populated. Direct
-    ``tool.invoke({"arg": ...})`` bypasses the injection path and fails."""
-    return tool.invoke({
-        "args": args,
-        "id": tool_call_id,
-        "type": "tool_call",
-        "name": tool.name,
-    })
+def _invoke_with_tool_call(
+    tool,
+    args: dict,
+    tool_call_id: str = "call_test",
+    *,
+    observations: list[str] | None = None,
+):
+    """Invoke a memory tool's underlying handler with both LLM args and the
+    graph-state values that ``InjectedState`` would inject in production.
+
+    ``StructuredTool.invoke(<tool_call_envelope>)`` populates
+    ``InjectedToolCallId`` from the envelope but does NOT populate
+    ``InjectedState`` — that work normally happens inside LangGraph's
+    ``ToolNode``. For unit coverage we bypass ToolNode and call the
+    underlying handler directly, passing ``observations`` as a keyword
+    arg to match the injection the production path performs.
+
+    ``observations`` defaults to an empty list — matches a fresh task
+    state before any ``note_finding`` call has run.
+    """
+    kwargs = dict(args)
+    kwargs["tool_call_id"] = tool_call_id
+    # note_finding / save_memory both take ``observations`` via InjectedState.
+    # memory_search / task_history_get do not; only pass it when the handler
+    # signature accepts it.
+    import inspect
+
+    params = inspect.signature(tool.func).parameters
+    if "observations" in params:
+        kwargs["observations"] = list(observations or [])
+    return tool.func(**kwargs)
 
 
 class TestMemoryNoteTool:
-    def test_returns_command_with_tool_message_and_observation(self) -> None:
+    """Coverage for the canonical ``note_finding`` tool plus the
+    ``memory_note`` alias retained for backward compatibility (issue #102).
+    """
+
+    def test_note_finding_returns_command_with_tool_message_and_observation(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
-        tool = _tool_by_name(tools, "memory_note")
+        tool = _tool_by_name(tools, "note_finding")
 
         result = _invoke_with_tool_call(tool, {"text": "hello"}, "call_xyz")
         assert isinstance(result, Command)
@@ -175,11 +200,50 @@ class TestMemoryNoteTool:
         messages = result.update["messages"]
         assert len(messages) == 1
         assert messages[0].tool_call_id == "call_xyz"
+        # Informative return — gives the agent direct evidence the call
+        # landed, which fixes the hedging behaviour documented in #102.
+        assert "1 finding" in messages[0].content
+        assert "captured" in messages[0].content
+
+    def test_note_finding_count_reflects_pre_update_state(self) -> None:
+        """Count in the ToolMessage is ``len(observations) + 1``."""
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
+        tool = _tool_by_name(tools, "note_finding")
+
+        result = _invoke_with_tool_call(
+            tool, {"text": "third"}, observations=["first", "second"]
+        )
+        assert "3 finding" in result.update["messages"][0].content
+
+    def test_memory_note_alias_logs_deprecation(self, caplog) -> None:
+        """The deprecated alias routes to the same handler but emits a
+        warning so operators can track residual usage."""
+        import logging
+
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
+        alias = _tool_by_name(tools, "memory_note")
+
+        with caplog.at_level(logging.WARNING, logger="tools.memory_tools"):
+            result = _invoke_with_tool_call(alias, {"text": "hi"}, "c1")
+
+        # Behaviour identical to the canonical tool — observation appended,
+        # informative ToolMessage content returned.
+        assert result.update["observations"] == ["hi"]
+        assert "1 finding" in result.update["messages"][0].content
+        # Exactly one deprecation warning emitted for this call.
+        matched = [
+            r for r in caplog.records
+            if "memory.deprecated_tool_name" in r.getMessage()
+        ]
+        assert len(matched) == 1
 
     def test_not_registered_when_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
+        assert "note_finding" not in names
         assert "memory_note" not in names
 
 
@@ -220,6 +284,29 @@ class TestSaveMemoryTool:
         messages = result.update["messages"]
         assert len(messages) == 1
         assert messages[0].tool_call_id == "call_save_1"
+        # Informative return — tells the agent the opt-in landed and how
+        # many findings will flow through to the memory entry. Issue #102.
+        assert "Opt-in confirmed" in messages[0].content
+        assert "0 finding" in messages[0].content
+
+    def test_return_counts_findings_excluding_save_memory_reasons(self) -> None:
+        """The count in save_memory's return excludes prior ``[save_memory]``
+        opt-in entries — agents should see "findings" as user-facing
+        observations, not bookkeeping records."""
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "save_memory")
+
+        result = _invoke_with_tool_call(
+            tool,
+            {"reason": "another reason"},
+            observations=[
+                "real finding 1",
+                "[save_memory] earlier opt-in",
+                "real finding 2",
+            ],
+        )
+        assert "2 finding" in result.update["messages"][0].content
 
     def test_strips_whitespace_around_reason(self) -> None:
         ctx = _make_ctx()
@@ -565,13 +652,20 @@ class TestTaskHistoryGetTool:
 
 
 class TestBuildMemoryToolsGating:
-    def test_always_mode_registers_memory_note_search_and_history(self) -> None:
+    def test_always_mode_registers_note_finding_alias_search_and_history(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         names = sorted(t.name for t in tools)
         # ``save_memory`` is NOT registered in ``always`` mode — the run
         # writes unconditionally, so the tool would be a no-op.
-        assert names == ["memory_note", "memory_search", "task_history_get"]
+        # ``memory_note`` alias is registered alongside ``note_finding``
+        # for backward compat with in-flight checkpoints (issue #102).
+        assert names == [
+            "memory_note",
+            "memory_search",
+            "note_finding",
+            "task_history_get",
+        ]
 
     def test_agent_decides_mode_also_registers_save_memory(self) -> None:
         ctx = _make_ctx()
@@ -580,6 +674,7 @@ class TestBuildMemoryToolsGating:
         assert names == [
             "memory_note",
             "memory_search",
+            "note_finding",
             "save_memory",
             "task_history_get",
         ]

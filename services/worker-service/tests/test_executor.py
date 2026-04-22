@@ -1423,7 +1423,13 @@ class TestInputFileInjection:
         assert "save_memory" not in msg
 
     def test_platform_system_message_memory_always_mode(self):
-        """``always`` mode → memory_search + memory_note framing, NO save_memory."""
+        """``always`` mode → memory_search + note_finding framing, NO save_memory.
+
+        Issue #102 — canonical name is ``note_finding``. The legacy
+        ``memory_note`` alias is registered but deliberately NOT named in
+        the platform framing so fresh sessions only see one finding-capture
+        verb.
+        """
         from executor.memory_graph import MemoryDecision
         executor = _build_test_executor()
         msg = executor._build_platform_system_message(
@@ -1431,7 +1437,8 @@ class TestInputFileInjection:
             memory_decision=MemoryDecision(stack_enabled=True, auto_write=True),
         )
         assert "memory_search" in msg
-        assert "memory_note" in msg
+        assert "note_finding" in msg
+        assert "memory_note" not in msg  # legacy alias hidden from fresh sessions
         assert "save_memory" not in msg
 
     def test_platform_system_message_memory_agent_decides_mode(self):
@@ -1443,13 +1450,18 @@ class TestInputFileInjection:
             memory_decision=MemoryDecision(stack_enabled=True, auto_write=False),
         )
         assert "memory_search" in msg
-        assert "memory_note" in msg
+        assert "note_finding" in msg
+        assert "memory_note" not in msg  # legacy alias hidden from fresh sessions
         assert "save_memory" in msg
         # The save_memory framing must preserve agent-decision semantics: the
         # prompt should say writes are opt-in, not a MUST directive. A MUST
         # would collapse ``agent_decides`` into ``always`` mode.
         assert "opt-in" in msg.lower()
         assert "MUST" not in msg  # no policy-level enforcement on save_memory
+        # Issue #102 guard — the prose must tell the agent that save_memory
+        # is NOT a way to record findings, so it doesn't hedge by calling
+        # both tools for the same finding.
+        assert "does NOT record findings" in msg or "findings go through `note_finding`" in msg
 
     def test_platform_system_message_warns_against_narrating_future_tool_calls(self):
         """Phase 1 guardrail: the platform prompt tells models to call tools now or answer finally."""

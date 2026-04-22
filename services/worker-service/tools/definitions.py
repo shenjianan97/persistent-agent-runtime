@@ -15,9 +15,11 @@ from tools.calculator import MAX_EXPRESSION_LENGTH, evaluate_expression
 from tools.memory_tools import (
     MemoryNoteArguments,
     MemorySearchArguments,
+    NoteFindingArguments,
     TaskHistoryGetArguments,
     MEMORY_NOTE_DESCRIPTION,
     MEMORY_SEARCH_DESCRIPTION,
+    NOTE_FINDING_DESCRIPTION,
     TASK_HISTORY_GET_DESCRIPTION,
 )
 from tools.providers.search import SearchProvider, SearchResult, TavilySearchProvider
@@ -224,14 +226,19 @@ EXPORT_SANDBOX_FILE_TOOL = ToolDefinition(
 
 
 class MemoryNoteResult(BaseModel):
-    """Placeholder schema for the ``memory_note`` catalog entry.
+    """Placeholder schema for the ``note_finding`` (and legacy ``memory_note``)
+    catalog entries.
 
-    ``memory_note`` is a state-mutating tool: its runtime return is a LangGraph
+    These are state-mutating tools: their runtime return is a LangGraph
     ``Command(update={"observations": [text]})`` consumed by the graph's
     ``operator.add`` reducer, not a JSON payload. This model exists only to
     satisfy :class:`ToolDefinition.output_model`'s non-optional contract and
     give catalog consumers a stable (empty) shape.
     """
+
+
+# Kept as an alias for catalog consumers that referenced the old name.
+NoteFindingResult = MemoryNoteResult
 
 
 class MemorySearchResultSummary(BaseModel):
@@ -285,6 +292,15 @@ class TaskHistoryGetResult(BaseModel):
 # Registered per-task from ``executor.graph`` via
 # :func:`tools.memory_tools.build_memory_tools`. Included here so tooling
 # that iterates the catalog (schema introspection, docs) can see them.
+NOTE_FINDING_TOOL = ToolDefinition(
+    name="note_finding",
+    description=NOTE_FINDING_DESCRIPTION,
+    input_model=NoteFindingArguments,
+    output_model=MemoryNoteResult,
+)
+# Deprecated alias — kept so catalog consumers and
+# ``context_management.exclude_tools`` validation accept the legacy name.
+# Remove after 2 releases (track in follow-up).
 MEMORY_NOTE_TOOL = ToolDefinition(
     name="memory_note",
     description=MEMORY_NOTE_DESCRIPTION,

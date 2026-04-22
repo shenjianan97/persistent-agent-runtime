@@ -77,14 +77,27 @@ class TestConstants:
 
 
 class TestPlatformExcludeTools:
-    """PLATFORM_EXCLUDE_TOOLS must be a frozenset containing all five tools."""
+    """PLATFORM_EXCLUDE_TOOLS must be a frozenset containing every tool
+    whose ToolMessages Tier 1 must never age out.
+
+    After issue #102 the set contains six names: the canonical
+    ``note_finding`` plus its deprecated alias ``memory_note`` (remove once
+    the alias retires), ``save_memory``, ``request_human_input``,
+    ``memory_search``, ``task_history_get``.
+    """
 
     def test_is_frozenset(self):
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
 
         assert isinstance(PLATFORM_EXCLUDE_TOOLS, frozenset)
 
-    def test_contains_memory_note(self):
+    def test_contains_note_finding(self):
+        from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
+
+        assert "note_finding" in PLATFORM_EXCLUDE_TOOLS
+
+    def test_contains_memory_note_alias(self):
+        """Legacy alias kept until the alias tool is retired (issue #102)."""
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
 
         assert "memory_note" in PLATFORM_EXCLUDE_TOOLS
@@ -109,10 +122,12 @@ class TestPlatformExcludeTools:
 
         assert "task_history_get" in PLATFORM_EXCLUDE_TOOLS
 
-    def test_exactly_five_tools(self):
+    def test_exactly_six_tools(self):
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
 
-        assert len(PLATFORM_EXCLUDE_TOOLS) == 5
+        # Six: note_finding, memory_note (alias), save_memory,
+        # request_human_input, memory_search, task_history_get.
+        assert len(PLATFORM_EXCLUDE_TOOLS) == 6
 
     def test_immutable(self):
         from executor.compaction.defaults import PLATFORM_EXCLUDE_TOOLS
