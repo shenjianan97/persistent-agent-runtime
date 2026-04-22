@@ -482,6 +482,11 @@ _OBSERVATION_BULLET_CAP: int = 20
 _OBSERVATION_BLOCK_CHAR_CAP: int = 4_000
 
 _OBSERVATION_HEADER: str = "AGENT FINDINGS (preserved across compaction):"
+_COMMIT_RATIONALE_HEADER: str = "COMMIT RATIONALE(S):"
+# Commit rationales are far smaller in practice than findings (one short
+# string per save_memory / commit_memory call, typically <= a handful per
+# task) — so a single char cap is enough.  No per-entry cap needed.
+_COMMIT_RATIONALE_BLOCK_CHAR_CAP: int = 1_500
 
 
 def _sanitize_observation_bullet(text: str) -> str:
@@ -537,6 +542,41 @@ def _format_observations_block(observations: list[str]) -> str:
     return _OBSERVATION_HEADER + "\n" + "\n".join(bullets)
 
 
+def _format_commit_rationales_block(rationales: list[str]) -> str:
+    """Render commit rationales as a bulleted block separate from findings.
+
+    Kept distinct from :func:`_format_observations_block` so the agent
+    sees the two concepts — "what I learned" vs. "why I chose to save"
+    — as different sections in its post-compaction projection. Issue #102.
+    """
+    if not rationales:
+        return ""
+    bullets = [
+        "- " + _sanitize_observation_bullet(r)
+        for r in rationales
+        if _sanitize_observation_bullet(r)
+    ]
+    header_len = len(_COMMIT_RATIONALE_HEADER) + 1
+    budget = _COMMIT_RATIONALE_BLOCK_CHAR_CAP - header_len
+    # Trim oldest rationales from the front until we fit. Trimmed count is
+    # announced via a synthetic marker so the agent knows something was
+    # dropped.
+    omitted = 0
+    while bullets and sum(len(b) + 1 for b in bullets) > budget:
+        bullets.pop(0)
+        omitted += 1
+    if not bullets:
+        return (
+            _COMMIT_RATIONALE_HEADER
+            + "\n- ... "
+            + str(len(rationales))
+            + " rationale(s) omitted (each exceeds block budget)"
+        )
+    if omitted > 0:
+        bullets.insert(0, f"- ... {omitted} older rationale(s) omitted")
+    return _COMMIT_RATIONALE_HEADER + "\n" + "\n".join(bullets)
+
+
 def _build_projection(
     *,
     system_prompt: str | None,
@@ -545,18 +585,25 @@ def _build_projection(
     middle: list[BaseMessage],
     keep_window: list[BaseMessage],
     observations: list[str] | None = None,
+    commit_rationales: list[str] | None = None,
 ) -> list[BaseMessage]:
     """Assemble the three-region projection.
 
     Final shape: ``[SystemMessage(system_prompt), SystemMessage(platform_msg)?,
-    SystemMessage(combined_summary_and_findings)?, *middle, *keep_window]``.
+    SystemMessage(combined_summary_findings_and_rationales)?, *middle, *keep_window]``.
 
-    The combined summary SystemMessage holds both the Tier-3 summary text
-    (when one has been written) AND an ``AGENT FINDINGS`` block rendered
-    from ``observations`` (issue #102). This is the only path through which
-    agent-written findings become visible to the agent after compaction:
-    Tier-3 replaces the original reasoning messages, so without this fold
-    the agent has no way to see its own notes on subsequent turns.
+    The combined summary SystemMessage holds:
+
+    1. The Tier-3 summary text (when one has been written).
+    2. An ``AGENT FINDINGS`` block rendered from ``observations`` — agent
+       notes from ``note_finding`` (issue #102 fold).
+    3. A ``COMMIT RATIONALE(S)`` block rendered from ``commit_rationales``
+       — agent reasons from ``commit_memory`` / ``save_memory``
+       (issue #102 follow-up, separate channel).
+
+    The two finding / rationale blocks are distinct so the agent sees
+    "what I've captured" and "why I want this saved" as separate concepts,
+    mirroring the memory-detail UI rendering.
 
     The combined SystemMessage carries
     ``additional_kwargs={"compaction": True}`` as before — downstream
@@ -573,16 +620,17 @@ def _build_projection(
     if platform_system_message:
         projection.append(SystemMessage(content=platform_system_message))
 
-    # Build the combined summary + findings content. Emit the SystemMessage
-    # only when there is something to show. When both are empty (fresh task
-    # before any Tier-3 firing and no note_finding calls), behaviour matches
-    # the pre-issue-#102 projection exactly.
+    # Build the combined summary + findings + rationale content. Emit the
+    # SystemMessage only when there is something to show. When all three
+    # are empty (fresh task, no note_finding, no commit_memory), behaviour
+    # matches the pre-issue-#102 projection exactly.
     findings_block = _format_observations_block(list(observations or []))
+    rationale_block = _format_commit_rationales_block(
+        list(commit_rationales or [])
+    )
     summary_text = summary or ""
-    if summary_text and findings_block:
-        combined = summary_text + "\n\n" + findings_block
-    else:
-        combined = summary_text or findings_block
+    parts = [p for p in (summary_text, findings_block, rationale_block) if p]
+    combined = "\n\n".join(parts)
     if combined:
         projection.append(
             SystemMessage(
@@ -750,9 +798,12 @@ async def compaction_pre_model_hook(
     # and the hard-floor safety net takes over as before. Evaluated up
     # front (before the token-estimate) so we don't waste cycles on the
     # common case where middle is non-empty already.
-    # Observations surfaced into the combined summary SystemMessage. Issue
-    # #102 — see ``_build_projection`` / ``_format_observations_block``.
+    # Observations + commit rationales surfaced into the combined summary
+    # SystemMessage. Issue #102 — see ``_build_projection`` and the
+    # ``_format_observations_block`` / ``_format_commit_rationales_block``
+    # formatters.
     observations = list(state.get("observations") or [])
+    commit_rationales = list(state.get("commit_rationales") or [])
 
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
@@ -764,6 +815,7 @@ async def compaction_pre_model_hook(
                 middle=[],
                 keep_window=keep_window,
                 observations=observations,
+                commit_rationales=commit_rationales,
             )
         )
         if _probe_est > model_context_window and _tool_count >= 2:
@@ -796,6 +848,7 @@ async def compaction_pre_model_hook(
         middle=middle,
         keep_window=keep_window,
         observations=observations,
+        commit_rationales=commit_rationales,
     )
     est_tokens = estimate_tokens_fn(projection)
 
@@ -1188,6 +1241,7 @@ async def compaction_pre_model_hook(
         middle=[],
         keep_window=keep_window,
         observations=observations,
+        commit_rationales=commit_rationales,
     )
     post_est = estimate_tokens_fn(post_projection)
     if post_est > model_context_window:

@@ -80,6 +80,10 @@ def _build_messages(n_pairs: int, large_result_bytes: int | None = None) -> list
 def _fresh_state(messages: list[BaseMessage]) -> dict[str, Any]:
     return {
         "messages": messages,
+        # Issue #102 — both finding / rationale channels seeded so tests
+        # can overwrite either without worrying about KeyError paths.
+        "observations": [],
+        "commit_rationales": [],
         "summary": "",
         "summarized_through_turn_index": 0,
         "memory_flush_fired_this_task": False,
@@ -334,6 +338,71 @@ async def test_projection_truncates_observations_to_budget():
     assert "- finding 0" not in combined.content
     # Explicit truncation marker so the agent knows older findings existed.
     assert "older finding(s) omitted" in combined.content
+
+
+@pytest.mark.asyncio
+async def test_projection_renders_commit_rationales_as_separate_block():
+    """Issue #102 follow-up — ``commit_rationales`` lands in its own
+    ``COMMIT RATIONALE(S):`` block, distinct from ``AGENT FINDINGS``.
+
+    The observations and commit_rationales channels must not pollute each
+    other's block: the user wants a clear visual separation between "what
+    the agent learned" and "why the agent chose to save this run."
+    """
+    msgs = _build_messages(n_pairs=3)
+    state = _fresh_state(msgs)
+    state["summary"] = "prior summary"
+    state["summarized_through_turn_index"] = 1
+    state["observations"] = ["finding A", "finding B"]
+    state["commit_rationales"] = ["shipped the fix"]
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(1_000),
+        system_prompt="SYS",
+    )
+
+    combined = result.messages[1].content
+    # Both blocks present with distinct headers, in order.
+    assert "AGENT FINDINGS" in combined
+    assert "COMMIT RATIONALE(S)" in combined
+    assert combined.index("AGENT FINDINGS") < combined.index("COMMIT RATIONALE(S)")
+    # Findings only contain note_finding entries; rationales contain the
+    # save_memory / commit_memory reasons — NOT muddled together.
+    assert "- finding A" in combined
+    assert "- shipped the fix" in combined
+
+
+@pytest.mark.asyncio
+async def test_projection_omits_rationale_block_when_none():
+    """No commit_rationales → no ``COMMIT RATIONALE(S):`` header.
+
+    Preserves the pre-rationale projection shape when the agent hasn't
+    called ``commit_memory`` / ``save_memory`` yet.
+    """
+    msgs = _build_messages(n_pairs=3)
+    state = _fresh_state(msgs)
+    state["observations"] = ["finding only"]
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(1_000),
+        system_prompt="SYS",
+    )
+
+    combined = result.messages[1].content
+    assert "AGENT FINDINGS" in combined
+    assert "COMMIT RATIONALE(S)" not in combined
 
 
 @pytest.mark.asyncio

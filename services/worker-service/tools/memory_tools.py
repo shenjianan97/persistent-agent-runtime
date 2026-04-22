@@ -133,7 +133,8 @@ class SaveMemoryArguments(BaseModel):
             description=(
                 "Short justification for why this run is worth remembering. "
                 "Flows into the task timeline and the summarizer input as "
-                f"an observation. Max {SAVE_MEMORY_REASON_MAX_LEN} characters."
+                f"the commit rationale. Max {SAVE_MEMORY_REASON_MAX_LEN} "
+                "characters."
             ),
         ),
     ]
@@ -145,6 +146,12 @@ class SaveMemoryArguments(BaseModel):
     observations: Annotated[
         list[str] | None, InjectedState("observations")
     ] = None
+
+
+# Canonical schema alias — the class name is kept for backward compat with
+# any importer referencing SaveMemoryArguments, but new code reads the
+# argument shape as ``CommitMemoryArguments``. See issue #102.
+CommitMemoryArguments = SaveMemoryArguments
 
 
 class MemorySearchArguments(BaseModel):
@@ -432,41 +439,50 @@ _build_memory_note_tool = _build_note_finding_tool
 # ---------------------------------------------------------------------------
 
 
-SAVE_MEMORY_DESCRIPTION = (
-    "Opt this task in to writing a durable memory entry at task completion. "
+COMMIT_MEMORY_DESCRIPTION = (
+    "Commit this run's findings to persistent memory at task completion. "
     "Call when the run has produced something worth remembering (non-trivial "
-    "findings, customer decisions, recurring patterns). Repeat calls append "
-    "to the justification but do not trigger additional writes — the memory "
-    "entry is composed and persisted ONCE at the terminal branch, built "
-    "from your `note_finding` bullets plus any `save_memory` reasons. "
-    "Do NOT use this to capture a finding — findings go through "
+    "findings, customer decisions, recurring patterns). This is the trigger, "
+    "NOT the save itself — a dedicated summarizer runs after you return and "
+    "distills your `note_finding` bullets into the stored memory entry. "
+    "Repeat calls append to the rationale but do not trigger additional "
+    "writes; the entry is composed and persisted ONCE at the terminal "
+    "branch. Do NOT use this to capture a finding — findings go through "
     "`note_finding`. "
     f"Max {SAVE_MEMORY_REASON_MAX_LEN} characters for `reason`. Zero cost."
 )
 
+# Back-compat alias — existing importers referencing the old constant
+# continue to work. Deprecated; remove after 2 releases.
+SAVE_MEMORY_DESCRIPTION = COMMIT_MEMORY_DESCRIPTION
 
-def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
-    """Task 12 — agent-decides opt-in tool.
+_SAVE_MEMORY_ALIAS_DESCRIPTION = (
+    "DEPRECATED alias for `commit_memory`. Do NOT call this — use "
+    "`commit_memory` instead. Registered only for backward compatibility "
+    "with tasks started before this worker upgrade; will be removed."
+)
 
-    Returns a :class:`Command` that sets ``memory_opt_in=True`` on the state
-    (simple last-write-wins overwrite) AND appends the reason to
-    ``observations`` so the opt-in is visible in the task timeline as a
-    ``ToolMessage`` and feeds the summarizer alongside the rest of the
-    observations. The reason is ``strip()``-ed to normalize agent whitespace;
-    length bounds (1..2048 chars after stripping) are enforced by
-    :class:`SaveMemoryArguments` — the Pydantic schema reports an error
-    through LangGraph's ToolNode, keeping the graph in-loop.
 
-    The reason is NOT persisted into ``agent_memory_entries``. It lives only
-    in the observations snapshot — the summarizer may reference it freely
-    when composing the final memory body.
+def _make_commit_memory_handler(
+    *,
+    bound_tenant: str,
+    bound_agent: str,
+    bound_task: str,
+    log_alias: bool = False,
+) -> Callable[..., Command]:
+    """Build the shared handler used by ``commit_memory`` and the legacy
+    ``save_memory`` alias. ``log_alias=True`` emits one deprecation log
+    per call so operators can track in-flight checkpoint usage and time
+    the alias removal.
+
+    Sets ``memory_opt_in=True`` (last-write-wins) and appends the
+    rationale to ``commit_rationales`` (``operator.add`` reducer).
+    Issue #102 — the rationale used to land in ``observations`` alongside
+    ``note_finding`` entries, muddling the memory-detail UI and search
+    corpus; commit_rationales is the new dedicated channel.
     """
 
-    bound_tenant = ctx.tenant_id
-    bound_agent = ctx.agent_id
-    bound_task = ctx.task_id
-
-    def save_memory(
+    def _handler(
         reason: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         observations: Annotated[list[str] | None, InjectedState("observations")] = None,
@@ -478,7 +494,7 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             # agent can self-correct in-loop rather than silently opting in
             # with a blank rationale.
             raise MemoryToolError(
-                "save_memory requires a non-empty reason after whitespace is "
+                "commit_memory requires a non-empty reason after whitespace is "
                 "stripped."
             )
         if len(stripped) > SAVE_MEMORY_REASON_MAX_LEN:
@@ -487,24 +503,25 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             # branch is unreachable in practice. Keep the guard so the
             # invariant is obvious.
             raise MemoryToolError(
-                f"save_memory reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
+                f"commit_memory reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
+            )
+        if log_alias:
+            logger.warning(
+                "memory.deprecated_tool_name used=save_memory "
+                "canonical=commit_memory tenant_id=%s agent_id=%s task_id=%s",
+                bound_tenant, bound_agent, bound_task,
             )
         logger.info(
-            "memory.save_memory.opt_in tenant_id=%s agent_id=%s task_id=%s "
+            "memory.commit_memory.opt_in tenant_id=%s agent_id=%s task_id=%s "
             "reason_chars=%d",
             bound_tenant, bound_agent, bound_task, len(stripped),
         )
-        # ``observations`` here is the pre-update list — findings captured so
-        # far by note_finding (and any prior save_memory reasons). The count
-        # in the returned ToolMessage tells the agent "this many findings
-        # will persist with the memory entry", which disambiguates the opt-in
-        # from the finding-capture tool. Without this context the agent can't
-        # tell whether its note_finding calls landed and tends to hedge by
-        # calling both (see issue #102).
-        findings_count = sum(
-            1 for o in (observations or [])
-            if not o.startswith("[save_memory]")
-        )
+        # ``observations`` is the pre-update finding list (no ``[save_memory]``
+        # entries now that rationales live on their own channel).  The count
+        # in the return tells the agent "N findings will persist with the
+        # memory entry", disambiguating commit_memory from note_finding —
+        # the fix for the hedging behavior documented in issue #102.
+        findings_count = len(observations or [])
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — every LLM tool call needs a paired
         # reply or the next agent step rejects the orphan as a fatal graph
@@ -515,7 +532,7 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
                 "messages": [
                     ToolMessage(
                         content=(
-                            f"Opt-in confirmed. {findings_count} finding(s) "
+                            f"Commit confirmed. {findings_count} finding(s) "
                             f"will persist with this task's memory entry "
                             f"at completion."
                         ),
@@ -523,16 +540,54 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
                     ),
                 ],
                 "memory_opt_in": True,
-                "observations": [f"[save_memory] {stripped}"],
+                "commit_rationales": [stripped],
             }
         )
 
+    return _handler
+
+
+def _build_commit_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Canonical ``commit_memory`` tool — the agent-decides opt-in trigger."""
+    handler = _make_commit_memory_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+        log_alias=False,
+    )
     return StructuredTool.from_function(
-        func=save_memory,
+        func=handler,
+        name="commit_memory",
+        description=COMMIT_MEMORY_DESCRIPTION,
+        args_schema=CommitMemoryArguments,
+    )
+
+
+def _build_save_memory_alias_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Deprecated alias — same handler under the legacy ``save_memory`` name.
+
+    Mirrors the ``memory_note`` alias registered for backward compat with
+    in-flight checkpoints (issue #102). Fresh sessions should see only
+    ``commit_memory``; this exists so a resumed task whose committed
+    ``AIMessage.tool_calls[*].name`` is ``"save_memory"`` still resolves
+    to a registered tool.
+    """
+    handler = _make_commit_memory_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+        log_alias=True,
+    )
+    return StructuredTool.from_function(
+        func=handler,
         name="save_memory",
-        description=SAVE_MEMORY_DESCRIPTION,
+        description=_SAVE_MEMORY_ALIAS_DESCRIPTION,
         args_schema=SaveMemoryArguments,
     )
+
+
+# Back-compat name for any importer referencing the old builder symbol.
+_build_save_memory_tool = _build_commit_memory_tool
 
 
 # ---------------------------------------------------------------------------
@@ -865,12 +920,19 @@ def build_memory_tools(
         tools.append(_build_memory_note_alias_tool(ctx))
         tools.append(_build_memory_search_tool(ctx))
         if not auto_write:
-            tools.append(_build_save_memory_tool(ctx))
+            # ``commit_memory`` is the canonical terminal-commit trigger;
+            # the ``save_memory`` alias matches the same backward-compat
+            # pattern as ``memory_note`` above.  Both forward to the same
+            # handler; the alias logs deprecation on each call.
+            tools.append(_build_commit_memory_tool(ctx))
+            tools.append(_build_save_memory_alias_tool(ctx))
     tools.append(_build_task_history_get_tool(ctx))
     return tools
 
 
 __all__ = [
+    "COMMIT_MEMORY_DESCRIPTION",
+    "CommitMemoryArguments",
     "MEMORY_NOTE_DESCRIPTION",  # deprecated alias — use NOTE_FINDING_DESCRIPTION
     "MEMORY_NOTE_MAX_LEN",
     "MEMORY_SEARCH_DEFAULT_LIMIT",
@@ -884,7 +946,7 @@ __all__ = [
     "MemoryToolNotFoundError",
     "NOTE_FINDING_DESCRIPTION",
     "NoteFindingArguments",
-    "SAVE_MEMORY_DESCRIPTION",
+    "SAVE_MEMORY_DESCRIPTION",  # deprecated alias — use COMMIT_MEMORY_DESCRIPTION
     "SAVE_MEMORY_REASON_MAX_LEN",
     "SaveMemoryArguments",
     "TASK_HISTORY_GET_DESCRIPTION",

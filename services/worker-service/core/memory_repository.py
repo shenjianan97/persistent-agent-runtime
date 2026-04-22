@@ -86,18 +86,19 @@ def max_entries_for_agent(agent_config: dict[str, Any] | None) -> int:
 _UPSERT_SQL = """
 INSERT INTO agent_memory_entries (
     tenant_id, agent_id, task_id,
-    title, summary, observations, outcome, tags,
+    title, summary, observations, commit_rationales, outcome, tags,
     content_vec, summarizer_model_id
 ) VALUES (
     $1, $2, $3::uuid,
-    $4, $5, $6::text[], $7, $8::text[],
-    CASE WHEN $9::text IS NULL THEN NULL ELSE $9::text::vector END,
-    $10
+    $4, $5, $6::text[], $7::text[], $8, $9::text[],
+    CASE WHEN $10::text IS NULL THEN NULL ELSE $10::text::vector END,
+    $11
 )
 ON CONFLICT (task_id) DO UPDATE SET
     title               = EXCLUDED.title,
     summary             = EXCLUDED.summary,
     observations        = EXCLUDED.observations,
+    commit_rationales   = EXCLUDED.commit_rationales,
     outcome             = EXCLUDED.outcome,
     tags                = EXCLUDED.tags,
     content_vec         = EXCLUDED.content_vec,
@@ -196,6 +197,7 @@ async def upsert_memory_entry(
         entry["title"],
         entry["summary"],
         list(entry.get("observations") or []),
+        list(entry.get("commit_rationales") or []),
         entry["outcome"],
         list(entry.get("tags") or []),
         _vec_to_sql_literal(entry.get("content_vec")),

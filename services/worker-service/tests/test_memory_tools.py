@@ -271,70 +271,111 @@ class TestSaveMemoryArguments:
             )
 
 
-class TestSaveMemoryTool:
-    def test_returns_command_opts_in_and_appends_observation(self) -> None:
+class TestCommitMemoryTool:
+    """Coverage for the canonical ``commit_memory`` tool plus the
+    ``save_memory`` alias retained for backward compatibility (issue #102).
+    Both route to the same handler; the alias emits a deprecation warning.
+    """
+
+    def test_commit_memory_opts_in_and_writes_to_commit_rationales(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "commit_memory")
 
-        result = _invoke_with_tool_call(tool, {"reason": "shipped the fix"}, "call_save_1")
+        result = _invoke_with_tool_call(
+            tool, {"reason": "shipped the fix"}, "call_commit_1"
+        )
         assert isinstance(result, Command)
         assert result.update["memory_opt_in"] is True
-        assert result.update["observations"] == ["[save_memory] shipped the fix"]
+        # Issue #102 — rationale lands on its own channel, NOT mixed into
+        # observations anymore.  Observations is not touched by this tool.
+        assert result.update["commit_rationales"] == ["shipped the fix"]
+        assert "observations" not in result.update
         messages = result.update["messages"]
         assert len(messages) == 1
-        assert messages[0].tool_call_id == "call_save_1"
+        assert messages[0].tool_call_id == "call_commit_1"
         # Informative return — tells the agent the opt-in landed and how
         # many findings will flow through to the memory entry. Issue #102.
-        assert "Opt-in confirmed" in messages[0].content
+        assert "Commit confirmed" in messages[0].content
         assert "0 finding" in messages[0].content
 
-    def test_return_counts_findings_excluding_save_memory_reasons(self) -> None:
-        """The count in save_memory's return excludes prior ``[save_memory]``
-        opt-in entries — agents should see "findings" as user-facing
-        observations, not bookkeeping records."""
+    def test_return_counts_findings_from_observations_only(self) -> None:
+        """The count in commit_memory's return is simply
+        ``len(observations)`` — rationales no longer pollute observations so
+        the old ``[save_memory]`` filter is unnecessary."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "commit_memory")
 
         result = _invoke_with_tool_call(
             tool,
             {"reason": "another reason"},
-            observations=[
-                "real finding 1",
-                "[save_memory] earlier opt-in",
-                "real finding 2",
-            ],
+            observations=["real finding 1", "real finding 2", "real finding 3"],
         )
-        assert "2 finding" in result.update["messages"][0].content
+        assert "3 finding" in result.update["messages"][0].content
+
+    def test_save_memory_alias_logs_deprecation(self, caplog) -> None:
+        """The deprecated ``save_memory`` alias routes to the same handler
+        but emits a warning so operators can track residual usage. Mirrors
+        the ``memory_note`` alias coverage in ``TestMemoryNoteTool``."""
+        import logging
+
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        alias = _tool_by_name(tools, "save_memory")
+
+        with caplog.at_level(logging.WARNING, logger="tools.memory_tools"):
+            result = _invoke_with_tool_call(
+                alias, {"reason": "shipped"}, "call_save_1"
+            )
+
+        assert result.update["memory_opt_in"] is True
+        assert result.update["commit_rationales"] == ["shipped"]
+        matched = [
+            r for r in caplog.records
+            if "memory.deprecated_tool_name" in r.getMessage()
+            and "used=save_memory" in r.getMessage()
+        ]
+        assert len(matched) == 1
 
     def test_strips_whitespace_around_reason(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "commit_memory")
 
         result = _invoke_with_tool_call(tool, {"reason": "   trimmed    "})
-        assert result.update["observations"] == ["[save_memory] trimmed"]
+        assert result.update["commit_rationales"] == ["trimmed"]
 
     def test_whitespace_only_reason_raises_tool_error(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "commit_memory")
 
         with pytest.raises(MemoryToolError):
             _invoke_with_tool_call(tool, {"reason": "     "})
 
     def test_not_registered_in_always_mode(self) -> None:
-        """``save_memory`` is unnecessary when the run will write
-        unconditionally — keep the tool list lean."""
+        """Neither ``commit_memory`` nor the ``save_memory`` alias is
+        necessary when the run will write unconditionally — keep the tool
+        list lean."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
-        assert "save_memory" not in [t.name for t in tools]
+        names = [t.name for t in tools]
+        assert "commit_memory" not in names
+        assert "save_memory" not in names
 
     def test_not_registered_in_skip_or_memory_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
-        assert "save_memory" not in [t.name for t in tools]
+        names = [t.name for t in tools]
+        assert "commit_memory" not in names
+        assert "save_memory" not in names
+
+
+# Keep the legacy class name as a back-compat alias for any external test
+# runners that filter by class name; the tests live on the renamed class
+# above. Remove when the ``save_memory`` alias tool is retired.
+TestSaveMemoryTool = TestCommitMemoryTool
 
 
 # ---------------------------------------------------------------------------
@@ -667,11 +708,15 @@ class TestBuildMemoryToolsGating:
             "task_history_get",
         ]
 
-    def test_agent_decides_mode_also_registers_save_memory(self) -> None:
+    def test_agent_decides_mode_also_registers_commit_memory(self) -> None:
+        """``agent_decides`` mode registers both the canonical
+        ``commit_memory`` tool AND the legacy ``save_memory`` alias for
+        backward compat with in-flight checkpoints (issue #102)."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
         names = sorted(t.name for t in tools)
         assert names == [
+            "commit_memory",
             "memory_note",
             "memory_search",
             "note_finding",

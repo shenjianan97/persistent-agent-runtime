@@ -1420,15 +1420,19 @@ class TestInputFileInjection:
         )
         assert "memory_search" not in msg
         assert "memory_note" not in msg
+        assert "note_finding" not in msg
         assert "save_memory" not in msg
+        assert "commit_memory" not in msg
 
     def test_platform_system_message_memory_always_mode(self):
-        """``always`` mode → memory_search + note_finding framing, NO save_memory.
+        """``always`` mode → memory_search + note_finding framing, no commit tool.
 
-        Issue #102 — canonical name is ``note_finding``. The legacy
-        ``memory_note`` alias is registered but deliberately NOT named in
-        the platform framing so fresh sessions only see one finding-capture
-        verb.
+        Issue #102 — canonical name is ``note_finding`` (write channel) and
+        ``commit_memory`` (terminal trigger). The legacy aliases
+        ``memory_note`` / ``save_memory`` are registered but deliberately
+        NOT named in the platform framing so fresh sessions only see the
+        canonical names. In ``always`` mode the write is automatic, so the
+        commit tool is also absent from the prose.
         """
         from executor.memory_graph import MemoryDecision
         executor = _build_test_executor()
@@ -1438,11 +1442,14 @@ class TestInputFileInjection:
         )
         assert "memory_search" in msg
         assert "note_finding" in msg
-        assert "memory_note" not in msg  # legacy alias hidden from fresh sessions
+        # Legacy aliases hidden from fresh sessions.
+        assert "memory_note" not in msg
         assert "save_memory" not in msg
+        # commit_memory/opt-in framing is only emitted in agent_decides mode.
+        assert "commit_memory" not in msg
 
     def test_platform_system_message_memory_agent_decides_mode(self):
-        """``agent_decides`` mode → full framing including save_memory opt-in."""
+        """``agent_decides`` mode → full framing including commit_memory opt-in."""
         from executor.memory_graph import MemoryDecision
         executor = _build_test_executor()
         msg = executor._build_platform_system_message(
@@ -1452,16 +1459,19 @@ class TestInputFileInjection:
         assert "memory_search" in msg
         assert "note_finding" in msg
         assert "memory_note" not in msg  # legacy alias hidden from fresh sessions
-        assert "save_memory" in msg
-        # The save_memory framing must preserve agent-decision semantics: the
-        # prompt should say writes are opt-in, not a MUST directive. A MUST
-        # would collapse ``agent_decides`` into ``always`` mode.
+        # Issue #102 — canonical terminal-commit tool is ``commit_memory``.
+        # Fresh sessions should NOT be told about the ``save_memory`` alias.
+        assert "commit_memory" in msg
+        assert "save_memory" not in msg
+        # The commit_memory framing must preserve agent-decision semantics:
+        # the prompt should say writes are opt-in, not a MUST directive.
+        # A MUST would collapse ``agent_decides`` into ``always`` mode.
         assert "opt-in" in msg.lower()
-        assert "MUST" not in msg  # no policy-level enforcement on save_memory
-        # Issue #102 guard — the prose must tell the agent that save_memory
+        assert "MUST" not in msg
+        # Issue #102 guard — the prose must tell the agent that commit_memory
         # is NOT a way to record findings, so it doesn't hedge by calling
         # both tools for the same finding.
-        assert "does NOT record findings" in msg or "findings go through `note_finding`" in msg
+        assert "findings go through `note_finding`" in msg
 
     def test_platform_system_message_warns_against_narrating_future_tool_calls(self):
         """Phase 1 guardrail: the platform prompt tells models to call tools now or answer finally."""

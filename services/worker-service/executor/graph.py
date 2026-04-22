@@ -2323,6 +2323,13 @@ class GraphExecutor:
                         "title": pending_memory["title"],
                         "summary": pending_memory["summary"],
                         "observations": list(pending_memory.get("observations_snapshot") or []),
+                        # Issue #102 — commit_rationales is the new separate
+                        # channel for ``commit_memory`` / ``save_memory`` reasons.
+                        # Older pending_memory dicts built pre-migration won't
+                        # carry the snapshot; fall back to empty list.
+                        "commit_rationales": list(
+                            pending_memory.get("commit_rationales_snapshot") or []
+                        ),
                         "outcome": pending_memory.get("outcome", "succeeded"),
                         "tags": list(pending_memory.get("tags") or []),
                         "content_vec": pending_memory.get("content_vec"),
@@ -2545,15 +2552,18 @@ class GraphExecutor:
             if not memory_decision.auto_write:
                 sections.append(
                     "Memory writes are opt-in for this run. At task end, "
-                    "call `save_memory(reason=...)` if this run produced "
+                    "call `commit_memory(reason=...)` if this run produced "
                     "something worth remembering (non-trivial findings, "
-                    "customer decisions, recurring patterns). `save_memory` "
-                    "is the commit switch — it does NOT record findings; "
-                    "findings go through `note_finding`. Repeat calls do not "
-                    "trigger additional writes; the memory entry is composed "
-                    "and persisted once at the terminal branch. Skip the "
-                    "call for routine runs — the absence of a call means no "
-                    "memory entry is written."
+                    "customer decisions, recurring patterns). `commit_memory` "
+                    "is the TRIGGER — it does NOT compose the memory entry "
+                    "itself; a dedicated summarizer distills your "
+                    "`note_finding` bullets into the stored summary after "
+                    "you return. Do NOT use `commit_memory` to record a "
+                    "finding — findings go through `note_finding`. Repeat "
+                    "calls do not trigger additional writes; the memory "
+                    "entry is composed and persisted once at the terminal "
+                    "branch. Skip the call for routine runs — the absence "
+                    "of a call means no memory entry is written."
                 )
 
         # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended
@@ -2966,6 +2976,11 @@ class GraphExecutor:
                     _payload: dict[str, Any] = {
                         "messages": initial_messages,
                         "observations": _observations,
+                        # Issue #102 — commit_rationales is the new parallel
+                        # channel for save_memory/commit_memory reasons. Empty
+                        # list seeds the ``operator.add`` reducer the same way
+                        # ``observations`` is seeded.
+                        "commit_rationales": [],
                         "pending_memory": {},
                         # Phase 2 Track 5 Task 12 — per-run reset of the
                         # ``agent_decides`` opt-in flag. The field has no
@@ -4103,9 +4118,15 @@ class GraphExecutor:
                 )
             if observations and (not opt_in_required or opt_in_confirmed):
                 memory_write_attempted = True
+                commit_rationales = (
+                    await self._read_commit_rationales_from_checkpoint(
+                        checkpointer, task_id
+                    )
+                )
                 pending_memory = build_pending_memory_dead_letter_template(
                     task_input=task_input,
                     observations=observations,
+                    commit_rationales=commit_rationales,
                     retry_count=retry_count,
                     last_error_code=effective_error_code,
                     last_error_message=error_msg,
@@ -4162,6 +4183,11 @@ class GraphExecutor:
                             "summary": pending_memory["summary"],
                             "observations": list(
                                 pending_memory.get("observations_snapshot") or []
+                            ),
+                            # Issue #102 — see matching block in the happy
+                            # path (memory_write_node branch) above.
+                            "commit_rationales": list(
+                                pending_memory.get("commit_rationales_snapshot") or []
                             ),
                             "outcome": pending_memory.get("outcome", "failed"),
                             "tags": list(pending_memory.get("tags") or []),
@@ -4326,6 +4352,41 @@ class GraphExecutor:
         except Exception:
             logger.warning(
                 "memory.deadletter.observations_read_failed task_id=%s",
+                task_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _read_commit_rationales_from_checkpoint(
+        self,
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+    ) -> list[str]:
+        """Read ``commit_rationales`` out of the latest checkpoint's state.
+
+        Mirror of :func:`_read_observations_from_checkpoint` for the new
+        channel added in issue #102. Returns ``[]`` on any read failure
+        so the dead-letter path degrades cleanly when the field is absent
+        (older tasks pre-dating migration 0023 may have no such channel).
+        """
+        try:
+            config: dict[str, Any] = {"configurable": {"thread_id": task_id}}
+            tup = await checkpointer.aget_tuple(config)
+            if tup is None:
+                return []
+            checkpoint = getattr(tup, "checkpoint", None) or {}
+            if not isinstance(checkpoint, dict):
+                return []
+            values = checkpoint.get("channel_values")
+            if not isinstance(values, dict):
+                return []
+            rationales = values.get("commit_rationales") or []
+            if isinstance(rationales, list):
+                return [str(x) for x in rationales if x is not None]
+            return []
+        except Exception:
+            logger.warning(
+                "memory.deadletter.commit_rationales_read_failed task_id=%s",
                 task_id,
                 exc_info=True,
             )

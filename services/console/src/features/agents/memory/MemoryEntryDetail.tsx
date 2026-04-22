@@ -170,16 +170,19 @@ export function MemoryEntryDetail({
             <Card className="console-surface border-white/10">
                 <CardHeader className="border-b border-white/8 pb-4">
                     <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">
-                        Observations
+                        Findings
                     </CardTitle>
                 </CardHeader>
                 <CardContent className="pt-6">
                     {entry.observations.length === 0 ? (
                         <p className="text-xs text-muted-foreground italic">
-                            The agent did not record any observations during this task.
+                            The agent did not record any findings during this task.
                         </p>
                     ) : (
-                        <ol className="space-y-2 list-decimal list-inside">
+                        <ol
+                            className="space-y-2 list-decimal list-inside"
+                            data-testid="memory-detail-observations"
+                        >
                             {entry.observations.map((obs: string, idx: number) => (
                                 <li key={idx} className="text-sm text-foreground/90 font-mono whitespace-pre-wrap">
                                     {obs}
@@ -189,6 +192,38 @@ export function MemoryEntryDetail({
                     )}
                 </CardContent>
             </Card>
+
+            {/*
+                Issue #102 — commit_rationales is a separate channel from
+                observations. Render the card only when there are rationales
+                to show so the UI doesn't sprout an empty section on older
+                rows (pre-migration-0023) or on memory-always mode where the
+                terminal write is automatic and the tool is never called.
+            */}
+            {(entry.commit_rationales?.length ?? 0) > 0 && (
+                <Card className="console-surface border-white/10">
+                    <CardHeader className="border-b border-white/8 pb-4">
+                        <CardTitle className="text-sm font-display uppercase tracking-widest text-primary">
+                            Why Saved
+                        </CardTitle>
+                    </CardHeader>
+                    <CardContent className="pt-6">
+                        <ol
+                            className="space-y-2 list-decimal list-inside"
+                            data-testid="memory-detail-commit-rationales"
+                        >
+                            {entry.commit_rationales!.map((reason: string, idx: number) => (
+                                <li
+                                    key={idx}
+                                    className="text-sm text-foreground/90 font-mono whitespace-pre-wrap"
+                                >
+                                    {reason}
+                                </li>
+                            ))}
+                        </ol>
+                    </CardContent>
+                </Card>
+            )}
 
             <Card className="console-surface border-white/10">
                 <CardHeader className="border-b border-white/8 pb-4">
