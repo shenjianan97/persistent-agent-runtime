@@ -146,6 +146,15 @@ class SaveMemoryArguments(BaseModel):
     observations: Annotated[
         list[str] | None, InjectedState("observations")
     ] = None
+    # Injected by ToolNode — used to count sibling ``note_finding`` tool
+    # calls on the current AIMessage so the "N finding(s) will persist"
+    # return is correct under super-step concurrency (issue #102).
+    # Must live on the schema, not just the function signature, otherwise
+    # ``StructuredTool`` drops the injection. ``default=None`` lets schema
+    # validation construct without a value; the injection always fires.
+    messages: Annotated[
+        list | None, InjectedState("messages")
+    ] = None
 
 
 # Canonical schema alias — the class name is kept for backward compat with
@@ -367,27 +376,21 @@ def _make_note_finding_handler(
             "note_chars=%d",
             bound_tenant, bound_agent, bound_task, len(text),
         )
-        # ``observations`` is the pre-update list (InjectedState reads state
-        # before this super-step's reducer runs). The post-update count is
-        # one higher. Surfacing the count gives the agent direct evidence
-        # that its call landed, which stops the hedging behavior where it
-        # re-invokes the sibling memory tool just to "be sure" (issue #102).
-        #
-        # Concurrency caveat: three parallel ``note_finding`` calls in the
-        # same super-step each see the same pre-reducer state and each
-        # would report the same ``new_count``. Hedge the wording so
-        # parallel-call outputs don't look like a stuck counter that would
-        # push the agent to retry — we qualify the count with "including
-        # this one" and drop the "so far in this run" framing.
-        current_count = len(observations or [])
-        new_count = current_count + 1
+        # ``observations`` is injected for future extensions but the count
+        # is NOT reported back to the agent here. Rationale: three parallel
+        # ``note_finding`` calls in the same LangGraph super-step each see
+        # the same pre-reducer state, so a count like "#N, including this
+        # call" would make every sibling report the same number — a lie
+        # that looks like a stuck counter to the agent. The reassurance is
+        # just as useful without the count.
+        _ = observations  # silence unused — kept for future instrumentation
         return Command(update={
             "messages": [
                 ToolMessage(
                     content=(
-                        f"Noted (#{new_count}, including this call). Your "
-                        "findings list is preserved across compaction and "
-                        "feeds the post-task summary."
+                        "Noted. This finding is queued in your findings "
+                        "list — it survives context compaction and feeds "
+                        "the post-task summary."
                     ),
                     tool_call_id=tool_call_id,
                 )
@@ -470,6 +473,45 @@ _SAVE_MEMORY_ALIAS_DESCRIPTION = (
 )
 
 
+def _count_pending_sibling_note_findings(
+    messages: list | None,
+    *,
+    self_tool_call_id: str,
+) -> int:
+    """Count ``note_finding`` tool calls on the current AIMessage that will
+    land in the same super-step as the caller.
+
+    Issue #102 follow-up: LangGraph runs all tool calls on one AIMessage
+    as parallel siblings within a single super-step. ``InjectedState``
+    reads the state BEFORE the reducer applies any of the super-step's
+    Commands, so ``observations`` is the pre-super-step list even when
+    sibling ``note_finding`` calls are about to append to it.
+
+    This helper restores the "what will the state look like after this
+    super-step commits" view by counting pending sibling ``note_finding``
+    invocations on the latest AIMessage.  The caller excludes its own
+    tool_call_id so a hypothetical ``note_finding``→``note_finding``
+    alias substitution doesn't double-count itself.
+
+    Returns 0 on any missing / malformed message state — best-effort
+    observability, never an exception path into the handler.
+    """
+    if not messages:
+        return 0
+    last_message = messages[-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+    count = 0
+    for call in tool_calls:
+        # ``tool_calls`` entries can be dicts (LangChain canonical) or
+        # objects with ``.name`` / ``.id`` attributes depending on the
+        # provider translator.  Accept both shapes.
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+        call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+        if name == "note_finding" and call_id != self_tool_call_id:
+            count += 1
+    return count
+
+
 def _make_commit_memory_handler(
     *,
     bound_tenant: str,
@@ -493,6 +535,7 @@ def _make_commit_memory_handler(
         reason: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
         observations: Annotated[list[str] | None, InjectedState("observations")] = None,
+        messages: Annotated[list | None, InjectedState("messages")] = None,
     ) -> Command:
         stripped = reason.strip()
         if not stripped:
@@ -528,7 +571,18 @@ def _make_commit_memory_handler(
         # in the return tells the agent "N findings will persist with the
         # memory entry", disambiguating commit_memory from note_finding —
         # the fix for the hedging behavior documented in issue #102.
-        findings_count = len(observations or [])
+        #
+        # Super-step concurrency correction: when the agent emits this call
+        # in the SAME AIMessage as one or more ``note_finding`` calls (batch
+        # decision), ``observations`` is still the pre-reducer state and
+        # sees none of the in-flight findings. Count sibling note_finding
+        # tool_calls on the current AIMessage and add them to the committed
+        # total so the report reflects what will actually land after the
+        # super-step commits, not what was there before it started.
+        pending_sibling_findings = _count_pending_sibling_note_findings(
+            messages, self_tool_call_id=tool_call_id
+        )
+        findings_count = len(observations or []) + pending_sibling_findings
         # Zero-findings branch: the literal "0 finding(s) will persist" reads
         # as an error to most models and triggers a retry / panic flow.
         # Reassure the agent that the memory write still composes usefully

@@ -201,22 +201,29 @@ class TestMemoryNoteTool:
         assert len(messages) == 1
         assert messages[0].tool_call_id == "call_xyz"
         # Informative return — gives the agent direct evidence the call
-        # landed, which fixes the hedging behaviour documented in #102.
-        # Informative return in the new "#N, including this call" shape so
-        # parallel-super-step siblings don't look like a stuck counter.
-        assert "#1" in messages[0].content
-        assert "including this call" in messages[0].content
+        # landed. Issue #102 follow-up: no longer counts, because
+        # parallel siblings in the same super-step would all see the same
+        # pre-reducer state and report the same count (a lie that looks
+        # like a stuck counter to the agent).
+        assert "Noted" in messages[0].content
+        assert "queued" in messages[0].content
+        assert "survives context compaction" in messages[0].content
 
-    def test_note_finding_count_reflects_pre_update_state(self) -> None:
-        """Count in the ToolMessage is ``len(observations) + 1``."""
+    def test_note_finding_wording_stable_under_parallel_invocation(self) -> None:
+        """Issue #102 follow-up: ``note_finding`` intentionally omits any
+        count because super-step-parallel siblings all see the same
+        pre-reducer ``observations`` state. The reassuring wording is the
+        same regardless of prior finding count."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         tool = _tool_by_name(tools, "note_finding")
 
-        result = _invoke_with_tool_call(
-            tool, {"text": "third"}, observations=["first", "second"]
-        )
-        assert "#3" in result.update["messages"][0].content
+        # Two invocations "from the same super-step" both see an empty
+        # observations list; the return wording is identical — no #1 / #2
+        # count divergence that would look like a stuck counter.
+        r1 = _invoke_with_tool_call(tool, {"text": "a"}, "c1", observations=[])
+        r2 = _invoke_with_tool_call(tool, {"text": "b"}, "c2", observations=[])
+        assert r1.update["messages"][0].content == r2.update["messages"][0].content
 
     def test_memory_note_alias_logs_deprecation(self, caplog) -> None:
         """The deprecated alias routes to the same handler but emits a
@@ -231,10 +238,11 @@ class TestMemoryNoteTool:
             result = _invoke_with_tool_call(alias, {"text": "hi"}, "c1")
 
         # Behaviour identical to the canonical tool — observation appended,
-        # informative ToolMessage content returned.
+        # informative ToolMessage content returned (no count, per the
+        # concurrency-correctness follow-up in issue #102).
         assert result.update["observations"] == ["hi"]
-        assert "#1" in result.update["messages"][0].content
-        assert "including this call" in result.update["messages"][0].content
+        assert "Noted" in result.update["messages"][0].content
+        assert "queued" in result.update["messages"][0].content
         # Exactly one deprecation warning emitted for this call.
         matched = [
             r for r in caplog.records
@@ -317,6 +325,64 @@ class TestCommitMemoryTool:
             observations=["real finding 1", "real finding 2", "real finding 3"],
         )
         assert "3 finding" in result.update["messages"][0].content
+
+    def test_return_counts_in_flight_sibling_note_findings(self) -> None:
+        """Super-step concurrency correction (issue #102): when the agent
+        emits ``commit_memory`` in the same AIMessage as ``note_finding``
+        siblings, ``InjectedState("observations")`` still shows the
+        pre-reducer list. The handler inspects the current AIMessage's
+        tool_calls and adds pending note_finding calls to the reported
+        count so the "N finding(s) will persist" return is accurate.
+        """
+        from langchain_core.messages import AIMessage
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "commit_memory")
+
+        # Simulate the super-step state: observations is empty (reducer
+        # hasn't merged sibling updates yet), but the current AIMessage
+        # has two note_finding calls alongside the commit_memory call.
+        ai = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "note_finding", "args": {"text": "f1"}, "id": "tf1"},
+                {"name": "note_finding", "args": {"text": "f2"}, "id": "tf2"},
+                {"name": "commit_memory", "args": {"reason": "x"}, "id": "c1"},
+            ],
+        )
+        result = tool.func(
+            reason="because",
+            tool_call_id="c1",
+            observations=[],
+            messages=[ai],
+        )
+        # Two pending siblings + zero committed = 2 findings will persist.
+        content = result.update["messages"][0].content
+        assert "2 finding" in content
+        # Zero-findings reassurance path must NOT fire when siblings are
+        # in flight.
+        assert "No findings captured" not in content
+
+    def test_return_zero_findings_branch_when_no_siblings_and_empty_state(self) -> None:
+        """When observations is empty AND there are no sibling
+        note_finding tool_calls, the commit_memory return falls into the
+        reassurance branch (composed from transcript + rationale)."""
+        from langchain_core.messages import AIMessage
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "commit_memory")
+
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "commit_memory", "args": {"reason": "x"}, "id": "c1"}],
+        )
+        result = tool.func(
+            reason="because",
+            tool_call_id="c1",
+            observations=[],
+            messages=[ai],
+        )
+        assert "No findings captured" in result.update["messages"][0].content
 
     def test_save_memory_alias_logs_deprecation(self, caplog) -> None:
         """The deprecated ``save_memory`` alias routes to the same handler
