@@ -70,7 +70,15 @@ def test_resolve_model_pricing_returns_explicit_price_for_known_model():
 
     pricing = discover_models.resolve_model_pricing("openai", "gpt-4o")
 
-    assert pricing == {"input": 2_500_000, "output": 10_000_000}
+    # OpenAI automatic caching: ``cache_creation`` is always 0 (the provider
+    # absorbs the write cost), ``cache_read`` is 50% of input for the 4o
+    # family.
+    assert pricing == {
+        "input": 2_500_000,
+        "output": 10_000_000,
+        "cache_creation": 0,
+        "cache_read": 1_250_000,
+    }
 
 
 def test_resolve_model_pricing_uses_provider_fallback_for_unknown_model():
