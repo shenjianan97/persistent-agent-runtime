@@ -64,9 +64,21 @@ When a phase exceeds ~40 tasks, split into sequential tracks of ~7-10 tasks each
 
 Priority: user instructions > skills > default behavior.
 
+## Claims Require Evidence
+
+**Never state a fact or recommend a practice from memory alone.** Every non-trivial claim — "this is the idiomatic pattern", "library X does Y", "we handle Z this way", "that flag has no effect" — must be backed by a verifiable reference *before* you state it. No citation → don't assert it.
+
+- **External claims** (best practices, library/framework behavior, API semantics, standards) → use `WebSearch` / `WebFetch` or read the actual docs/source. Cite the URL and, for anything version-sensitive (LangChain, React, Spring, SDKs), the version you verified against. Training-data recall is not a citation — library behavior shifts between minor versions.
+- **Internal claims** (how this repo does X, what a function returns, where config lives, what a migration did) → use `Read` / `Grep` / `Glob`. Cite `path:line` for the exact code you verified against, not a paraphrase.
+- **Behavioral claims about running systems** (what a worker logs, what an endpoint returns, whether a test covers a path) → run the command or read the log. "It should work" is not evidence.
+- **If you can't find a reference, say so explicitly** — "I couldn't verify this, treat as a guess" or "I'm recalling this from training data, please double-check." Never launder uncertainty as confidence.
+
+Applies to research, design docs, task specs, PR descriptions, code review comments, and in-conversation recommendations. A plausible-sounding claim without a citation is a hallucination risk that costs more to unwind later than it takes to verify now.
+
 ## Boundaries
 
 **Never:**
+- Assert a fact or recommend a practice without a verifiable citation — web reference for external claims, `path:line` for internal claims (§Claims Require Evidence)
 - Use bare `python3` or `uv run` for worker code — always the pinned venv at `services/worker-service/.venv/` (§Local Validation Notes)
 - Point tests at the dev DB (port 55432) — tests use `par-e2e-postgres` on 55433 (§Local Validation Notes)
 - Link to PRs in third-party repos from commits or PR descriptions (§External Pull Request References)
