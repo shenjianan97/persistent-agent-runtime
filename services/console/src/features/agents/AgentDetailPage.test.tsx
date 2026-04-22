@@ -122,6 +122,19 @@ const MOCK_AGENT_WITH_MEMORY_DEFAULTS = {
     },
 };
 
+const MOCK_AGENT_WITH_CONTEXT_MANAGEMENT = {
+    ...MOCK_AGENT,
+    agent_config: {
+        ...MOCK_AGENT.agent_config,
+        context_management: {
+            summarizer_model: 'gpt-4o-mini',
+            summarizer_provider: 'openai',
+            exclude_tools: ['web_search'],
+            pre_tier3_memory_flush: true,
+        },
+    },
+};
+
 describe('AgentDetailPage', () => {
     it('shows sandbox info in read-only mode when sandbox is enabled', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
@@ -285,6 +298,22 @@ describe('AgentDetailPage', () => {
             screen.getByText('Platform default (runtime-configured; fallback: claude-haiku-4-5)')
         ).toBeInTheDocument();
         expect(screen.getByText('10,000')).toBeInTheDocument();
+    });
+
+    it('uses customer-facing labels for context management in the read-only overview', async () => {
+        agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_CONTEXT_MANAGEMENT, isLoading: false, error: null });
+
+        render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+        expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+        expect(screen.getByText('Long-Running Task Context')).toBeInTheDocument();
+        expect(screen.getByText('Summarizer Model')).toBeInTheDocument();
+        expect(screen.getByText('gpt-4o-mini (OpenAI)')).toBeInTheDocument();
+        expect(screen.getByText('Always Keep Outputs From')).toBeInTheDocument();
+        expect(screen.getByText('Save Important Facts Before Summarizing')).toBeInTheDocument();
+        expect(screen.getByText('web_search')).toBeInTheDocument();
+        expect(screen.getByText('Enabled')).toBeInTheDocument();
     });
 
     it('shows loading state', () => {

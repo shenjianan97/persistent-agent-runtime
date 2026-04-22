@@ -17,7 +17,7 @@ afterEach(() => {
 describe('ContextManagementSection', () => {
     describe('rendering', () => {
         it('renders section header copy describing always-on infrastructure', () => {
-            render(
+            const { container } = render(
                 <ContextManagementSection
                     value={undefined}
                     memoryEnabled={false}
@@ -26,8 +26,12 @@ describe('ContextManagementSection', () => {
                 />
             );
             expect(
-                screen.getByText(/Context management is always-on platform infrastructure/i)
+                screen.getByText('Long-Running Task Context')
             ).toBeInTheDocument();
+            expect(
+                screen.getByText(/When tasks run for a long time, the platform may summarize older context/i)
+            ).toBeInTheDocument();
+            expect(container.querySelector('svg.lucide-chevron-down')).toBeInTheDocument();
         });
 
         it('renders summarizer_model select with correct testid', () => {
@@ -120,9 +124,33 @@ describe('ContextManagementSection', () => {
                     onChange={vi.fn()}
                 />
             );
-            expect(screen.getByRole('option', { name: 'Claude Haiku 4.5' })).toBeInTheDocument();
-            expect(screen.getByRole('option', { name: 'Claude Sonnet 4.5' })).toBeInTheDocument();
-            expect(screen.getByRole('option', { name: 'GPT-4o' })).toBeInTheDocument();
+            expect(screen.getByRole('option', { name: 'Claude Haiku 4.5 (Anthropic)' })).toBeInTheDocument();
+            expect(screen.getByRole('option', { name: 'Claude Sonnet 4.5 (Anthropic)' })).toBeInTheDocument();
+            expect(screen.getByRole('option', { name: 'GPT-4o (OpenAI)' })).toBeInTheDocument();
+        });
+
+        it('uses customer-facing labels and helper copy for advanced controls', () => {
+            render(
+                <ContextManagementSection
+                    value={undefined}
+                    memoryEnabled={false}
+                    availableSummarizerModels={MOCK_MODELS}
+                    onChange={vi.fn()}
+                />
+            );
+
+            expect(screen.getByText('Summarizer Model')).toBeInTheDocument();
+            expect(
+                screen.getByText(/Choose which model summarizes older context when a task gets long/i)
+            ).toBeInTheDocument();
+            expect(screen.getByText('Always Keep Outputs From')).toBeInTheDocument();
+            expect(
+                screen.getByText(/Preserve outputs from these tools even when older context is reduced/i)
+            ).toBeInTheDocument();
+            expect(screen.getByText('Save Important Facts Before Summarizing')).toBeInTheDocument();
+            expect(
+                screen.getByText(/Before older context is summarized for the first time, let the agent save durable facts to memory/i)
+            ).toBeInTheDocument();
         });
 
         it('renders existing exclude_tools chips when value is provided', () => {
@@ -177,9 +205,12 @@ describe('ContextManagementSection', () => {
                 />
             );
             const select = screen.getByTestId('context-management-summarizer-model');
-            fireEvent.change(select, { target: { value: 'claude-haiku-4-5' } });
+            fireEvent.change(select, { target: { value: 'anthropic|claude-haiku-4-5' } });
             expect(handleChange).toHaveBeenCalledWith(
-                expect.objectContaining({ summarizer_model: 'claude-haiku-4-5' })
+                expect.objectContaining({
+                    summarizer_model: 'claude-haiku-4-5',
+                    summarizer_provider: 'anthropic',
+                })
             );
         });
 
@@ -351,7 +382,7 @@ describe('ContextManagementSection', () => {
 
             // Verify all fields render with their existing values
             const select = screen.getByTestId('context-management-summarizer-model') as HTMLSelectElement;
-            expect(select.value).toBe('claude-haiku-4-5');
+            expect(select.value).toBe('anthropic|claude-haiku-4-5');
 
             expect(screen.getByText('web_search')).toBeInTheDocument();
 

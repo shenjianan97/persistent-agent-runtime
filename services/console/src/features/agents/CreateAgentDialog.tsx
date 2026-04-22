@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -61,9 +61,11 @@ function buildContextManagementPayload(
     config: ContextManagementConfig | undefined,
 ): ContextManagementConfig {
     const summarizer = config?.summarizer_model?.trim();
+    const summarizerProvider = config?.summarizer_provider?.trim();
     const excludeTools = config?.exclude_tools ?? [];
     return {
         ...(summarizer ? { summarizer_model: summarizer } : {}),
+        ...(summarizer && summarizerProvider ? { summarizer_provider: summarizerProvider } : {}),
         ...(excludeTools.length ? { exclude_tools: excludeTools } : {}),
         pre_tier3_memory_flush: !!config?.pre_tier3_memory_flush,
     };
@@ -103,7 +105,6 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const selectedToolServers = form.watch('tool_servers');
     const sandboxEnabled = form.watch('sandbox_enabled');
     const memoryEnabled = form.watch('memory_enabled');
-    const selectedProvider = form.watch('provider');
     const selectedModel = form.watch('model');
 
     useEffect(() => {
@@ -113,19 +114,21 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
         form.setValue('provider', first.provider);
         form.setValue('model', first.model_id);
     }, [models, selectedModel, form]);
-    const providerFilteredModels = useMemo(
-        () => models.filter((m) => m.provider === selectedProvider),
-        [models, selectedProvider],
-    );
-
     useEffect(() => {
         if (!ctxMgmt?.summarizer_model) return;
-        const stillValid = providerFilteredModels.some((m) => m.model_id === ctxMgmt.summarizer_model);
+        const stillValid = models.some(
+            (m) => m.model_id === ctxMgmt.summarizer_model
+                && (!ctxMgmt.summarizer_provider || m.provider === ctxMgmt.summarizer_provider)
+        );
         if (!stillValid) {
             ctxMgmtDirty.current = true;
-            setCtxMgmt({ ...ctxMgmt, summarizer_model: undefined });
+            setCtxMgmt({
+                ...ctxMgmt,
+                summarizer_model: undefined,
+                summarizer_provider: undefined,
+            });
         }
-    }, [providerFilteredModels, ctxMgmt]);
+    }, [models, ctxMgmt]);
 
     const handleCtxMgmtChange = useCallback((next: ContextManagementConfig) => {
         ctxMgmtDirty.current = true;
@@ -561,7 +564,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                         <ContextManagementSection
                             value={ctxMgmt}
                             memoryEnabled={memoryEnabled}
-                            availableSummarizerModels={providerFilteredModels}
+                            availableSummarizerModels={models}
                             onChange={handleCtxMgmtChange}
                         />
 

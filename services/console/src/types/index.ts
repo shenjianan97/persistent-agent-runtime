@@ -259,6 +259,7 @@ export interface MemoryConfig {
 
 export interface ContextManagementConfig {
     summarizer_model?: string;
+    summarizer_provider?: string;
     exclude_tools?: string[];
     pre_tier3_memory_flush?: boolean;
     /**

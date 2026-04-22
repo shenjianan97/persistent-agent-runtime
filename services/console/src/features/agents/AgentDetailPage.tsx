@@ -5,9 +5,9 @@ import { z } from 'zod';
 import { useAgent, useUpdateAgent } from './useAgents';
 import { useModels } from '@/features/submit/useModels';
 import { ALL_TOOL_LABELS, HUMAN_INPUT_TOOL_ID } from '@/features/submit/schema';
-import { groupModelsByProvider } from '@/lib/models';
+import { formatProviderLabel, groupModelsByProvider } from '@/lib/models';
 import { toast } from 'sonner';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
 import { MemoryTab } from './memory/MemoryTab';
@@ -143,21 +143,21 @@ export function AgentDetailPage() {
         setCtxMgmt(next);
     }, []);
 
-    const selectedProvider = form.watch('provider');
-    const providerFilteredModels = useMemo(
-        () => models.filter((m) => m.provider === selectedProvider),
-        [models, selectedProvider],
-    );
-
     useEffect(() => {
         if (!ctxMgmt?.summarizer_model) return;
-        if (!selectedProvider) return;
-        const stillValid = providerFilteredModels.some((m) => m.model_id === ctxMgmt.summarizer_model);
+        const stillValid = models.some(
+            (m) => m.model_id === ctxMgmt.summarizer_model
+                && (!ctxMgmt.summarizer_provider || m.provider === ctxMgmt.summarizer_provider)
+        );
         if (!stillValid) {
             ctxMgmtDirty.current = true;
-            setCtxMgmt({ ...ctxMgmt, summarizer_model: undefined });
+            setCtxMgmt({
+                ...ctxMgmt,
+                summarizer_model: undefined,
+                summarizer_provider: undefined,
+            });
         }
-    }, [providerFilteredModels, ctxMgmt, selectedProvider]);
+    }, [models, ctxMgmt]);
 
     function onSubmit(data: AgentDetailFormValues) {
         if (!agentId) return;
@@ -193,10 +193,12 @@ export function AgentDetailPage() {
         const hasExistingCtxMgmt = !!loadedCtxMgmt.current;
         const shouldSendCtxMgmt = hasExistingCtxMgmt || ctxMgmtDirty.current;
         const summarizer = ctxMgmt?.summarizer_model?.trim();
+        const summarizerProvider = ctxMgmt?.summarizer_provider?.trim();
         const excludeTools = ctxMgmt?.exclude_tools ?? [];
         const contextManagementPayload: ContextManagementConfig | undefined = shouldSendCtxMgmt
             ? {
                 ...(summarizer ? { summarizer_model: summarizer } : {}),
+                ...(summarizer && summarizerProvider ? { summarizer_provider: summarizerProvider } : {}),
                 ...(excludeTools.length ? { exclude_tools: excludeTools } : {}),
                 pre_tier3_memory_flush: !!ctxMgmt?.pre_tier3_memory_flush,
             }
@@ -416,16 +418,20 @@ export function AgentDetailPage() {
                             )}
                             {agent?.agent_config?.context_management && (
                                 <div className="pt-4 border-t border-white/8 space-y-2">
-                                    <div className="uppercase tracking-widest text-muted-foreground text-[10px]">Context Management</div>
+                                    <div className="uppercase tracking-widest text-muted-foreground text-[10px]">Long-Running Task Context</div>
                                     <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                                         <div>
                                             <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Summarizer Model</span>
                                             <span className="text-foreground text-sm font-mono">
-                                                {agent.agent_config.context_management.summarizer_model || 'Platform default'}
+                                                {agent.agent_config.context_management.summarizer_model
+                                                    ? agent.agent_config.context_management.summarizer_provider
+                                                        ? `${agent.agent_config.context_management.summarizer_model} (${formatProviderLabel(agent.agent_config.context_management.summarizer_provider)})`
+                                                        : agent.agent_config.context_management.summarizer_model
+                                                    : 'Platform default'}
                                             </span>
                                         </div>
                                         <div>
-                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Exclude Tools</span>
+                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Always Keep Outputs From</span>
                                             <span className="text-foreground text-sm font-mono">
                                                 {agent.agent_config.context_management.exclude_tools?.length
                                                     ? agent.agent_config.context_management.exclude_tools.join(', ')
@@ -433,7 +439,7 @@ export function AgentDetailPage() {
                                             </span>
                                         </div>
                                         <div>
-                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Pre-Tier-3 Memory Flush</span>
+                                            <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">Save Important Facts Before Summarizing</span>
                                             <span className="text-foreground text-sm font-mono">
                                                 {agent.agent_config.context_management.pre_tier3_memory_flush ? 'Enabled' : 'Disabled'}
                                             </span>
@@ -842,7 +848,7 @@ export function AgentDetailPage() {
                                 <ContextManagementSection
                                     value={ctxMgmt}
                                     memoryEnabled={memoryEnabledInForm}
-                                    availableSummarizerModels={providerFilteredModels}
+                                    availableSummarizerModels={models}
                                     onChange={handleCtxMgmtChange}
                                 />
                             </CardContent>

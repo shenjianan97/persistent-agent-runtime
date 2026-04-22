@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { X } from 'lucide-react';
-import { groupModelsByProvider } from '@/lib/models';
+import { ChevronDown, X } from 'lucide-react';
+import { formatProviderLabel, groupModelsByProvider } from '@/lib/models';
 import type { ModelResponse } from '@/types';
 
 export interface ContextManagementConfig {
     summarizer_model?: string;
+    summarizer_provider?: string;
     exclude_tools?: string[];
     pre_tier3_memory_flush?: boolean;
 }
@@ -31,13 +32,33 @@ export function ContextManagementSection({
     const currentValue: ContextManagementConfig = value ?? {};
     const excludeTools = currentValue.exclude_tools ?? [];
     const summarizerModel = currentValue.summarizer_model ?? '';
+    const summarizerProvider = currentValue.summarizer_provider ?? '';
     const preFlush = currentValue.pre_tier3_memory_flush ?? false;
+    const selectedSummarizerValue = summarizerModel
+        ? (summarizerProvider
+            ? `${summarizerProvider}|${summarizerModel}`
+            : (availableSummarizerModels.find((m) => m.model_id === summarizerModel)
+                ? `${availableSummarizerModels.find((m) => m.model_id === summarizerModel)?.provider}|${summarizerModel}`
+                : ''))
+        : '';
 
     function handleSummarizerModelChange(e: React.ChangeEvent<HTMLSelectElement>) {
         const next = e.target.value;
+        if (!next) {
+            onChange({
+                ...currentValue,
+                summarizer_model: undefined,
+                summarizer_provider: undefined,
+            });
+            return;
+        }
+        const separatorIndex = next.indexOf('|');
+        const provider = next.slice(0, separatorIndex);
+        const modelId = next.slice(separatorIndex + 1);
         onChange({
             ...currentValue,
-            summarizer_model: next || undefined,
+            summarizer_model: modelId || undefined,
+            summarizer_provider: provider || undefined,
         });
     }
 
@@ -92,11 +113,12 @@ export function ContextManagementSection({
     return (
         <div className="space-y-3">
             <span className="text-xs font-medium uppercase tracking-widest text-muted-foreground">
-                Context Management
+                Long-Running Task Context
             </span>
             <div className="p-3 border border-border rounded-none bg-black/30 space-y-4">
                 <p className="text-xs text-muted-foreground">
-                    Context management is always-on platform infrastructure; the fields below are tuning knobs, not an enable toggle.
+                    When tasks run for a long time, the platform may summarize older context to keep the
+                    agent effective. These are advanced settings.
                 </p>
 
                 {/* summarizer_model */}
@@ -107,26 +129,40 @@ export function ContextManagementSection({
                     >
                         Summarizer Model
                     </label>
-                    <select
-                        id="ctx-summarizer-model"
-                        data-testid="context-management-summarizer-model"
-                        className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 rounded-none appearance-none"
-                        value={summarizerModel}
-                        onChange={handleSummarizerModelChange}
-                    >
-                        <option value="">Platform default</option>
-                        {modelGroups.map((group) => (
-                            <optgroup key={group.provider} label={group.label}>
-                                {group.models.map((m) => (
-                                    <option key={m.model_id} value={m.model_id}>
-                                        {m.display_name}
-                                    </option>
-                                ))}
-                            </optgroup>
-                        ))}
-                    </select>
+                    <div className="relative">
+                        <select
+                            id="ctx-summarizer-model"
+                            data-testid="context-management-summarizer-model"
+                            className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 pr-10 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 rounded-none appearance-none"
+                            value={selectedSummarizerValue}
+                            onChange={handleSummarizerModelChange}
+                        >
+                            <option value="">Platform default</option>
+                            {modelGroups.map((group) => (
+                                <optgroup key={group.provider} label={group.label}>
+                                    {group.models.map((m) => (
+                                        <option key={`${m.provider}|${m.model_id}`} value={`${m.provider}|${m.model_id}`}>
+                                            {m.display_name}
+                                            {' '}
+                                            (
+                                            {formatProviderLabel(m.provider)}
+                                            )
+                                        </option>
+                                    ))}
+                                </optgroup>
+                            ))}
+                        </select>
+                        <ChevronDown
+                            aria-hidden="true"
+                            className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                        />
+                    </div>
                     <p className="text-xs text-muted-foreground mt-1">
-                        Model used for Tier 3 summarization. Leave as "Platform default" unless you need a specific model.
+                        Choose which model summarizes older context when a task gets long. Leave on
+                        {' '}
+                        Platform default
+                        {' '}
+                        unless you have a specific reason to change it.
                     </p>
                 </div>
 
@@ -137,7 +173,7 @@ export function ContextManagementSection({
                 >
                     <div className="flex items-center justify-between">
                         <label className="uppercase tracking-widest text-muted-foreground/70 text-[10px]">
-                            Exclude Tools from Compaction
+                            Always Keep Outputs From
                         </label>
                         <span className="text-[10px] text-muted-foreground">
                             {excludeTools.length}&nbsp;/&nbsp;50
@@ -185,7 +221,7 @@ export function ContextManagementSection({
                     )}
 
                     <p className="text-xs text-muted-foreground">
-                        Tool names whose results are never masked during Tier 1 compaction. Additive on top of the platform-seeded list.
+                        Preserve outputs from these tools even when older context is reduced.
                     </p>
                 </div>
 
@@ -206,11 +242,11 @@ export function ContextManagementSection({
                                 htmlFor="ctx-pre-tier3-flush"
                                 className="font-normal font-mono cursor-pointer text-sm"
                             >
-                                Pre-Tier-3 Memory Flush
+                                Save Important Facts Before Summarizing
                             </label>
                             <p className="text-xs text-muted-foreground mt-0.5">
-                                Before the first Tier 3 summarization in a task, give the agent a chance to
-                                call <code>memory_note</code> to preserve cross-task facts.
+                                Before older context is summarized for the first time, let the agent save
+                                durable facts to memory.
                             </p>
                             {!memoryEnabled && (
                                 <p className="text-xs text-amber-400 mt-0.5">
