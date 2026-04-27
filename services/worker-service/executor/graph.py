@@ -2341,6 +2341,37 @@ class GraphExecutor:
                     inserted = upserted["inserted"]
                     memory_written = True
 
+                    # Issue #102 follow-up — emit a ``memory_written`` task_event
+                    # in the SAME transaction as the UPSERT so the activity
+                    # timeline shows a "Memory saved" marker that either lands
+                    # atomically with the row or rolls back with it. No dedup
+                    # logic needed because the UPSERT key (task_id) already
+                    # guarantees one memory row per task. ``agent_id`` is
+                    # mirrored into details so the Console can link to
+                    # ``/agents/{agent_id}/memory/{memory_id}`` directly off
+                    # the event payload (the agent_id column on task_events
+                    # is not surfaced through the activity event response).
+                    await _insert_task_event(
+                        conn,
+                        task_id,
+                        tenant_id,
+                        agent_id,
+                        "memory_written",
+                        None,  # status_before
+                        None,  # status_after
+                        worker_id,
+                        details={
+                            "agent_id": agent_id,
+                            "memory_id": str(memory_id),
+                            "title": entry["title"],
+                            "outcome": entry["outcome"],
+                            "summarizer_model_id": entry.get("summarizer_model_id"),
+                            "observations_count": len(entry["observations"]),
+                            "commit_rationales_count": len(entry["commit_rationales"]),
+                            "inserted": inserted,
+                        },
+                    )
+
                     if inserted:
                         post_insert_count = await count_entries_for_agent(
                             conn, tenant_id, agent_id
@@ -4227,6 +4258,36 @@ class GraphExecutor:
                         memory_id = upserted["memory_id"]
                         inserted_branch = upserted["inserted"]
                         memory_written = True
+
+                        # Issue #102 follow-up — emit ``memory_written``
+                        # marker for dead-lettered tasks too. Tasks that
+                        # opt in but then fail still produce a memory row
+                        # (via the dead-letter template), and the user
+                        # should still see the marker.
+                        await _insert_task_event(
+                            conn,
+                            task_id,
+                            tenant_id,
+                            agent_id,
+                            "memory_written",
+                            None,
+                            None,
+                            worker_id,
+                            details={
+                                "agent_id": agent_id,
+                                "memory_id": str(memory_id),
+                                "title": entry["title"],
+                                "outcome": entry["outcome"],
+                                "summarizer_model_id": entry.get(
+                                    "summarizer_model_id"
+                                ),
+                                "observations_count": len(entry["observations"]),
+                                "commit_rationales_count": len(
+                                    entry["commit_rationales"]
+                                ),
+                                "inserted": inserted_branch,
+                            },
+                        )
 
                         if inserted_branch:
                             post_insert_count = await count_entries_for_agent(

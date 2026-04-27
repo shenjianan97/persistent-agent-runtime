@@ -448,6 +448,7 @@ export type ActivityEventKind =
     | 'turn.tool'
     | 'marker.compaction_fired'
     | 'marker.memory_flush'
+    | 'marker.memory_written'
     | 'marker.offload_emitted'
     | 'marker.system_note'
     | 'marker.lifecycle'
