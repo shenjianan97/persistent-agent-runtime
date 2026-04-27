@@ -103,8 +103,18 @@ class RuntimeState(TypedDict, total=False):
         messages associatively (append / update-by-id semantics).
 
     observations:
-        Append-only list of agent observations written by the ``memory_note``
-        tool.  Reducer is ``operator.add``.
+        Append-only list of agent findings written by the ``note_finding``
+        tool (formerly ``memory_note``). Reducer is ``operator.add``. Kept
+        clean of ``save_memory`` opt-in rationales — those live on their
+        own channel (``commit_rationales``) so the memory-detail UI and
+        summarizer can render the two concepts separately. Issue #102.
+
+    commit_rationales:
+        Append-only list of ``save_memory`` / ``commit_memory`` reasons.
+        Each call contributes one entry. Reducer is ``operator.add``.
+        Distinct from ``observations`` so the downstream writer and UI
+        can treat "why the agent chose to save" as a different field
+        from "what the agent learned". Issue #102.
 
     pending_memory:
         Written once by the terminal ``memory_write`` node on memory-enabled
@@ -147,6 +157,9 @@ class RuntimeState(TypedDict, total=False):
 
     # Track 5 (memory) fields — populated by memory-enabled graphs only.
     observations: Annotated[list[str], operator.add]
+    # Issue #102 — save_memory/commit_memory opt-in rationales. Lives
+    # alongside ``observations`` with the same ``operator.add`` reducer.
+    commit_rationales: Annotated[list[str], operator.add]
     pending_memory: dict
     memory_opt_in: bool
 

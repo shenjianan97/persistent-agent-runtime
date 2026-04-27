@@ -61,7 +61,11 @@ public class ActivityProjectionService {
             "marker.hitl.input_requested",
             "marker.hitl.approved",
             "marker.hitl.rejected",
-            "marker.hitl.input_received"
+            "marker.hitl.input_received",
+            // Issue #102 follow-up — surface successful memory commits as a
+            // user-meaningful timeline event so customers see when persistent
+            // memory was actually written for the task.
+            "marker.memory_written"
     );
 
     private final TaskRepository taskRepository;
@@ -472,6 +476,7 @@ public class ActivityProjectionService {
         String kind = switch (type) {
             case "task_compaction_fired" -> "marker.compaction_fired";
             case "memory_flush" -> "marker.memory_flush";
+            case "memory_written" -> "marker.memory_written";
             case "offload_emitted" -> "marker.offload_emitted";
             case "system_note" -> "marker.system_note";
             case "task_paused" -> "marker.hitl.paused";

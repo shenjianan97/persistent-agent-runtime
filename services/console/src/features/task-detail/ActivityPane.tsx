@@ -7,6 +7,7 @@ import {
     Archive,
     PauseCircle,
     PlayCircle,
+    Save,
     StickyNote,
     Info,
     ChevronDown,
@@ -544,6 +545,64 @@ function CompactionMarkerRow({ event, index }: RowProps) {
     );
 }
 
+function MemoryWrittenMarkerRow({ event, index }: RowProps) {
+    const memoryId = (event.details?.memory_id as string | undefined) ?? null;
+    const title = (event.details?.title as string | undefined) ?? null;
+    const findings = (event.details?.observations_count as number | undefined) ?? null;
+    const rationales = (event.details?.commit_rationales_count as number | undefined) ?? null;
+    const agentId = (event.details?.agent_id as string | undefined) ?? null;
+    const summaryText = title
+        ? `Memory saved: ${title}`
+        : 'Memory saved';
+    const counts: string[] = [];
+    if (findings != null) counts.push(`${findings} finding${findings === 1 ? '' : 's'}`);
+    if (rationales != null && rationales > 0) {
+        counts.push(`${rationales} rationale${rationales === 1 ? '' : 's'}`);
+    }
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none animate-in fade-in duration-300"
+        >
+            <div className="flex items-center gap-2 text-xs font-mono text-emerald-300/80 py-2 border-y border-dashed border-emerald-500/30">
+                <Save className="w-3 h-3 shrink-0" />
+                <span
+                    data-testid={`activity-row-${index}-content`}
+                    className="flex-1 truncate"
+                >
+                    {agentId && memoryId ? (
+                        <a
+                            href={`/agents/${encodeURIComponent(agentId)}/memory/${encodeURIComponent(memoryId)}`}
+                            className="hover:underline"
+                            data-testid={`activity-row-${index}-memory-link`}
+                        >
+                            {summaryText}
+                        </a>
+                    ) : (
+                        summaryText
+                    )}
+                    {counts.length > 0 && (
+                        <span className="text-muted-foreground/70">
+                            {' '}— {counts.join(' · ')}
+                        </span>
+                    )}
+                </span>
+                {event.timestamp && (
+                    <span className="tabular-nums text-muted-foreground">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <div className="mx-4">
+                <DetailsAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+
 function MemoryFlushMarkerRow({ event, index }: RowProps) {
     return (
         <li
@@ -822,6 +881,8 @@ function ActivityRow(props: RowProps) {
             return <CompactionMarkerRow {...props} />;
         case 'marker.memory_flush':
             return <MemoryFlushMarkerRow {...props} />;
+        case 'marker.memory_written':
+            return <MemoryWrittenMarkerRow {...props} />;
         case 'marker.offload_emitted':
             return <OffloadMarkerRow {...props} />;
         case 'marker.system_note':

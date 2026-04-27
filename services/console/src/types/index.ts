@@ -411,6 +411,13 @@ export interface MemoryEntryResponse {
     title: string;
     summary: string;
     observations: string[];
+    /**
+     * Commit rationales from `commit_memory` / `save_memory` calls — reasons
+     * the agent gave for opting in to persist this run. Rendered as a separate
+     * section from `observations` on the detail view. Issue #102. Older rows
+     * (pre-migration-0023) may omit this field; treat absence as `[]`.
+     */
+    commit_rationales?: string[];
     outcome: MemoryOutcome;
     tags: string[];
     summarizer_model_id?: string;
@@ -441,6 +448,7 @@ export type ActivityEventKind =
     | 'turn.tool'
     | 'marker.compaction_fired'
     | 'marker.memory_flush'
+    | 'marker.memory_written'
     | 'marker.offload_emitted'
     | 'marker.system_note'
     | 'marker.lifecycle'

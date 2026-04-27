@@ -215,6 +215,7 @@ def build_pending_memory_template_fallback(
     task_input: str | None,
     final_output: str | None,
     observations: list[str],
+    commit_rationales: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a ``pending_memory`` dict when the summarizer is unavailable.
 
@@ -222,6 +223,9 @@ def build_pending_memory_template_fallback(
     emits exactly one ``agent_memory_entries`` row. The caller turns this
     dict into the row verbatim; ``summarizer_model_id`` is the sentinel
     ``'template:fallback'`` so operators can later regenerate.
+
+    ``commit_rationales`` is accepted but not folded into the fallback
+    summary text — kept verbatim in the snapshot for later regeneration.
     """
 
     safe_input = task_input or ""
@@ -243,6 +247,7 @@ def build_pending_memory_template_fallback(
         "content_vec": None,  # Caller may overwrite with the embedding result.
         "summarizer_model_id": SUMMARIZER_TEMPLATE_FALLBACK,
         "observations_snapshot": list(observations),
+        "commit_rationales_snapshot": list(commit_rationales or []),
         "tags": list(_EMPTY_TAGS),
         # Ledger-attribution metadata. The fallback never produced a
         # billable summarizer call, so all three are zero.
@@ -288,12 +293,17 @@ def _build_summarizer_prompt(
     *,
     messages: list[BaseMessage],
     observations: list[str],
+    commit_rationales: list[str] | None = None,
 ) -> tuple[str, str]:
     """Assemble system + user messages for the summarizer call.
 
     * ``system`` — describes the exact output shape. Keeping this out of the
       user message lets template-fallback stay layout-agnostic.
-    * ``user`` — the per-task payload: observations + truncated transcript.
+    * ``user`` — the per-task payload: findings (observations), commit
+      rationales, and the truncated transcript. Findings answer "what did
+      the agent learn"; rationales answer "why did the agent decide this
+      run was worth saving" — distinct concepts, rendered as distinct
+      sections since issue #102.
     """
     system = (
         "You are the post-task memory summarizer. Produce a concise, "
@@ -301,13 +311,21 @@ def _build_summarizer_prompt(
         "Output exactly two sections, separated by a single blank line:\n"
         "TITLE: <one line, action-oriented, max 10 words>\n"
         "SUMMARY: <one paragraph, ≤400 words, describing what happened and "
-        "why — complement, do not duplicate, the agent observations below>"
+        "why — lean on the agent findings below; treat commit rationale(s) "
+        "as justification context, not content to repeat verbatim>"
     )
     obs_block = (
-        "AGENT OBSERVATIONS:\n"
+        "AGENT FINDINGS:\n"
         + "\n".join(f"- {o}" for o in observations)
         if observations
-        else "AGENT OBSERVATIONS: (none)"
+        else "AGENT FINDINGS: (none)"
+    )
+    rationales = list(commit_rationales or [])
+    rationale_block = (
+        "COMMIT RATIONALE:\n"
+        + "\n".join(f"- {r}" for r in rationales)
+        if rationales
+        else "COMMIT RATIONALE: (none)"
     )
     # Keep the transcript summary bounded — very long runs can otherwise
     # blow the summarizer's context. We hand the assistant a compact
@@ -325,7 +343,13 @@ def _build_summarizer_prompt(
         else:
             content_str = str(content)
         transcript_lines.append(f"{role}: {content_str[:2000]}")
-    user = obs_block + "\n\nTRANSCRIPT:\n" + "\n".join(transcript_lines)
+    user = (
+        obs_block
+        + "\n\n"
+        + rationale_block
+        + "\n\nTRANSCRIPT:\n"
+        + "\n".join(transcript_lines)
+    )
     return system, user
 
 
@@ -381,6 +405,12 @@ async def memory_write_node(
     started_ns = time.monotonic_ns()
     messages = state.get("messages") or []
     observations = list(state.get("observations") or [])
+    # Issue #102 — commit_rationales is the new parallel channel for
+    # save_memory/commit_memory reasons. Kept separate from observations so
+    # the detail UI and the summarizer prompt can render the two concepts
+    # distinctly. Older tasks (pre-migration-0023) may have no field on
+    # state → fall back to empty list.
+    commit_rationales = list(state.get("commit_rationales") or [])
     resolved_model_id = summarizer_model_id or PLATFORM_DEFAULT_SUMMARIZER_MODEL
     summarizer_cost_microdollars = 0
     summarizer_tokens_in = 0
@@ -388,14 +418,17 @@ async def memory_write_node(
 
     logger.info(
         "memory.write.started tenant_id=%s agent_id=%s task_id=%s "
-        "observations=%d messages=%d",
-        tenant_id, agent_id, task_id, len(observations), len(messages),
+        "observations=%d commit_rationales=%d messages=%d",
+        tenant_id, agent_id, task_id,
+        len(observations), len(commit_rationales), len(messages),
     )
 
     # 1. Summarizer call — template fallback on any unexpected exception.
     try:
         system, user = _build_summarizer_prompt(
-            messages=messages, observations=observations
+            messages=messages,
+            observations=observations,
+            commit_rationales=commit_rationales,
         )
         raw = await summarizer_callable(
             system=system, user=user, model_id=resolved_model_id
@@ -412,6 +445,7 @@ async def memory_write_node(
             "content_vec": None,  # filled in step 2.
             "summarizer_model_id": summarizer.model_id or resolved_model_id,
             "observations_snapshot": observations,
+            "commit_rationales_snapshot": commit_rationales,
             "tags": list(_EMPTY_TAGS),
             "summarizer_tokens_in": summarizer.tokens_in,
             "summarizer_tokens_out": summarizer.tokens_out,
@@ -432,6 +466,7 @@ async def memory_write_node(
             task_input=task_input,
             final_output=final_output,
             observations=observations,
+            commit_rationales=commit_rationales,
         )
 
     # 2. Embedding — compute over the concatenated title + summary + obs + tags.
@@ -520,6 +555,7 @@ def build_pending_memory_dead_letter_template(
     retry_count: int | None,
     last_error_code: str | None,
     last_error_message: str | None,
+    commit_rationales: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a ``pending_memory``-shaped dict for the dead-letter write path.
 
@@ -528,8 +564,9 @@ def build_pending_memory_dead_letter_template(
     differ in three places: ``outcome='failed'``, ``summarizer_model_id=
     'template:dead_letter'``, and the summary is an error-oriented one-liner.
 
-    No LLM is invoked on this path — template only. Observations are preserved
-    verbatim; the caller also still owns the embedding call if it wants one.
+    No LLM is invoked on this path — template only. Observations and commit
+    rationales are preserved verbatim; the caller still owns the embedding
+    call if it wants one.
     """
     safe_input = task_input or ""
     input_slice = _sanitize_one_line(safe_input)[
@@ -554,6 +591,7 @@ def build_pending_memory_dead_letter_template(
         "content_vec": None,  # Caller overwrites with embedding or leaves NULL.
         "summarizer_model_id": SUMMARIZER_TEMPLATE_DEAD_LETTER,
         "observations_snapshot": list(observations),
+        "commit_rationales_snapshot": list(commit_rationales or []),
         "tags": list(_EMPTY_TAGS),
         # No LLM call on this path — billable summarizer cost is zero.
         "summarizer_tokens_in": 0,

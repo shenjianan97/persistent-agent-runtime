@@ -470,6 +470,113 @@ def find_keep_window_start(
 # ---------------------------------------------------------------------------
 
 
+# Budget guards for the observations block appended to the compaction summary
+# SystemMessage (issue #102). An agent calling ``note_finding`` dozens of
+# times with 2KB payloads would otherwise inflate the system region by >100KB
+# on every turn, worsening cache economics and crowding the keep window.
+#
+# The full observation list stays on ``state["observations"]`` for the
+# terminal summarizer and the dead-letter path — these caps only bound what
+# appears in the live projection shown to the agent.
+_OBSERVATION_BULLET_CAP: int = 20
+_OBSERVATION_BLOCK_CHAR_CAP: int = 4_000
+
+_OBSERVATION_HEADER: str = "AGENT FINDINGS (preserved across compaction):"
+_COMMIT_RATIONALE_HEADER: str = "COMMIT RATIONALE(S):"
+# Commit rationales are far smaller in practice than findings (one short
+# string per save_memory / commit_memory call, typically <= a handful per
+# task) — so a single char cap is enough.  No per-entry cap needed.
+_COMMIT_RATIONALE_BLOCK_CHAR_CAP: int = 1_500
+
+
+def _sanitize_observation_bullet(text: str) -> str:
+    """Collapse embedded newlines so an adversarial observation cannot inject
+    synthetic ``SYSTEM:`` headers into the combined SystemMessage."""
+    return text.replace("\n", " ").strip()
+
+
+def _format_observations_block(observations: list[str]) -> str:
+    """Render observations as a bulleted block suitable for prepending or
+    appending to a SystemMessage's content.
+
+    Honours :data:`_OBSERVATION_BULLET_CAP` and
+    :data:`_OBSERVATION_BLOCK_CHAR_CAP`. When either cap kicks in, drop the
+    oldest findings (keep the most recent) and prepend a synthetic
+    ``- ... {N} older finding(s) omitted`` marker so the agent knows
+    something was truncated. Returns ``""`` when ``observations`` is empty,
+    which the caller treats as "do not emit a findings block."
+    """
+    if not observations:
+        return ""
+    # Keep the most recent ``_OBSERVATION_BULLET_CAP`` findings — tail is
+    # where the agent's latest reasoning lives, and older findings are
+    # still visible through the summarizer's body on the terminal write.
+    total_count = len(observations)
+    kept_tail = observations[-_OBSERVATION_BULLET_CAP:]
+    omitted_count = total_count - len(kept_tail)
+    bullets = [
+        "- " + _sanitize_observation_bullet(o)
+        for o in kept_tail
+        if _sanitize_observation_bullet(o)
+    ]
+    # Char budget — strip oldest kept bullets until we fit. Decrement into
+    # the tail from the front (oldest kept first) so the most recent findings
+    # are guaranteed in the block.
+    header_len = len(_OBSERVATION_HEADER) + 1  # newline after header
+    budget = _OBSERVATION_BLOCK_CHAR_CAP - header_len
+    # +1 per bullet for the joining newline.
+    while bullets and sum(len(b) + 1 for b in bullets) > budget:
+        bullets.pop(0)
+        omitted_count += 1
+    if not bullets:
+        # Pathological case: even one bullet blows the budget. Surface a
+        # single truncation marker so the agent at least knows findings exist.
+        return (
+            _OBSERVATION_HEADER
+            + "\n- ... "
+            + str(total_count)
+            + " finding(s) omitted (each exceeds block budget)"
+        )
+    if omitted_count > 0:
+        bullets.insert(0, f"- ... {omitted_count} older finding(s) omitted")
+    return _OBSERVATION_HEADER + "\n" + "\n".join(bullets)
+
+
+def _format_commit_rationales_block(rationales: list[str]) -> str:
+    """Render commit rationales as a bulleted block separate from findings.
+
+    Kept distinct from :func:`_format_observations_block` so the agent
+    sees the two concepts — "what I learned" vs. "why I chose to save"
+    — as different sections in its post-compaction projection. Issue #102.
+    """
+    if not rationales:
+        return ""
+    bullets = [
+        "- " + _sanitize_observation_bullet(r)
+        for r in rationales
+        if _sanitize_observation_bullet(r)
+    ]
+    header_len = len(_COMMIT_RATIONALE_HEADER) + 1
+    budget = _COMMIT_RATIONALE_BLOCK_CHAR_CAP - header_len
+    # Trim oldest rationales from the front until we fit. Trimmed count is
+    # announced via a synthetic marker so the agent knows something was
+    # dropped.
+    omitted = 0
+    while bullets and sum(len(b) + 1 for b in bullets) > budget:
+        bullets.pop(0)
+        omitted += 1
+    if not bullets:
+        return (
+            _COMMIT_RATIONALE_HEADER
+            + "\n- ... "
+            + str(len(rationales))
+            + " rationale(s) omitted (each exceeds block budget)"
+        )
+    if omitted > 0:
+        bullets.insert(0, f"- ... {omitted} older rationale(s) omitted")
+    return _COMMIT_RATIONALE_HEADER + "\n" + "\n".join(bullets)
+
+
 def _build_projection(
     *,
     system_prompt: str | None,
@@ -477,15 +584,34 @@ def _build_projection(
     summary: str,
     middle: list[BaseMessage],
     keep_window: list[BaseMessage],
+    observations: list[str] | None = None,
+    commit_rationales: list[str] | None = None,
 ) -> list[BaseMessage]:
     """Assemble the three-region projection.
 
     Final shape: ``[SystemMessage(system_prompt), SystemMessage(platform_msg)?,
-    SystemMessage(summary)?, *middle, *keep_window]``.
+    SystemMessage(combined_summary_findings_and_rationales)?, *middle, *keep_window]``.
 
-    The platform SystemMessage (auto-synthesised by the worker when
-    memory is enabled) sits between the user's system prompt and the
-    summary region to preserve today's behaviour — see ``agent_node`` in
+    The combined summary SystemMessage holds:
+
+    1. The Tier-3 summary text (when one has been written).
+    2. An ``AGENT FINDINGS`` block rendered from ``observations`` — agent
+       notes from ``note_finding`` (issue #102 fold).
+    3. A ``COMMIT RATIONALE(S)`` block rendered from ``commit_rationales``
+       — agent reasons from ``commit_memory`` / ``save_memory``
+       (issue #102 follow-up, separate channel).
+
+    The two finding / rationale blocks are distinct so the agent sees
+    "what I've captured" and "why I want this saved" as separate concepts,
+    mirroring the memory-detail UI rendering.
+
+    The combined SystemMessage carries
+    ``additional_kwargs={"compaction": True}`` as before — downstream
+    cache-marker logic and tests key on that flag.
+
+    The platform SystemMessage (auto-synthesised by the worker when memory
+    is enabled) sits between the user's system prompt and the combined
+    region to preserve today's behaviour — see ``agent_node`` in
     ``executor/graph.py``.
     """
     projection: list[BaseMessage] = []
@@ -493,10 +619,22 @@ def _build_projection(
         projection.append(SystemMessage(content=system_prompt))
     if platform_system_message:
         projection.append(SystemMessage(content=platform_system_message))
-    if summary:
+
+    # Build the combined summary + findings + rationale content. Emit the
+    # SystemMessage only when there is something to show. When all three
+    # are empty (fresh task, no note_finding, no commit_memory), behaviour
+    # matches the pre-issue-#102 projection exactly.
+    findings_block = _format_observations_block(list(observations or []))
+    rationale_block = _format_commit_rationales_block(
+        list(commit_rationales or [])
+    )
+    summary_text = summary or ""
+    parts = [p for p in (summary_text, findings_block, rationale_block) if p]
+    combined = "\n\n".join(parts)
+    if combined:
         projection.append(
             SystemMessage(
-                content=summary,
+                content=combined,
                 additional_kwargs={"compaction": True},
             )
         )
@@ -660,6 +798,13 @@ async def compaction_pre_model_hook(
     # and the hard-floor safety net takes over as before. Evaluated up
     # front (before the token-estimate) so we don't waste cycles on the
     # common case where middle is non-empty already.
+    # Observations + commit rationales surfaced into the combined summary
+    # SystemMessage. Issue #102 — see ``_build_projection`` and the
+    # ``_format_observations_block`` / ``_format_commit_rationales_block``
+    # formatters.
+    observations = list(state.get("observations") or [])
+    commit_rationales = list(state.get("commit_rationales") or [])
+
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
         _probe_est = estimate_tokens_fn(
@@ -669,6 +814,8 @@ async def compaction_pre_model_hook(
                 summary=summary,
                 middle=[],
                 keep_window=keep_window,
+                observations=observations,
+                commit_rationales=commit_rationales,
             )
         )
         if _probe_est > model_context_window and _tool_count >= 2:
@@ -700,6 +847,8 @@ async def compaction_pre_model_hook(
         summary=summary,
         middle=middle,
         keep_window=keep_window,
+        observations=observations,
+        commit_rationales=commit_rationales,
     )
     est_tokens = estimate_tokens_fn(projection)
 
@@ -1091,6 +1240,8 @@ async def compaction_pre_model_hook(
         summary=new_summary,
         middle=[],
         keep_window=keep_window,
+        observations=observations,
+        commit_rationales=commit_rationales,
     )
     post_est = estimate_tokens_fn(post_projection)
     if post_est > model_context_window:

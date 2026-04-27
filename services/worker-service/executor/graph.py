@@ -92,6 +92,7 @@ from core.memory_repository import (
     count_entries_for_agent,
     max_entries_for_agent,
     pending_memory_log_preview,
+    read_memory_commit_rationales_by_task_id,
     read_memory_observations_by_task_id,
     read_pending_memory_from_state_values,
     resolve_attached_memories_for_task,
@@ -1168,10 +1169,10 @@ class GraphExecutor:
         # Scope is captured by closure; the LLM cannot override it via
         # arguments.
         #
-        # - ``memory_note`` and ``memory_search`` are gated on
+        # - ``note_finding`` and ``memory_search`` are gated on
         #   ``decision.stack_enabled`` (agent.memory.enabled AND memory_mode
         #   ∈ {always, agent_decides}).
-        # - ``save_memory`` (Task 12) is registered only in
+        # - ``remember_this_run`` (Task 12 opt-in) is registered only in
         #   ``agent_decides`` mode (``stack_enabled=True AND auto_write=False``)
         #   — the agent's lever to opt this run in to writing a memory.
         # - ``task_history_get`` is always registered — diagnostic drill-down
@@ -2323,6 +2324,13 @@ class GraphExecutor:
                         "title": pending_memory["title"],
                         "summary": pending_memory["summary"],
                         "observations": list(pending_memory.get("observations_snapshot") or []),
+                        # Issue #102 — commit_rationales is the new separate
+                        # channel for ``commit_memory`` / ``save_memory`` reasons.
+                        # Older pending_memory dicts built pre-migration won't
+                        # carry the snapshot; fall back to empty list.
+                        "commit_rationales": list(
+                            pending_memory.get("commit_rationales_snapshot") or []
+                        ),
                         "outcome": pending_memory.get("outcome", "succeeded"),
                         "tags": list(pending_memory.get("tags") or []),
                         "content_vec": pending_memory.get("content_vec"),
@@ -2332,6 +2340,37 @@ class GraphExecutor:
                     memory_id = upserted["memory_id"]
                     inserted = upserted["inserted"]
                     memory_written = True
+
+                    # Issue #102 follow-up — emit a ``memory_written`` task_event
+                    # in the SAME transaction as the UPSERT so the activity
+                    # timeline shows a "Memory saved" marker that either lands
+                    # atomically with the row or rolls back with it. No dedup
+                    # logic needed because the UPSERT key (task_id) already
+                    # guarantees one memory row per task. ``agent_id`` is
+                    # mirrored into details so the Console can link to
+                    # ``/agents/{agent_id}/memory/{memory_id}`` directly off
+                    # the event payload (the agent_id column on task_events
+                    # is not surfaced through the activity event response).
+                    await _insert_task_event(
+                        conn,
+                        task_id,
+                        tenant_id,
+                        agent_id,
+                        "memory_written",
+                        None,  # status_before
+                        None,  # status_after
+                        worker_id,
+                        details={
+                            "agent_id": agent_id,
+                            "memory_id": str(memory_id),
+                            "title": entry["title"],
+                            "outcome": entry["outcome"],
+                            "summarizer_model_id": entry.get("summarizer_model_id"),
+                            "observations_count": len(entry["observations"]),
+                            "commit_rationales_count": len(entry["commit_rationales"]),
+                            "inserted": inserted,
+                        },
+                    )
 
                     if inserted:
                         post_insert_count = await count_entries_for_agent(
@@ -2522,30 +2561,42 @@ class GraphExecutor:
                 f"with sandbox_exec commands."
             )
 
-        # Phase 2 Track 5 Task 12 — memory-tool framing. Gated on what is
-        # actually registered: ``memory_note`` / ``memory_search`` whenever
-        # the stack is on; ``save_memory`` only in ``agent_decides``. Tool
-        # descriptions alone underspecify behavior — Anthropic / OpenAI /
-        # Bedrock LLMs reliably forget optional retrieval tools without a
-        # platform nudge, and ``save_memory`` in particular needs the
-        # opt-in framing to preserve ``agent_decides`` semantics (a MUST
-        # directive would collapse it into ``always`` mode).
+        # Phase 2 Track 5 Task 12 / Issue #102 — memory-tool framing. Gated
+        # on what is actually registered: ``note_finding`` / ``memory_search``
+        # whenever the stack is on; ``remember_this_run`` only in
+        # ``agent_decides``. Tool descriptions alone underspecify behavior
+        # — LLMs reliably forget optional retrieval tools without a platform
+        # nudge, and the two memory-writing tools need sequencing guidance
+        # or agents hedge by calling both for every finding (the failure
+        # mode that issue #102 tracks). The prose here explicitly names
+        # the distinct roles: ``note_finding`` = scratchpad during the run,
+        # ``remember_this_run`` = terminal trigger (NOT the save itself —
+        # a dedicated summarizer composes the body afterward).
         if memory_decision is not None and memory_decision.stack_enabled:
             sections.append(
                 "This agent has persistent memory. Before starting non-trivial "
-                "work, consider calling `memory_search` to recall relevant past "
-                "runs. During the run, use `memory_note` to capture salient "
-                "intermediate findings that should survive into the final "
-                "memory entry."
+                "work, call `memory_search` to recall relevant past runs. "
+                "During the run, call `note_finding(text=...)` whenever you "
+                "discover something worth preserving — each call captures one "
+                "finding, and your findings list survives context compaction "
+                "and feeds the post-task summarizer."
             )
             if not memory_decision.auto_write:
                 sections.append(
-                    "Memory writes are opt-in for this run: call "
-                    "`save_memory(reason=...)` exactly when the run has "
+                    "Memory writes are opt-in for this run. At task end, "
+                    "call `remember_this_run(reason=...)` if this run "
                     "produced something worth remembering (non-trivial "
                     "findings, customer decisions, recurring patterns). "
-                    "Skip the call for routine or trivial runs — the absence "
-                    "of a call means no memory entry is written."
+                    "`remember_this_run` is the TRIGGER — it does NOT "
+                    "compose the memory entry itself; a dedicated "
+                    "summarizer distills your `note_finding` bullets into "
+                    "the stored summary after you return. Do NOT use "
+                    "`remember_this_run` to record a finding — findings go "
+                    "through `note_finding`. Repeat calls do not trigger "
+                    "additional writes; the memory entry is composed and "
+                    "persisted once at the terminal branch. Skip the call "
+                    "for routine runs — the absence of a call means no "
+                    "memory entry is written."
                 )
 
         # Track 7 Follow-up Task 5 — ingestion-offload directive. Appended
@@ -2877,11 +2928,22 @@ class GraphExecutor:
                 # super-step checkpoint and implicit for subsequent resumes.
                 attached_preamble: str | None = None
                 seeded_observations: list[str] | None = None
+                # Issue #102 — redrive / follow-up needs to re-seed both the
+                # findings channel AND the new commit_rationales channel so
+                # the UPSERT's ``ON CONFLICT DO UPDATE`` doesn't clobber a
+                # prior run's rationales with the current run's (possibly
+                # empty) list.
+                seeded_commit_rationales: list[str] | None = None
                 if first_execution:
                     async with self.pool.acquire() as _attach_conn:
                         if memory_enabled_for_task:
                             seeded_observations = (
                                 await read_memory_observations_by_task_id(
+                                    _attach_conn, tenant_id, agent_id, task_id,
+                                )
+                            )
+                            seeded_commit_rationales = (
+                                await read_memory_commit_rationales_by_task_id(
                                     _attach_conn, tenant_id, agent_id, task_id,
                                 )
                             )
@@ -2955,9 +3017,19 @@ class GraphExecutor:
                         if memory_enabled_for_task and seeded_observations
                         else []
                     )
+                    # Issue #102 — seed commit_rationales from the prior-run
+                    # DB row on redrive so the UPSERT's UPDATE branch doesn't
+                    # overwrite prior rationales with an empty list when the
+                    # redriven run doesn't call commit_memory.
+                    _commit_rationales: list[str] = (
+                        list(seeded_commit_rationales)
+                        if memory_enabled_for_task and seeded_commit_rationales
+                        else []
+                    )
                     _payload: dict[str, Any] = {
                         "messages": initial_messages,
                         "observations": _observations,
+                        "commit_rationales": _commit_rationales,
                         "pending_memory": {},
                         # Phase 2 Track 5 Task 12 — per-run reset of the
                         # ``agent_decides`` opt-in flag. The field has no
@@ -3011,6 +3083,15 @@ class GraphExecutor:
                             follow_up_payload: dict[str, Any] = {
                                 "messages": [_follow_up_message],
                                 "memory_opt_in": False,
+                                # Issue #102 — seed commit_rationales: []
+                                # defensively for resumes from pre-migration
+                                # checkpoints whose state may lack the
+                                # channel entirely. ``operator.add`` on
+                                # ``None + [...]`` would TypeError; an
+                                # explicit [] is a belt-and-suspenders
+                                # guarantee that a legacy checkpoint's next
+                                # commit_memory call merges cleanly.
+                                "commit_rationales": [],
                             }
                             initial_input = follow_up_payload
                         elif payload.get("kind") == "input":
@@ -4095,9 +4176,15 @@ class GraphExecutor:
                 )
             if observations and (not opt_in_required or opt_in_confirmed):
                 memory_write_attempted = True
+                commit_rationales = (
+                    await self._read_commit_rationales_from_checkpoint(
+                        checkpointer, task_id
+                    )
+                )
                 pending_memory = build_pending_memory_dead_letter_template(
                     task_input=task_input,
                     observations=observations,
+                    commit_rationales=commit_rationales,
                     retry_count=retry_count,
                     last_error_code=effective_error_code,
                     last_error_message=error_msg,
@@ -4155,6 +4242,11 @@ class GraphExecutor:
                             "observations": list(
                                 pending_memory.get("observations_snapshot") or []
                             ),
+                            # Issue #102 — see matching block in the happy
+                            # path (memory_write_node branch) above.
+                            "commit_rationales": list(
+                                pending_memory.get("commit_rationales_snapshot") or []
+                            ),
                             "outcome": pending_memory.get("outcome", "failed"),
                             "tags": list(pending_memory.get("tags") or []),
                             "content_vec": pending_memory.get("content_vec"),
@@ -4166,6 +4258,36 @@ class GraphExecutor:
                         memory_id = upserted["memory_id"]
                         inserted_branch = upserted["inserted"]
                         memory_written = True
+
+                        # Issue #102 follow-up — emit ``memory_written``
+                        # marker for dead-lettered tasks too. Tasks that
+                        # opt in but then fail still produce a memory row
+                        # (via the dead-letter template), and the user
+                        # should still see the marker.
+                        await _insert_task_event(
+                            conn,
+                            task_id,
+                            tenant_id,
+                            agent_id,
+                            "memory_written",
+                            None,
+                            None,
+                            worker_id,
+                            details={
+                                "agent_id": agent_id,
+                                "memory_id": str(memory_id),
+                                "title": entry["title"],
+                                "outcome": entry["outcome"],
+                                "summarizer_model_id": entry.get(
+                                    "summarizer_model_id"
+                                ),
+                                "observations_count": len(entry["observations"]),
+                                "commit_rationales_count": len(
+                                    entry["commit_rationales"]
+                                ),
+                                "inserted": inserted_branch,
+                            },
+                        )
 
                         if inserted_branch:
                             post_insert_count = await count_entries_for_agent(
@@ -4318,6 +4440,41 @@ class GraphExecutor:
         except Exception:
             logger.warning(
                 "memory.deadletter.observations_read_failed task_id=%s",
+                task_id,
+                exc_info=True,
+            )
+            return []
+
+    async def _read_commit_rationales_from_checkpoint(
+        self,
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+    ) -> list[str]:
+        """Read ``commit_rationales`` out of the latest checkpoint's state.
+
+        Mirror of :func:`_read_observations_from_checkpoint` for the new
+        channel added in issue #102. Returns ``[]`` on any read failure
+        so the dead-letter path degrades cleanly when the field is absent
+        (older tasks pre-dating migration 0023 may have no such channel).
+        """
+        try:
+            config: dict[str, Any] = {"configurable": {"thread_id": task_id}}
+            tup = await checkpointer.aget_tuple(config)
+            if tup is None:
+                return []
+            checkpoint = getattr(tup, "checkpoint", None) or {}
+            if not isinstance(checkpoint, dict):
+                return []
+            values = checkpoint.get("channel_values")
+            if not isinstance(values, dict):
+                return []
+            rationales = values.get("commit_rationales") or []
+            if isinstance(rationales, list):
+                return [str(x) for x in rationales if x is not None]
+            return []
+        except Exception:
+            logger.warning(
+                "memory.deadletter.commit_rationales_read_failed task_id=%s",
                 task_id,
                 exc_info=True,
             )

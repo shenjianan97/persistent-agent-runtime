@@ -26,6 +26,7 @@ public class MemoryRepository {
     /** Column list returned by detail + list queries — keep in sync with schema. */
     static final String DETAIL_COLUMNS =
             "memory_id, tenant_id, agent_id, task_id, title, summary, observations, "
+            + "commit_rationales, "
             + "outcome, tags, summarizer_model_id, version, created_at, updated_at";
 
     static final String SUMMARY_COLUMNS =
@@ -146,6 +147,7 @@ public class MemoryRepository {
                         + "  pg_column_size(title)"
                         + " + pg_column_size(summary)"
                         + " + pg_column_size(observations)"
+                        + " + COALESCE(pg_column_size(commit_rationales), 0)"
                         + " + pg_column_size(tags)"
                         + " + 1536 * 4"
                         + "), 0) FROM agent_memory_entries"

@@ -17,6 +17,15 @@ public record MemoryEntryResponse(
         @JsonProperty("title") String title,
         @JsonProperty("summary") String summary,
         @JsonProperty("observations") List<String> observations,
+        /**
+         * Commit rationales from ``commit_memory`` / ``save_memory`` calls.
+         * Issue #102 — rendered as a separate UI section from
+         * {@code observations} so the agent's findings and its "why I saved
+         * this run" justifications aren't muddled in one list. NULL for rows
+         * written before migration 0023; callers should render an empty
+         * collection in that case.
+         */
+        @JsonProperty("commit_rationales") List<String> commitRationales,
         @JsonProperty("outcome") String outcome,
         @JsonProperty("tags") List<String> tags,
         @JsonProperty("summarizer_model_id") String summarizerModelId,
