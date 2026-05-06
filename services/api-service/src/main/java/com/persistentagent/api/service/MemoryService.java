@@ -347,6 +347,10 @@ public class MemoryService {
                 (String) row.get("title"),
                 (String) row.get("summary"),
                 MemoryRepository.coerceTextArray(row.get("observations")),
+                // Issue #102 — NULL for rows written before migration 0023.
+                // ``coerceTextArray`` returns an empty list on NULL so the
+                // caller never has to null-check.
+                MemoryRepository.coerceTextArray(row.get("commit_rationales")),
                 (String) row.get("outcome"),
                 MemoryRepository.coerceTextArray(row.get("tags")),
                 (String) row.get("summarizer_model_id"),

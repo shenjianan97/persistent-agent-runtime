@@ -171,7 +171,10 @@ class MemoryControllerTest {
         MemoryEntryResponse response = new MemoryEntryResponse(
                 MEMORY_ID, AGENT, UUID.randomUUID().toString(),
                 "title", "summary body",
-                List.of("obs1", "obs2"), "succeeded",
+                List.of("obs1", "obs2"),
+                // Issue #102 — commit_rationales is the new separate channel.
+                List.of("run shipped a fix"),
+                "succeeded",
                 List.of("tag1"),
                 "claude-haiku", 1, NOW, NOW);
         when(memoryService.get(AGENT, MEMORY_ID)).thenReturn(response);
@@ -180,6 +183,7 @@ class MemoryControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.memory_id").value(MEMORY_ID))
                 .andExpect(jsonPath("$.observations[0]").value("obs1"))
+                .andExpect(jsonPath("$.commit_rationales[0]").value("run shipped a fix"))
                 .andExpect(jsonPath("$.tags[0]").value("tag1"))
                 .andExpect(jsonPath("$.summarizer_model_id").value("claude-haiku"));
     }

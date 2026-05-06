@@ -2,7 +2,7 @@
 
 Covered contracts:
 
-- ``memory_note`` validates its argument (1..2048 chars), returns a
+- ``note_finding`` validates its argument (1..2048 chars), returns a
   ``Command(update={"observations": [text]})`` so LangGraph's
   ``operator.add`` reducer appends durably. No DB / network calls.
 - ``memory_search`` delegates to ``GET /v1/agents/{bound_agent}/memory/search``;
@@ -14,8 +14,9 @@ Covered contracts:
   malformed UUID → ``MemoryToolNotFoundError``; happy path returns a
   bounded structured view with truncation.
 - ``build_memory_tools`` gating:
-    * memory-enabled → all three tools returned (``memory_note``,
-      ``memory_search``, ``task_history_get``).
+    * memory-enabled always → ``note_finding`` + ``memory_search`` +
+      ``task_history_get``.
+    * memory-enabled agent_decides → above plus ``remember_this_run``.
     * memory-disabled → only ``task_history_get``.
 
 These tests cover the Task 7 acceptance criteria without touching Postgres
@@ -41,13 +42,13 @@ from tools.memory_tools import (
     MEMORY_NOTE_MAX_LEN,
     MEMORY_SEARCH_TOOL_LIMIT_MAX,
     SAVE_MEMORY_REASON_MAX_LEN,
-    MemoryNoteArguments,
     MemorySearchArguments,
     MemorySearchVectorUnavailableError,
     MemoryToolContext,
     MemoryToolError,
     MemoryToolNotFoundError,
-    SaveMemoryArguments,
+    NoteFindingArguments,
+    RememberThisRunArguments,
     TaskHistoryGetArguments,
     build_memory_tools,
 )
@@ -128,45 +129,69 @@ def _tool_by_name(tools: list[Any], name: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# memory_note
+# note_finding (renamed from memory_note in issue #102)
 # ---------------------------------------------------------------------------
 
 
-class TestMemoryNoteArguments:
+class TestNoteFindingArguments:
     def test_accepts_normal_text(self) -> None:
-        parsed = MemoryNoteArguments(
+        parsed = NoteFindingArguments(
             text="Observed that X correlates with Y", tool_call_id="call_x"
         )
         assert parsed.text.startswith("Observed")
 
     def test_rejects_empty(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(text="", tool_call_id="call_x")
+            NoteFindingArguments(text="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            MemoryNoteArguments(
+            NoteFindingArguments(
                 text="a" * (MEMORY_NOTE_MAX_LEN + 1), tool_call_id="call_x"
             )
 
 
-def _invoke_with_tool_call(tool, args: dict, tool_call_id: str = "call_test"):
-    """Invoke a StructuredTool via the full tool_call envelope so
-    ``InjectedToolCallId``-annotated parameters get populated. Direct
-    ``tool.invoke({"arg": ...})`` bypasses the injection path and fails."""
-    return tool.invoke({
-        "args": args,
-        "id": tool_call_id,
-        "type": "tool_call",
-        "name": tool.name,
-    })
+def _invoke_with_tool_call(
+    tool,
+    args: dict,
+    tool_call_id: str = "call_test",
+    *,
+    observations: list[str] | None = None,
+):
+    """Invoke a memory tool's underlying handler with both LLM args and the
+    graph-state values that ``InjectedState`` would inject in production.
+
+    ``StructuredTool.invoke(<tool_call_envelope>)`` populates
+    ``InjectedToolCallId`` from the envelope but does NOT populate
+    ``InjectedState`` — that work normally happens inside LangGraph's
+    ``ToolNode``. For unit coverage we bypass ToolNode and call the
+    underlying handler directly, passing ``observations`` as a keyword
+    arg to match the injection the production path performs.
+
+    ``observations`` defaults to an empty list — matches a fresh task
+    state before any ``note_finding`` call has run.
+    """
+    kwargs = dict(args)
+    kwargs["tool_call_id"] = tool_call_id
+    # note_finding / remember_this_run both take ``observations`` via
+    # InjectedState. memory_search / task_history_get do not; only pass it
+    # when the handler signature accepts it.
+    import inspect
+
+    params = inspect.signature(tool.func).parameters
+    if "observations" in params:
+        kwargs["observations"] = list(observations or [])
+    return tool.func(**kwargs)
 
 
-class TestMemoryNoteTool:
-    def test_returns_command_with_tool_message_and_observation(self) -> None:
+class TestNoteFindingTool:
+    """Coverage for ``note_finding`` (renamed from ``memory_note`` in
+    issue #102)."""
+
+    def test_note_finding_returns_command_with_tool_message_and_observation(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
-        tool = _tool_by_name(tools, "memory_note")
+        tool = _tool_by_name(tools, "note_finding")
 
         result = _invoke_with_tool_call(tool, {"text": "hello"}, "call_xyz")
         assert isinstance(result, Command)
@@ -175,79 +200,198 @@ class TestMemoryNoteTool:
         messages = result.update["messages"]
         assert len(messages) == 1
         assert messages[0].tool_call_id == "call_xyz"
+        # Informative return — gives the agent direct evidence the call
+        # landed. Issue #102 follow-up: no longer counts, because
+        # parallel siblings in the same super-step would all see the same
+        # pre-reducer state and report the same count (a lie that looks
+        # like a stuck counter to the agent).
+        assert "Noted" in messages[0].content
+        assert "queued" in messages[0].content
+        assert "survives context compaction" in messages[0].content
+
+    def test_note_finding_wording_stable_under_parallel_invocation(self) -> None:
+        """Issue #102 follow-up: ``note_finding`` intentionally omits any
+        count because super-step-parallel siblings all see the same
+        pre-reducer ``observations`` state. The reassuring wording is the
+        same regardless of prior finding count."""
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
+        tool = _tool_by_name(tools, "note_finding")
+
+        # Two invocations "from the same super-step" both see an empty
+        # observations list; the return wording is identical — no #1 / #2
+        # count divergence that would look like a stuck counter.
+        r1 = _invoke_with_tool_call(tool, {"text": "a"}, "c1", observations=[])
+        r2 = _invoke_with_tool_call(tool, {"text": "b"}, "c2", observations=[])
+        assert r1.update["messages"][0].content == r2.update["messages"][0].content
 
     def test_not_registered_when_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
         names = [t.name for t in tools]
+        assert "note_finding" not in names
+        # Legacy name also absent — the PR shipped the canonical name only.
         assert "memory_note" not in names
 
 
 # ---------------------------------------------------------------------------
-# save_memory (Task 12)
+# remember_this_run (Task 12; renamed from save_memory in issue #102)
 # ---------------------------------------------------------------------------
 
 
-class TestSaveMemoryArguments:
+class TestRememberThisRunArguments:
     def test_accepts_normal_reason(self) -> None:
-        parsed = SaveMemoryArguments(
+        parsed = RememberThisRunArguments(
             reason="this run shipped the fix", tool_call_id="call_x"
         )
         assert parsed.reason.startswith("this run")
 
     def test_rejects_empty_reason(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(reason="", tool_call_id="call_x")
+            RememberThisRunArguments(reason="", tool_call_id="call_x")
 
     def test_rejects_over_limit(self) -> None:
         with pytest.raises(ValidationError):
-            SaveMemoryArguments(
+            RememberThisRunArguments(
                 reason="a" * (SAVE_MEMORY_REASON_MAX_LEN + 1),
                 tool_call_id="call_x",
             )
 
 
-class TestSaveMemoryTool:
-    def test_returns_command_opts_in_and_appends_observation(self) -> None:
+class TestRememberThisRunTool:
+    """Coverage for ``remember_this_run`` (renamed from ``save_memory`` in
+    issue #102). The PR ships the canonical name only — no alias."""
+
+    def test_remember_this_run_opts_in_and_writes_to_commit_rationales(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
-        result = _invoke_with_tool_call(tool, {"reason": "shipped the fix"}, "call_save_1")
+        result = _invoke_with_tool_call(
+            tool, {"reason": "shipped the fix"}, "call_commit_1"
+        )
         assert isinstance(result, Command)
         assert result.update["memory_opt_in"] is True
-        assert result.update["observations"] == ["[save_memory] shipped the fix"]
+        # Issue #102 — rationale lands on its own channel, NOT mixed into
+        # observations anymore.  Observations is not touched by this tool.
+        assert result.update["commit_rationales"] == ["shipped the fix"]
+        assert "observations" not in result.update
         messages = result.update["messages"]
         assert len(messages) == 1
-        assert messages[0].tool_call_id == "call_save_1"
+        assert messages[0].tool_call_id == "call_commit_1"
+        # Informative return — tells the agent the opt-in landed and reassures
+        # that an empty-findings commit still produces a useful memory entry
+        # (composed from transcript + rationale). Issue #102.
+        assert "Remember confirmed" in messages[0].content
+        assert "No findings captured" in messages[0].content
+
+    def test_return_counts_findings_from_observations_only(self) -> None:
+        """The count in remember_this_run's return is simply
+        ``len(observations)`` — rationales live on their own
+        ``commit_rationales`` channel (no need for the old
+        ``[save_memory]`` prefix filter)."""
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "remember_this_run")
+
+        result = _invoke_with_tool_call(
+            tool,
+            {"reason": "another reason"},
+            observations=["real finding 1", "real finding 2", "real finding 3"],
+        )
+        assert "3 finding" in result.update["messages"][0].content
+
+    def test_return_counts_in_flight_sibling_note_findings(self) -> None:
+        """Super-step concurrency correction (issue #102): when the agent
+        emits ``remember_this_run`` in the same AIMessage as
+        ``note_finding`` siblings, ``InjectedState("observations")`` still
+        shows the pre-reducer list. The handler inspects the current
+        AIMessage's tool_calls and adds pending note_finding calls to the
+        reported count so the "N finding(s) will persist" return is
+        accurate.
+        """
+        from langchain_core.messages import AIMessage
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "remember_this_run")
+
+        # Simulate the super-step state: observations is empty (reducer
+        # hasn't merged sibling updates yet), but the current AIMessage
+        # has two note_finding calls alongside the remember_this_run call.
+        ai = AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "note_finding", "args": {"text": "f1"}, "id": "tf1"},
+                {"name": "note_finding", "args": {"text": "f2"}, "id": "tf2"},
+                {"name": "remember_this_run", "args": {"reason": "x"}, "id": "c1"},
+            ],
+        )
+        result = tool.func(
+            reason="because",
+            tool_call_id="c1",
+            observations=[],
+            messages=[ai],
+        )
+        # Two pending siblings + zero committed = 2 findings will persist.
+        content = result.update["messages"][0].content
+        assert "2 finding" in content
+        # Zero-findings reassurance path must NOT fire when siblings are
+        # in flight.
+        assert "No findings captured" not in content
+
+    def test_return_zero_findings_branch_when_no_siblings_and_empty_state(self) -> None:
+        """When observations is empty AND there are no sibling
+        note_finding tool_calls, the remember_this_run return falls into
+        the reassurance branch (composed from transcript + rationale)."""
+        from langchain_core.messages import AIMessage
+        ctx = _make_ctx()
+        tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
+        tool = _tool_by_name(tools, "remember_this_run")
+
+        ai = AIMessage(
+            content="",
+            tool_calls=[{"name": "remember_this_run", "args": {"reason": "x"}, "id": "c1"}],
+        )
+        result = tool.func(
+            reason="because",
+            tool_call_id="c1",
+            observations=[],
+            messages=[ai],
+        )
+        assert "No findings captured" in result.update["messages"][0].content
 
     def test_strips_whitespace_around_reason(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         result = _invoke_with_tool_call(tool, {"reason": "   trimmed    "})
-        assert result.update["observations"] == ["[save_memory] trimmed"]
+        assert result.update["commit_rationales"] == ["trimmed"]
 
     def test_whitespace_only_reason_raises_tool_error(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
-        tool = _tool_by_name(tools, "save_memory")
+        tool = _tool_by_name(tools, "remember_this_run")
 
         with pytest.raises(MemoryToolError):
             _invoke_with_tool_call(tool, {"reason": "     "})
 
     def test_not_registered_in_always_mode(self) -> None:
-        """``save_memory`` is unnecessary when the run will write
+        """``remember_this_run`` is unnecessary when the run will write
         unconditionally — keep the tool list lean."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
-        assert "save_memory" not in [t.name for t in tools]
+        names = [t.name for t in tools]
+        assert "remember_this_run" not in names
+        # Legacy name also absent — the PR shipped the canonical name only.
+        assert "save_memory" not in names
 
     def test_not_registered_in_skip_or_memory_disabled(self) -> None:
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=False, auto_write=False)
-        assert "save_memory" not in [t.name for t in tools]
+        names = [t.name for t in tools]
+        assert "remember_this_run" not in names
+        assert "save_memory" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -565,22 +709,28 @@ class TestTaskHistoryGetTool:
 
 
 class TestBuildMemoryToolsGating:
-    def test_always_mode_registers_memory_note_search_and_history(self) -> None:
+    def test_always_mode_registers_note_finding_search_and_history(self) -> None:
+        """``always`` mode skips ``remember_this_run`` — the run writes
+        unconditionally, so the opt-in trigger would be a no-op."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=True)
         names = sorted(t.name for t in tools)
-        # ``save_memory`` is NOT registered in ``always`` mode — the run
-        # writes unconditionally, so the tool would be a no-op.
-        assert names == ["memory_note", "memory_search", "task_history_get"]
+        assert names == [
+            "memory_search",
+            "note_finding",
+            "task_history_get",
+        ]
 
-    def test_agent_decides_mode_also_registers_save_memory(self) -> None:
+    def test_agent_decides_mode_also_registers_remember_this_run(self) -> None:
+        """``agent_decides`` mode adds ``remember_this_run`` — the
+        terminal-commit opt-in trigger."""
         ctx = _make_ctx()
         tools = build_memory_tools(ctx, stack_enabled=True, auto_write=False)
         names = sorted(t.name for t in tools)
         assert names == [
-            "memory_note",
             "memory_search",
-            "save_memory",
+            "note_finding",
+            "remember_this_run",
             "task_history_get",
         ]
 

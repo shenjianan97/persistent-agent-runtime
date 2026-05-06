@@ -65,8 +65,10 @@ ARG_TRUNCATION_CAP_BYTES: int = 1_000
 # age. These are load-bearing across many turns. Customer agents can extend
 # this list via agent_config.context_management.exclude_tools.
 PLATFORM_EXCLUDE_TOOLS: frozenset[str] = frozenset({
-    "memory_note",
-    "save_memory",
+    # Findings-capture tool (issue #102).
+    "note_finding",
+    # Terminal-commit opt-in tool (issue #102).
+    "remember_this_run",
     "request_human_input",
     # Memory-retrieval results: the agent *just explicitly fetched* these to
     # inform the current task. Clearing them once they age out of the keep

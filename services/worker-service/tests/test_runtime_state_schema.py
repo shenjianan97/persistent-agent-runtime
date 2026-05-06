@@ -118,12 +118,22 @@ class TestRuntimeStateSchemaShape:
                 "the Track 7 Follow-up (Task 3) pipeline rewrite."
             )
 
-    def test_exactly_ten_fields(self) -> None:
-        """Track 7 Follow-up shape: 4 Track 5 + 6 compaction = 10 total."""
+    def test_exactly_eleven_fields(self) -> None:
+        """Track 7 Follow-up + issue #102 shape: 5 Track 5 + 6 compaction = 11 total.
+
+        Issue #102 added ``commit_rationales`` as a parallel channel to
+        ``observations`` for ``commit_memory`` / ``save_memory`` reasons.
+        """
         hints = get_type_hints(RuntimeState, include_extras=True)
         expected = {
             # Track 5
-            "messages", "observations", "pending_memory", "memory_opt_in",
+            "messages",
+            "observations",
+            # Issue #102 — separate channel for save_memory/commit_memory
+            # reasons, distinct from note_finding observations.
+            "commit_rationales",
+            "pending_memory",
+            "memory_opt_in",
             # Track 7 Follow-up (replace-and-rehydrate)
             "summary", "summarized_through_turn_index",
             "memory_flush_fired_this_task", "last_super_step_message_count",

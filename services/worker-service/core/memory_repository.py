@@ -86,18 +86,19 @@ def max_entries_for_agent(agent_config: dict[str, Any] | None) -> int:
 _UPSERT_SQL = """
 INSERT INTO agent_memory_entries (
     tenant_id, agent_id, task_id,
-    title, summary, observations, outcome, tags,
+    title, summary, observations, commit_rationales, outcome, tags,
     content_vec, summarizer_model_id
 ) VALUES (
     $1, $2, $3::uuid,
-    $4, $5, $6::text[], $7, $8::text[],
-    CASE WHEN $9::text IS NULL THEN NULL ELSE $9::text::vector END,
-    $10
+    $4, $5, $6::text[], $7::text[], $8, $9::text[],
+    CASE WHEN $10::text IS NULL THEN NULL ELSE $10::text::vector END,
+    $11
 )
 ON CONFLICT (task_id) DO UPDATE SET
     title               = EXCLUDED.title,
     summary             = EXCLUDED.summary,
     observations        = EXCLUDED.observations,
+    commit_rationales   = EXCLUDED.commit_rationales,
     outcome             = EXCLUDED.outcome,
     tags                = EXCLUDED.tags,
     content_vec         = EXCLUDED.content_vec,
@@ -167,9 +168,11 @@ async def upsert_memory_entry(
         transaction. On rollback the memory row is rolled back with it.
     entry:
         Dict with keys ``tenant_id``, ``agent_id``, ``task_id``, ``title``,
-        ``summary``, ``observations`` (list[str]), ``outcome``
-        (``'succeeded'`` / ``'failed'``), ``tags`` (list[str]),
-        ``content_vec`` (list[float] | None), and ``summarizer_model_id``.
+        ``summary``, ``observations`` (list[str]), ``commit_rationales``
+        (list[str]; ``commit_memory`` / ``save_memory`` reasons — issue
+        #102), ``outcome`` (``'succeeded'`` / ``'failed'``), ``tags``
+        (list[str]), ``content_vec`` (list[float] | None), and
+        ``summarizer_model_id``.
 
     Returns
     -------
@@ -196,6 +199,7 @@ async def upsert_memory_entry(
         entry["title"],
         entry["summary"],
         list(entry.get("observations") or []),
+        list(entry.get("commit_rationales") or []),
         entry["outcome"],
         list(entry.get("tags") or []),
         _vec_to_sql_literal(entry.get("content_vec")),
@@ -331,7 +335,7 @@ def pending_memory_log_preview(pending_memory: dict[str, Any]) -> str:
 
 
 _READ_OBSERVATIONS_SQL = """
-SELECT observations
+SELECT observations, commit_rationales
 FROM agent_memory_entries
 WHERE tenant_id = $1 AND agent_id = $2 AND task_id = $3::uuid
 """
@@ -369,6 +373,34 @@ async def read_memory_observations_by_task_id(
     if obs is None:
         return []
     return list(obs)
+
+
+async def read_memory_commit_rationales_by_task_id(
+    conn: asyncpg.Connection,
+    tenant_id: str,
+    agent_id: str,
+    task_id: str,
+) -> list[str] | None:
+    """Sibling of :func:`read_memory_observations_by_task_id` for the
+    ``commit_rationales`` channel added in issue #102.
+
+    Returns ``None`` when no memory row exists for the task; ``[]`` when
+    the row exists but the column is NULL (older row pre-migration 0023
+    or a run that never called ``commit_memory``); otherwise the verbatim
+    list. Scope binding same as the sibling.
+
+    Reuses :data:`_READ_OBSERVATIONS_SQL` (which now selects both columns)
+    so a redrive pays only one round-trip instead of two.
+    """
+    row = await conn.fetchrow(
+        _READ_OBSERVATIONS_SQL, tenant_id, agent_id, str(task_id)
+    )
+    if row is None:
+        return None
+    rationales = row["commit_rationales"]
+    if rationales is None:
+        return []
+    return list(rationales)
 
 
 _RESOLVE_ATTACHED_SQL = """

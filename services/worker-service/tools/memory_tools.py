@@ -54,6 +54,7 @@ import asyncpg
 import httpx
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, StructuredTool
+from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
@@ -79,15 +80,16 @@ TASK_HISTORY_PREVIEW_BYTES = 512
 _ALLOWED_MODES = ("hybrid", "text", "vector")
 
 
-class MemoryNoteArguments(BaseModel):
+class NoteFindingArguments(BaseModel):
     text: Annotated[
         str,
         Field(
             min_length=1,
             max_length=MEMORY_NOTE_MAX_LEN,
             description=(
-                "A short, durable note to append to this task's draft memory "
-                "entry. Persisted across worker restarts. "
+                "A short finding you want to preserve for this task. Appended "
+                "to your findings list, which survives context compaction and "
+                "feeds the post-task summary. "
                 f"Max {MEMORY_NOTE_MAX_LEN} characters."
             ),
         ),
@@ -97,14 +99,27 @@ class MemoryNoteArguments(BaseModel):
     # ``ToolMessage`` paired to the agent's tool call — LangGraph's ``ToolNode``
     # rejects a ``Command`` update that lacks the pairing.
     tool_call_id: Annotated[str, InjectedToolCallId]
+    # Injected by ToolNode — reads ``state["observations"]`` before the tool
+    # runs. Required on the schema (not just the function signature) so
+    # ``StructuredTool`` includes it in the kwargs routed to the handler;
+    # without this, LangGraph's ToolNode doesn't pass it through and the
+    # handler fails with ``missing 1 required positional argument``.
+    # ``default=None`` lets :class:`BaseModel` construct successfully during
+    # schema-level validation (the injected value always overrides at
+    # runtime). Kept off the LLM-facing JSON schema by the ``InjectedState``
+    # marker, same pattern as ``tool_call_id`` above.
+    observations: Annotated[
+        list[str] | None, InjectedState("observations")
+    ] = None
 
 
-# Phase 2 Track 5 Task 12 — ``save_memory`` mirror shape. Same 1..2048 char
-# bound as ``memory_note`` so a reason fits in the observations channel too.
+# Hard cap on the ``reason`` argument to ``remember_this_run``. Matches the
+# ``note_finding`` content cap so a commit rationale fits in the
+# ``commit_rationales`` channel alongside findings.
 SAVE_MEMORY_REASON_MAX_LEN = 2048
 
 
-class SaveMemoryArguments(BaseModel):
+class RememberThisRunArguments(BaseModel):
     reason: Annotated[
         str,
         Field(
@@ -113,13 +128,28 @@ class SaveMemoryArguments(BaseModel):
             description=(
                 "Short justification for why this run is worth remembering. "
                 "Flows into the task timeline and the summarizer input as "
-                f"an observation. Max {SAVE_MEMORY_REASON_MAX_LEN} characters."
+                f"the commit rationale. Max {SAVE_MEMORY_REASON_MAX_LEN} "
+                "characters."
             ),
         ),
     ]
     # Injected by ToolNode at runtime; hidden from the LLM schema. See
-    # ``MemoryNoteArguments.tool_call_id`` for rationale.
+    # ``NoteFindingArguments.tool_call_id`` for rationale.
     tool_call_id: Annotated[str, InjectedToolCallId]
+    # Injected by ToolNode — see ``NoteFindingArguments.observations`` for
+    # the full rationale on why this lives on the schema.
+    observations: Annotated[
+        list[str] | None, InjectedState("observations")
+    ] = None
+    # Injected by ToolNode — used to count sibling ``note_finding`` tool
+    # calls on the current AIMessage so the "N finding(s) will persist"
+    # return is correct under super-step concurrency (issue #102).
+    # Must live on the schema, not just the function signature, otherwise
+    # ``StructuredTool`` drops the injection. ``default=None`` lets schema
+    # validation construct without a value; the injection always fires.
+    messages: Annotated[
+        list | None, InjectedState("messages")
+    ] = None
 
 
 class MemorySearchArguments(BaseModel):
@@ -271,31 +301,36 @@ def _maybe_await_or_cancel(
 
 
 # ---------------------------------------------------------------------------
-# memory_note
+# note_finding
 # ---------------------------------------------------------------------------
+# Previously named ``memory_note``. Renamed in issue #102; the old name is
+# NOT retained as an alias — this PR ships the canonical name only.
 
 
-MEMORY_NOTE_DESCRIPTION = (
-    "Append a short observation to this task's draft memory entry. "
-    "Use this to capture salient intermediate findings that should survive "
-    "into the final retrospective memory. Returns {ok, count}. "
-    f"Max {MEMORY_NOTE_MAX_LEN} characters per note. Zero cost."
+NOTE_FINDING_DESCRIPTION = (
+    "Jot down a finding you want to preserve. Call freely during the run — "
+    "each call appends to your findings list, which survives context "
+    "compaction and feeds the post-task summary. This is a scratchpad, NOT "
+    "a durable save: in `agent_decides` memory mode, findings only persist "
+    "across runs if you also call `remember_this_run` at task end. "
+    f"Max {MEMORY_NOTE_MAX_LEN} characters per call. Zero cost."
 )
 
 
-def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
-    # ``tenant_id`` / ``agent_id`` are captured for logging. The tool does
-    # NOT touch the DB — the ``operator.add`` reducer on the
-    # ``observations`` state field merges the append at super-step commit.
-    bound_tenant = ctx.tenant_id
-    bound_agent = ctx.agent_id
-    bound_task = ctx.task_id
+def _make_note_finding_handler(
+    *,
+    bound_tenant: str,
+    bound_agent: str,
+    bound_task: str,
+) -> Callable[..., Command]:
+    """Build the ``note_finding`` handler."""
 
-    def memory_note(
+    def _handler(
         text: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        observations: Annotated[list[str] | None, InjectedState("observations")] = None,
     ) -> Command:
-        # Argument validation is enforced by ``MemoryNoteArguments`` — if we
+        # Argument validation is enforced by ``NoteFindingArguments`` — if we
         # reach here, ``text`` already satisfies length 1..MEMORY_NOTE_MAX_LEN.
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — without it the next agent step
@@ -305,59 +340,129 @@ def _build_memory_note_tool(ctx: MemoryToolContext) -> StructuredTool:
             "note_chars=%d",
             bound_tenant, bound_agent, bound_task, len(text),
         )
+        # ``observations`` is injected for future extensions but the count
+        # is NOT reported back to the agent here. Rationale: three parallel
+        # ``note_finding`` calls in the same LangGraph super-step each see
+        # the same pre-reducer state, so a count like "#N, including this
+        # call" would make every sibling report the same number — a lie
+        # that looks like a stuck counter to the agent. The reassurance is
+        # just as useful without the count.
+        _ = observations  # silence unused — kept for future instrumentation
         return Command(update={
-            "messages": [ToolMessage(content="ok", tool_call_id=tool_call_id)],
+            "messages": [
+                ToolMessage(
+                    content=(
+                        "Noted. This finding is queued in your findings "
+                        "list — it survives context compaction and feeds "
+                        "the post-task summary."
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            ],
             "observations": [text],
         })
 
+    return _handler
+
+
+def _build_note_finding_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Canonical findings scratchpad tool."""
+    handler = _make_note_finding_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+    )
     return StructuredTool.from_function(
-        func=memory_note,
-        name="memory_note",
-        description=MEMORY_NOTE_DESCRIPTION,
-        args_schema=MemoryNoteArguments,
+        func=handler,
+        name="note_finding",
+        description=NOTE_FINDING_DESCRIPTION,
+        args_schema=NoteFindingArguments,
     )
 
 
 # ---------------------------------------------------------------------------
-# save_memory (Phase 2 Track 5 Task 12)
+# remember_this_run (Phase 2 Track 5 Task 12; renamed in issue #102)
 # ---------------------------------------------------------------------------
+# Previously named ``save_memory``. Renamed in issue #102; the old name is
+# NOT retained as an alias — this PR ships the canonical name only.
 
 
-SAVE_MEMORY_DESCRIPTION = (
-    "Opt this task in to writing a durable retrospective memory entry. "
-    "Call this exactly when the run has produced something worth "
-    "remembering (non-trivial findings, customer decisions, recurring "
-    "patterns). Silently no-ops when called more than once. Argument: "
-    "reason (1-2048 chars) — a short justification that will appear in "
-    "the task timeline and feed the summarizer. Zero cost; the write "
-    "itself happens once at the terminal branch."
+REMEMBER_THIS_RUN_DESCRIPTION = (
+    "Ask the runtime to remember this run. Call at task completion when "
+    "the run has produced something worth remembering across future runs "
+    "(non-trivial findings, customer decisions, recurring patterns). This "
+    "is the TRIGGER — it does NOT compose the memory entry itself; a "
+    "dedicated summarizer runs after you return and distills your "
+    "`note_finding` bullets into the stored entry. Repeat calls append to "
+    "the rationale but do not trigger additional writes; the entry is "
+    "composed and persisted ONCE at the terminal branch. Do NOT use this "
+    "to capture a finding — findings go through `note_finding`. "
+    f"Max {SAVE_MEMORY_REASON_MAX_LEN} characters for `reason`. Zero cost."
 )
 
 
-def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
-    """Task 12 — agent-decides opt-in tool.
+def _count_pending_sibling_note_findings(
+    messages: list | None,
+    *,
+    self_tool_call_id: str,
+) -> int:
+    """Count ``note_finding`` tool calls on the current AIMessage that will
+    land in the same super-step as the caller.
 
-    Returns a :class:`Command` that sets ``memory_opt_in=True`` on the state
-    (simple last-write-wins overwrite) AND appends the reason to
-    ``observations`` so the opt-in is visible in the task timeline as a
-    ``ToolMessage`` and feeds the summarizer alongside the rest of the
-    observations. The reason is ``strip()``-ed to normalize agent whitespace;
-    length bounds (1..2048 chars after stripping) are enforced by
-    :class:`SaveMemoryArguments` — the Pydantic schema reports an error
-    through LangGraph's ToolNode, keeping the graph in-loop.
+    Issue #102 follow-up: LangGraph runs all tool calls on one AIMessage
+    as parallel siblings within a single super-step. ``InjectedState``
+    reads the state BEFORE the reducer applies any of the super-step's
+    Commands, so ``observations`` is the pre-super-step list even when
+    sibling ``note_finding`` calls are about to append to it.
 
-    The reason is NOT persisted into ``agent_memory_entries``. It lives only
-    in the observations snapshot — the summarizer may reference it freely
-    when composing the final memory body.
+    This helper restores the "what will the state look like after this
+    super-step commits" view by counting pending sibling ``note_finding``
+    invocations on the latest AIMessage.  The caller excludes its own
+    tool_call_id so a hypothetical ``note_finding``→``note_finding``
+    alias substitution doesn't double-count itself.
+
+    Returns 0 on any missing / malformed message state — best-effort
+    observability, never an exception path into the handler.
+    """
+    if not messages:
+        return 0
+    last_message = messages[-1]
+    tool_calls = getattr(last_message, "tool_calls", None) or []
+    count = 0
+    for call in tool_calls:
+        # ``tool_calls`` entries can be dicts (LangChain canonical) or
+        # objects with ``.name`` / ``.id`` attributes depending on the
+        # provider translator.  Accept both shapes.
+        name = call.get("name") if isinstance(call, dict) else getattr(call, "name", None)
+        call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+        if name == "note_finding" and call_id != self_tool_call_id:
+            count += 1
+    return count
+
+
+def _make_remember_this_run_handler(
+    *,
+    bound_tenant: str,
+    bound_agent: str,
+    bound_task: str,
+) -> Callable[..., Command]:
+    """Build the ``remember_this_run`` handler.
+
+    Sets ``memory_opt_in=True`` (last-write-wins) and appends the
+    rationale to ``commit_rationales`` (``operator.add`` reducer). Issue
+    #102 — the rationale used to land in ``observations`` alongside
+    ``note_finding`` entries, muddling the memory-detail UI and search
+    corpus; ``commit_rationales`` is the dedicated channel. The state /
+    DB field name stays ``commit_rationales`` because renaming it would
+    mean another migration and a DB column rewrite on a populated table
+    — a tool rename shouldn't force that.
     """
 
-    bound_tenant = ctx.tenant_id
-    bound_agent = ctx.agent_id
-    bound_task = ctx.task_id
-
-    def save_memory(
+    def _handler(
         reason: str,
         tool_call_id: Annotated[str, InjectedToolCallId],
+        observations: Annotated[list[str] | None, InjectedState("observations")] = None,
+        messages: Annotated[list | None, InjectedState("messages")] = None,
     ) -> Command:
         stripped = reason.strip()
         if not stripped:
@@ -366,8 +471,8 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             # agent can self-correct in-loop rather than silently opting in
             # with a blank rationale.
             raise MemoryToolError(
-                "save_memory requires a non-empty reason after whitespace is "
-                "stripped."
+                "remember_this_run requires a non-empty reason after "
+                "whitespace is stripped."
             )
         if len(stripped) > SAVE_MEMORY_REASON_MAX_LEN:
             # Defense in depth — normally caught by the Pydantic max_length
@@ -375,13 +480,46 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
             # branch is unreachable in practice. Keep the guard so the
             # invariant is obvious.
             raise MemoryToolError(
-                f"save_memory reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
+                f"remember_this_run reason exceeds {SAVE_MEMORY_REASON_MAX_LEN} chars."
             )
         logger.info(
-            "memory.save_memory.opt_in tenant_id=%s agent_id=%s task_id=%s "
-            "reason_chars=%d",
+            "memory.remember_this_run.opt_in tenant_id=%s agent_id=%s "
+            "task_id=%s reason_chars=%d",
             bound_tenant, bound_agent, bound_task, len(stripped),
         )
+        # ``observations`` is the pre-update finding list (no ``[save_memory]``
+        # entries now that rationales live on their own channel).  The count
+        # in the return tells the agent "N findings will persist with the
+        # memory entry", disambiguating remember_this_run from note_finding
+        # — the fix for the hedging behavior documented in issue #102.
+        #
+        # Super-step concurrency correction: when the agent emits this call
+        # in the SAME AIMessage as one or more ``note_finding`` calls (batch
+        # decision), ``observations`` is still the pre-reducer state and
+        # sees none of the in-flight findings. Count sibling note_finding
+        # tool_calls on the current AIMessage and add them to the committed
+        # total so the report reflects what will actually land after the
+        # super-step commits, not what was there before it started.
+        pending_sibling_findings = _count_pending_sibling_note_findings(
+            messages, self_tool_call_id=tool_call_id
+        )
+        findings_count = len(observations or []) + pending_sibling_findings
+        # Zero-findings branch: the literal "0 finding(s) will persist" reads
+        # as an error to most models and triggers a retry / panic flow.
+        # Reassure the agent that the memory write still composes usefully
+        # from the final transcript + rationale even with no note_finding
+        # calls — that's what the summarizer does at ``memory_graph.py`` anyway.
+        if findings_count == 0:
+            tool_content = (
+                "Remember confirmed. No findings captured this run — the "
+                "memory entry will be composed from the transcript and "
+                "your rationale."
+            )
+        else:
+            tool_content = (
+                f"Remember confirmed. {findings_count} finding(s) will "
+                "persist with this task's memory entry at completion."
+            )
         # LangGraph's ``ToolNode`` requires a matching ``ToolMessage`` in the
         # Command's ``messages`` update — every LLM tool call needs a paired
         # reply or the next agent step rejects the orphan as a fatal graph
@@ -390,18 +528,33 @@ def _build_save_memory_tool(ctx: MemoryToolContext) -> StructuredTool:
         return Command(
             update={
                 "messages": [
-                    ToolMessage(content="ok", tool_call_id=tool_call_id),
+                    ToolMessage(
+                        content=tool_content,
+                        tool_call_id=tool_call_id,
+                    ),
                 ],
                 "memory_opt_in": True,
-                "observations": [f"[save_memory] {stripped}"],
+                "commit_rationales": [stripped],
             }
         )
 
+    return _handler
+
+
+def _build_remember_this_run_tool(ctx: MemoryToolContext) -> StructuredTool:
+    """Canonical ``remember_this_run`` tool — the agent-decides opt-in
+    trigger. Sets ``memory_opt_in=True`` so the terminal ``memory_write``
+    node fires at task completion."""
+    handler = _make_remember_this_run_handler(
+        bound_tenant=ctx.tenant_id,
+        bound_agent=ctx.agent_id,
+        bound_task=ctx.task_id,
+    )
     return StructuredTool.from_function(
-        func=save_memory,
-        name="save_memory",
-        description=SAVE_MEMORY_DESCRIPTION,
-        args_schema=SaveMemoryArguments,
+        func=handler,
+        name="remember_this_run",
+        description=REMEMBER_THIS_RUN_DESCRIPTION,
+        args_schema=RememberThisRunArguments,
     )
 
 
@@ -712,12 +865,13 @@ def build_memory_tools(
 
     Gating:
 
-    - ``memory_note`` and ``memory_search`` are returned whenever
+    - ``note_finding`` and ``memory_search`` are returned whenever
       ``stack_enabled`` is True.
-    - ``save_memory`` (Task 12) is returned only when ``stack_enabled`` is
-      True AND ``auto_write`` is False — i.e., the ``agent_decides`` mode.
-      In ``always`` mode the run writes unconditionally so the tool would be
-      a no-op; in ``skip`` / memory-disabled mode the stack is off entirely.
+    - ``remember_this_run`` (Task 12 opt-in) is returned only when
+      ``stack_enabled`` is True AND ``auto_write`` is False — i.e., the
+      ``agent_decides`` mode.  In ``always`` mode the run writes
+      unconditionally so the tool would be a no-op; in ``skip`` /
+      memory-disabled mode the stack is off entirely.
     - ``task_history_get`` is returned unconditionally — diagnostic drill-
       down, scope-bound, safe even for memory-disabled agents.
 
@@ -727,29 +881,29 @@ def build_memory_tools(
     """
     tools: list[StructuredTool] = []
     if stack_enabled:
-        tools.append(_build_memory_note_tool(ctx))
+        tools.append(_build_note_finding_tool(ctx))
         tools.append(_build_memory_search_tool(ctx))
         if not auto_write:
-            tools.append(_build_save_memory_tool(ctx))
+            tools.append(_build_remember_this_run_tool(ctx))
     tools.append(_build_task_history_get_tool(ctx))
     return tools
 
 
 __all__ = [
-    "MEMORY_NOTE_DESCRIPTION",
     "MEMORY_NOTE_MAX_LEN",
     "MEMORY_SEARCH_DEFAULT_LIMIT",
     "MEMORY_SEARCH_DESCRIPTION",
     "MEMORY_SEARCH_TOOL_LIMIT_MAX",
-    "MemoryNoteArguments",
     "MemorySearchArguments",
     "MemorySearchVectorUnavailableError",
     "MemoryToolContext",
     "MemoryToolError",
     "MemoryToolNotFoundError",
-    "SAVE_MEMORY_DESCRIPTION",
+    "NOTE_FINDING_DESCRIPTION",
+    "NoteFindingArguments",
+    "REMEMBER_THIS_RUN_DESCRIPTION",
+    "RememberThisRunArguments",
     "SAVE_MEMORY_REASON_MAX_LEN",
-    "SaveMemoryArguments",
     "TASK_HISTORY_GET_DESCRIPTION",
     "TaskHistoryGetArguments",
     "build_memory_tools",
