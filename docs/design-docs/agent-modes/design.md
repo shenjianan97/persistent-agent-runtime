@@ -212,10 +212,12 @@ Decomposing persistence into its concerns shows that **the expensive parts are 1
 | 4 | Budget rollup (incremental debit) | Same | Same | ✅ Identical |
 | 5 | Cascading cancellation | Same | Same | ✅ Identical |
 | 6 | Redrive composition with `rollback_last_checkpoint` | Same | Same | ✅ Identical |
-| 7 | Pause parent at dispatch | Tool-execution layer pauses (extends Track 2's `waiting_for_input` pause mechanism) | Graph-fan-out edge pauses (same primitive, different call site) | ⚠️ Same primitive, different call site |
+| 7 | Pause parent at dispatch | Tool-execution layer pauses into a distinct `waiting_for_subagent` state (reuses Track 2's durable-pause *primitive* — checkpoint + release lease — **not** the `waiting_for_input` human state) | Graph-fan-out edge pauses into the same `waiting_for_subagent` state (same primitive, different call site) | ⚠️ Same primitive, different call site |
 | 8 | Inject child results on resume | Results arrive as `ToolMessage` entries in the parent's message history | Results land in a typed state field (`state["subagent_results"]`) that the Supervisor node reads | ⚠️ Different integration shape |
 
 **Reuse vs. new build:** "✅ Identical" means identical *between the two topologies* — **not already implemented**. Phase 1 ships the single-task lease/checkpoint/recovery primitive (concern #2). The parent/child layer on top of it — `parent_task_id` lineage, budget rollup, cancellation cascade, redrive composition — is net-new build *shared by both topologies*, not existing machinery being wired up. (`parent_task_id` does not yet exist anywhere in the schema.)
+
+**Child-wait is a distinct pause state, not `waiting_for_input` (concern #7).** A parent waiting on subagents must *not* reuse Track 2's human-input states. The human-input-timeout reaper dead-letters `waiting_for_input` / `waiting_for_approval` tasks once `human_input_timeout_at` elapses (`services/worker-service/core/reaper.py`), and resume requires a `human_response` injected as a `HumanMessage` via `/respond` (`TaskRepository.respondToTask`) — both wrong for machine child-wait: a slow child would be killed as `human_input_timeout`, and the Console/API would surface a "waiting for human" affordance. So child-wait gets its own status (`waiting_for_subagent`) that reuses *only* the durable-pause primitive (persist checkpoint, set status, release lease), carries **no** `human_input_timeout_at`, and resumes on child completion rather than on a human response. *(New pause state — exact name/transitions are an implementation-track detail.)*
 
 #### Architectural shape: one shared service + two thin adapters
 
