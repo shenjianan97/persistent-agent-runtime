@@ -7,12 +7,26 @@ SHELL := /bin/bash
 
 # --- Configuration & Environment ---
 
-# Load local environment variables if present
+# Checkout roots, resolved BEFORE loading env files. ROOT_DIR is the current
+# checkout (a git worktree or the primary checkout); MAIN_ROOT is the primary
+# checkout, which holds the shared Python .venv and the local .env.localdev.
+# They are equal in a normal checkout. Resolving MAIN_ROOT from git's common
+# dir lets `make` targets run from a worktree borrow the primary checkout's
+# venv and secrets instead of failing on a venv the worktree doesn't have.
+ROOT_DIR := $(shell pwd)
+MAIN_ROOT := $(shell d=$$(git rev-parse --git-common-dir 2>/dev/null); \
+	[ -n "$$d" ] && (cd "$$d/.." && pwd) || pwd)
+
+# Load local environment variables if present. From a worktree, load the
+# primary checkout's file FIRST, then the worktree-local one LAST so a
+# per-worktree override wins for any overlapping key.
+ifneq ($(MAIN_ROOT),$(ROOT_DIR))
+-include $(MAIN_ROOT)/.env.localdev
+endif
 -include .env.localdev
 .EXPORT_ALL_VARIABLES:
 
 # Default Paths & Variables
-ROOT_DIR := $(shell pwd)
 WORKER_DIR := $(ROOT_DIR)/services/worker-service
 API_DIR := $(ROOT_DIR)/services/api-service
 CONSOLE_DIR := $(ROOT_DIR)/services/console
@@ -22,7 +36,15 @@ MIGRATION_FILES := $(sort $(wildcard $(ROOT_DIR)/infrastructure/database/migrati
 LANGFUSE_COMPOSE_FILE := $(ROOT_DIR)/tests/fixtures/langfuse/docker-compose.yml
 LANGFUSE_DOCKER_PROJECT ?= persistent-agent-runtime-langfuse
 
+# Prefer this checkout's own venv; fall back to the primary checkout's venv
+# when run from a worktree that has none. We don't auto-create a per-worktree
+# venv — borrowing the primary checkout's is correct and avoids a slow reinstall
+# per worktree. (Source still comes from $(WORKER_DIR), i.e. the worktree, so a
+# worktree's code is what gets tested.)
 WORKER_VENV_DIR := $(WORKER_DIR)/.venv
+ifeq ($(wildcard $(WORKER_VENV_DIR)/bin/python),)
+WORKER_VENV_DIR := $(MAIN_ROOT)/services/worker-service/.venv
+endif
 WORKER_VENV_PYTHON := $(WORKER_VENV_DIR)/bin/python
 
 PYTHON ?= $(shell \
