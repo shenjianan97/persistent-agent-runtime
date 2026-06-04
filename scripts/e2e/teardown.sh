@@ -34,19 +34,27 @@ set -a
 set +a
 
 # --- API (if this run started one) -----------------------------------------
+# Only kill a pid whose command still looks like our API/Gradle process. A stale
+# pid file (crashed run) or a freed dynamic API port could otherwise have been
+# recycled by an unrelated process, and we must not kill that.
+_looks_like_api() {
+  ps -p "$1" -o command= 2>/dev/null | grep -qiE 'bootrun|gradle|[j]ava'
+}
 if [ -f "$TMP_DIR/e2e-api.pid" ]; then
   pid=$(cat "$TMP_DIR/e2e-api.pid" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && _looks_like_api "$pid"; then
     kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
     kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$TMP_DIR/e2e-api.pid"
 fi
-# Best-effort port sweep (lsof may be absent on minimal Linux).
+# Best-effort port sweep — catches the JVM that actually holds the port (the pid
+# file may track the gradle wrapper). lsof may be absent on minimal Linux.
 if [ -n "${E2E_API_PORT:-}" ] && command -v lsof >/dev/null 2>&1; then
-  p=$(lsof -ti ":$E2E_API_PORT" 2>/dev/null || true)
-  [ -n "$p" ] && kill $p 2>/dev/null || true
+  for p in $(lsof -ti ":$E2E_API_PORT" 2>/dev/null || true); do
+    _looks_like_api "$p" && kill "$p" 2>/dev/null || true
+  done
 fi
 
 # --- Postgres --------------------------------------------------------------

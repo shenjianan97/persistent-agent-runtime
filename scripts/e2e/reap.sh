@@ -16,13 +16,22 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 command -v docker >/dev/null 2>&1 || { echo "❌ Docker is required" >&2; exit 1; }
 
 # --- Containers ------------------------------------------------------------
-ids=$(docker ps -aq --filter label=par-e2e=1 || true)
+# Only per-WORKTREE containers (non-empty par-run label) — never the primary
+# `par-e2e-postgres` (par-run is empty there). The primary container is owned by
+# the primary checkout's own teardown / `make e2e-clean`; reap is for crashed
+# worktree agents. `--filter label=par-run` can't express "non-empty" (it
+# matches the key even when the value is ""), so inspect each candidate.
+ids=""
+for id in $(docker ps -aq --filter label=par-e2e=1 || true); do
+  run=$(docker inspect -f '{{ index .Config.Labels "par-run" }}' "$id" 2>/dev/null || true)
+  [ -n "$run" ] && ids="$ids $id"
+done
 if [ -n "$ids" ]; then
-  echo "▶ Removing $(printf '%s\n' "$ids" | grep -c . | tr -d ' ') labeled test container(s)..."
+  echo "▶ Removing $(echo $ids | wc -w | tr -d ' ') worktree test container(s)..."
   # shellcheck disable=SC2086
   docker rm -f $ids >/dev/null 2>&1 || true
 else
-  echo "  no labeled test containers to reap"
+  echo "  no worktree test containers to reap"
 fi
 
 # --- Per-run buckets (never the shared base bucket) ------------------------

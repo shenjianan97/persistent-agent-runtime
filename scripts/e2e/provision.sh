@@ -25,12 +25,15 @@ ENV_FILE=$(e2e_env_file)
 MIGRATIONS_DIR=$(e2e_migrations_dir)
 NEED_API="${E2E_NEED_API:-}"
 
-# If we abort before finishing (e.g. a migration/seed failure), remove a freshly
-# created worktree container so a failed run never leaks one. Primary (empty
-# RUN_ID) is left alone — it's reused, not disposable.
+# If we abort before finishing (e.g. a migration/seed failure), remove the
+# worktree container WE CREATED this run so a failed run never leaks one. Only
+# fires for a freshly-created worktree container — never a reused one (it may be
+# serving a kept API or a concurrent step) and never the primary (empty RUN_ID),
+# which is reused, not disposable.
 PROVISION_DONE=
+CONTAINER_CREATED=
 _provision_cleanup() {
-  if [ -n "$RUN_ID" ] && [ "$PROVISION_DONE" != "1" ]; then
+  if [ -n "$RUN_ID" ] && [ "$PROVISION_DONE" != "1" ] && [ -n "$CONTAINER_CREATED" ]; then
     docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
   fi
 }
@@ -76,6 +79,7 @@ else
       -e POSTGRES_DB="$E2E_DB_NAME" \
       -p 0:5432 \
       "$E2E_PG_IMAGE" >/dev/null
+    CONTAINER_CREATED=1
   fi
   DB_PORT=$(e2e_discover_pg_port "$PG_CONTAINER")
   if [ -z "$DB_PORT" ]; then
@@ -84,8 +88,9 @@ else
   fi
 fi
 
-# Wait for readiness.
-for _ in $(seq 1 60); do
+# Wait for readiness (up to ~60s — generous so concurrent container starts under
+# load don't time out spuriously).
+for _ in $(seq 1 120); do
   docker exec "$PG_CONTAINER" pg_isready -U "$E2E_DB_USER" >/dev/null 2>&1 && break
   sleep 0.5
 done
