@@ -23,7 +23,8 @@ MAIN_ROOT := $(shell d=$$(git rev-parse --git-common-dir 2>/dev/null); \
 # SHELL), so keep it POSIX.
 RUN_ID := $(shell if [ "$(ROOT_DIR)" = "$(MAIN_ROOT)" ]; then echo ""; \
 	else s=$$(basename "$(ROOT_DIR)" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+//; s/-+$$//'); \
-	[ -n "$$s" ] && echo "$$s" || echo "wt-$$(basename "$(ROOT_DIR)" | cksum | cut -d' ' -f1)"; fi)
+	h=$$(printf '%s' "$(ROOT_DIR)" | cksum | cut -d' ' -f1); \
+	[ -n "$$s" ] && echo "$$s-$$h" || echo "wt-$$h"; fi)
 
 # Load local environment variables if present. From a worktree, load the
 # primary checkout's file FIRST, then the worktree-local one LAST so a

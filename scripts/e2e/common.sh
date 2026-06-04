@@ -35,10 +35,10 @@ e2e_main_root() {
   fi
 }
 
-# RUN_ID: empty on the primary checkout, else a lowercase slug of the worktree
-# basename. MUST match the Makefile's RUN_ID derivation.
+# RUN_ID: empty on the primary checkout, else a readable slug of the worktree
+# basename plus a hash of the FULL path. MUST match the Makefile's RUN_ID.
 e2e_run_id() {
-  local root main slug
+  local root main slug hash
   root=$(e2e_root_dir)
   main=$(e2e_main_root)
   if [ "$root" = "$main" ]; then
@@ -46,14 +46,18 @@ e2e_run_id() {
     return
   fi
   slug=$(basename "$root" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+//; s/-+$//')
-  # A worktree whose basename is all punctuation slugs to empty — which would be
-  # misread as the primary checkout and collide with it. Fall back to a stable
-  # non-empty token so a worktree is NEVER classified as primary. (cksum is the
-  # same binary Make's $(shell) sees, so RUN_ID parity holds on this machine.)
+  # Hash the FULL path, not just the basename: two worktrees that share a leaf
+  # name (…/a/feature vs …/b/feature) would otherwise derive the same RUN_ID and
+  # clobber each other's container/bucket. The hash guarantees uniqueness; the
+  # slug is just a readable prefix (and is omitted when the basename is all
+  # punctuation, so a worktree is never misread as the primary checkout). cksum
+  # is the same binary Make's $(shell) sees, so RUN_ID parity holds per machine.
+  hash=$(printf '%s' "$root" | cksum | cut -d' ' -f1)
   if [ -z "$slug" ]; then
-    slug="wt-$(basename "$root" | cksum | cut -d' ' -f1)"
+    printf 'wt-%s' "$hash"
+  else
+    printf '%s-%s' "$slug" "$hash"
   fi
-  printf '%s' "$slug"
 }
 
 # --- Fixed constants (match Makefile defaults) -----------------------------
@@ -115,16 +119,20 @@ e2e_discover_pg_port() {
   docker port "$container" 5432/tcp 2>/dev/null | head -1 | sed -E 's/.*:([0-9]+)$/\1/'
 }
 
-# Ensure the shared LocalStack container is up and S3 is answering. Idempotent;
-# safe to call concurrently (guarded by a running-check, then compose up).
+# Ensure the shared LocalStack container is up AND S3 is answering. Idempotent
+# and concurrency-safe.
 e2e_ensure_localstack() {
-  if docker ps --format '{{.Names}}' | grep -qx "$LOCALSTACK_CONTAINER_NAME"; then
-    return 0
+  if ! docker ps --format '{{.Names}}' | grep -qx "$LOCALSTACK_CONTAINER_NAME"; then
+    # `|| true`: two concurrent cold provisions may both race `compose up` on the
+    # shared fixed container_name and one returns non-zero — tolerate it and let
+    # the readiness loop below be the real gate.
+    docker compose -f "$(e2e_compose_file)" up -d localstack >/dev/null 2>&1 || true
   fi
-  # `|| true`: two concurrent cold provisions may both race `compose up` on the
-  # shared fixed container_name and one returns non-zero — tolerate it and let
-  # the readiness loop below be the real gate.
-  docker compose -f "$(e2e_compose_file)" up -d localstack >/dev/null 2>&1 || true
+  # ALWAYS wait for S3 to actually answer — a running container does NOT imply a
+  # ready S3 endpoint. If a concurrent provision just started LocalStack, the
+  # container shows "running" before `awslocal s3 ls` works; returning early here
+  # would let `awslocal s3 mb` (which swallows errors with `|| true`) no-op, so
+  # artifact tests would run without their bucket.
   local attempts=0
   until docker exec "$LOCALSTACK_CONTAINER_NAME" awslocal s3 ls >/dev/null 2>&1; do
     attempts=$((attempts + 1))

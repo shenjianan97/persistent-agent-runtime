@@ -13,6 +13,7 @@ stdlib only.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -101,17 +102,36 @@ def test_free_port_zero_exits_two():
 # --------------------------------------------------------------------------- #
 # 2. e2e_run_id derivation
 # --------------------------------------------------------------------------- #
+def test_e2e_run_id_primary_is_empty():
+    out = _eval_common("e2e_run_id", {"ROOT_DIR": "/repo", "MAIN_ROOT": "/repo"})
+    assert out == ""
+
+
 @pytest.mark.parametrize(
-    "root_dir, main_root, expected",
+    "root_dir, prefix",
     [
-        ("/repo", "/repo", ""),                          # primary checkout
-        ("/x/Feature_Foo", "/repo", "feature-foo"),      # uppercase + underscore
-        ("/x/--wt 1.2--", "/repo", "wt-1-2"),            # punctuation + trim dashes
+        ("/x/Feature_Foo", "feature-foo"),   # uppercase + underscore slug
+        ("/x/--wt 1.2--", "wt-1-2"),         # punctuation + trim dashes
+        ("/x/___", "wt"),                    # all-punctuation basename -> wt-<hash>
     ],
 )
-def test_e2e_run_id(root_dir, main_root, expected):
-    out = _eval_common("e2e_run_id", {"ROOT_DIR": root_dir, "MAIN_ROOT": main_root})
-    assert out == expected
+def test_e2e_run_id_worktree_is_slug_plus_hash(root_dir, prefix):
+    # A worktree RUN_ID is a readable slug prefix + a full-path hash suffix.
+    out = _eval_common("e2e_run_id", {"ROOT_DIR": root_dir, "MAIN_ROOT": "/repo"})
+    assert re.fullmatch(rf"{re.escape(prefix)}-[0-9]+", out), out
+
+
+def test_e2e_run_id_is_deterministic():
+    env = {"ROOT_DIR": "/x/Feature_Foo", "MAIN_ROOT": "/repo"}
+    assert _eval_common("e2e_run_id", env) == _eval_common("e2e_run_id", env)
+
+
+def test_e2e_run_id_distinct_for_same_basename_different_path():
+    # The bug the hash fixes: two worktrees sharing a leaf name must NOT collide.
+    a = _eval_common("e2e_run_id", {"ROOT_DIR": "/a/feature", "MAIN_ROOT": "/repo"})
+    b = _eval_common("e2e_run_id", {"ROOT_DIR": "/b/feature", "MAIN_ROOT": "/repo"})
+    assert a != b, (a, b)
+    assert a.startswith("feature-") and b.startswith("feature-")
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +146,7 @@ def test_pg_container_worktree():
     out = _eval_common(
         "e2e_pg_container", {"ROOT_DIR": "/x/Feature_Foo", "MAIN_ROOT": "/repo"}
     )
-    assert out == "par-e2e-postgres-feature-foo"
+    assert re.fullmatch(r"par-e2e-postgres-feature-foo-[0-9]+", out), out
 
 
 def test_s3_bucket_primary():
@@ -138,7 +158,7 @@ def test_s3_bucket_worktree():
     out = _eval_common(
         "e2e_s3_bucket", {"ROOT_DIR": "/x/Feature_Foo", "MAIN_ROOT": "/repo"}
     )
-    assert out == "platform-artifacts-feature-foo"
+    assert re.fullmatch(r"platform-artifacts-feature-foo-[0-9]+", out), out
 
 
 def test_env_file_path_uses_root_dir():
@@ -180,7 +200,10 @@ def test_make_run_id_matches_script_for_worktree():
     script_run_id = _eval_common(
         "e2e_run_id", {"ROOT_DIR": "/x/Feature_Foo", "MAIN_ROOT": "/repo"}
     )
-    assert make_run_id == script_run_id == "feature-foo"
+    # Parity is the point: Make and the script must derive the SAME RUN_ID
+    # (slug + full-path hash) on this machine.
+    assert make_run_id == script_run_id
+    assert re.fullmatch(r"feature-foo-[0-9]+", script_run_id), script_run_id
 
 
 # --------------------------------------------------------------------------- #
