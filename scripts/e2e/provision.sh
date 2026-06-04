@@ -153,7 +153,20 @@ if [ -n "$NEED_API" ]; then
     API_PORT=8081
     EMB_PORT=18099
   else
-    read -r API_PORT EMB_PORT < <("${PYTHON:-python3}" "$SCRIPT_DIR/free-port.py" 2)
+    # Reuse the prior run's ports if an e2e.env survived (E2E_KEEP=1 or a crash):
+    # a still-running kept API stays on E2E_API_PORT, so the Makefile finds it
+    # healthy and does NOT spawn a second bootRun — which would orphan the first
+    # (its pid file gets overwritten) and break API↔mock port agreement. If the
+    # old API is actually dead, its port is free again and the Makefile starts a
+    # fresh one there. (No `head`: e2e.env has one line per key, and dropping it
+    # avoids the grep|head SIGPIPE under `pipefail`.)
+    if [ -f "$ENV_FILE" ]; then
+      API_PORT=$(grep -E '^E2E_API_PORT=' "$ENV_FILE" | cut -d= -f2 || true)
+      EMB_PORT=$(grep -E '^E2E_EMBEDDING_MOCK_PORT=' "$ENV_FILE" | cut -d= -f2 || true)
+    fi
+    if [ -z "$API_PORT" ] || [ -z "$EMB_PORT" ]; then
+      read -r API_PORT EMB_PORT < <("${PYTHON:-python3}" "$SCRIPT_DIR/free-port.py" 2)
+    fi
   fi
 fi
 
