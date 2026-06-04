@@ -19,9 +19,8 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 | Track 6 | GitHub Integration | Not started | — | — |
 | Track 7 | Context Window Management | Complete | [plan](docs/exec-plans/completed/phase-2/track-7/plan.md) | [progress](docs/exec-plans/completed/phase-2/track-7/progress.md) |
 | Track 8 | Coding-Agent Primitives | Design proposed ([track-8-coding-primitives.md](docs/design-docs/phase-2/track-8-coding-primitives.md)); relocated from AC Track 3; plan not started | — | — |
-| Track 9 | Planning Primitive | Stub ([track-9-planning-primitive.md](docs/design-docs/phase-2/track-9-planning-primitive.md)); brainstorm pending | — | — |
-| Track 10 | Deep Research Mode | Not started (brainstorm after Track 9) | — | — |
 
+Tracks 9 (Planning Primitive) and 10 (Deep Research Mode) were removed on 2026-05-22 — their concepts are now subsumed by the cross-cutting [Agent Modes design](docs/design-docs/agent-modes/design.md). Implementation tracks that flow from that framing (Planning Primitive, Supervisor topology, Workflow resource, Presets) will be re-introduced with their own plans when prioritized.
 
 ### Cross-Cutting
 
@@ -29,6 +28,7 @@ Bird's-eye view of where the project stands. For navigation and structure, see [
 |------------|--------|--------|
 | Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
 | Agent Capabilities (sandbox, artifacts, file input, coding primitives) | Tracks 1 & 2 complete; Track 3 proposed | [design](docs/design-docs/agent-capabilities/design.md) |
+| Agent Modes (topologies, delegation tools, Workflow resource, presets) | Framing approved (2026-05-22); implementation tracks pending | [design](docs/design-docs/agent-modes/design.md) |
 
 #### Agent Capabilities Tracks
 
