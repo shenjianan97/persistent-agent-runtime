@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import sys
 from pathlib import Path
 
@@ -35,8 +36,22 @@ async def _wait_for_port(host: str, port: int, timeout_seconds: float = 10.0) ->
             await asyncio.sleep(0.1)
 
 
-async def _start_test_server(host: str = "127.0.0.1", port: int = 9100):
-    """Start the custom tool test server as a subprocess."""
+def _free_port(host: str = "127.0.0.1") -> int:
+    """Pick an ephemeral free TCP port.
+
+    Per-call allocation (not a fixed port) so two test runs in parallel git
+    worktrees don't collide on the MCP test-server port — see issue #112.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
+
+
+async def _start_test_server(host: str = "127.0.0.1", port: int | None = None):
+    """Start the custom tool test server as a subprocess on a free port."""
+    if port is None:
+        port = _free_port(host)
     process = await asyncio.create_subprocess_exec(
         str(PYTHON_BIN), "-u", str(CUSTOM_TOOL_SERVER_SCRIPT),
         "--host", host, "--port", str(port),
@@ -63,7 +78,7 @@ class TestMcpSessionManagerIntegration:
     @pytest.mark.asyncio
     async def test_connect_and_discover_tools(self):
         """Connect to a real MCP server and discover its tools."""
-        process, server_url = await _start_test_server(port=9100)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",
@@ -93,7 +108,7 @@ class TestMcpSessionManagerIntegration:
     @pytest.mark.asyncio
     async def test_call_tool_echo(self):
         """Invoke a tool on the MCP server and verify the result."""
-        process, server_url = await _start_test_server(port=9101)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",
@@ -113,7 +128,7 @@ class TestMcpSessionManagerIntegration:
     @pytest.mark.asyncio
     async def test_call_tool_add_numbers(self):
         """Invoke add_numbers tool and verify arithmetic result."""
-        process, server_url = await _start_test_server(port=9102)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",
@@ -147,7 +162,7 @@ class TestMcpSessionManagerIntegration:
     @pytest.mark.asyncio
     async def test_connect_multiple_servers_one_fails(self):
         """If one server fails to connect, all sessions are cleaned up."""
-        process, server_url = await _start_test_server(port=9103)
+        process, server_url = await _start_test_server()
         try:
             good_config = ToolServerConfig(
                 name="good-server",
@@ -171,7 +186,7 @@ class TestMcpSessionManagerIntegration:
     @pytest.mark.asyncio
     async def test_session_lifecycle_connect_close(self):
         """Session can be opened and closed cleanly."""
-        process, server_url = await _start_test_server(port=9104)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",
@@ -195,7 +210,7 @@ class TestSchemaConversionIntegration:
         """Discover real tools and convert their schemas to StructuredTool."""
         from executor.schema_converter import mcp_tools_to_structured_tools
 
-        process, server_url = await _start_test_server(port=9105)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",
@@ -241,7 +256,7 @@ class TestBearerAuthIntegration:
     @pytest.mark.asyncio
     async def test_bearer_token_accepted_by_noauth_server(self):
         """A bearer token does not break connections to a no-auth server."""
-        process, server_url = await _start_test_server(port=9106)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="auth-test",
@@ -266,7 +281,7 @@ class TestBearerAuthIntegration:
     @pytest.mark.asyncio
     async def test_no_auth_mode_sends_no_header(self):
         """In 'none' auth mode, no Authorization header is sent."""
-        process, server_url = await _start_test_server(port=9107)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="noauth-test",
@@ -308,7 +323,7 @@ class TestMixedToolsIntegration:
         )
 
         # Get custom tools from MCP server
-        process, server_url = await _start_test_server(port=9108)
+        process, server_url = await _start_test_server()
         try:
             config = ToolServerConfig(
                 name="test-tools",

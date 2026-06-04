@@ -27,7 +27,7 @@ make help        # list all targets with descriptions
 make init        # first-time setup
 make install     # install deps across services
 make test        # unit tests (fast, no infra)
-make e2e-test    # E2E on isolated infra (DB port 55433)
+make e2e-test    # E2E on per-worktree isolated infra (DB 55433 on primary checkout; dynamic in worktrees)
 make test-all    # unit + E2E
 make start       # live stack: Console :5173, API :8080
 make stop        # stop live stack
@@ -80,7 +80,7 @@ Applies to research, design docs, task specs, PR descriptions, code review comme
 **Never:**
 - Assert a fact or recommend a practice without a verifiable citation — web reference for external claims, `path:line` for internal claims (§Claims Require Evidence)
 - Use bare `python3` or `uv run` for worker code — always the pinned venv at `services/worker-service/.venv/` (§Local Validation Notes)
-- Point tests at the dev DB (port 55432) — tests use `par-e2e-postgres` on 55433 (§Local Validation Notes)
+- Point tests at the dev DB (port 55432) — tests use a per-worktree `par-e2e-postgres[-<slug>]` container on a dynamic port (the fixed 55433 only on the primary checkout) (§Local Validation Notes)
 - Link to PRs in third-party repos from commits or PR descriptions (§External Pull Request References)
 - Commit or open a PR with unverified Console UI (§Browser Verification (Console Changes))
 - Merge without running the narrowest-scope tests that cover your change (§Testing (Mandatory))
@@ -133,7 +133,7 @@ If an external PR reference slips in, rewrite the commit / PR description before
 - See `README.md` and `docs/LOCAL_DEVELOPMENT.md` for setup details.
 - When validating background `Makefile` targets (`make start`, `make status`, `make stop`), prefer an interactive shell / PTY.
 - **Python venv:** the worker venv at `services/worker-service/.venv/` has all deps pinned. Activate with `source services/worker-service/.venv/bin/activate` or call `services/worker-service/.venv/bin/python` directly.
-- **Test DB isolation:** `par-e2e-postgres` on port **55433** is the tests' DB; the dev DB on 55432 is off-limits for tests (it corrupts local state). `make worker-test` passes `E2E_DB_DSN`; `make e2e-test` passes `E2E_DB_*` vars.
+- **Test DB isolation (per-worktree):** `make worker-test` / `make e2e-test` self-provision isolated test infra keyed by the checkout — same command, no manual steps, no port-picking. From a **git worktree** each gets its own Postgres container `par-e2e-postgres-<slug>` on a dynamically allocated host port, its own S3 bucket `platform-artifacts-<slug>`, and (for e2e-test) its own API + embedding-mock ports, all recorded in `<worktree>/.tmp/e2e.env` — so multiple agents in multiple worktrees run tests concurrently without clobbering each other (one shared LocalStack on `:4566` is reused). The **primary checkout** (not a worktree) keeps the fixed `par-e2e-postgres` / DB 55433 / API 8081 / embedding-mock 18099 / bucket `platform-artifacts` for CI parity. Run a single test through the isolated harness with `make e2e-test PYTEST_ARGS='-k my_test'` — **never run raw `pytest tests/backend-integration` in a worktree**, it hits the fixed default ports (55433/8081/18099) and can collide. Each run **disposes its DB container by default** when it finishes — primary checkout and worktree alike — so a run always cleans up after itself; `E2E_KEEP=1 make worker-test` is the opt-out that leaves it (and the API/bucket) up so a fix→test loop reuses them. `make e2e-reap` GCs leftover per-worktree containers/buckets from crashed agents (fleet hygiene — a single agent never needs it, since deterministic names mean a re-run replaces its own container). The shared `platform-artifacts` bucket and LocalStack are never torn down. The dev DB on 55432 stays off-limits for tests (using it corrupts local state).
 - **Tracking a running task:** two surfaces answer "what's this task doing?" — the worker log (`.tmp/worker-*.log`) for runtime decisions (lifecycle, compaction, memory routing, dead-letter, retries) and `GET /v1/tasks/<id>/conversation` for what the agent actually did (turns / tool calls / tool results). `make start` runs workers at `WORKER_LOG_LEVEL=DEBUG` by default so per-turn compaction traces are already there; quiet it with `WORKER_LOG_LEVEL=INFO make start-worker`. See [Tracking a running task](./docs/LOCAL_DEVELOPMENT.md#tracking-a-running-task) for the event catalogue and jq recipes.
 
 ## Testing (Mandatory)
@@ -141,6 +141,7 @@ If an external PR reference slips in, rewrite the commit / PR description before
 **Every code change must be tested before it is considered done.** No exceptions. See [LOCAL_DEVELOPMENT.md](./docs/LOCAL_DEVELOPMENT.md) for test locations, single-test commands, and conventions.
 
 - Write tests covering the change, including failure scenarios.
+- **Tests must be worktree-concurrency-safe:** a test that binds a TCP port or spawns a server subprocess must use an **ephemeral/free port** (bind to `:0`, or call `scripts/e2e/free-port.py`), never a hardcoded one. Two worktrees run the same test simultaneously, so a fixed port collides — see the dynamic-port helpers in `services/worker-service/tests/test_mcp_http_integration.py` and `test_custom_tool_integration.py` for the pattern.
 - Run the **narrowest scope** that covers your change (a single test file or package is fine — you don't need to run the whole `make test` suite if it doesn't touch your change). Run `make e2e-test` after DB/schema or cross-service changes. If tests fail — including pre-existing failures — fix them before moving on.
 - **CI maintenance:** when adding DB migrations, new service containers, or infra deps, verify `.github/workflows/ci.yml` picks them up. Migrations auto-apply via glob (`[0-9][0-9][0-9][0-9]_*.sql`); new services (e.g., LocalStack) must be added as CI service containers manually.
 
