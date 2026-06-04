@@ -622,6 +622,52 @@ async def test_finding_text_visible_via_tool_call_args_below_threshold():
     assert finding_text in tool_call_args_text
 
 
+@pytest.mark.asyncio
+async def test_legacy_checkpoint_seeds_projected_block_from_live_channels():
+    """Upgrade safety (issue #108): a checkpoint written before the
+    ``projected_*`` fields existed has them ABSENT while ``observations`` /
+    ``commit_rationales`` already hold findings whose tool-call messages were
+    summarised past the watermark. Coercing the absent snapshot to ``[]`` would
+    drop those findings from the projection until the next Tier-3; instead we
+    distinguish "absent (legacy)" from "present but empty" and seed the
+    projected block from the live channels so nothing disappears on the
+    upgrade/resume turn.
+    """
+    msgs = _build_messages(n_pairs=5)
+    state = _fresh_state(msgs)
+    # Simulate a pre-#108 checkpoint: the snapshot fields were never written.
+    del state["projected_observations"]
+    del state["projected_commit_rationales"]
+    # Live channels already hold findings, and the watermark has advanced past
+    # the turns that produced them (so their tool-call args are summarised away).
+    state["observations"] = ["legacy finding A", "legacy finding B"]
+    state["commit_rationales"] = ["legacy rationale"]
+    state["summary"] = "prior summary"
+    state["summarized_through_turn_index"] = 3
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(1_000),  # below threshold
+        system_prompt="SYS",
+    )
+
+    combined = next(
+        m
+        for m in result.messages
+        if isinstance(m, SystemMessage)
+        and m.additional_kwargs.get("compaction") is True
+    )
+    # Legacy findings/rationales are surfaced (seeded from live), not dropped.
+    assert "legacy finding A" in combined.content
+    assert "legacy finding B" in combined.content
+    assert "legacy rationale" in combined.content
+
+
 # ---------------------------------------------------------------------------
 # AC-4 / AC-5 — summariser receives RAW middle; main LLM sees no stubs
 # ---------------------------------------------------------------------------

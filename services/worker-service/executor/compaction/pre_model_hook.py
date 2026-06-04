@@ -812,8 +812,24 @@ async def compaction_pre_model_hook(
     #     folds it into the snapshot in the same step — so coverage is gapless.
     live_observations = list(state.get("observations") or [])
     live_commit_rationales = list(state.get("commit_rationales") or [])
-    observations = list(state.get("projected_observations") or [])
-    commit_rationales = list(state.get("projected_commit_rationales") or [])
+    # Distinguish "field absent (legacy checkpoint written before #108)" from
+    # "present but intentionally empty". On a pre-#108 checkpoint the snapshot
+    # was never written while ``observations`` may already hold findings whose
+    # tool-call messages were summarised past the watermark — coercing the
+    # absent snapshot to ``[]`` would drop them from the projection until the
+    # next Tier-3 (or forever, if the run stays below threshold / Tier-3 is
+    # capped). Seed the projected block from the live channel in that case so
+    # nothing vanishes on the upgrade/resume turn; the next firing re-snapshots
+    # and restores the cache-stable behaviour. A fresh task always has the
+    # field (graph seeds it), so this fallback only fires on legacy resumes.
+    _proj_obs = state.get("projected_observations")
+    observations = (
+        list(_proj_obs) if _proj_obs is not None else list(live_observations)
+    )
+    _proj_rat = state.get("projected_commit_rationales")
+    commit_rationales = (
+        list(_proj_rat) if _proj_rat is not None else list(live_commit_rationales)
+    )
 
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
