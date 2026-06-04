@@ -32,7 +32,7 @@ This doc resolves the framing so the track-shaped work that follows has a cohere
 │      Scope → Supervisor (with iteration) → Subagents → Writer│
 ├──────────────────────────────────────────────────────────────┤
 │  Delegation tools (available inside ReAct, optional)         │
-│  ├── dispatch_subagent  (ad-hoc child agent task)            │
+│  ├── dispatch_subagent  (ad-hoc in-process child agent)      │
 │  └── execute_workflow   (invoke a defined Workflow resource) │
 ├──────────────────────────────────────────────────────────────┤
 │  Resource type                                               │
@@ -87,9 +87,9 @@ These tools turn ReAct into something more powerful without changing the topolog
 
 #### `dispatch_subagent(prompt, tools, budget)`
 
-Spawns a child task as a focused ReAct agent with its own context window and tool allowlist. Returns a structured summary to the parent on completion. The child is a normal durable task — checkpointed, observable, dead-letter-able, budget-tracked.
+Runs a focused ReAct sub-agent **in-process** as a LangGraph subgraph with its own context window and tool allowlist, and returns a structured summary to the parent. The sub-agent is *not* a separate task — it executes within the parent's run (same `thread_id`, same checkpoint, same task row); see *Execution model*. Its work is durable as part of the parent's graph state (LangGraph checkpoints the super-step), and its activity surfaces as sub-steps in the parent's event timeline, not as a separate Console row.
 
-The child is always a **ReAct** agent — children are never themselves Supervisor topology. Nesting is bounded by a `max_depth` cap (default **2**): budget caps bound *cost*, but depth needs its own structural limit, or a buggy prompt can recurse into an expensive fork-bomb before the budget trips. **Depth is the `parent_task_id`-chain length, counted regardless of topology** — a Supervisor's structural fan-out consumes one level just as a `dispatch_subagent` call does, so a Supervisor → ReAct-subagent → `dispatch_subagent` chain reaches the depth-2 ceiling. This keeps the fork-bomb bound unambiguous across both topologies.
+The sub-agent is always a **ReAct** agent — sub-agents are never themselves Supervisor topology. Nesting is bounded by a `max_depth` cap (default **2**), carried in graph state and incremented on each `dispatch_subagent` / fan-out level: budget caps bound *cost*, but depth needs its own structural limit, or a buggy prompt can recurse into an expensive fork-bomb before the budget trips. A Supervisor's structural fan-out consumes one level just as a `dispatch_subagent` call does, so a Supervisor → ReAct-sub-agent → `dispatch_subagent` chain reaches the depth-2 ceiling.
 
 Why expose this as a *tool* and not a topology: ReAct agents sometimes benefit from delegating a focused subtask without polluting their own context (e.g., "investigate why test X is flaky"). Making this a tool keeps the parent's topology unchanged; the parent decides when to delegate. *Not a substitute for the Supervisor topology — see below.*
 
@@ -157,9 +157,8 @@ The four-phase architecture combines proven choices from two production deep-res
 - **Subagent prompt template** emitting structured findings (`finding_id` + claim + source + supporting quote), not freeform prose (see *Citation binding*)
 - **Writer prompt template** that cites by `finding_id` (see *Citation binding*)
 - **Citation verification pass** — a thin, single-purpose node that confirms each cited quote supports its sentence
-- **Per-iteration parallel fan-out**: the graph reads the Supervisor's subtask list and dispatches N children in parallel (see *Shared subagent machinery* below)
-- **Budget rollup**: parent task's budget envelope includes all subagent costs
-- **Fan-out and iteration caps**: hard limits on subagents-per-iteration and total Supervisor → Subagents loops to prevent runaway
+- **Per-iteration parallel fan-out**: the graph reads the Supervisor's subtask list and `Send`s N sub-agents in parallel, in-process (see *Execution model* and *Shared fan-out machinery* below)
+- **Fan-out and iteration caps**: hard limits on sub-agents-per-iteration and total Supervisor → Sub-agents loops to prevent runaway (also the v1 bound on worker-slot occupancy — see *Execution model*)
 
 ### Subagent count — dynamic, capped
 
@@ -169,7 +168,7 @@ Subagent count is **not fixed**. The Supervisor decides per iteration how many s
 
 A subagent that fails (error, budget exhaustion, cancellation) does **not** error the whole graph. The Supervisor node receives the partial result set — successful subagents' findings plus a failure marker for each that didn't return — and decides how to proceed: re-dispatch the failed subtask next iteration, proceed with what it has, or, **only if zero subagents returned**, fail the task. Fail-fast applies to the all-failed case alone; one flaky web fetch must not sink an otherwise-complete research run.
 
-Re-dispatching across rounds requires a stable **`subtask_id`** distinct from `iteration_id` (the round marker): the round-2 retry of a failed subtask must link back to its round-1 attempt, or the Console tree renders them as two unrelated children instead of "subtask X: failed (round 1) → succeeded (round 2)." So child tasks carry both `iteration_id` (which round) and `subtask_id` (which logical subtask, surviving re-dispatch). See *iteration rounds* and *Open decisions*.
+Re-dispatching across rounds needs a stable logical **`subtask`** identifier distinct from the `iteration` (round) marker: the round-2 retry of a failed subtask must link back to its round-1 attempt, or the Console tree shows them as two unrelated entries instead of "subtask X: failed (round 1) → succeeded (round 2)." Since sub-agents run in-process (see *Execution model*), these are **markers in graph state / on emitted events**, not columns on separate task rows. See *Observability*.
 
 ### Citation binding
 
@@ -183,104 +182,55 @@ This is a deliberate divergence from Anthropic's dedicated CitationAgent, which 
 
 **Invariant (load-bearing):** findings are **immutable and addressable by `finding_id`**. Any reduction of the finding set to fit the Writer's context (see *Open decisions*) may drop, reorder, or summarize-for-selection — but must never mutate a finding's `supporting_quote`, or both the ID resolution and the verify pass break. Only the *reduction algorithm* is open; this immutability is decided.
 
-### Shared subagent machinery
+### Execution model: in-process fan-out (Pattern A)
 
-The underlying primitive for spawning a child agent is the **same** as `dispatch_subagent`: child task creation with isolated context, isolated tool allowlist, budget rolled up to parent, structured summary returned. **Built once, used by both topologies.**
+Both topologies fan out **in-process**, using LangGraph's native parallel-node machinery (`Send` / subgraphs) rather than spawning separate durable child tasks. A sub-agent is a subgraph that runs **inside the parent's run** — same `thread_id`, same checkpoint, same task row — and the parent's `ainvoke` drives the whole fan-out to completion before returning. This is the pattern LangChain's Open Deep Research uses and the officially documented LangGraph approach to parallelism ([Send / graph API](https://docs.langchain.com/oss/python/langgraph/use-graph-api)). Verified against `langgraph==1.0.5`.
 
-The *driver* differs:
+**What this buys (free, from LangGraph):**
+- **Parallelism for I/O-bound sub-agents.** Our nodes are `async`; `Send`-fanned sub-agents run concurrently on the event loop (web fetch + LLM calls overlap). The parent `await`s them but yields the loop — no CPU burn while waiting.
+- **Crash durability as graph state.** LangGraph checkpoints at super-step boundaries and records per-node `pending_writes` (`langgraph/pregel/_loop.py`), so a worker crash mid-fan-out resumes the parent's run and re-executes only the unfinished sub-agents — completed siblings' results are restored, not recomputed. Default durability mode is `"async"` (`langgraph/types.py`).
+- **One unified budget, lineage, and cancellation.** Sub-agent spend *is* the parent task's spend; cancelling the task cancels the run; there is one task row to observe and redrive.
+
+**What this explicitly does *not* buy (the accepted Pattern-A tradeoff):**
+- **The parent holds its worker slot for the whole fan-out.** The parent task stays `running` (lease held, counting against Track 3's `max_concurrent_tasks`) from Scope through Writer — it does not suspend and release the slot while sub-agents work. Bounded by `max_fanout_per_iteration` × `max_iterations`; acceptable for v1 because async waiting isn't CPU-bound. *If worker-slot pressure becomes real under multi-tenant load, the upgrade path is durable cross-task sub-agents (each its own `thread_id`/task, parent suspends via `interrupt()`) — see Open decisions. Nothing here blocks that later.*
+- **Sub-agents are not independently addressable tasks.** No per-sub-agent task row, lease, dead-letter, or redrive; no `parent_task_id` task tree. Sub-agent activity is sub-steps in the parent's event timeline, and a partial sub-agent failure is handled in-graph (see *Partial subagent failure*), not as a separately dead-lettered task.
+
+### Shared fan-out machinery
+
+The in-process fan-out helper — run a ReAct sub-agent subgraph with isolated context + tool allowlist, return a structured summary — is the **same** for both topologies. **Built once, used by both.** The *driver* differs:
 
 | | ReAct + `dispatch_subagent` (Topology 1) | Supervisor (Topology 2) |
 |---|---|---|
-| Who decides to dispatch | The LLM, by emitting a tool call | The graph, by reading Supervisor's structured subtask list |
-| Concurrency | LLM-emergent (depends on multi-tool-call behavior of the model) | Structural — graph fans out N children in parallel, deterministically |
-| Failure mode | LLM might not call the tool → no fan-out | Structurally guaranteed to fan out, or the graph errors |
-| When this is the right driver | Coding/investigation agents that *sometimes* benefit from delegation — autonomy is the point | Deep Research, where the *guarantee* of structured fan-out is the point |
+| Who decides to fan out | The LLM, by emitting a tool call | The graph, by reading Supervisor's structured subtask list |
+| Concurrency | LLM-emergent (depends on the model's multi-tool-call behavior) | Structural — the graph `Send`s N sub-agents in parallel, deterministically |
+| Failure mode | LLM might not call the tool → no fan-out | Structurally guaranteed to fan out |
+| Result injection | `ToolMessage` in the parent's message history | Typed state field (`state["subagent_results"]`) the Supervisor node reads |
+| When this is the right driver | Coding/investigation agents that *sometimes* delegate — autonomy is the point | Deep Research, where the *guarantee* of structured fan-out is the point |
 
 This is the same controllability argument that made Supervisor a topology rather than a tool, applied one level deeper. Share machinery, differ on driver.
 
-### Persistence
+### Durability
 
-A dispatched subagent is a **first-class durable child task** with the same persistence guarantees as the parent — consistent with the platform's "durable execution" premise.
+Because fan-out is in-process (see *Execution model*), a Deep Research run is **one durable task**, not a tree of tasks. Its durability is LangGraph's per-task durability — the same machinery the runtime already uses for every ReAct task:
 
-Decomposing persistence into its concerns shows that **the expensive parts are 100% shared between the two topologies, and the parts that differ are thin LangGraph-integration adapters**:
+- **Crash recovery** is checkpoint-based: a worker dying mid-fan-out re-claims the parent task and resumes its run from the last super-step checkpoint, re-executing only the sub-agents whose `pending_writes` weren't persisted. No separate child tasks to reap.
+- **Cancellation** cancels the one run; there is no cascade.
+- **Lineage / observability** is the parent task's `task_events` timeline (Track 2), with sub-agent activity as sub-steps (see *Observability*).
+- **Redrive** (`rollback_last_checkpoint`) rolls the parent run back to a prior super-step and re-runs forward.
 
-| # | Concern | Topology 1 (tool) | Topology 2 (graph) | Shared? |
-|---|---|---|---|---|
-| 1 | Create child task with `parent_task_id` | Same | Same | ✅ Identical |
-| 2 | Child lease / checkpoint / crash recovery | Phase 1 machinery | Phase 1 machinery | ✅ Identical |
-| 3 | Lineage tracking (`parent_task_id` FK) | Same FK | Same FK | ✅ Identical |
-| 4 | Budget rollup (incremental debit) | Same | Same | ✅ Identical |
-| 5 | Cascading cancellation | Same | Same | ✅ Identical |
-| 6 | Redrive composition with `rollback_last_checkpoint` | Same | Same | ✅ Identical |
-| 7 | Pause parent at dispatch | Tool-execution layer pauses into a distinct `waiting_for_subagent` state (reuses Track 2's durable-pause *primitive* — checkpoint + release lease — **not** the `waiting_for_input` human state) | Graph-fan-out edge pauses into the same `waiting_for_subagent` state (same primitive, different call site) | ⚠️ Same primitive, different call site |
-| 8 | Inject child results on resume | Results arrive as `ToolMessage` entries in the parent's message history | Results land in a typed state field (`state["subagent_results"]`) that the Supervisor node reads | ⚠️ Different integration shape |
+This is a deliberate simplification over a durable-cross-task design (separate `thread_id`/task per sub-agent, `parent_task_id` tree, per-sub-agent lease/dead-letter). That design buys independent sub-agent addressability and worker-slot release, at the cost of building cross-task spawn-and-await orchestration on top of LangGraph. We don't take it on for v1; it's the documented upgrade path (see *Open decisions*).
 
-**Reuse vs. new build:** "✅ Identical" means identical *between the two topologies* — **not already implemented**. Phase 1 ships the single-task lease/checkpoint/recovery primitive (concern #2). The parent/child layer on top of it — `parent_task_id` lineage, budget rollup, cancellation cascade, redrive composition — is net-new build *shared by both topologies*, not existing machinery being wired up. (`parent_task_id` does not yet exist anywhere in the schema.)
+### Budget and redrive
 
-**Child-wait is a distinct pause state, not `waiting_for_input` (concern #7).** A parent waiting on subagents must *not* reuse Track 2's human-input states. The human-input-timeout reaper dead-letters `waiting_for_input` / `waiting_for_approval` tasks once `human_input_timeout_at` elapses (`services/worker-service/core/reaper.py`), and resume requires a `human_response` injected as a `HumanMessage` via `/respond` (`TaskRepository.respondToTask`) — both wrong for machine child-wait: a slow child would be killed as `human_input_timeout`, and the Console/API would surface a "waiting for human" affordance. So child-wait gets its own status (`waiting_for_subagent`) that reuses *only* the durable-pause primitive (persist checkpoint, set status, release lease), carries **no** `human_input_timeout_at`, and resumes on child completion rather than on a human response. *(New pause state — exact name/transitions are an implementation-track detail.)*
+With in-process fan-out there is no cross-task tree to reconcile — budget and redrive are simply the **parent task's**:
 
-#### Architectural shape: one shared service + two thin adapters
+- **Budget defers wholesale to Track 3 (Scheduler and Budgets).** The run is one task metered per `(tenant_id, agent_id)` against `budget_max_per_task` / `budget_max_per_hour`, evaluated at claim time and checkpoint boundaries ([track-3-scheduler-and-budgets.md](../phase-2/track-3-scheduler-and-budgets.md)). All sub-agent cost is just this task's cost — no rollup, no per-tree composition question. Over-budget work **pauses** (per-task → operator increase + manual resume; hourly → auto-recovers), Track 3's posture, with no special case.
+- **Cost is cumulative and never refunded** — consistent with usage-based provider billing (Anthropic bills successful requests; a disconnect mid-successful-call is still charged — [billing policy](https://support.anthropic.com/en/articles/8114526-how-will-i-be-billed)). The cap, not a refund, is the protection. The only unbilled tokens are those the provider never billed us (e.g., a worker dies before the LLM call returns).
+- **Redrive** (`rollback_last_checkpoint`) rolls the parent run back to a prior super-step and re-runs forward; a fan-out super-step re-runs all of its sub-agents (the super-step is the checkpoint/redrive unit). Re-execution costs real new tokens the meter counts; work before the rollback point is reused.
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Subagent Lifecycle Service                 │
-│  (one implementation, used by both topologies)              │
-│  - Spawn child task with parent_task_id                     │
-│  - Lease / checkpoint / crash-recovery (Phase 1 machinery)  │
-│  - Budget rollup, cancellation cascade, redrive composition │
-│  - Pause parent (checkpoint + status + release lease)       │
-│  - Detect child completion → enqueue parent resume          │
-└──────────┬──────────────────────────────────────────────────┘
-           │
-   ┌───────┴────────┐
-   ▼                ▼
-┌──────────────┐  ┌──────────────────┐
-│ Tool adapter │  │ Graph adapter    │
-│ (Topology 1) │  │ (Topology 2)     │
-│              │  │                  │
-│ Invoke via   │  │ Invoke via       │
-│ tool call    │  │ graph fan-out    │
-│              │  │ node             │
-│ Inject on    │  │ Inject on        │
-│ resume:      │  │ resume:          │
-│ ToolMessage  │  │ state field      │
-└──────────────┘  └──────────────────┘
-```
+### Observability: one task, sub-agent sub-steps
 
-The adapters are thin (each handles only "how to invoke the spawn service from the parent's graph" and "how to inject the child's result back into the parent's state on resume"). All six expensive concerns — durable spawn, lease/checkpoint/recovery, budget, cancellation, redrive, lineage — are built once in the shared service.
-
-The thin-adapter shape is *evidence the boundary is well-placed*. If an adapter needed to reimplement budget rollup or lease management, that would signal the boundary was wrong.
-
-#### What customers see (same in both topologies)
-
-- Child tasks survive worker crashes (lease reaper + checkpointer)
-- Parents do not burn a worker slot while waiting on children (paused + lease released)
-- Lineage is observable: parent ↔ children via `parent_task_id`; events on Track 2's append-only `task_events` timeline
-- Budget tracking is durable and incremental — interrupted subagents preserve costs already incurred
-- Cancelling the parent cancels in-flight children; cancelling a child bubbles up as an error the parent decides how to handle
-- Redrive past a completed subagent rolls the subagent's result back along with the parent
-
-#### Budget and redrive semantics
-
-Budget is **actual tokens consumed, cumulative, and never refunded** — consistent with usage-based provider billing (Anthropic bills only successful requests, but a disconnect mid-successful-call is still charged — [billing policy](https://support.anthropic.com/en/articles/8114526-how-will-i-be-billed)). You pay for the tokens a malfunctioning or retried agent burns; the *cap*, not a refund, is the protection. Enforcement defers to **Track 3 (Scheduler and Budgets)** rather than inventing a parallel mechanism:
-
-- Budget is metered globally per `(tenant_id, agent_id)` via Track 3's `budget_max_per_task` and `budget_max_per_hour`, evaluated at claim time and checkpoint boundaries ([track-3-scheduler-and-budgets.md](../phase-2/track-3-scheduler-and-budgets.md)). Subagents are tasks under the same `agent_id`, so their spend already counts against the agent meter automatically.
-- Over-budget work **pauses, it is not rejected** (Track 3 chose pause over dead-lettering so expensive work isn't lost): per-task exhaustion pauses and requires an operator budget increase + manual resume; hourly exhaustion pauses and auto-recovers as the rolling window clears. A redrive whose re-execution would cross a budget therefore **pauses at its next boundary** — same mechanism, no special case.
-- A redrive (`rollback_last_checkpoint`) re-runs the work after the rollback point, costing **real new tokens** that the meter counts; work *before* the rollback point is reused (durable-execution replay: completed work is never redone).
-- The only tokens not charged are those the provider never charged *us* for — e.g., a worker dies before the LLM call returns, so no completion was billed. This falls out of metering actual provider usage; it is **not** a fault-attribution policy (we do not distinguish "system fault" vs. "agent fault" for billing).
-- Re-running children on redrive creates **new child task records** (append-only lineage); the superseded round stays visible. Never in-place mutation.
-
-**Redrive granularity across a parallel fan-out:** the rollback unit is the whole fan-out **super-step**. Redriving past a round where 8/10 children succeeded re-runs all 10 and re-spends — the simple, consistent choice that matches "the super-step is the checkpoint boundary." Per-child reuse of the 8 successful findings is a possible later optimization, not the v1 contract.
-
-**Open (Supervisor track):** how `budget_max_per_task` composes across a parent + children *tree* (Track 3 predates subagent trees), and whether the Supervisor adds pre-fan-out admission control — Track 3 enforcement is reactive (claim-time + checkpoint only, no predictive admission), so N parallel children *can* overshoot `budget_max_per_hour` before their checkpoints fire. Accepted as a known reactive-enforcement property unless the Supervisor track adds reservation.
-
-#### Topology 2 nuance: iteration rounds
-
-Because the Supervisor may iterate (dispatch round 1, see results, dispatch round 2), a single parent task can accumulate multiple *rounds* of children. Children need to be distinguishable per round *and* per logical subtask for observability, partial retries, and Console rendering. Solution: child tasks carry both an `iteration_id` (round) and a `subtask_id` (logical subtask, stable across re-dispatch) alongside `parent_task_id`, populated by the graph adapter — `iteration_id` alone cannot link a round-2 retry to its round-1 failure (see *Partial subagent failure*). *Exact column shapes are an implementation-track detail.*
-
-#### UX implication (flag for the implementation track)
-
-Child tasks will be visible in the Console's task list. A Deep Research task with 5 subagents per round across 2 rounds will produce 11 task records (1 parent + 10 children). The implementation needs tree-under-parent rendering — not flat siblings — to keep this comprehensible.
+A Deep Research run is **one task row**. Sub-agent activity — each sub-agent's tool calls and findings, grouped by iteration round — surfaces as sub-steps on Track 2's append-only `task_events` timeline, *not* as separate task rows. Events carry an in-state `iteration` (round) and `subtask` index so that a round-2 retry of a failed subtask links to its round-1 attempt (see *Partial subagent failure*) and the Console can render an expandable tree *within* the task (round → sub-agent → steps). No task-list explosion: 5 sub-agents × 2 rounds is still **1 task**, not 11.
 
 ### What customers configure
 
@@ -393,7 +343,7 @@ When prioritized, the following tracks become real (each gets its own design + p
 | **Supervisor topology** (customer-facing: "Deep Research"; was Track 10) | Scope → Supervisor (with iteration) → parallel Subagents → Writer; parallel subagent execution; budget rollup | Pending — design ready in *Topology 2: Supervisor* |
 | **Workflow resource** | Definition schema; `execute_workflow` tool; direct submission API; HITL gates per step | Phase 3 candidate — new track, not on Phase 2 roadmap |
 | **Presets** | Curated default bundles per use case | Small slice; can fold into Supervisor track or ship as a Phase 3 polish item |
-| **`dispatch_subagent` tool** | Child-task spawning available to ReAct agents | Small slice; can fold into Supervisor track since it shares execution machinery |
+| **`dispatch_subagent` tool** | In-process ReAct sub-agent (subgraph) available to ReAct agents | Small slice; can fold into Supervisor track since it shares the in-process fan-out machinery |
 
 ## Decisions log
 
@@ -403,22 +353,23 @@ When prioritized, the following tracks become real (each gets its own design + p
 - **2026-05-22**: Verified the Supervisor topology design against primary sources. Anthropic's pattern (Lead Researcher that plans + synthesizes + iterates + a separate CitationAgent) and LangChain's Open Deep Research (Scope → Supervisor → Subagents → one-shot Writer) were both reviewed. Final architecture: four-phase graph combining LangChain's Scope (with conditional clarification) + Supervisor (with iteration) + parallel Subagents + one-shot Writer. LangChain's empirical finding that parallel report-writing causes coordination problems is the load-bearing reason for one-shot Writer over Anthropic's Lead-also-synthesizes shape.
 - **2026-05-22**: Two-layer naming committed. Customer-facing: "Deep Research"; internal: "Supervisor topology" (matches LangChain terminology; the academic name for the pattern is "orchestrator-worker"). *(The `agent_config.mode = "deep_research"` field originally proposed here was dropped on 2026-06-03 — see below; the naming itself stands.)*
 - **2026-05-22**: Subagent execution machinery is shared between `dispatch_subagent` (Topology 1 tool) and Supervisor topology fan-out. Built once as a primitive; ReAct invokes via LLM tool call (loose, emergent), Supervisor invokes via structured graph-driven dispatch (strict, guaranteed). Subagent count in Supervisor is dynamic, decided per iteration by the Supervisor LLM within customer-configured `max_fanout_per_iteration` and `max_iterations` caps.
-- **2026-05-22**: Dispatched subagents are first-class durable child tasks. Same persistence guarantees as parent tasks (crash recovery via lease reaper + checkpointer, durable budget tracking, cascading cancellation, redrive composition, observable lineage via `parent_task_id`). Parents pause at dispatch and resume on child completion, reusing Track 2's pause infrastructure — they do not burn worker slots while waiting.
-- **2026-05-22**: Decomposed persistence to confirm sharing intent is well-founded. 6 of 8 concerns (spawn, lease/checkpoint/recovery, lineage, budget, cancellation, redrive) are 100% identical between topologies and live in a single Subagent Lifecycle Service. The 2 remaining concerns (parent pause and child-result injection) share a pause primitive but differ in LangGraph integration shape — each topology has a thin adapter (~tool-call vs. graph-fan-out) that invokes the shared service. The thinness of the adapters is evidence the architectural boundary is well-placed.
+- **2026-05-22** *(superseded 2026-06-03 — see Pattern A below)*: An earlier draft made dispatched subagents first-class durable child tasks (own `parent_task_id`, lease, dead-letter, cascading cancellation, redrive composition), with parents pausing into a `waiting_for_subagent` state and resuming on child completion. This cross-task model was dropped in favor of in-process fan-out.
+- **2026-05-22** *(superseded 2026-06-03)*: The accompanying "one Subagent Lifecycle Service + two thin adapters" decomposition (8 persistence concerns) assumed the cross-task model and no longer applies under in-process fan-out.
+- **2026-06-03**: **Chose Pattern A — in-process fan-out — over Pattern B (durable cross-task sub-agents).** Both topologies fan out via LangGraph's native `Send` / subgraph parallelism inside the parent's run (one `thread_id`, one task, one checkpoint), verified against `langgraph==1.0.5`; this is what LangChain's Open Deep Research does. Rationale: Pattern B's per-sub-agent task identity and worker-slot release require building cross-task spawn-and-await orchestration on top of LangGraph (not a native feature), which is large net-new work; Pattern A is officially supported and drops the entire cross-task persistence layer. Accepted tradeoffs: the parent holds its worker slot (counts against `max_concurrent_tasks`) for the whole fan-out — bounded by the fan-out/iteration caps and not CPU-bound since waiting is async — and sub-agents are in-graph sub-steps, not independently addressable/dead-letterable tasks. Consequences: removed the `waiting_for_subagent` pause state, the `parent_task_id` task tree, budget rollup, and the multi-row Console tree; budget/redrive/cancellation collapse to the parent task's own (Track 3, unchanged). Pattern B remains the documented upgrade path if worker-slot pressure appears under multi-tenant load.
 - **2026-06-03** (review pass): resolved five open points raised in design review.
   - **Citations** — bind deterministically: subagents emit `{finding_id, claim, source_url, supporting_quote}`, the Writer cites by `finding_id` (cannot fabricate a source), and a thin verification pass confirms each cited quote supports its sentence. Deliberate divergence from Anthropic's CitationAgent (which still lets the model choose the source). One-shot Writer preserved.
   - **Partial subagent failure** — Supervisor collects partial results and decides; the graph fails only when *zero* subagents return. One flaky subagent never sinks the run.
   - **Subagent recursion** — children are ReAct-only (never Supervisor); nesting bounded by `max_depth` (default 2). Budget bounds cost; depth needs its own structural cap.
   - **Config model** — dropped the proposed `agent_config.mode` field. Customer picks a **preset** → preset sets the internal **topology** field (`react` | `supervisor`) → topology fixes graph shape. "Deep Research" is the display label of the `research` preset. A task targets `agent_id`; the `workflow_id` task target is deferred to the Phase-3 Workflow track (schema not widened now).
-  - **Budget / redrive** — actual tokens consumed, cumulative, never refunded (consistent with usage-based provider billing). Enforcement **defers to Track 3**: metered per `(tenant_id, agent_id)`, over-budget work **pauses** (per-task → manual resume; hourly → auto-recovers), *not* rejected — corrected from an earlier "reject" draft that contradicted Track 3's pause-over-dead-letter posture. Redrive re-runs post-rollback work at real new cost (rollback unit = the fan-out super-step); work before the rollback is reused. Only provider-unbilled tokens are free (e.g., worker dies pre-completion) — a metering consequence, not fault attribution. Re-run children are new append-only records. *Open:* per-tree `budget_max_per_task` composition and pre-fan-out admission control (Track 3 is reactive-only).
+  - **Budget / redrive** — actual tokens consumed, cumulative, never refunded (consistent with usage-based provider billing). Enforcement **defers to Track 3**: metered per `(tenant_id, agent_id)`, over-budget work **pauses** (per-task → manual resume; hourly → auto-recovers), *not* rejected — corrected from an earlier "reject" draft that contradicted Track 3's pause-over-dead-letter posture. With in-process fan-out (Pattern A) a run is one task, so all sub-agent cost is the parent task's own cost — the earlier "per-tree rollup / fan-out admission" open question dissolves. Redrive rolls the parent run back to a prior super-step and re-runs forward (rollback unit = the fan-out super-step); re-execution costs real new tokens, work before the rollback is reused. Only provider-unbilled tokens are free (e.g., worker dies pre-completion) — a metering consequence, not fault attribution.
 
 ## Open decisions
 
 Genuinely unsettled; each belongs to the implementation track that picks it up.
 
 - **One-shot Writer reduction *algorithm*.** The one-shot Writer solves a *coordination* problem but reintroduces a *context-size* one: many iterations × many subagents × findings all funnel into a single Writer call. When the corpus exceeds the Writer's context, how is it reduced — map-reduce summarization, Track 7 compaction on Writer input, or a hard cap on findings? The immutability *invariant* is already decided (see *Citation binding*: findings are never mutated, only selected/reordered, so `finding_id` resolution survives); only the reduction algorithm is open. Owner: Supervisor track.
-- **`iteration_id` / `subtask_id` column shapes.** The *need* for both fields is decided (round marker + stable logical-subtask marker, see *Partial subagent failure* / *iteration rounds*); the exact schema (types, indexing, FK shape) is a Supervisor-track detail.
-- **Per-tree budget composition + fan-out admission.** How Track 3's per-task budget composes across a parent + children tree, and whether the Supervisor adds pre-fan-out budget reservation (Track 3 enforcement is reactive-only, so parallel children can overshoot the hourly cap before checkpoints fire). Owner: Supervisor track. See *Budget and redrive semantics*.
+- **`iteration` / `subtask` marker shape.** The *need* for both markers is decided (round marker + stable logical-subtask marker, in graph state / on events — see *Partial subagent failure* / *Observability*); the exact representation (state fields, event tagging) is a Supervisor-track detail.
+- **Pattern B as a future upgrade.** If the parent-holds-a-worker-slot tradeoff (see *Execution model*) becomes a capacity problem under multi-tenant load, the upgrade is durable cross-task sub-agents: each sub-agent its own `thread_id`/task with `parent_task_id` lineage, the parent suspending via `interrupt()` and resuming on child completion. This is application-level orchestration over LangGraph's durable-pause primitive (LangGraph has no native spawn-and-await), so it is deferred, not designed here. Not needed for v1.
 
 ## References
 
