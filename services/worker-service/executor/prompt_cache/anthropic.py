@@ -9,8 +9,13 @@ without spending breakpoints we can't justify:
 1. **Trailing SystemMessage.** The projection always leads with one or more
    ``SystemMessage``s (platform system + user system + optional compaction
    summary). Marking the last block of the last system message caches the
-   entire system region as a single prefix. The summary message mutates
-   only when Tier-3 fires, so this breakpoint stays valid across most turns.
+   entire system region as a single prefix. The combined summary message —
+   which also carries the folded AGENT FINDINGS / COMMIT RATIONALE blocks —
+   mutates only when Tier-3 fires: the findings/rationale blocks render the
+   Tier-3-gated ``projected_observations`` / ``projected_commit_rationales``
+   snapshots, NOT the live append-only channels (issue #108), so a
+   ``note_finding`` between firings leaves this prefix byte-identical. The
+   breakpoint therefore stays valid across most turns.
 2. **Last message overall.** Usually a ``HumanMessage`` or ``ToolMessage``.
    This is the sliding-window breakpoint: on turn ``N+1``, what was the
    tail on turn ``N`` becomes an interior prefix, and the request enjoys a

@@ -3030,6 +3030,16 @@ class GraphExecutor:
                         "messages": initial_messages,
                         "observations": _observations,
                         "commit_rationales": _commit_rationales,
+                        # Issue #108 — seed the projected snapshots from the
+                        # prior-run findings too. On a redrive the prior
+                        # findings have no ToolMessages in this fresh message
+                        # list, so the snapshot is their only path into the
+                        # projection; seeding it surfaces them from turn 1
+                        # (matching pre-#108 behaviour) while fresh findings
+                        # added during this run stay out of the cached prefix
+                        # until the next Tier-3 refresh.
+                        "projected_observations": _observations,
+                        "projected_commit_rationales": _commit_rationales,
                         "pending_memory": {},
                         # Phase 2 Track 5 Task 12 — per-run reset of the
                         # ``agent_decides`` opt-in flag. The field has no

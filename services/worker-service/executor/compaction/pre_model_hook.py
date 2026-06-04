@@ -470,14 +470,15 @@ def find_keep_window_start(
 # ---------------------------------------------------------------------------
 
 
-# Budget guards for the observations block appended to the compaction summary
-# SystemMessage (issue #102). An agent calling ``note_finding`` dozens of
-# times with 2KB payloads would otherwise inflate the system region by >100KB
-# on every turn, worsening cache economics and crowding the keep window.
+# Budget guards for the observations block folded into the compaction summary
+# SystemMessage (issue #102). They bound the system-region size so a verbose
+# agent can't crowd the keep window or balloon the cached prefix.
 #
-# The full observation list stays on ``state["observations"]`` for the
-# terminal summarizer and the dead-letter path — these caps only bound what
-# appears in the live projection shown to the agent.
+# Issue #108 — the block now renders the Tier-3-gated
+# ``projected_observations`` snapshot rather than the live channel, so it only
+# changes on a firing turn; these caps bound the snapshot rendering. The full
+# observation list stays on ``state["observations"]`` for the terminal
+# summarizer and the dead-letter path.
 _OBSERVATION_BULLET_CAP: int = 20
 _OBSERVATION_BLOCK_CHAR_CAP: int = 4_000
 
@@ -798,12 +799,37 @@ async def compaction_pre_model_hook(
     # and the hard-floor safety net takes over as before. Evaluated up
     # front (before the token-estimate) so we don't waste cycles on the
     # common case where middle is non-empty already.
-    # Observations + commit rationales surfaced into the combined summary
-    # SystemMessage. Issue #102 — see ``_build_projection`` and the
-    # ``_format_observations_block`` / ``_format_commit_rationales_block``
-    # formatters.
-    observations = list(state.get("observations") or [])
-    commit_rationales = list(state.get("commit_rationales") or [])
+    # Findings / rationales. Issue #102 introduced the fold into the combined
+    # summary SystemMessage; issue #108 split it into two reads:
+    #   * the LIVE append-only channels feed the Tier-3 snapshot refresh (and
+    #     the terminal memory_write node, elsewhere), and
+    #   * the SNAPSHOT channels — refreshed only when Tier-3 fires — are what
+    #     the projection renders, so a ``note_finding`` between firings does
+    #     NOT mutate the cached system region. A finding created since the last
+    #     firing stays visible via the agent's own note_finding tool-call args
+    #     (the text is in the args; the ToolMessage is a generic ack), shown
+    #     verbatim in the middle / keep window until a firing summarises it and
+    #     folds it into the snapshot in the same step — so coverage is gapless.
+    live_observations = list(state.get("observations") or [])
+    live_commit_rationales = list(state.get("commit_rationales") or [])
+    # Distinguish "field absent (legacy checkpoint written before #108)" from
+    # "present but intentionally empty". On a pre-#108 checkpoint the snapshot
+    # was never written while ``observations`` may already hold findings whose
+    # tool-call messages were summarised past the watermark — coercing the
+    # absent snapshot to ``[]`` would drop them from the projection until the
+    # next Tier-3 (or forever, if the run stays below threshold / Tier-3 is
+    # capped). Seed the projected block from the live channel in that case so
+    # nothing vanishes on the upgrade/resume turn; the next firing re-snapshots
+    # and restores the cache-stable behaviour. A fresh task always has the
+    # field (graph seeds it), so this fallback only fires on legacy resumes.
+    _proj_obs = state.get("projected_observations")
+    observations = (
+        list(_proj_obs) if _proj_obs is not None else list(live_observations)
+    )
+    _proj_rat = state.get("projected_commit_rationales")
+    commit_rationales = (
+        list(_proj_rat) if _proj_rat is not None else list(live_commit_rationales)
+    )
 
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
@@ -1199,6 +1225,16 @@ async def compaction_pre_model_hook(
     state_updates["summarized_through_turn_index"] = new_summarized_through
     state_updates["tier3_firings_count"] = tier3_firings_count + 1
 
+    # Issue #108 — refresh the findings/rationale snapshots from the live
+    # append-only channels on (and only on) a firing turn. The system region
+    # already mutates here (new summary), so folding the latest findings in now
+    # is "free" cache-wise; between firings the snapshot is frozen and the
+    # cached prefix survives every ``note_finding``. Findings absorbed into the
+    # new summary window are captured verbatim here at the same instant their
+    # ToolMessages leave the projection's middle.
+    state_updates["projected_observations"] = live_observations
+    state_updates["projected_commit_rationales"] = live_commit_rationales
+
     # Recall-pointer rewrite — the SOLE sanctioned mutation to
     # ``state["messages"]`` under the replace-and-rehydrate architecture;
     # every other code path treats the journal as append-only. Recalled
@@ -1240,8 +1276,10 @@ async def compaction_pre_model_hook(
         summary=new_summary,
         middle=[],
         keep_window=keep_window,
-        observations=observations,
-        commit_rationales=commit_rationales,
+        # Render the just-refreshed snapshot (issue #108) so the firing turn's
+        # projection already reflects the findings folded in above.
+        observations=live_observations,
+        commit_rationales=live_commit_rationales,
     )
     post_est = estimate_tokens_fn(post_projection)
     if post_est > model_context_window:

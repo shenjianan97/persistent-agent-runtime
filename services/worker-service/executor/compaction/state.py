@@ -67,6 +67,19 @@ def _any_reducer(a: bool, b: bool) -> bool:
     return a or b
 
 
+def _list_replace_reducer(a: list[str], b: list[str]) -> list[str]:
+    """Replace semantics for the issue #108 findings/rationale snapshots.
+
+    The ``pre_model_hook`` emits the full snapshot list (not a delta) whenever
+    Tier-3 fires, so last-write-wins is correct. Routing through a reducer (vs.
+    a bare field) means nodes that do NOT update the snapshot leave the prior
+    value intact — the snapshot only advances on a firing turn, which is the
+    whole point: it keeps the projected findings block byte-stable between
+    firings so the prompt-cache prefix survives every ``note_finding`` call.
+    """
+    return b
+
+
 def _summary_replace_reducer(a: str, b: str) -> str:
     """Replace semantics for the Track 7 Follow-up ``summary`` field.
 
@@ -116,6 +129,24 @@ class RuntimeState(TypedDict, total=False):
         can treat "why the agent chose to save" as a different field
         from "what the agent learned". Issue #102.
 
+    projected_observations / projected_commit_rationales:
+        Issue #108 — last-write-wins snapshots (``_list_replace_reducer``) of
+        the two append-only channels above, refreshed ONLY when Tier-3 fires.
+        The projection renders these snapshots into the combined-summary
+        ``SystemMessage``; the live append-only channels feed only the terminal
+        ``memory_write`` node. Decoupling the projected block from per-turn
+        appends keeps the Anthropic prompt-cache prefix byte-stable between
+        firings — a ``note_finding`` no longer invalidates the cached system
+        region. Coverage is exhaustive: a finding created since the last firing
+        is shown verbatim via the agent's own ``note_finding`` tool-call args
+        on the invoking ``AIMessage`` (the text lives in the args — the
+        ``ToolMessage`` itself is only a generic acknowledgement), which the
+        projection keeps verbatim in the middle / keep window until a firing
+        summarises it; that SAME firing folds it into the snapshot. (Relies on
+        tool-call args not being truncated in the projection, which the
+        replace-and-rehydrate architecture guarantees — the old
+        ``truncated_args_through_turn_index`` watermark is gone.)
+
     pending_memory:
         Written once by the terminal ``memory_write`` node on memory-enabled
         tasks.
@@ -160,6 +191,11 @@ class RuntimeState(TypedDict, total=False):
     # Issue #102 — save_memory/commit_memory opt-in rationales. Lives
     # alongside ``observations`` with the same ``operator.add`` reducer.
     commit_rationales: Annotated[list[str], operator.add]
+    # Issue #108 — Tier-3-gated snapshots of the two channels above. Replace
+    # semantics; refreshed only on a firing turn so the projected findings
+    # block (and thus the prompt-cache prefix) stays stable between firings.
+    projected_observations: Annotated[list[str], _list_replace_reducer]
+    projected_commit_rationales: Annotated[list[str], _list_replace_reducer]
     pending_memory: dict
     memory_opt_in: bool
 

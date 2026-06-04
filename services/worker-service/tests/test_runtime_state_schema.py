@@ -118,11 +118,15 @@ class TestRuntimeStateSchemaShape:
                 "the Track 7 Follow-up (Task 3) pipeline rewrite."
             )
 
-    def test_exactly_eleven_fields(self) -> None:
-        """Track 7 Follow-up + issue #102 shape: 5 Track 5 + 6 compaction = 11 total.
+    def test_exactly_thirteen_fields(self) -> None:
+        """Shape: 5 Track 5 + 2 issue-#108 snapshots + 6 compaction = 13 total.
 
         Issue #102 added ``commit_rationales`` as a parallel channel to
         ``observations`` for ``commit_memory`` / ``save_memory`` reasons.
+        Issue #108 added the Tier-3-gated ``projected_observations`` /
+        ``projected_commit_rationales`` snapshots so the projected findings
+        block (and thus the prompt-cache prefix) only changes when Tier-3
+        fires, not on every ``note_finding``.
         """
         hints = get_type_hints(RuntimeState, include_extras=True)
         expected = {
@@ -132,6 +136,9 @@ class TestRuntimeStateSchemaShape:
             # Issue #102 — separate channel for save_memory/commit_memory
             # reasons, distinct from note_finding observations.
             "commit_rationales",
+            # Issue #108 — Tier-3-gated snapshots of the two channels above.
+            "projected_observations",
+            "projected_commit_rationales",
             "pending_memory",
             "memory_opt_in",
             # Track 7 Follow-up (replace-and-rehydrate)
