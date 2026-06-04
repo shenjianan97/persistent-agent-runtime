@@ -559,6 +559,69 @@ async def test_tier3_refreshes_findings_snapshot():
     assert "- why we shipped" in combined.content
 
 
+@pytest.mark.asyncio
+async def test_finding_text_visible_via_tool_call_args_below_threshold():
+    """A finding's TEXT stays visible between Tier-3 firings even though the
+    snapshot is empty and the ``note_finding`` ToolMessage is only a generic
+    acknowledgement.
+
+    The text lives in the agent's own ``note_finding`` tool-call args on the
+    invoking AIMessage, which the projection shows verbatim in the middle/keep
+    regions until a firing summarises it (at which point the same firing folds
+    it into the snapshot). This is the exhaustive-coverage guarantee behind
+    issue #108 — it refutes the "findings disappear below threshold" concern.
+    """
+    finding_text = "DB pool exhausted under load; cap connections at 20"
+    msgs = [
+        HumanMessage(content="task input"),
+        AIMessage(
+            content="recording a finding",
+            tool_calls=[
+                {
+                    "id": "nf1",
+                    "name": "note_finding",
+                    "args": {"text": finding_text},
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        # Mirrors the real handler: a generic ack, NOT the finding text.
+        ToolMessage(
+            content="Noted. This finding is queued in your findings list.",
+            tool_call_id="nf1",
+            name="note_finding",
+        ),
+    ]
+    state = _fresh_state(msgs)
+    state["observations"] = [finding_text]      # live channel holds the text
+    state["projected_observations"] = []        # snapshot empty — no Tier-3 yet
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=10_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(1_000),  # below threshold
+        system_prompt="SYS",
+    )
+
+    # The text is NOT in any system/snapshot block (snapshot is empty)...
+    sys_text = "\n".join(
+        str(m.content) for m in result.messages if isinstance(m, SystemMessage)
+    )
+    assert finding_text not in sys_text
+    # ...but IS present in the projection via the note_finding tool-call args,
+    # so the agent can still reason over it.
+    tool_call_args_text = " ".join(
+        str(tc.get("args", {}))
+        for m in result.messages
+        for tc in (getattr(m, "tool_calls", None) or [])
+    )
+    assert finding_text in tool_call_args_text
+
+
 # ---------------------------------------------------------------------------
 # AC-4 / AC-5 — summariser receives RAW middle; main LLM sees no stubs
 # ---------------------------------------------------------------------------

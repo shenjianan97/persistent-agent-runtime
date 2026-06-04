@@ -137,9 +137,15 @@ class RuntimeState(TypedDict, total=False):
         ``memory_write`` node. Decoupling the projected block from per-turn
         appends keeps the Anthropic prompt-cache prefix byte-stable between
         firings — a ``note_finding`` no longer invalidates the cached system
-        region. Findings created since the last firing remain visible to the
-        agent as their ``ToolMessage``s in the middle / keep window until the
-        next firing folds them into the snapshot.
+        region. Coverage is exhaustive: a finding created since the last firing
+        is shown verbatim via the agent's own ``note_finding`` tool-call args
+        on the invoking ``AIMessage`` (the text lives in the args — the
+        ``ToolMessage`` itself is only a generic acknowledgement), which the
+        projection keeps verbatim in the middle / keep window until a firing
+        summarises it; that SAME firing folds it into the snapshot. (Relies on
+        tool-call args not being truncated in the projection, which the
+        replace-and-rehydrate architecture guarantees — the old
+        ``truncated_args_through_turn_index`` watermark is gone.)
 
     pending_memory:
         Written once by the terminal ``memory_write`` node on memory-enabled

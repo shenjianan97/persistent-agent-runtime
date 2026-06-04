@@ -805,8 +805,11 @@ async def compaction_pre_model_hook(
     #     the terminal memory_write node, elsewhere), and
     #   * the SNAPSHOT channels — refreshed only when Tier-3 fires — are what
     #     the projection renders, so a ``note_finding`` between firings does
-    #     NOT mutate the cached system region. Findings created since the last
-    #     firing stay visible as their ToolMessages in the middle / keep window.
+    #     NOT mutate the cached system region. A finding created since the last
+    #     firing stays visible via the agent's own note_finding tool-call args
+    #     (the text is in the args; the ToolMessage is a generic ack), shown
+    #     verbatim in the middle / keep window until a firing summarises it and
+    #     folds it into the snapshot in the same step — so coverage is gapless.
     live_observations = list(state.get("observations") or [])
     live_commit_rationales = list(state.get("commit_rationales") or [])
     observations = list(state.get("projected_observations") or [])
