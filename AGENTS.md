@@ -95,6 +95,9 @@ Applies to research, design docs, task specs, PR descriptions, code review comme
 - Invoke relevant superpowers skills (§Agent Skills (Superpowers))
 - Use `isolation: "worktree"` when parallel subagents could touch overlapping files (§Parallel Subagent Safety)
 
+**Prefer:**
+- Do PR work in a **git worktree** when it may run alongside other agents (or when the user is fanning out several tasks). This repo is built for it — the test infra is per-worktree isolated (#112) and the worker venv / `.env.localdev` fall back to the primary checkout (#111), so there's no bootstrap penalty. Reserve the **primary checkout** for single-stream work and CI-parity runs (which need the fixed `par-e2e-postgres` / 55433 / 8081). Not required for a lone serial task. (§Local Validation Notes)
+
 ## Parallel Subagent Safety
 
 When orchestrating parallel subagents via the Agent tool, **always use `isolation: "worktree"`** if there is any chance two agents modify the same file — even different methods in the same file. Without worktrees, concurrent Edit tool calls on the same file can clobber each other (last writer wins, or `old_string` match fails silently).

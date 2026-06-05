@@ -315,12 +315,12 @@ make e2e-test PYTEST_ARGS='-k my_test'
 # Skip teardown so a fix→test loop reuses this run's container
 E2E_KEEP=1 make worker-test
 
-# Or manage E2E infra manually
-make e2e-up        # start isolated DB + API
+# Or manage E2E infra manually — PRIMARY CHECKOUT ONLY (see note below)
+make e2e-up        # start the fixed primary DB + API (par-e2e-postgres / 8081)
 make e2e-status    # check what's running
-make e2e-down      # stop E2E stack
+make e2e-down      # stop the primary E2E stack
 
-# If something failed mid-run, force-clean leftovers
+# If something failed mid-run, force-clean leftovers (primary checkout)
 make e2e-clean
 
 # GC per-worktree containers/buckets left behind by crashed agents (fleet hygiene)
@@ -330,6 +330,8 @@ make e2e-reap
 `make e2e-test` uses `-v --tb=short -ra` for verbose progress and failure details. Logs are written to `.tmp/e2e-test.log` and `.tmp/e2e-api-service.log`.
 
 **Teardown contract (both checkouts):** by default every `make worker-test` / `make e2e-test` run **disposes its DB container** (`docker rm -f`) when it finishes — on the primary checkout and inside a worktree alike — so a run always cleans up after itself. `E2E_KEEP=1` is the opt-out: it leaves the container (and the API/bucket) up so the next run reuses them for a faster fix→test loop. The shared `platform-artifacts` bucket and the shared LocalStack are never torn down (only per-worktree `platform-artifacts-<slug>` buckets are). The legacy `make e2e-up` / `make e2e-down` targets are the exception — they `docker stop` (not remove) the primary container for a manual reuse lifecycle.
+
+> **`make e2e-up` / `e2e-down` / `e2e-status` / `e2e-clean` are primary-checkout-only.** They use the fixed names/ports (`par-e2e-postgres`, 55433/8081) and do **not** read `.tmp/e2e.env`, so running them from a worktree operates on the *primary* infra — it won't manage that worktree's isolated run and can collide with the primary checkout or another worktree. From a worktree, use `make worker-test` / `make e2e-test` (which self-provision and tear down per run); to clean up a crashed worktree run, re-run it (deterministic names replace it in place) or `make e2e-reap`.
 
 `PYTEST_ARGS` is forwarded to both `make worker-test` and `make e2e-test`, so a single test always runs against this checkout's isolated infra. `make e2e-reap` garbage-collects leftover per-worktree containers and buckets from agents that crashed before teardown — run it when agents are idle. A single agent normally never needs `e2e-reap`: container/bucket names are deterministic per checkout, so a re-run replaces its own infra in place.
 
