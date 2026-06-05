@@ -277,31 +277,63 @@ make db-reset-verify
 
 ## E2E Tests (Isolated Infrastructure)
 
-E2E tests run against **fully isolated infrastructure** that does not interfere with local development:
+E2E tests run against **fully isolated infrastructure** that does not interfere with local development. `make worker-test` and `make e2e-test` self-provision this infra keyed by the checkout — the command you run is unchanged, with no manual steps or port-picking.
 
-| Resource   | Local Dev          | E2E Tests                    |
-|------------|--------------------|------------------------------|
-| Postgres   | `:55432`           | `:55433`                     |
-| API        | `:8080`            | `:8081`                      |
-| DB name    | `persistent_agent_runtime` | `persistent_agent_runtime_e2e` |
-| Container  | `persistent-agent-runtime-postgres` | `par-e2e-postgres` |
+**Primary checkout** (the main working tree, not a worktree) uses fixed values, byte-identical to before — this is the path CI runs:
+
+| Resource          | Local Dev                           | E2E Tests (primary checkout)   |
+|-------------------|-------------------------------------|--------------------------------|
+| Postgres          | `:55432`                            | `:55433`                       |
+| API               | `:8080`                             | `:8081`                        |
+| Embedding mock    | —                                   | `:18099`                       |
+| DB name           | `persistent_agent_runtime`          | `persistent_agent_runtime_e2e` |
+| Postgres container| `persistent-agent-runtime-postgres` | `par-e2e-postgres`             |
+| S3 bucket         | —                                   | `platform-artifacts`           |
+
+**Inside a git worktree**, each checkout gets its **own** isolated infra so multiple agents can run `make worker-test` / `make e2e-test` concurrently without clobbering each other:
+
+| Resource          | E2E Tests (in a worktree)                  |
+|-------------------|--------------------------------------------|
+| Postgres container| `par-e2e-postgres-<slug>`                  |
+| Postgres port     | dynamically allocated host port            |
+| API / embed ports | dynamically allocated (e2e-test)           |
+| S3 bucket         | `platform-artifacts-<slug>`                |
+
+`<slug>` is a lowercase slug of the worktree directory name. The resolved container names, ports, and bucket are recorded in the contract file `<worktree>/.tmp/e2e.env`. One shared LocalStack (`:4566`) is reused by all checkouts. Implementation lives in `scripts/e2e/` (`provision.sh`, `teardown.sh`, `reap.sh`, `free-port.py`, `common.sh`).
+
+> **From a worktree, always use `make e2e-test` / `make worker-test`, never raw `pytest`.** Raw `pytest tests/backend-integration` hits the fixed default ports (55433 / 8081 / 18099) and can collide with the primary checkout or another worktree. To run a single test through the isolated harness, pass `PYTEST_ARGS` (see below).
 
 ### Running E2E tests
 
 ```bash
-# Run E2E tests (auto-starts isolated Postgres + API if needed)
+# Run E2E tests (auto-provisions isolated infra for this checkout if needed)
 make e2e-test
 
-# Or manage E2E infra manually
-make e2e-up        # start isolated DB + API
-make e2e-status    # check what's running
-make e2e-down      # stop E2E stack
+# Run a single test THROUGH the isolated harness
+make e2e-test PYTEST_ARGS='-k my_test'
 
-# If something failed mid-run, force-clean leftovers
+# Skip teardown so a fix→test loop reuses this run's container
+E2E_KEEP=1 make worker-test
+
+# Or manage E2E infra manually — PRIMARY CHECKOUT ONLY (see note below)
+make e2e-up        # start the fixed primary DB + API (par-e2e-postgres / 8081)
+make e2e-status    # check what's running
+make e2e-down      # stop the primary E2E stack
+
+# If something failed mid-run, force-clean leftovers (primary checkout)
 make e2e-clean
+
+# GC per-worktree containers/buckets left behind by crashed agents (fleet hygiene)
+make e2e-reap
 ```
 
 `make e2e-test` uses `-v --tb=short -ra` for verbose progress and failure details. Logs are written to `.tmp/e2e-test.log` and `.tmp/e2e-api-service.log`.
+
+**Teardown contract (both checkouts):** by default every `make worker-test` / `make e2e-test` run **disposes its DB container** (`docker rm -f`) when it finishes — on the primary checkout and inside a worktree alike — so a run always cleans up after itself. `E2E_KEEP=1` is the opt-out: it leaves the container (and the API/bucket) up so the next run reuses them for a faster fix→test loop. The shared `platform-artifacts` bucket and the shared LocalStack are never torn down (only per-worktree `platform-artifacts-<slug>` buckets are). The legacy `make e2e-up` / `make e2e-down` targets are the exception — they `docker stop` (not remove) the primary container for a manual reuse lifecycle.
+
+> **`make e2e-up` / `e2e-down` / `e2e-status` / `e2e-clean` are primary-checkout-only.** They use the fixed names/ports (`par-e2e-postgres`, 55433/8081) and do **not** read `.tmp/e2e.env`, so running them from a worktree operates on the *primary* infra — it won't manage that worktree's isolated run and can collide with the primary checkout or another worktree. From a worktree, use `make worker-test` / `make e2e-test` (which self-provision and tear down per run); to clean up a crashed worktree run, re-run it (deterministic names replace it in place) or `make e2e-reap`.
+
+`PYTEST_ARGS` is forwarded to both `make worker-test` and `make e2e-test`, so a single test always runs against this checkout's isolated infra. `make e2e-reap` garbage-collects leftover per-worktree containers and buckets from agents that crashed before teardown — run it when agents are idle. A single agent normally never needs `e2e-reap`: container/bucket names are deterministic per checkout, so a re-run replaces its own infra in place.
 
 ### Test targets
 
@@ -378,11 +410,11 @@ npx vitest run --reporter=verbose -t "renders budget fields"
 
 ### Infrastructure prerequisites for tests
 
-**All tests use an isolated test database — never the local dev database.** Worker integration tests and E2E tests both connect to a dedicated test PostgreSQL container (`par-e2e-postgres`) on port **55433**, separate from the local dev DB on port 55432. This ensures tests never destroy your local development data.
+**All tests use an isolated test database — never the local dev database.** Worker integration tests and E2E tests both connect to a dedicated test PostgreSQL container, separate from the local dev DB on port 55432. On the **primary checkout** that container is `par-e2e-postgres` on port **55433**; **inside a git worktree** it is `par-e2e-postgres-<slug>` on a dynamically allocated port (see [E2E Tests (Isolated Infrastructure)](#e2e-tests-isolated-infrastructure) above for the full per-worktree model and the `.tmp/e2e.env` contract file). Either way, tests never destroy your local development data — and from a worktree you must use `make worker-test` / `make e2e-test`, not raw `pytest`, so the run targets this checkout's isolated infra rather than the fixed default ports.
 
-`make worker-test` automatically starts the test database container and applies migrations via the `test-db-up` dependency. If you see `N passed, 12 skipped` in worker test output, it means Docker is not running — start Docker Desktop and re-run.
+`make worker-test` automatically provisions the test database container and applies migrations. If you see `N passed, 12 skipped` in worker test output, it means Docker is not running — start Docker Desktop and re-run.
 
-`make e2e-test` also depends on the test database (via `e2e-up → test-db-up`) plus an API service on port 8081. LocalStack on port 4566 must be running for artifact-related E2E tests — `make db-up` starts both the dev PostgreSQL and LocalStack containers.
+`make e2e-test` also provisions the test database plus an isolated API service (port 8081 on the primary checkout; dynamic in a worktree). LocalStack on port 4566 must be running for artifact-related E2E tests and is shared across all checkouts — `make db-up` starts both the dev PostgreSQL and LocalStack containers.
 
 ### Pre-existing test failures
 

@@ -16,6 +16,15 @@ SHELL := /bin/bash
 ROOT_DIR := $(shell pwd)
 MAIN_ROOT := $(shell d=$$(git rev-parse --git-common-dir 2>/dev/null); \
 	[ -n "$$d" ] && (cd "$$d/.." && pwd) || pwd)
+# RUN_ID namespaces per-worktree test infra (issue #112). Empty on the primary
+# checkout (ROOT_DIR == MAIN_ROOT) so container/bucket/port names stay fixed and
+# CI is byte-identical; a lowercase slug of the worktree basename otherwise.
+# MUST match scripts/e2e/common.sh:e2e_run_id. Uses /bin/sh ($(shell) ignores
+# SHELL), so keep it POSIX.
+RUN_ID := $(shell if [ "$(ROOT_DIR)" = "$(MAIN_ROOT)" ]; then echo ""; \
+	else s=$$(basename "$(ROOT_DIR)" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+//; s/-+$$//'); \
+	h=$$(printf '%s' "$(ROOT_DIR)" | cksum | cut -d' ' -f1); \
+	[ -n "$$s" ] && echo "$$s-$$h" || echo "wt-$$h"; fi)
 
 # Load local environment variables if present. From a worktree, load the
 # primary checkout's file FIRST, then the worktree-local one LAST so a
@@ -130,6 +139,14 @@ E2E_EMBEDDING_MOCK_PORT ?= 18099
 E2E_EMBEDDING_MOCK_PROVIDER_ID ?= memory-mock
 E2E_EMBEDDING_MOCK_ENDPOINT ?= http://127.0.0.1:$(E2E_EMBEDDING_MOCK_PORT)/v1/embeddings
 
+# Per-worktree test harness knobs (issue #112).
+# PYTEST_ARGS: extra args (e.g. -k name, a test path) passed THROUGH the isolated
+#   harness — prefer this over running raw `pytest` in a worktree, which would hit
+#   conftest's fixed default ports and collide.
+# E2E_KEEP=1: skip teardown so a fix→test loop reuses the run's container.
+PYTEST_ARGS ?=
+E2E_KEEP ?=
+
 # Color Output
 GREEN := $(shell printf '\033[0;32m')
 YELLOW := $(shell printf '\033[0;33m')
@@ -142,7 +159,7 @@ NC := $(shell printf '\033[0m')
         scale-worker \
         status check check-env check-python db-up db-down db-status db-migrate db-reset-verify \
         test-langfuse-up test-langfuse-down test-langfuse-status \
-        test test-all api-test worker-test console-test e2e-test e2e-up e2e-down e2e-clean e2e-status \
+        test test-all api-test worker-test console-test e2e-test e2e-up e2e-down e2e-clean e2e-status e2e-reap e2e-scripts-test \
         test-e2e-langfuse local-ci clean logs
 
 
@@ -820,38 +837,50 @@ api-test:
 	@echo "$(CYAN)🧪 Running API tests...$(NC)"
 	@cd $(API_DIR) && ./gradlew test
 
-worker-test: test-db-up
-	@echo "$(CYAN)🧪 Running Worker tests...$(NC)"
-	@E2E_DB_DSN=$(E2E_DB_DSN) $(WORKER_VENV_PYTHON) -m pytest $(WORKER_DIR)/tests -q
+worker-test:
+	@echo "$(CYAN)🧪 Running Worker tests (run: $(if $(RUN_ID),$(RUN_ID),primary))...$(NC)"
+	@$(ROOT_DIR)/scripts/e2e/provision.sh
+	@set -a; . $(TMP_DIR)/e2e.env; set +a; \
+	  rc=0; \
+	  $(WORKER_VENV_PYTHON) -m pytest $(WORKER_DIR)/tests $(PYTEST_ARGS) -q || rc=$$?; \
+	  $(ROOT_DIR)/scripts/e2e/teardown.sh; \
+	  exit $$rc
 
 console-test:
 	@echo "$(CYAN)🧪 Running Console tests...$(NC)"
 	@cd $(CONSOLE_DIR) && npm test
 
-e2e-test: e2e-up
-	@echo "$(CYAN)🧪 Running E2E tests (isolated infra: DB :$(E2E_DB_PORT), API :$(E2E_API_PORT))...$(NC)"
+e2e-test:
+	@echo "$(CYAN)🧪 Running E2E tests (run: $(if $(RUN_ID),$(RUN_ID),primary))...$(NC)"
+	@E2E_NEED_API=1 $(ROOT_DIR)/scripts/e2e/provision.sh
 	@mkdir -p $(TMP_DIR)
-	@E2E_DB_HOST=$(E2E_DB_HOST) \
-	 E2E_DB_PORT=$(E2E_DB_PORT) \
-	 E2E_DB_NAME=$(E2E_DB_NAME) \
-	 E2E_DB_USER=$(E2E_DB_USER) \
-	 E2E_DB_PASSWORD=$(E2E_DB_PASSWORD) \
-	 E2E_DB_DSN=$(E2E_DB_DSN) \
-	 E2E_PG_CONTAINER=$(E2E_PG_CONTAINER) \
-	 E2E_PG_IMAGE=$(E2E_PG_IMAGE) \
-	 E2E_API_PORT=$(E2E_API_PORT) \
-	 E2E_API_BASE=$(E2E_API_BASE) \
-	 E2E_EMBEDDING_MOCK_PORT=$(E2E_EMBEDDING_MOCK_PORT) \
-	 E2E_EMBEDDING_MOCK_PROVIDER_ID=$(E2E_EMBEDDING_MOCK_PROVIDER_ID) \
-	 APP_DEV_TASK_CONTROLS_ENABLED=true \
-	 $(WORKER_VENV_PYTHON) -m pytest tests/backend-integration -v --tb=short -ra 2>&1 | tee $(TMP_DIR)/e2e-test.log; \
-	 e2e_exit=$${PIPESTATUS[0]}; \
-	 $(MAKE) e2e-down; \
-	 if [ $$e2e_exit -ne 0 ]; then \
-	   echo "$(RED)❌ E2E tests failed. Full log: $(TMP_DIR)/e2e-test.log$(NC)"; \
-	   echo "$(YELLOW)   API log: $(E2E_API_LOG)$(NC)"; \
-	   exit $$e2e_exit; \
-	 fi
+	@set -a; . $(TMP_DIR)/e2e.env; set +a; \
+	  echo "$(CYAN)   DB :$$E2E_DB_PORT  API :$$E2E_API_PORT  embed :$$E2E_EMBEDDING_MOCK_PORT  bucket $$S3_BUCKET_NAME$(NC)"; \
+	  if ! curl -sf $$E2E_API_BASE/health >/dev/null 2>&1; then \
+	    echo "$(YELLOW)▶ Starting E2E API on port $$E2E_API_PORT...$(NC)"; \
+	    DB_HOST=$$E2E_DB_HOST DB_PORT=$$E2E_DB_PORT DB_NAME=$$E2E_DB_NAME \
+	    DB_USER=$$E2E_DB_USER DB_PASSWORD=$$E2E_DB_PASSWORD \
+	    SERVER_PORT=$$E2E_API_PORT APP_DEV_TASK_CONTROLS_ENABLED=true \
+	    APP_MEMORY_EMBEDDING_ENDPOINT=$$E2E_EMBEDDING_MOCK_ENDPOINT \
+	    APP_MEMORY_EMBEDDING_PROVIDER_ID=$$E2E_EMBEDDING_MOCK_PROVIDER_ID \
+	    nohup $(API_DIR)/gradlew bootRun -p $(API_DIR) > $(E2E_API_LOG) 2>&1 & \
+	    echo $$! > $(TMP_DIR)/e2e-api.pid; \
+	    echo "$(YELLOW)⏳ Waiting for E2E API health...$(NC)"; \
+	    for i in $$(seq 1 120); do curl -sf $$E2E_API_BASE/health >/dev/null 2>&1 && break; sleep 1; done; \
+	    if ! curl -sf $$E2E_API_BASE/health >/dev/null 2>&1; then \
+	      echo "$(RED)❌ E2E API failed to start. Check $(E2E_API_LOG)$(NC)"; \
+	      $(ROOT_DIR)/scripts/e2e/teardown.sh; \
+	      exit 1; \
+	    fi; \
+	  fi; \
+	  $(WORKER_VENV_PYTHON) -m pytest tests/backend-integration $(PYTEST_ARGS) -v --tb=short -ra 2>&1 | tee $(TMP_DIR)/e2e-test.log; \
+	  e2e_exit=$${PIPESTATUS[0]}; \
+	  $(ROOT_DIR)/scripts/e2e/teardown.sh; \
+	  if [ $$e2e_exit -ne 0 ]; then \
+	    echo "$(RED)❌ E2E tests failed. Full log: $(TMP_DIR)/e2e-test.log$(NC)"; \
+	    echo "$(YELLOW)   API log: $(E2E_API_LOG)$(NC)"; \
+	    exit $$e2e_exit; \
+	  fi
 
 test-e2e-langfuse: ## Run Langfuse E2E tests (requires: make test-langfuse-up && make start)
 	@echo "$(CYAN)🧪 Running Langfuse E2E tests...$(NC)"
@@ -995,6 +1024,12 @@ e2e-status:
 	else \
 		echo "$(RED)not running$(NC)"; \
 	fi
+
+e2e-reap: ## GC per-worktree test containers/buckets left by crashed agents (run when agents are idle)
+	@$(ROOT_DIR)/scripts/e2e/reap.sh
+
+e2e-scripts-test: ## Unit-test the scripts/e2e helpers (free-port, RUN_ID, provision/teardown)
+	@$(WORKER_VENV_PYTHON) -m pytest $(ROOT_DIR)/tests/e2e-scripts -q
 
 local-ci:
 	@echo "$(CYAN)🚀 Running Local CI checks...$(NC)"

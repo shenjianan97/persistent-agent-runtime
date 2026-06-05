@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import socket
 import sys
 
 import pytest
@@ -14,6 +15,15 @@ from mcp.client.streamable_http import streamable_http_client
 WORKER_SERVICE_DIR = Path(__file__).resolve().parents[1]
 PYTHON_BIN = Path(sys.executable)
 HTTP_SERVER_SCRIPT = WORKER_SERVICE_DIR / "tests" / "fixtures" / "http_test_server.py"
+
+
+def _free_port(host: str = "127.0.0.1") -> int:
+    """Pick an ephemeral free TCP port so parallel worktree runs don't collide
+    on a fixed server port — see issue #112."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, 0))
+        return sock.getsockname()[1]
 
 
 async def _wait_for_port(host: str, port: int, timeout_seconds: float = 5.0) -> None:
@@ -34,7 +44,7 @@ class TestMcpHttpIntegration:
     @pytest.mark.asyncio
     async def test_client_can_connect_to_local_http_server_and_call_tools(self) -> None:
         host = "127.0.0.1"
-        port = 8765
+        port = _free_port(host)
         process = await asyncio.create_subprocess_exec(
             str(PYTHON_BIN),
             "-u",
