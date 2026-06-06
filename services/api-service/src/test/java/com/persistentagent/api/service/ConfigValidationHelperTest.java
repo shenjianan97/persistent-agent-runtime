@@ -545,4 +545,22 @@ class ConfigValidationHelperTest {
         assertThrows(ValidationException.class, () -> helper.validateAgentConfig(config),
                 "validateAgentConfig must propagate context_management validation errors");
     }
+
+    // --- plan_write allowed tool (Planning Primitive P3) ---
+
+    @Test
+    void testValidateAllowedTools_planWrite_accepted() {
+        // plan_write must be in ALLOWED_TOOLS so agent configs that allowlist it pass validation.
+        // Without this, ConfigValidationHelper.validateAllowedTools rejects the tool and the
+        // worker's plan_write tool is unreachable in production.
+        assertDoesNotThrow(() -> helper.validateAllowedTools(List.of("plan_write")),
+                "plan_write must be in the allowed-tools set");
+    }
+
+    @Test
+    void testValidateAllowedTools_planWriteAlongsideOtherTools_accepted() {
+        // plan_write should coexist with standard platform tools.
+        assertDoesNotThrow(() -> helper.validateAllowedTools(List.of("web_search", "plan_write")),
+                "plan_write alongside standard tools must be accepted");
+    }
 }
