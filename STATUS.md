@@ -28,7 +28,16 @@ Tracks 9 (Planning Primitive) and 10 (Deep Research Mode) were removed on 2026-0
 |------------|--------|--------|
 | Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
 | Agent Capabilities (sandbox, artifacts, file input, coding primitives) | Tracks 1 & 2 complete; Track 3 proposed | [design](docs/design-docs/agent-capabilities/design.md) |
-| Agent Modes (topologies, delegation tools, Workflow resource, presets) | Framing approved (2026-05-22); implementation tracks pending | [design](docs/design-docs/agent-modes/design.md) |
+| Agent Modes (topologies, delegation tools, Workflow resource, presets) | Framing approved (2026-05-22); two tracks planned (2026-06-05) — see below | [design](docs/design-docs/agent-modes/design.md) · [tracks](docs/exec-plans/active/agent-modes/README.md) |
+
+#### Agent Modes Tracks
+
+| Track | Name | Status | Plan | Progress |
+|-------|------|--------|------|----------|
+| 1 | Supervisor Topology (Deep Research) | Planned (not started); blockers spiked & resolved; **3 deferred decisions (D1–D3) gated to S11/pre-GA — track not "done" until dispositioned ([§A12 ledger](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md#a12-deferred-decisions-ledger-definition-of-done-gate))** | [plan](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md) | [progress](docs/exec-plans/active/agent-modes/supervisor-topology/progress.md) |
+| 2 | Planning Primitive | Planned (not started); low-risk, no open blockers | [plan](docs/exec-plans/active/agent-modes/planning-primitive/plan.md) | [progress](docs/exec-plans/active/agent-modes/planning-primitive/progress.md) |
+
+Workflow resource and additional presets remain Phase-3 / deferred. The two planned tracks are independent and separately archivable. See the [tracks index](docs/exec-plans/active/agent-modes/README.md).
 
 #### Agent Capabilities Tracks
 

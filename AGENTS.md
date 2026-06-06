@@ -58,6 +58,15 @@ Task specs in `agent_tasks/` are contracts, not implementation blueprints. They 
 
 When a phase exceeds ~40 tasks, split into sequential tracks of ~7-10 tasks each. Tracks are spec subsections, may add `track-N-<name>.md` design docs, and each get their own `exec-plans/` subdirectory. Archive per-track; a phase is complete when all tracks are archived. See `exec-plans/completed/phase-2/` for a worked example.
 
+### Deferred decisions must be tracked to definition-of-done
+
+When a plan **ships a safe v1 default and defers the better choice** to "later, with data" (a tuning threshold, a richer algorithm, an optimization), that deferral is a silent-drop risk — "implementation done" gets claimed while the open call quietly vanishes. Prevent it structurally:
+
+- Record every deferral in a **Deferred Decisions Ledger** in the track plan: *v1 behavior (ships now) · observable trigger · review gate · disposition*. The trigger is the v1 instrumentation (a logged metric), not a calendar date.
+- **Tie it to the track's definition-of-done.** A track is **not "complete"/archivable until every ledger row is dispositioned** — either **Closed** (with the metric as evidence that v1 sufficed) or **spun into a named follow-up task**. Never a silent third option.
+- Force the look at a real checkpoint: the integration/acceptance task's criteria must **report the deferred-item metrics and disposition each**. Surface outstanding rows in `STATUS.md`.
+- Hold the line on language: **"v1 shipped" ≠ "fully optimized."** When v1 tasks merge, claim "v1 implemented and verified," not "done," while ledger rows remain open. (Worked example: `exec-plans/active/agent-modes/supervisor-topology/` §A12.)
+
 ## Agent Skills (Superpowers)
 
 **Non-negotiable when installed.** At conversation start, invoke `using-superpowers` via the `Skill` tool before any other action — including reading files or asking clarifying questions. Before every task, invoke any relevant skill (debugging, TDD, brainstorming, code review). If there's even a 1% chance a skill applies, invoke it. "This is a simple question" and "let me explore first" are not valid reasons to skip — the skill tells you *how* to explore.
@@ -71,6 +80,7 @@ Priority: user instructions > skills > default behavior.
 - **External claims** (best practices, library/framework behavior, API semantics, standards) → use `WebSearch` / `WebFetch` or read the actual docs/source. Cite the URL and, for anything version-sensitive (LangChain, React, Spring, SDKs), the version you verified against. Training-data recall is not a citation — library behavior shifts between minor versions.
 - **Internal claims** (how this repo does X, what a function returns, where config lives, what a migration did) → use `Read` / `Grep` / `Glob`. Cite `path:line` for the exact code you verified against, not a paraphrase.
 - **Behavioral claims about running systems** (what a worker logs, what an endpoint returns, whether a test covers a path) → run the command or read the log. "It should work" is not evidence.
+- **Load-bearing framework/runtime assumptions baked into a plan** (e.g. "LangGraph resumes mid-subgraph", "this stream surfaces sub-agent usage", "a checkpointed subgraph node persists its inner steps") → **verify with a throwaway spike against the pinned version before writing it into a task contract.** A plan built on an unverified behavioral assumption is a hallucination risk with a long blast radius — the cost surfaces three tasks deep, not at review. Spikes are cheap, disposable (`/tmp`), and double as regression-test seeds. (Worked example: the six `agent_modes_spike*.py` that settled the Supervisor durability/cost/delegation model.)
 - **If you can't find a reference, say so explicitly** — "I couldn't verify this, treat as a guess" or "I'm recalling this from training data, please double-check." Never launder uncertainty as confidence.
 
 Applies to research, design docs, task specs, PR descriptions, code review comments, and in-conversation recommendations. A plausible-sounding claim without a citation is a hallucination risk that costs more to unwind later than it takes to verify now.
