@@ -11,7 +11,7 @@ You are a software engineer implementing one module of a larger system. Your sco
 2. `docs/exec-plans/active/agent-modes/supervisor-topology/plan.md` — **§A4** (migration shape: additive CHECK extend, no new columns; `iteration`/`subtask` ride in `details`), **§A4.1 S9 row** (handoff contract), **§A6 deploy-order constraint** (migration MUST reach prod before emitting code), **§A7 Observability** (the exact event payloads this task owns), **§A0 invariants 1 & 6** (Pattern A: no sub-agent task rows; `subagent_results` keyed by `subtask`).
 3. `infrastructure/database/migrations/0024_*.sql` — the **DROP + re-ADD** CHECK-constraint pattern (mirrors `0020`). Copy this shape exactly; the latest migration is `0024`, so this one is **`0025`**.
 4. `infrastructure/database/migrations/0006_runtime_state_model.sql:25` — original `task_events.event_type` CHECK + the `task_events` table (`details JSONB` column already exists).
-5. `services/worker-service/core/reaper.py:523` — `_insert_task_event(conn, task_id, tenant_id, agent_id, event_type, status_before, status_after, worker_id=, error_code=, error_message=, details=)`. This is the **only** emit helper; the new events go through it with `details` carrying `iteration`/`subtask`. Note it must be called **inside an active transaction** so the event commits/rolls back atomically with the paired state mutation.
+5. `services/worker-service/core/reaper.py:523` — `_insert_task_event(conn, task_id, tenant_id, agent_id, event_type, status_before, status_after, worker_id=, error_code=, error_message=, details=)`. This is the **only** emit helper; the new events go through it with `details` carrying `iteration`/`subtask`. **Atomicity caveat (corrected in PR review):** in the *reaper*, the caller owns one transaction pairing the event with the task-row update — that works because both writes are the caller's. The fan-out events **cannot** get that guarantee: LangGraph checkpoint persistence happens inside `PostgresDurableCheckpointer.aput`/`aput_writes`, which open **their own** connections + transactions (`services/worker-service/checkpointer/postgres.py:181-204`, `:247-260`) — an emit on a caller-owned connection can never share them. See the **at-least-once contract** below.
 6. `services/api-service/.../service/ActivityProjectionService.java` — `mapMarker(TaskEventResponse)` (the `switch (type)` at ~line 476) and the `USER_VISIBLE_MARKERS` set (~line 56). This is where the new types become `marker.*` kinds.
 7. `services/api-service/.../model/response/ActivityEventResponse.java` — the discriminated-union record (`kind` field names the payload; consumers ignore unrecognised fields — forward-compatible). New optional fields are added here.
 
@@ -32,7 +32,12 @@ A Deep Research run is **one task row**. Sub-agent activity (each sub-agent's li
 
 This task owns all three, **plus the emit contract** the fan-out call sites (S6/S7) consume. S9 does **not** build the Supervisor graph or the fan-out helper — it provides the helper function those tasks call and the payload schema they fill. The worker call sites live in S6 (fan-out / iteration) and S7 (findings); S9 lands the emit helper, its payload validation, and at least one emit at a call site that already exists or a thin shim S6/S7 wire into. Coordinate the exact wiring with S6/S7 via the handoff contract below.
 
-**Deploy-order constraint (§A6 — load-bearing, state it in the PR):** the migration `0025` **MUST land in production before** any worker build that emits `subagent_*` / `supervisor_iteration` events. Otherwise the `INSERT INTO task_events` violates the CHECK and the fan-out transaction rolls back. **Merge S9's migration commit before S6/S7's emitting code ships to prod.** The migration is additive and non-breaking for existing rows, so it is safe to land early on its own.
+**Deploy-order constraint (§A6 — load-bearing, state it in the PR):** the migration `0025` **MUST land in production before** any worker build that emits `subagent_*` / `supervisor_iteration` events. Otherwise the `INSERT INTO task_events` violates the CHECK and the emit fails (erroring the emitting node). **Merge S9's migration commit before S6/S7's emitting code ships to prod.** The migration is additive and non-breaking for existing rows, so it is safe to land early on its own.
+
+**At-least-once event contract (load-bearing — corrected in PR review):** sub-agent events are **NOT atomic with checkpoint writes** and must not be specified as such. The checkpointer (`PostgresDurableCheckpointer.aput`/`aput_writes`) opens its own connections and transactions (`checkpointer/postgres.py:181-204`, `:247-260`); event emission happens during node execution on a separate caller-owned connection. Consequences the contract embraces instead of denying:
+- On a crash, a marker can commit **without** its checkpointed state, or state can persist **without** its marker — transient skew is normal and self-heals on resume.
+- **Per-turn resume re-emits:** a crashed-and-resumed inner step runs again and emits its events again — **duplicates are expected, not exceptional**.
+- Therefore every `subagent_*` / `supervisor_iteration` event carries a **stable dedup key** — `(event_type, iteration, subtask)` (already in `details`) — and the **projection (and any consumer) must be duplicate-tolerant**: when building the round→sub-agent tree, dedup by that key (first-wins for `subagent_started`; last-wins for `subagent_failed` / result-bearing markers).
 
 ## Task-Specific Shared Contract
 
@@ -56,7 +61,7 @@ Provide a thin typed emit surface over `_insert_task_event` so S6/S7 call sites 
 - `emit_subagent_failed(conn, *, task_id, tenant_id, agent_id, iteration, subtask, reason)`
 - `emit_supervisor_iteration(conn, *, task_id, tenant_id, agent_id, iteration, subtasks_emitted, decision, reason)`
 
-Each delegates to `_insert_task_event` with the correct `event_type` and a `details` dict built from its args. `status_before`/`status_after` are `None` for these (they are activity markers, not state transitions). `prompt_preview` MUST be truncated (e.g. ≤ 200 chars) so the row stays small. Helpers must be callable **inside the same transaction** as the paired state mutation (the design requires the event to commit/roll back with the fan-out checkpoint write — same atomicity contract `memory_written` follows in `0024`).
+Each delegates to `_insert_task_event` with the correct `event_type` and a `details` dict built from its args. `status_before`/`status_after` are `None` for these (they are activity markers, not state transitions). `prompt_preview` MUST be truncated (e.g. ≤ 200 chars) so the row stays small. Helpers take a caller-owned connection and emit **at-least-once** — they are **NOT atomic with the checkpoint write** (the checkpointer owns its own connections/transactions; see the at-least-once contract above). Emissions must be safe to repeat: a resumed inner step re-emits, and the `(event_type, iteration, subtask)` dedup key is what consumers group/dedup on.
 
 Place these alongside the existing emit helper (or a new `core/subagent_events.py` re-exported for the fan-out callers) — coordinate the import path with S3/S6 so they don't fork the machinery.
 
@@ -103,7 +108,7 @@ Place these alongside the existing emit helper (or a new `core/subagent_events.p
 
 ### Worker emit helpers
 
-Implement the four `emit_*` functions per the contract above. Each builds a `details` dict from its keyword args (omitting `None`s is fine), calls `_insert_task_event` with the right `event_type` and `status_before=None, status_after=None`, and truncates `prompt_preview`. Add a module-level constant for the preview cap. Do **not** open a transaction inside the helper — the caller owns the txn (atomic with the fan-out state write).
+Implement the four `emit_*` functions per the contract above. Each builds a `details` dict from its keyword args (omitting `None`s is fine), calls `_insert_task_event` with the right `event_type` and `status_before=None, status_after=None`, and truncates `prompt_preview`. Add a module-level constant for the preview cap. Do **not** open a transaction inside the helper — the caller owns the connection scope. Do **not** claim or rely on atomicity with the checkpoint write (impossible — `checkpointer/postgres.py:181-204`, `:247-260`); the at-least-once contract + dedup key is the guarantee.
 
 ### API projection
 
@@ -120,6 +125,7 @@ Implement the four `emit_*` functions per the contract above. Each builds a `det
 - [ ] `include_details=false` returns the user-visible subset (`marker.subagent.finding`, `marker.subagent.failed`, `marker.supervisor.iteration`) and hides `marker.subagent.started`; `include_details=true` returns all four.
 - [ ] Existing activity projection is **unaffected** — turns and pre-existing markers (`marker.compaction_fired`, `marker.hitl.*`, `marker.memory_written`, `marker.lifecycle`) serialise identically; the two new fields are absent (omitted) on those kinds.
 - [ ] A row written with an `event_type` the API does not recognise is dropped (not errored) — the `default -> null` forward-compat branch is intact.
+- [ ] **Duplicate tolerance (at-least-once contract):** two rows with the same `(event_type, iteration, subtask)` dedup key (the per-turn-resume re-emit case) project as **one** logical tree entry — first-wins for `marker.subagent.started`, last-wins for `marker.subagent.failed` / result-bearing markers. A test inserts a duplicate pair and asserts the grouped projection contains a single entry.
 - [ ] `0025` is picked up by the CI migration glob (verified in `.github/workflows/ci.yml`); no manual CI wiring added.
 - [ ] `docs/exec-plans/active/agent-modes/supervisor-topology/progress.md` reflects S9 done.
 
@@ -134,7 +140,7 @@ Implement the four `emit_*` functions per the contract above. Each builds a `det
 - **Pattern A discipline (plan §A0 invariant 1):** do NOT add a `parent_task_id` / `sub_agent_id` column, a sub-agent task row, or any new column for `iteration`/`subtask`. They ride in `details` JSONB only.
 - The migration is **additive**: never drop an existing allowlist value; re-ADD the full set.
 - Do NOT put a finding's `claim` or `supporting_quote` in the `details` row (size bound — §A7; they live in the Langfuse span). Only `finding_id` + `source_url` go on the `subagent_finding` row.
-- Do NOT change the `_insert_task_event` signature or its atomicity contract — wrap it, don't fork it.
+- Do NOT change the `_insert_task_event` signature — wrap it, don't fork it. Do NOT promise atomicity with checkpoint writes anywhere (at-least-once + dedup is the contract).
 - Do NOT build the Supervisor graph, the fan-out helper, or the actual call-site wiring decisions that belong to S6/S7 — S9 provides the emit helpers + payload schema + projection; S6/S7 call them.
 - Do NOT touch the Console here (S10 reads the projected markers).
 - Keep `mapMarker`'s `default -> null` forward-compat behavior — never throw on an unknown type.
