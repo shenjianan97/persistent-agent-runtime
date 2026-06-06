@@ -20,7 +20,10 @@ public final class ValidationConstants {
     /** All valid tool names accepted by the API (for validation only). */
     public static final Set<String> ALLOWED_TOOLS = Set.of(
             "web_search", "read_url", "request_human_input", "create_text_artifact",
-            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file");
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file",
+            // Planning Primitive (agent-modes) — allows agents to write structured
+            // plans into the LangGraph checkpoint so GET /v1/tasks/{id}/plan can project them.
+            "plan_write");
 
     /** Platform tools auto-enabled for every agent. */
     public static final List<String> BASE_PLATFORM_TOOLS = List.of(
