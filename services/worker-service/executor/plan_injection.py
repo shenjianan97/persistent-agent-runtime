@@ -85,12 +85,17 @@ def render_plan_block(plan_items: Sequence[dict]) -> str:
     * ``in_progress`` → ``- [ ] {title} (in progress)``
     * ``pending``     → ``- [ ] {title}``
 
-    Statuses are validated upstream by ``plan_write`` (Task P1); anything
-    unrecognised renders defensively as unchecked-pending.
+    Item shape is validated upstream by ``plan_write`` (Task P1), but the
+    renderer stays defensive against a corrupted checkpoint — a raise here
+    would wedge the task on every turn: non-dict items are skipped, a
+    missing/``None`` title renders as empty, and any unrecognised status
+    renders as unchecked-pending.
     """
     lines = [PLAN_PREAMBLE, ""]
     for item in plan_items:
-        title = item.get("title", "")
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title") or ""
         status = item.get("status")
         if status == "completed":
             lines.append(f"- [x] {title}")

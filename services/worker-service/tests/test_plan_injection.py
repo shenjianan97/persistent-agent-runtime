@@ -36,6 +36,7 @@ from __future__ import annotations
 import copy
 import pathlib
 
+import pytest
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -51,6 +52,7 @@ from executor.plan_injection import (
     make_plan_block_message,
     render_plan_block,
 )
+from executor.prompt_cache import _REGISTRY
 from executor.prompt_cache.anthropic import AnthropicPromptCacheStrategy
 from executor.prompt_cache.bedrock import BedrockPromptCacheStrategy
 from executor.prompt_cache.noop import NoopPromptCacheStrategy
@@ -152,6 +154,41 @@ def test_render_preserves_item_order():
     assert block.index("Set up the schema") < block.index("Write the tests")
 
 
+def test_render_unrecognised_status_renders_as_unchecked_pending():
+    """Documented defensive behavior: statuses are validated upstream by
+    ``plan_write``, but anything unrecognised renders as unchecked-pending
+    (no checkbox tick, no ``(in progress)`` marker)."""
+    plan = [{"id": "a", "title": "Mystery step", "status": "blocked"}]
+    block = render_plan_block(plan)
+    assert "- [ ] Mystery step" in block
+    assert "(in progress)" not in block
+    assert "- [x]" not in block
+
+
+def test_render_skips_non_dict_items():
+    """A corrupted checkpoint must not wedge the task: non-dict items are
+    skipped, the rest of the plan still renders."""
+    plan = [
+        {"id": "a", "title": "Real step", "status": "pending"},
+        None,
+        "garbage",
+        {"id": "b", "title": "Another step", "status": "completed"},
+    ]
+    block = render_plan_block(plan)
+    assert "- [ ] Real step" in block
+    assert "- [x] Another step" in block
+    assert "garbage" not in block
+    # Exactly two checklist lines — the junk items contributed nothing.
+    assert sum(line.startswith("- [") for line in block.splitlines()) == 2
+
+
+def test_render_none_title_does_not_render_the_word_none():
+    plan = [{"id": "a", "title": None, "status": "pending"}]
+    block = render_plan_block(plan)
+    assert "None" not in block
+    assert "- [ ]" in block
+
+
 def test_render_only_checklist_varies_between_plans():
     """The preamble is a stable constant — two different plans share the
     identical preamble prefix; only the checklist body differs."""
@@ -250,7 +287,8 @@ def test_agent_node_injects_after_hook_before_cache_markers():
 
 def test_agent_node_passes_injected_list_to_cache_markers():
     """The list handed to ``apply_cache_markers`` (and the no-marker
-    fallback) is the plan-injected projection, not the raw hook output."""
+    fallback when ``WORKER_PROMPT_CACHE_DISABLED=1`` / model unsupported)
+    is the plan-injected projection, not the raw hook output."""
     graph_path = pathlib.Path(__file__).parent.parent / "executor" / "graph.py"
     src = graph_path.read_text()
 
@@ -258,6 +296,11 @@ def test_agent_node_passes_injected_list_to_cache_markers():
     marker_window = src[src.index(".apply_cache_markers(") :]
     assert "projected_messages" in marker_window[:200], (
         "apply_cache_markers must receive the plan-injected projection."
+    )
+    # The no-marker fallback branch must use the same injected projection.
+    assert "messages_for_llm = list(projected_messages)" in src, (
+        "The markers-disabled fallback must also receive the plan-injected "
+        "projection."
     )
 
 
@@ -361,3 +404,21 @@ def test_noop_and_openai_leave_plan_block_unmarked():
         out = strategy.apply_cache_markers(msgs)
         assert out == msgs
         assert isinstance(out[-1].content, str)
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [*_REGISTRY.values(), NoopPromptCacheStrategy()],
+    ids=lambda s: s.provider,
+)
+def test_every_registered_strategy_leaves_plan_block_unchanged(strategy):
+    """Structural guard for FUTURE strategies: any strategy registered in
+    ``prompt_cache._REGISTRY`` must let the injected plan block survive
+    ``apply_cache_markers`` byte-unchanged (no marker, no reshaping) — the
+    block lives in the uncached suffix by contract. A new provider that
+    forgets to skip ``is_plan_block`` messages fails here instead of
+    surfacing as a production cache-cost regression."""
+    msgs = inject_plan_block(_projection(), _plan())
+    out = strategy.apply_cache_markers(msgs)
+    assert is_plan_block(out[-1])
+    assert out[-1].content == msgs[-1].content

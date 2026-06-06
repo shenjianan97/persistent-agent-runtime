@@ -10,6 +10,11 @@ Adding a new provider:
    whatever shape the provider uses).
 2. Register it in :data:`_REGISTRY` below under the same provider id that
    :func:`executor.providers.create_llm` accepts.
+3. If the strategy places breakpoints, every breakpoint scan must skip
+   messages where :func:`executor.plan_injection.is_plan_block` is True —
+   the injected plan block is mutable and must stay in the uncached suffix
+   (see the Anthropic strategy's module docstring). Enforced by the
+   ``_REGISTRY``-parametrized guard in ``tests/test_plan_injection.py``.
 
 ``executor.graph`` obtains a strategy via :func:`get_strategy` and otherwise
 stays provider-neutral — no ``if provider == "..."`` branches for cache
