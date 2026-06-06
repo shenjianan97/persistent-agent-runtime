@@ -310,7 +310,7 @@ export function TaskDetailPage() {
                         </div>
                     )}
 
-                    <PlanChecklist taskId={taskId!} />
+                    <PlanChecklist taskId={taskId!} status={task.status} />
 
                     <div data-testid="task-detail-tabs" className="space-y-3">
                         <ActivityPane

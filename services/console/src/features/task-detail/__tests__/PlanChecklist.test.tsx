@@ -115,15 +115,24 @@ describe('PlanChecklist', () => {
         expect(screen.getByTestId('plan-item-p3-badge')).toHaveTextContent('pending');
     });
 
-    it('renders nothing (or empty state) for an empty plan without error', async () => {
+    it('renders nothing for an empty plan without error', async () => {
         getTaskPlanMock.mockResolvedValue(EMPTY_PLAN);
         renderWithClient(<PlanChecklist taskId="task-456" />);
 
-        // Container still renders (or is absent) — no error thrown
         await waitFor(() => expect(getTaskPlanMock).toHaveBeenCalledWith('task-456'));
 
-        // No plan item rows (exclude badge testids)
+        // Empty plan → container absent entirely (Scenario 20 step 5 contract)
+        expect(screen.queryByTestId('plan-checklist')).not.toBeInTheDocument();
         expect(screen.queryAllByTestId(/^plan-item-(?!.*-badge$)/)).toHaveLength(0);
+    });
+
+    it('renders nothing when the plan fetch rejects (no throw, no error UI)', async () => {
+        getTaskPlanMock.mockRejectedValue(new Error('boom'));
+        renderWithClient(<PlanChecklist taskId="task-err" />);
+
+        await waitFor(() => expect(getTaskPlanMock).toHaveBeenCalledWith('task-err'));
+
+        expect(screen.queryByTestId('plan-checklist')).not.toBeInTheDocument();
     });
 
     it('checkboxes are read-only (disabled, no interactive toggle)', async () => {
@@ -218,8 +227,40 @@ describe('PlanChecklist', () => {
 
     it('calls getTaskPlan with the correct taskId', async () => {
         getTaskPlanMock.mockResolvedValue(POPULATED_PLAN);
-        renderWithClient(<PlanChecklist taskId="task-xyz" />);
+        renderWithClient(<PlanChecklist taskId="task-xyz" status="completed" />);
 
         await waitFor(() => expect(getTaskPlanMock).toHaveBeenCalledWith('task-xyz'));
+    });
+
+    it('polls every 5s while the task is non-terminal', async () => {
+        vi.useFakeTimers();
+        try {
+            getTaskPlanMock.mockResolvedValue(POPULATED_PLAN);
+            renderWithClient(<PlanChecklist taskId="task-123" status="running" />);
+
+            await vi.advanceTimersByTimeAsync(0);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(5_000);
+            expect(getTaskPlanMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('does not poll when the task is terminal', async () => {
+        vi.useFakeTimers();
+        try {
+            getTaskPlanMock.mockResolvedValue(POPULATED_PLAN);
+            renderWithClient(<PlanChecklist taskId="task-123" status="completed" />);
+
+            await vi.advanceTimersByTimeAsync(0);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(1);
+
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(1);
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });

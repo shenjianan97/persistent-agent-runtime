@@ -1,19 +1,31 @@
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/api/client';
-import type { PlanItem } from '@/types';
+import type { PlanItem, TaskStatus } from '@/types';
 
 // ------------------------------------------------------------------
 // Status helpers
 // ------------------------------------------------------------------
 
+// Mirrors ActivityPane's terminal-status predicate so the plan polls on the
+// same cadence policy as the rest of the task-detail page.
+const TERMINAL_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>([
+    'completed',
+    'cancelled',
+    'dead_letter',
+]);
+
+function isTerminalStatus(status?: TaskStatus): boolean {
+    return !!status && TERMINAL_STATUSES.has(status);
+}
+
 type KnownStatus = 'pending' | 'in_progress' | 'completed';
 
 /**
- * Normalise any value (including null / unknown future strings) to one of the
- * three known statuses, defaulting to 'pending' for anything unrecognised.
+ * Normalize any value (including null / unknown future strings) to one of the
+ * three known statuses, defaulting to 'pending' for anything unrecognized.
  * This keeps the renderer crash-free per the P3 wire-format guarantee.
  */
-function normaliseStatus(raw: unknown): KnownStatus {
+function normalizeStatus(raw: unknown): KnownStatus {
     if (raw === 'completed') return 'completed';
     if (raw === 'in_progress') return 'in_progress';
     // null, undefined, unknown string → treat as pending
@@ -48,7 +60,7 @@ interface PlanItemRowProps {
 }
 
 function PlanItemRow({ item, index }: PlanItemRowProps) {
-    const status = normaliseStatus(item.status);
+    const status = normalizeStatus(item.status);
     const isCompleted = status === 'completed';
 
     // id may be null (corrupted checkpoint — P3 tolerates it)
@@ -59,12 +71,12 @@ function PlanItemRow({ item, index }: PlanItemRowProps) {
             data-testid={`plan-item-${rowId}`}
             className="flex items-start gap-3 py-2 px-1 rounded-md hover:bg-muted/10 transition-colors"
         >
-            {/* Read-only checkbox — disabled so there's no interactive affordance */}
+            {/* Read-only checkbox — disabled carries the no-interaction contract
+                (HTML readonly does not apply to checkboxes) */}
             <input
                 type="checkbox"
                 checked={isCompleted}
                 disabled
-                readOnly
                 aria-label={item.title ?? '(untitled)'}
                 className="mt-0.5 h-4 w-4 shrink-0 accent-primary cursor-default"
             />
@@ -95,6 +107,8 @@ function PlanItemRow({ item, index }: PlanItemRowProps) {
 
 interface PlanChecklistProps {
     taskId: string;
+    /** Current task status — drives polling: refetch while non-terminal. */
+    status?: TaskStatus;
 }
 
 /**
@@ -104,12 +118,15 @@ interface PlanChecklistProps {
  * Read-only; plan is agent-owned and there is no mutation API.
  * Renders nothing (null) when the plan is empty — an agent that never called
  * `plan_write` is the common case and should produce no visual clutter.
+ * Polls every 5s while the task is non-terminal (matching the page's events
+ * query cadence) so a plan written mid-run appears without a reload.
  */
-export function PlanChecklist({ taskId }: PlanChecklistProps) {
+export function PlanChecklist({ taskId, status }: PlanChecklistProps) {
     const { data, isLoading } = useQuery({
         queryKey: ['task-plan', taskId],
         queryFn: () => api.getTaskPlan(taskId),
         enabled: !!taskId,
+        refetchInterval: isTerminalStatus(status) ? false : 5_000,
     });
 
     if (isLoading) {
