@@ -416,8 +416,31 @@ Covers Planning Primitive track P4 — the `PlanChecklist` component on the task
 
 Preconditions:
 - `make start` running; API at `:8080`, Console at `:5173`.
-- One completed task whose agent called `plan_write` at least once (produces a non-empty `GET /v1/tasks/:taskId/plan` response). If no such task exists, use the API to seed one or run a task against a planning-capable agent.
-- One completed task whose agent never called `plan_write` (produces `plan: []`).
+- One completed task whose agent called `plan_write` at least once (produces a non-empty `GET /v1/tasks/:taskId/plan` response) **with items in at least two distinct statuses**, and one completed task whose agent never called `plan_write` (produces `plan: []`). Seed both via the API (finalized by P5 — these exact steps are executable against the live stack):
+
+  1. **Planning agent** — create an agent with `plan_write` allowlisted and a prompt that scripts the exact plan (a live LLM follows this reliably; statuses cover all three badges):
+
+     ```bash
+     curl -s -X POST localhost:8080/v1/agents -H 'Content-Type: application/json' -d '{
+       "display_name": "Scenario 20 Planning Agent",
+       "agent_config": {
+         "system_prompt": "Before doing anything else, call the plan_write tool exactly once with exactly these items: [{\"id\": \"step-1\", \"title\": \"Collect the inputs\", \"status\": \"completed\"}, {\"id\": \"step-2\", \"title\": \"Analyze the data\", \"status\": \"in_progress\"}, {\"id\": \"step-3\", \"title\": \"Write the summary\", \"status\": \"pending\"}]. Then reply with the single word: done.",
+         "provider": "anthropic", "model": "claude-haiku-4-5", "temperature": 0.0,
+         "allowed_tools": ["plan_write"]
+       }
+     }' | jq -r .agent_id
+     ```
+
+  2. **⚠ Known blocker (P5 finding, must be worked around until fixed):** `AgentService.canonicalizeConfig` (`services/api-service/.../service/AgentService.java` ~:186-205) currently REPLACES the requested `allowed_tools` with the base platform set, silently dropping `plan_write` — the tripwire test `tests/backend-integration/test_plan_read_api.py::test_plan_write_allowlist_survives_agent_creation` (strict xfail) pins this. Until it XPASSes, seed the allowlist directly in the dev DB after creating the agent:
+
+     ```bash
+     psql postgresql://postgres:postgres@localhost:55432/persistent_agent_runtime -c \
+       "UPDATE agents SET agent_config = jsonb_set(agent_config::jsonb, '{allowed_tools}', '[\"plan_write\"]'::jsonb) WHERE agent_id = '<id from step 1>'"
+     ```
+
+  3. **Plan task** — submit `{"agent_id": "<id from step 1>", "input": "Follow your instructions."}` to `POST localhost:8080/v1/tasks`, capture `task_id`, then poll `GET localhost:8080/v1/tasks/<task_id>/plan` until `plan` is non-empty (a few seconds once a worker picks it up). If the model produced different items (rare at temperature 0), re-submit once.
+  4. **Empty-plan task** — create a second agent identical to step 1 but with `"allowed_tools": []` and a plain prompt ("Reply with the single word: done."), submit a task against it, and wait for `completed`. Its `GET .../plan` returns `{"plan": []}` and is the Scenario's empty-render fixture.
+  5. The backend-integration test `tests/backend-integration/test_plan_read_api.py` (run via `make e2e-test PYTEST_ARGS='-k plan_read_api'`) asserts the same two API shapes deterministically with a stub LLM — if the live seeding misbehaves, that test localizes whether the API or the live model is at fault.
 
 What to verify:
 
