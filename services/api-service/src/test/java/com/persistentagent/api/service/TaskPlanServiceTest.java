@@ -216,4 +216,64 @@ class TaskPlanServiceTest {
         assertEquals("First step", response.plan().get(0).title());
         assertEquals("pending", response.plan().get(0).status());
     }
+
+    // --- Malformed payload tolerance ---
+
+    @Test
+    void getPlan_malformedPayloadJson_returns200WithEmptyPlan() {
+        // A checkpoint_payload that fails to parse must degrade to plan: []
+        // (200 path), never a 500 — same tolerance as the Activity projection.
+        UUID taskId = UUID.randomUUID();
+        Timestamp created = Timestamp.from(Instant.parse("2026-06-03T00:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_bad",
+                "checkpoint_payload", "not json",
+                "created_at", created)));
+
+        TaskPlanResponse response = assertDoesNotThrow(() -> service.getPlan(taskId));
+
+        assertEquals(taskId, response.taskId());
+        assertNotNull(response.plan());
+        assertTrue(response.plan().isEmpty());
+        // updated_at still reflects the checkpoint row's created_at.
+        assertNotNull(response.updatedAt());
+    }
+
+    @Test
+    void getPlan_malformedPlanEntries_skipsNonDictsAndToleratesMissingKeys() {
+        // A plan list containing a bare string entry (not a dict) is skipped;
+        // a dict missing id/status keys yields a null-field item. Neither throws.
+        UUID taskId = UUID.randomUUID();
+        String payload = """
+                {
+                  "channel_values": {
+                    "plan": [
+                      "i am not a dict",
+                      {"title": "only a title"},
+                      {"id": "step-ok", "title": "Complete item", "status": "pending"}
+                    ]
+                  }
+                }
+                """;
+        Timestamp created = Timestamp.from(Instant.parse("2026-06-03T01:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_mixed",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+
+        TaskPlanResponse response = assertDoesNotThrow(() -> service.getPlan(taskId));
+
+        // Bare string entry skipped → 2 items remain, in stored order.
+        assertEquals(2, response.plan().size());
+
+        TaskPlanResponse.PlanItem partial = response.plan().get(0);
+        assertNull(partial.id());
+        assertEquals("only a title", partial.title());
+        assertNull(partial.status());
+
+        TaskPlanResponse.PlanItem complete = response.plan().get(1);
+        assertEquals("step-ok", complete.id());
+        assertEquals("Complete item", complete.title());
+        assertEquals("pending", complete.status());
+    }
 }

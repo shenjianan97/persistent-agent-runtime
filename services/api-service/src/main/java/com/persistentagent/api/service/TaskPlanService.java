@@ -6,8 +6,7 @@ import com.persistentagent.api.exception.TaskNotFoundException;
 import com.persistentagent.api.model.response.TaskPlanResponse;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.util.DateTimeUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.persistentagent.api.util.JsonParseUtil;
 import org.springframework.stereotype.Service;
 
 import java.time.OffsetDateTime;
@@ -34,8 +33,6 @@ import java.util.UUID;
  */
 @Service
 public class TaskPlanService {
-
-    private static final Logger log = LoggerFactory.getLogger(TaskPlanService.class);
 
     private final TaskRepository taskRepository;
     private final ObjectMapper objectMapper;
@@ -93,9 +90,8 @@ public class TaskPlanService {
     // Plan extraction from checkpoint_payload.channel_values.plan
     // -------------------------------------------------------------------------
 
-    @SuppressWarnings("unchecked")
     private List<TaskPlanResponse.PlanItem> extractPlanItems(Object payload) {
-        Map<String, Object> parsed = parsePayload(payload);
+        Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, payload);
         if (parsed == null) {
             return Collections.emptyList();
         }
@@ -103,7 +99,7 @@ public class TaskPlanService {
         if (!(channelValues instanceof Map<?, ?> channelMap)) {
             return Collections.emptyList();
         }
-        Object planRaw = ((Map<String, Object>) channelMap).get("plan");
+        Object planRaw = channelMap.get("plan");
         if (!(planRaw instanceof List<?> planList)) {
             return Collections.emptyList();
         }
@@ -112,38 +108,12 @@ public class TaskPlanService {
             if (!(entry instanceof Map<?, ?> itemMap)) {
                 continue;
             }
-            Map<String, Object> item = (Map<String, Object>) itemMap;
-            String id = asString(item.get("id"));
-            String title = asString(item.get("title"));
-            String status = asString(item.get("status"));
+            String id = asString(itemMap.get("id"));
+            String title = asString(itemMap.get("title"));
+            String status = asString(itemMap.get("status"));
             items.add(new TaskPlanResponse.PlanItem(id, title, status));
         }
         return Collections.unmodifiableList(items);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> parsePayload(Object payload) {
-        if (payload == null) {
-            return null;
-        }
-        if (payload instanceof Map<?, ?> map) {
-            return (Map<String, Object>) map;
-        }
-        String json;
-        if (payload instanceof org.postgresql.util.PGobject pg) {
-            json = pg.getValue();
-        } else {
-            json = payload.toString();
-        }
-        if (json == null || json.isBlank()) {
-            return null;
-        }
-        try {
-            return objectMapper.readValue(json, Map.class);
-        } catch (Exception e) {
-            log.warn("Failed to parse checkpoint_payload JSON in TaskPlanService: {}", e.getMessage());
-            return null;
-        }
     }
 
     private static String asString(Object value) {

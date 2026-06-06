@@ -209,7 +209,9 @@ public class TaskController {
      * agent has not called {@code plan_write} yet (or no checkpoint written).
      *
      * <p>404 when the task does not exist OR belongs to another tenant.
-     * No POST/PUT/PATCH/DELETE counterpart — plan mutation is the worker's surface.
+     * No POST/PUT/PATCH/DELETE counterpart — plan mutation is Workflow's
+     * surface (Phase 3); the worker's {@code plan_write} tool is the
+     * agent-write path.
      */
     @GetMapping("/{taskId}/plan")
     public ResponseEntity<TaskPlanResponse> getTaskPlan(@PathVariable UUID taskId) {

@@ -13,7 +13,10 @@ import java.util.UUID;
  * <p>Projects the {@code plan} channel from the latest root checkpoint. Items
  * are returned in stored order (worker-written insertion order). The
  * {@code updated_at} field reflects the {@code created_at} of the checkpoint
- * the plan was projected from; it is {@code null} when no checkpoint exists yet.
+ * the plan was projected from; when no checkpoint exists yet it is {@code null}
+ * in Java and — via the class-level {@code @JsonInclude(NON_NULL)} — OMITTED
+ * from the JSON response entirely. Clients should type it as optional
+ * ({@code updated_at?: string}), not {@code string | null}.
  *
  * <p>An empty {@code plan} list is always a 200 — it means the agent has not
  * called {@code plan_write} yet (or the plan channel is absent in the latest
