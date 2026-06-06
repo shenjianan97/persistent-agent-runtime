@@ -55,6 +55,7 @@ from executor.compaction.tokens import (
     extract_text_content as _extract_message_text,
 )
 from executor.compaction.summarizer import summarize_slice
+from executor.plan_injection import inject_plan_block
 from executor.prompt_cache import TokenUsage, get_strategy as _get_cache_strategy
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
@@ -1399,6 +1400,18 @@ class GraphExecutor:
                 platform_system_message=platform_system_msg if platform_system_msg else None,
                 summarizer_context_window=_summarizer_context_window,
             )
+            # Planning Primitive (Task P2) — re-inject the agent's durable
+            # plan channel into the projection. AFTER the compaction hook
+            # (the block is rebuilt from state every turn, so Tier 1/3 can
+            # never summarise it away) and BEFORE cache markers (the
+            # strategies skip the tagged block when placing breakpoints, so
+            # it sits in the uncached suffix and a plan edit re-prefills
+            # only the block itself — see executor/plan_injection.py).
+            # Empty/absent plan → byte-identical pass-through. Projection-
+            # only: ``state["messages"]`` (the journal) is never touched.
+            projected_messages = inject_plan_block(
+                pass_result.messages, state.get("plan")
+            )
             # The compaction hook produced the final projection; layer
             # provider-specific prompt-cache markers on top before the LLM
             # call. The strategy returns a new list so the pre-marker shape
@@ -1410,10 +1423,10 @@ class GraphExecutor:
             # correctly.
             if _apply_cache_markers:
                 messages_for_llm = _cache_strategy.apply_cache_markers(
-                    pass_result.messages
+                    projected_messages
                 )
             else:
-                messages_for_llm = list(pass_result.messages)
+                messages_for_llm = list(projected_messages)
             compaction_state_updates = pass_result.state_updates
 
             # Emit structured-log events from the hook and raise immediately

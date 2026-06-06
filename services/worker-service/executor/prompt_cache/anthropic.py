@@ -21,6 +21,17 @@ without spending breakpoints we can't justify:
    tail on turn ``N`` becomes an interior prefix, and the request enjoys a
    cache hit for everything up to that point.
 
+Both scans skip the Planning Primitive's injected plan block
+(``executor.plan_injection.is_plan_block`` — Task P2). The plan block is a
+per-call projection addendum whose bytes change whenever the agent rewrites
+its plan; it must live in the **uncached suffix** after both breakpoints.
+Marking it as the trailing-system breakpoint would invalidate the whole
+conversation cache on every plan edit, and marking it as the tail breakpoint
+would store a sliding-window entry ending in mutable bytes that the next
+turn's prompt never prefix-matches — either way a full re-prefill per turn
+for planning agents. Untagged messages are unaffected, so non-planning
+traffic marks exactly as before.
+
 Content reshaping
 -----------------
 Anthropic requires cache markers to live on individual content blocks, so
@@ -48,6 +59,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
+from executor.plan_injection import is_plan_block
 from executor.prompt_cache.strategy import PromptCacheStrategy, TokenUsage
 
 
@@ -125,7 +137,9 @@ class AnthropicPromptCacheStrategy(PromptCacheStrategy):
         out = list(messages)
         last_system_idx: int | None = None
         for idx in range(len(out) - 1, -1, -1):
-            if isinstance(out[idx], SystemMessage):
+            if isinstance(out[idx], SystemMessage) and not is_plan_block(
+                out[idx]
+            ):
                 last_system_idx = idx
                 break
 
@@ -133,11 +147,17 @@ class AnthropicPromptCacheStrategy(PromptCacheStrategy):
             out[last_system_idx] = _mark_message(out[last_system_idx])
 
         # Mark the tail message too — gives us the sliding-window breakpoint.
-        # Skip the SystemMessage case (already marked) to avoid double-
-        # marking when the projection is system-only (shouldn't happen in the
-        # real agent loop, but be defensive).
-        tail_idx = len(out) - 1
-        if tail_idx != last_system_idx:
+        # Walk back past plan blocks (Task P2 — they must stay in the
+        # uncached suffix; see module docstring). Skip the SystemMessage
+        # case (already marked) to avoid double-marking when the projection
+        # is system-only (shouldn't happen in the real agent loop, but be
+        # defensive).
+        tail_idx: int | None = None
+        for idx in range(len(out) - 1, -1, -1):
+            if not is_plan_block(out[idx]):
+                tail_idx = idx
+                break
+        if tail_idx is not None and tail_idx != last_system_idx:
             out[tail_idx] = _mark_message(out[tail_idx])
 
         return out

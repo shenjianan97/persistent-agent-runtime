@@ -30,6 +30,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
+from executor.plan_injection import is_plan_block
 from executor.prompt_cache.anthropic import AnthropicPromptCacheStrategy
 
 
@@ -163,15 +164,24 @@ class BedrockPromptCacheStrategy(AnthropicPromptCacheStrategy):
         out = list(messages)
         last_system_idx: int | None = None
         for idx in range(len(out) - 1, -1, -1):
-            if isinstance(out[idx], SystemMessage):
+            if isinstance(out[idx], SystemMessage) and not is_plan_block(
+                out[idx]
+            ):
                 last_system_idx = idx
                 break
 
         if last_system_idx is not None:
             out[last_system_idx] = _mark_message(out[last_system_idx])
 
-        tail_idx = len(out) - 1
-        if tail_idx != last_system_idx:
+        # Walk back past Planning Primitive plan blocks (Task P2) — they
+        # must stay in the uncached suffix; see the Anthropic strategy's
+        # module docstring for the full rationale.
+        tail_idx: int | None = None
+        for idx in range(len(out) - 1, -1, -1):
+            if not is_plan_block(out[idx]):
+                tail_idx = idx
+                break
+        if tail_idx is not None and tail_idx != last_system_idx:
             out[tail_idx] = _mark_message(out[tail_idx])
 
         return out
