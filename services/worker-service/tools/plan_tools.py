@@ -23,6 +23,10 @@ Exceeding either cap is a tool-layer rejection (returns a structured error the
 LLM can correct), not silent truncation.  This resolves the design's open
 question "Plan size limits".
 
+**Ids must be unique within a plan** — they are the stable-identity key that
+P3's read API and P4's Console ``data-testid="plan-item-{id}"`` key on;
+duplicates are a tool-layer rejection.
+
 **One-in-progress NOT enforced:** the tool accepts zero, one, or many
 ``in_progress`` items without complaint.  Exactly-one-``in_progress`` is
 prompt-layer guidance delivered in P2's injected preamble.
@@ -31,7 +35,7 @@ prompt-layer guidance delivered in P2's injected preamble.
 from __future__ import annotations
 
 import logging
-from typing import Annotated
+from typing import Annotated, Literal, get_args
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, StructuredTool
@@ -53,8 +57,16 @@ PLAN_MAX_ITEMS: int = 50
 #: Resolves design open item "Plan size limits: content length".
 PLAN_MAX_TITLE_CHARS: int = 200
 
+#: Canonical status enum. ``PlanItem.status`` is typed with this Literal and
+#: ``VALID_STATUSES`` is DERIVED from it — single source of truth, so the two
+#: validation layers (pydantic args schema + ``validate_plan_items``) cannot
+#: drift.
+PlanStatus = Literal["pending", "in_progress", "completed"]
+
 #: Valid values for item ``status``.  Any other value is a tool-layer rejection.
-VALID_STATUSES: frozenset[str] = frozenset({"pending", "in_progress", "completed"})
+#: Derived from :data:`PlanStatus` so the LLM-visible enum and the dict-level
+#: validator always agree.
+VALID_STATUSES: frozenset[str] = frozenset(get_args(PlanStatus))
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +88,31 @@ class PlanWriteError(ValueError):
 
 
 class PlanItem(BaseModel):
-    """A single plan item.
+    """A single plan item — the element type of ``PlanWriteArguments.items``.
 
     ``id`` is agent-supplied so a rewrite can preserve item identity across
     calls (the design favors agent-supplied ids so P3's API and P4's Console
-    ``data-testid="plan-item-{id}"`` key on them).
+    ``data-testid="plan-item-{id}"`` key on them).  **Ids must be unique
+    within a plan** — downstream surfaces key on them; duplicates are rejected
+    by :func:`validate_plan_items`.
+
+    Validation layering (documented decision): this model's constraints
+    *derive from the same constants* as :func:`validate_plan_items`
+    (``PLAN_MAX_TITLE_CHARS`` referenced directly; ``status`` typed as
+    :data:`PlanStatus`, from which ``VALID_STATUSES`` is derived) — the two
+    layers cannot drift.  On the LLM path, pydantic parsing is the first gate
+    (structured schema, typed errors); ``validate_plan_items`` is the
+    authoritative dict-level enforcer the handler always runs, and the only
+    place for cross-item rules (item-count cap, duplicate ids).
     """
 
     id: str = Field(
         ...,
         min_length=1,
         description=(
-            "Stable identifier supplied by the agent. Preserved across rewrites "
-            "so the read API and Console can track item identity."
+            "Stable identifier supplied by the agent, unique within the plan. "
+            "Preserved across rewrites so the read API and Console can track "
+            "item identity."
         ),
     )
     title: str = Field(
@@ -99,7 +123,7 @@ class PlanItem(BaseModel):
             f"The item text. Max {PLAN_MAX_TITLE_CHARS} characters."
         ),
     )
-    status: str = Field(
+    status: PlanStatus = Field(
         ...,
         description=(
             "Item status. Must be one of: pending, in_progress, completed."
@@ -126,14 +150,18 @@ PLAN_WRITE_DESCRIPTION: str = (
 class PlanWriteArguments(BaseModel):
     """Input schema for ``plan_write``.
 
-    ``items`` is the *entire* plan — full-list replace semantics.
+    ``items`` is the *entire* plan — full-list replace semantics.  It is
+    **required** (no default): a malformed call that omits ``items`` is a
+    schema error the LLM can correct, NOT a silent plan-clear.  Clearing the
+    plan requires an explicit ``items=[]``.
     """
 
-    items: list[dict] = Field(
-        default_factory=list,
+    items: list[PlanItem] = Field(
+        ...,
         description=(
             "The complete plan as a list of {id, title, status} items. "
-            "Replaces the current plan entirely."
+            "Replaces the current plan entirely. Pass [] explicitly to "
+            "clear the plan."
         ),
     )
     # Injected by ToolNode at runtime; hidden from the LLM schema so the model
@@ -148,19 +176,32 @@ class PlanWriteArguments(BaseModel):
 
 
 def validate_plan_items(items: list[dict]) -> None:
-    """Validate a list of plan items.
+    """Validate a list of plan items (dict-level — the authoritative enforcer).
 
     Raises :class:`PlanWriteError` on the first structural violation.
     Validation rules:
 
     * Item count ≤ ``PLAN_MAX_ITEMS`` (50).
-    * Each item has a ``title`` and ``status``.
+    * Each item has a non-empty string ``id``, ``title``, and ``status``
+      (non-string values are rejected with an error naming the field and the
+      expected type — never a bare ``TypeError``).
     * ``status`` must be in ``VALID_STATUSES`` (``pending`` | ``in_progress`` |
       ``completed``).
     * ``title`` length ≤ ``PLAN_MAX_TITLE_CHARS`` (200 characters).
+    * **Ids must be unique within the plan.** They are the stable-identity
+      key the read API (P3) and the Console's ``data-testid="plan-item-{id}"``
+      (P4) key on — duplicates would break that contract, so they are
+      rejected.
 
     **Does NOT enforce exactly-one-``in_progress``.**  That rule is
     prompt-layer guidance delivered in P2's injected preamble.
+
+    Layering note: on the LLM invoke path the pydantic args schema
+    (:class:`PlanItem`) has already enforced the per-item rules — both layers
+    derive from the same constants so they cannot drift.  This function is
+    kept as the dict-level single source of truth for direct callers (tests,
+    future projections) and is the only place for cross-item rules (count
+    cap, duplicate ids).
 
     :param items: List of plan item dicts, each expected to have ``id``,
         ``title``, and ``status`` keys.
@@ -173,35 +214,52 @@ def validate_plan_items(items: list[dict]) -> None:
             f"{PLAN_MAX_ITEMS} items."
         )
 
+    seen_ids: set[str] = set()
     for i, item in enumerate(items):
-        # Validate status
-        status = item.get("status")
-        if status not in VALID_STATUSES:
-            allowed = ", ".join(sorted(VALID_STATUSES))
+        # Validate id — must be a non-empty string (type-checked first so a
+        # non-string never reaches truthiness/len with a confusing TypeError).
+        id_ = item.get("id")
+        if not isinstance(id_, str) or not id_:
             raise PlanWriteError(
-                f"plan_write rejected: item {i} has invalid status "
-                f"{status!r}. Allowed values: {allowed}."
+                f"plan_write rejected: item {i} field 'id' must be a "
+                f"non-empty string, got {id_!r}."
             )
 
-        # Validate title length
-        title = item.get("title", "")
+        # Duplicate-id check — ids are the stable-identity key downstream
+        # surfaces (P3 API, P4 Console data-testid) key on.
+        if id_ in seen_ids:
+            raise PlanWriteError(
+                f"plan_write rejected: duplicate item id {id_!r}. Ids must "
+                f"be unique within the plan — they identify items across "
+                f"rewrites."
+            )
+        seen_ids.add(id_)
+
+        # Validate title — must be a non-empty string within the cap.
+        title = item.get("title")
+        if not isinstance(title, str) or not title:
+            raise PlanWriteError(
+                f"plan_write rejected: item {i} field 'title' must be a "
+                f"non-empty string, got {title!r}."
+            )
         if len(title) > PLAN_MAX_TITLE_CHARS:
             raise PlanWriteError(
                 f"plan_write rejected: item {i} title is {len(title)} "
                 f"characters, which exceeds the {PLAN_MAX_TITLE_CHARS}-character cap."
             )
 
-        # Validate title is present (missing title key or empty string)
-        if not title:
+        # Validate status — must be a string in the enum.
+        status = item.get("status")
+        if not isinstance(status, str):
             raise PlanWriteError(
-                f"plan_write rejected: item {i} has a missing or empty title."
+                f"plan_write rejected: item {i} field 'status' must be a "
+                f"string, got {status!r}."
             )
-
-        # Validate id is present
-        id_ = item.get("id")
-        if not id_:
+        if status not in VALID_STATUSES:
+            allowed = ", ".join(sorted(VALID_STATUSES))
             raise PlanWriteError(
-                f"plan_write rejected: item {i} has a missing or empty id."
+                f"plan_write rejected: item {i} has invalid status "
+                f"{status!r}. Allowed values: {allowed}."
             )
 
 
@@ -211,7 +269,7 @@ def validate_plan_items(items: list[dict]) -> None:
 
 
 def _plan_write_handler(
-    items: list[dict],
+    items: list,
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> Command:
     """Handle a ``plan_write`` tool call.
@@ -220,6 +278,12 @@ def _plan_write_handler(
     ``state["plan"]`` via a LangGraph ``Command`` update, and returns a
     short confirmation ``ToolMessage`` so the LLM knows the write landed.
 
+    On the LLM invoke path the args schema has parsed each item into a
+    :class:`PlanItem`; those are dumped back to plain dicts before the write
+    so the checkpoint JSONB stays codec-free — the dict content is identical
+    to what the LLM sent (verbatim contract preserved).  Direct callers may
+    pass plain dicts, which flow through unchanged.
+
     **Does NOT transform, re-order, or normalize item content** beyond
     validation.  The plan channel is written verbatim.
 
@@ -227,11 +291,18 @@ def _plan_write_handler(
     ``Command``'s ``messages`` update — without it the next agent step
     rejects the orphan tool call as a fatal graph error.
     """
+    # Normalize PlanItem models (LLM invoke path) to plain dicts; plain dicts
+    # (direct callers) pass through unchanged.
+    plain_items: list[dict] = [
+        item.model_dump() if isinstance(item, PlanItem) else item
+        for item in items
+    ]
+
     # Validate — raises PlanWriteError on violation (ToolNode surfaces it back
     # to the agent as a tool-result error so the graph stays in-loop).
-    validate_plan_items(items)
+    validate_plan_items(plain_items)
 
-    item_count = len(items)
+    item_count = len(plain_items)
     logger.debug(
         "plan.write.applied item_count=%d",
         item_count,
@@ -249,7 +320,7 @@ def _plan_write_handler(
             )
         ],
         # Write the plan verbatim — full-list replace.
-        "plan": items,
+        "plan": plain_items,
     })
 
 
@@ -282,6 +353,7 @@ __all__ = [
     "PLAN_WRITE_DESCRIPTION",
     "VALID_STATUSES",
     "PlanItem",
+    "PlanStatus",
     "PlanWriteArguments",
     "PlanWriteError",
     "build_plan_write_tool",

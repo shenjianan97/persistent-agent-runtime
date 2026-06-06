@@ -13,21 +13,29 @@ Covered contracts:
    tool does NOT enforce exactly-one-in-progress (that is prompt-layer).
 5. **``plan_write`` validation — item cap** — 51 items rejected, 50 succeed.
 6. **``plan_write`` validation — title cap** — title > 200 chars rejected.
-7. **``plan_write`` registration gate** — appears in ``_get_tools`` output
-   iff ``"plan_write"`` is in the allowlist; absent → tool not in the list.
+7. **``plan_write`` validation — wrong types** — non-string ``title`` /
+   unhashable ``status`` / non-string ``id`` produce actionable
+   ``PlanWriteError`` messages, never bare ``TypeError``.
+8. **``plan_write`` validation — duplicate ids rejected** — ids are the
+   stable-identity key for P3's API and P4's ``data-testid="plan-item-{id}"``.
+9. **Input schema** — ``items`` is REQUIRED in the LLM-visible schema (a
+   malformed ``plan_write({})`` must not silently clear the plan), and the
+   ``PlanItem`` model is wired in so the LLM sees a structured item shape.
+10. **``plan_write`` registration gate** — appears in ``_get_tools`` output
+    iff ``"plan_write"`` is in the allowlist; absent → tool not in the list.
 
 These tests are pure-Python / in-process — no network, no DB, no LLM.
 """
 
 from __future__ import annotations
 
-import asyncio
 from typing import get_type_hints
 
 import pytest
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import Command
+from pydantic import ValidationError
 
 from executor.compaction.state import RuntimeState, _plan_replace_reducer
 from tools.plan_tools import (
@@ -55,18 +63,11 @@ def _make_item(
     return {"id": id_, "title": title, "status": status}
 
 
-def _make_tool() -> StructuredTool:
-    """Build a ``plan_write`` StructuredTool with a dummy tool_call_id injected."""
-    return build_plan_write_tool()
-
-
-async def _call_plan_write(items: list[dict], *, tool_call_id: str = "tc-1") -> Command:
-    """Invoke the ``plan_write`` handler directly, simulating ToolNode injection."""
-    tool = _make_tool()
-    # StructuredTool.func or .coroutine is the handler. The args_schema is
-    # PlanWriteArguments; we call the handler with parsed args directly.
-    handler = tool.func  # plan_write is sync (returns Command, no I/O)
-    return handler(items=items, tool_call_id=tool_call_id)
+def _call_plan_write(items: list, *, tool_call_id: str = "tc-1") -> Command:
+    """Invoke the ``plan_write`` handler directly (sync — no I/O), simulating
+    ToolNode injection of ``tool_call_id``."""
+    tool = build_plan_write_tool()
+    return tool.func(items=items, tool_call_id=tool_call_id)
 
 
 # ---------------------------------------------------------------------------
@@ -136,18 +137,14 @@ class TestPlanWriteHappyPath:
             {"id": "p2", "title": "Draft solution", "status": "in_progress"},
             {"id": "p3", "title": "Test and review", "status": "pending"},
         ]
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write(items)
-        )
+        result = _call_plan_write(items)
         assert isinstance(result, Command)
         # plan channel must be set to the exact items (verbatim)
         assert result.update["plan"] == items  # type: ignore[index]
 
     def test_confirmation_message_includes_item_count(self) -> None:
         items = [_make_item(f"item-{i}") for i in range(5)]
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write(items)
-        )
+        result = _call_plan_write(items)
         messages = result.update["messages"]  # type: ignore[index]
         assert len(messages) == 1
         assert isinstance(messages[0], ToolMessage)
@@ -156,24 +153,19 @@ class TestPlanWriteHappyPath:
 
     def test_tool_call_id_is_paired_in_tool_message(self) -> None:
         items = [_make_item()]
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write(items, tool_call_id="my-tc-id")
-        )
+        result = _call_plan_write(items, tool_call_id="my-tc-id")
         messages = result.update["messages"]  # type: ignore[index]
         assert messages[0].tool_call_id == "my-tc-id"
 
     def test_single_pending_item_accepted(self) -> None:
         items = [{"id": "only", "title": "Only item", "status": "pending"}]
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write(items)
-        )
+        result = _call_plan_write(items)
         assert result.update["plan"] == items  # type: ignore[index]
 
-    def test_empty_list_accepted(self) -> None:
-        """Clearing the plan (empty list) is valid."""
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write([])
-        )
+    def test_explicit_empty_list_clears_plan(self) -> None:
+        """Clearing the plan with an EXPLICIT empty list is valid (distinct
+        from a malformed call that omits ``items`` — see the schema tests)."""
+        result = _call_plan_write([])
         assert result.update["plan"] == []  # type: ignore[index]
 
     def test_items_written_verbatim_not_reordered(self) -> None:
@@ -181,15 +173,77 @@ class TestPlanWriteHappyPath:
             {"id": "z", "title": "Last alphabetically", "status": "pending"},
             {"id": "a", "title": "First alphabetically", "status": "pending"},
         ]
-        result = asyncio.get_event_loop().run_until_complete(
-            _call_plan_write(items)
-        )
+        result = _call_plan_write(items)
         assert result.update["plan"] == items  # type: ignore[index]
         assert result.update["plan"][0]["id"] == "z"  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------
-# 3. Validation — bad status
+# 3. Input schema — items required + PlanItem wired in
+# ---------------------------------------------------------------------------
+
+
+class TestPlanWriteInputSchema:
+    """A malformed ``plan_write({})`` must NOT silently clear the plan — the
+    ``items`` argument is required in the LLM-visible schema. And the
+    ``PlanItem`` model is the items element type so the LLM sees a structured
+    {id, title, status} shape, not a free-form object."""
+
+    def test_items_is_required_in_llm_visible_schema(self) -> None:
+        tool = build_plan_write_tool()
+        schema = tool.tool_call_schema.model_json_schema()
+        assert "items" in (schema.get("required") or []), (
+            "items must be a required argument — otherwise plan_write({}) "
+            "silently clears the plan"
+        )
+
+    def test_arguments_model_rejects_missing_items(self) -> None:
+        with pytest.raises(ValidationError):
+            PlanWriteArguments(tool_call_id="tc-1")
+
+    def test_items_element_schema_is_structured(self) -> None:
+        """The LLM-visible schema for items elements must expose the
+        {id, title, status} structure (PlanItem), not a bare object."""
+        tool = build_plan_write_tool()
+        schema = tool.tool_call_schema.model_json_schema()
+        defs = schema.get("$defs", {})
+        assert "PlanItem" in defs
+        item_props = defs["PlanItem"]["properties"]
+        assert set(item_props) == {"id", "title", "status"}
+
+    def test_handler_accepts_plan_item_models_and_writes_plain_dicts(self) -> None:
+        """When the args schema parses items into PlanItem models, the handler
+        must dump them back to plain dicts so the checkpoint JSONB stays
+        codec-free — content identical to what the LLM sent."""
+        items = [PlanItem(id="a", title="Alpha", status="pending")]
+        result = _call_plan_write(items)
+        written = result.update["plan"]  # type: ignore[index]
+        assert written == [{"id": "a", "title": "Alpha", "status": "pending"}]
+        assert all(type(i) is dict for i in written)
+
+    def test_tool_invoke_end_to_end_parses_and_writes_dicts(self) -> None:
+        """Exercise the real StructuredTool invoke path (pydantic parse of
+        dicts → PlanItem → handler → plain-dict write)."""
+        tool = build_plan_write_tool()
+        items = [
+            {"id": "p1", "title": "First", "status": "in_progress"},
+            {"id": "p2", "title": "Second", "status": "pending"},
+        ]
+        result = tool.invoke(
+            {
+                "name": "plan_write",
+                "args": {"items": items},
+                "id": "tc-real",
+                "type": "tool_call",
+            }
+        )
+        assert isinstance(result, Command)
+        assert result.update["plan"] == items  # type: ignore[index]
+        assert all(type(i) is dict for i in result.update["plan"])  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# 4. Validation — bad status
 # ---------------------------------------------------------------------------
 
 
@@ -221,7 +275,61 @@ class TestPlanWriteStatusValidation:
 
 
 # ---------------------------------------------------------------------------
-# 4. Validation — two in_progress accepted (prompt-layer rule, not tool-layer)
+# 5. Validation — wrong types produce actionable errors, not TypeError
+# ---------------------------------------------------------------------------
+
+
+class TestPlanWriteTypeValidation:
+    def test_non_string_title_raises_plan_write_error(self) -> None:
+        items = [{"id": "x", "title": 123, "status": "pending"}]
+        with pytest.raises(PlanWriteError) as exc_info:
+            validate_plan_items(items)
+        msg = str(exc_info.value)
+        assert "title" in msg
+        assert "string" in msg
+
+    def test_unhashable_status_raises_plan_write_error(self) -> None:
+        items = [{"id": "x", "title": "Title", "status": ["in_progress"]}]
+        with pytest.raises(PlanWriteError) as exc_info:
+            validate_plan_items(items)
+        msg = str(exc_info.value)
+        assert "status" in msg
+        assert "string" in msg
+
+    def test_non_string_id_raises_plan_write_error(self) -> None:
+        items = [{"id": 7, "title": "Title", "status": "pending"}]
+        with pytest.raises(PlanWriteError) as exc_info:
+            validate_plan_items(items)
+        msg = str(exc_info.value)
+        assert "id" in msg
+        assert "string" in msg
+
+
+# ---------------------------------------------------------------------------
+# 6. Validation — duplicate ids rejected (stable-identity contract)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanWriteDuplicateIds:
+    def test_duplicate_ids_rejected_naming_the_id(self) -> None:
+        items = [
+            {"id": "dup", "title": "First", "status": "pending"},
+            {"id": "dup", "title": "Second", "status": "pending"},
+        ]
+        with pytest.raises(PlanWriteError) as exc_info:
+            validate_plan_items(items)
+        assert "dup" in str(exc_info.value)
+
+    def test_unique_ids_accepted(self) -> None:
+        items = [
+            {"id": "a", "title": "First", "status": "pending"},
+            {"id": "b", "title": "Second", "status": "pending"},
+        ]
+        validate_plan_items(items)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# 7. Validation — two in_progress accepted (prompt-layer rule, not tool-layer)
 # ---------------------------------------------------------------------------
 
 
@@ -250,7 +358,7 @@ class TestPlanWriteMultipleInProgressAccepted:
 
 
 # ---------------------------------------------------------------------------
-# 5. Validation — item cap (50 max)
+# 8. Validation — item cap (50 max)
 # ---------------------------------------------------------------------------
 
 
@@ -268,11 +376,11 @@ class TestPlanWriteItemCap:
     def test_51_items_via_tool_raises_error(self) -> None:
         items = [_make_item(f"item-{i}") for i in range(PLAN_MAX_ITEMS + 1)]
         with pytest.raises(PlanWriteError):
-            asyncio.get_event_loop().run_until_complete(_call_plan_write(items))
+            _call_plan_write(items)
 
 
 # ---------------------------------------------------------------------------
-# 6. Validation — title cap (200 chars max)
+# 9. Validation — title cap (200 chars max)
 # ---------------------------------------------------------------------------
 
 
@@ -290,11 +398,11 @@ class TestPlanWriteTitleCap:
     def test_201_char_title_via_tool_raises_error(self) -> None:
         items = [_make_item(title="x" * (PLAN_MAX_TITLE_CHARS + 1))]
         with pytest.raises(PlanWriteError):
-            asyncio.get_event_loop().run_until_complete(_call_plan_write(items))
+            _call_plan_write(items)
 
 
 # ---------------------------------------------------------------------------
-# 7. Registration gate in _get_tools
+# 10. Registration gate in _get_tools
 # ---------------------------------------------------------------------------
 
 
@@ -342,7 +450,7 @@ class TestPlanWriteRegistrationGate:
 
 
 # ---------------------------------------------------------------------------
-# 8. validate_plan_items — exportable helper
+# 11. validate_plan_items — exportable helper
 # ---------------------------------------------------------------------------
 
 
@@ -357,10 +465,10 @@ class TestValidatePlanItems:
 
     def test_missing_status_field_raises(self) -> None:
         items = [{"id": "a", "title": "Alpha"}]
-        with pytest.raises((PlanWriteError, KeyError, Exception)):
+        with pytest.raises(PlanWriteError):
             validate_plan_items(items)
 
     def test_missing_title_field_raises(self) -> None:
         items = [{"id": "a", "status": "pending"}]
-        with pytest.raises((PlanWriteError, KeyError, Exception)):
+        with pytest.raises(PlanWriteError):
             validate_plan_items(items)
