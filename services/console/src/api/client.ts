@@ -27,6 +27,7 @@ import {
     MemorySearchResponse,
     MemoryEntryResponse,
     ActivityListResponse,
+    TaskPlanResponse,
 } from '@/types';
 
 export class ApiError extends Error {
@@ -256,6 +257,10 @@ export const api = {
             `/v1/tasks/${encodeURIComponent(taskId)}/activity${query ? `?${query}` : ''}`,
         );
     },
+
+    /** Planning Primitive (P3) — fetch the agent's current plan for a task. */
+    getTaskPlan: (taskId: string) =>
+        fetchApi<TaskPlanResponse>(`/v1/tasks/${encodeURIComponent(taskId)}/plan`),
 
     // Tool Servers
     createToolServer: (request: ToolServerCreateRequest) =>

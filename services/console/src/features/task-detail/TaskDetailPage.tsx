@@ -9,6 +9,7 @@ import { useLangfuseEndpoints } from '@/features/settings/useLangfuseEndpoints';
 import { TaskStatusBadge } from './TaskStatusBadge';
 import { CostSummary } from './CostSummary';
 import { ActivityPane } from './ActivityPane';
+import { PlanChecklist } from './PlanChecklist';
 import { ApprovalPanel } from './ApprovalPanel';
 import { InputResponsePanel } from './InputResponsePanel';
 import { ArtifactsTab } from './ArtifactsTab';
@@ -308,6 +309,8 @@ export function TaskDetailPage() {
                             )}
                         </div>
                     )}
+
+                    <PlanChecklist taskId={taskId!} />
 
                     <div data-testid="task-detail-tabs" className="space-y-3">
                         <ActivityPane

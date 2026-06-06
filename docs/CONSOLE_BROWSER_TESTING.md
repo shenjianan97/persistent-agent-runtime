@@ -410,6 +410,29 @@ Steps:
 5. **Per-row expander reveals raw payload.** Locate a `marker.compaction_fired` row. Click `[data-testid="activity-row-<i>-expand"]` on that row. `[data-testid="activity-row-<i>-details"]` appears inline with a JSON blob containing `tokens_in`, `tokens_out`, and `turns_summarized`. Click the expander again; the details block disappears.
 6. **Polished surfaces visible when data warrants.** Scroll to a task that has tool calls + lifecycle markers + HITL pause/resume and assert each of the new `activity-*` testids is queryable when the underlying data is present: `activity-row-<i>-duration` on any assistant/tool row with a predecessor timestamp, `activity-row-<i>-cumulative-cost` on the 2nd+ assistant turn, `activity-handoff-<i>` when consecutive turns carry different `worker_id`s, `activity-row-<i>-byte-cap-notice` inside a tool-result fold whose `orig_bytes > content.length`, and `activity-running-indicator` on a non-terminal task (amber dot + "Awaiting approval…" / "Awaiting input…" when the tail is a HITL pause / input_requested). On a dead-lettered task, assert the lifecycle row promotes to a destructive banner ("Task failed — …"); on a redriven task, the lifecycle row promotes to a green "Resumed from checkpoint" banner. When the server caps the page, `activity-truncation-notice` renders at the top. Hovering a tool-call fold adds a ring to the matching `activity-row-<i>` tool-result row via shared `data-tool-call-id` (both elements carry the attribute). When the user scrolls up during a running task, `activity-jump-to-latest` appears; click it to snap back to the bottom.
 
+### Scenario 20: Plan Checklist on Task Detail
+
+Covers Planning Primitive track P4 — the `PlanChecklist` component on the task-detail page. Verifies that a task whose agent called `plan_write` renders a read-only checklist with one row per item, correct status badges, and that tasks without a plan render cleanly.
+
+Preconditions:
+- `make start` running; API at `:8080`, Console at `:5173`.
+- One completed task whose agent called `plan_write` at least once (produces a non-empty `GET /v1/tasks/:taskId/plan` response). If no such task exists, use the API to seed one or run a task against a planning-capable agent.
+- One completed task whose agent never called `plan_write` (produces `plan: []`).
+
+What to verify:
+
+1. **Populated plan renders.** Navigate to the task-detail page for the task with a plan. Assert `[data-testid="plan-checklist"]` is present. Assert one `[data-testid="plan-item-{id}"]` row per plan item returned by `GET /v1/tasks/:taskId/plan`, in the same order as the API response. Each row renders the item title text.
+
+2. **Checkbox state.** For each item whose status is `completed`, the row's checkbox is checked. For items with status `pending` or `in_progress`, the checkbox is unchecked.
+
+3. **Status badges.** Each row carries a badge element (`data-testid="plan-item-{id}-badge"`). The badge text distinguishes the three statuses: "completed", "in progress", "pending". At least two distinct badge texts are visible when the fixture task has items in different statuses.
+
+4. **Read-only.** Every checkbox is disabled. Clicking a checkbox produces no state change and no network request. There is no edit affordance.
+
+5. **Empty plan renders cleanly.** Navigate to the task-detail page for the task without a plan. Assert `[data-testid="plan-checklist"]` is **absent** (empty plan → render nothing). No error banner appears. `browser_console_messages` shows zero uncaught exceptions.
+
+6. `browser_console_messages` shows no uncaught exceptions across the full walkthrough.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -432,6 +455,7 @@ Steps:
 | Context window management / compaction observability | 1, 17 |
 | Task detail conversation log feature | 1, 18 |
 | Task detail unified Activity view | 1, 4, 18, 19 |
+| Task detail plan checklist feature | 1, 4, 20 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |

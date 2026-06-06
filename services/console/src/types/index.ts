@@ -156,6 +156,20 @@ export interface TaskObservabilityResponse {
     items: TaskObservabilityItemResponse[];
 }
 
+// Planning Primitive — P3 wire types (snake_case, mirrors Java DTO exactly)
+export interface PlanItem {
+    id: string;
+    title: string;
+    status: 'pending' | 'in_progress' | 'completed';
+}
+
+export interface TaskPlanResponse {
+    task_id: string;
+    plan: PlanItem[];
+    /** Omitted from JSON when null (Java @JsonInclude(NON_NULL)). */
+    updated_at?: string;
+}
+
 export interface DeadLetterItemResponse {
     task_id: string;
     agent_id: string;
