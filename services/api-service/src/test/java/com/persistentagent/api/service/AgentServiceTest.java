@@ -742,6 +742,137 @@ class AgentServiceTest {
                 "Jackson must reject unknown 'enabled' field inside context_management");
     }
 
+    // --- plan_write opt-in tool canonicalization tests ---
+
+    /**
+     * TDD RED: createAgent with plan_write in allowed_tools must store it alongside the base
+     * platform tools. Validates the OPT_IN_TOOLS preservation loop in canonicalizeConfig.
+     */
+    @Test
+    void createAgent_planWriteRequested_survivesCanonicalization() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a planning agent.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("plan_write"), null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Planning Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Planning Agent"),
+                jsonCaptor.capture(), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        // plan_write must survive — the opt-in tool is explicitly requested
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "plan_write must survive canonicalization when caller requests it; got: "
+                        + parsed.allowedTools());
+        // Base platform tools must also be present
+        assertTrue(parsed.allowedTools().containsAll(
+                com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS),
+                "Base platform tools must always be present; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * TDD RED: createAgent WITHOUT plan_write must NOT silently seed it — opt-in means
+     * the caller must ask for it explicitly.
+     */
+    @Test
+    void createAgent_planWriteNotRequested_notSeededInConfig() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "A plain agent.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("web_search"), null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Plain Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Plain Agent"),
+                jsonCaptor.capture(), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertFalse(parsed.allowedTools().contains("plan_write"),
+                "plan_write must NOT be seeded when caller did not request it; got: "
+                        + parsed.allowedTools());
+    }
+
+    /**
+     * TDD RED: OPT_IN_TOOLS must be a subset of ALLOWED_TOOLS and disjoint from
+     * BASE_PLATFORM_TOOLS — so opt-in tools pass validation but are NOT auto-added.
+     * Also validates that DEV_TASK_CONTROL_TOOLS and BASE_PLATFORM_TOOLS remain
+     * disjoint (existing auto-determine design is intact).
+     */
+    @Test
+    void validationConstants_optInToolsSubsetRelationship() {
+        // OPT_IN_TOOLS ⊆ ALLOWED_TOOLS
+        assertTrue(
+                com.persistentagent.api.config.ValidationConstants.ALLOWED_TOOLS.containsAll(
+                        com.persistentagent.api.config.ValidationConstants.OPT_IN_TOOLS),
+                "Every OPT_IN_TOOLS entry must appear in ALLOWED_TOOLS for validation to pass");
+
+        // OPT_IN_TOOLS ∩ BASE_PLATFORM_TOOLS = ∅ (opt-in means not auto-added)
+        java.util.Set<String> overlap = new java.util.HashSet<>(
+                com.persistentagent.api.config.ValidationConstants.OPT_IN_TOOLS);
+        overlap.retainAll(com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS);
+        assertTrue(overlap.isEmpty(),
+                "OPT_IN_TOOLS must be disjoint from BASE_PLATFORM_TOOLS; overlap: " + overlap);
+
+        // plan_write is in OPT_IN_TOOLS
+        assertTrue(
+                com.persistentagent.api.config.ValidationConstants.OPT_IN_TOOLS.contains("plan_write"),
+                "plan_write must be in OPT_IN_TOOLS");
+    }
+
+    /**
+     * TDD RED: updateAgent with plan_write in allowed_tools must keep it after PUT
+     * (full-config replacement semantics — the caller sends the complete config each time).
+     */
+    @Test
+    void updateAgent_planWriteRequested_survivesCanonicalization() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "Updated planning agent.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("plan_write"), null, null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Map<String, Object> existingRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "planning-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("planning-agent"), eq("Planning Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        agentService.updateAgent("planning-agent", request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        // PUT full-config semantics: the caller explicitly includes plan_write, so it must survive
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "plan_write must survive PUT canonicalization when caller explicitly includes it; got: "
+                        + parsed.allowedTools());
+    }
+
     // --- helpers ---
 
     private Map<String, Object> buildAgentRow(String agentId, String displayName, String status) {

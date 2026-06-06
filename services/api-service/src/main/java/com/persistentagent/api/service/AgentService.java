@@ -200,6 +200,19 @@ public class AgentService {
                 }
             }
         }
+        // Preserve opt-in tools explicitly requested by the caller (e.g. plan_write for the
+        // Planning Primitive). These are validated entries that are NOT seeded by default — they
+        // activate optional platform capabilities only when the agent owner opts in. No feature
+        // flag required (unlike DEV_TASK_CONTROL_TOOLS): if the caller asks for it and it passed
+        // validation, it is preserved.
+        if (config.allowedTools() != null) {
+            for (String tool : config.allowedTools()) {
+                if (ValidationConstants.OPT_IN_TOOLS.contains(tool)
+                        && !canonicalizedTools.contains(tool)) {
+                    canonicalizedTools.add(tool);
+                }
+            }
+        }
 
         // Memory sub-object round-trip: preserve verbatim when present, omit
         // when absent. No platform defaults are written into the canonical

@@ -10,21 +10,14 @@ read-only projection contract:
   ``{task_id, plan: [{id, title, status}, ...], updated_at}`` with items in
   written order and fields verbatim.
 
-  **KNOWN DEFECT (surfaced by this test, P5 integration):**
-  ``AgentService.canonicalizeConfig``
-  (``services/api-service/.../service/AgentService.java`` ~:186-205,
-  pre-existing Track-2-era code) REPLACES the caller's ``allowed_tools``
-  with ``ValidationConstants.BASE_PLATFORM_TOOLS`` (+ sandbox/dev tools) —
-  it never preserves other validated entries. P3 added ``plan_write`` to
-  ``ALLOWED_TOOLS`` so validation passes, but canonicalization silently
-  strips it, so **the Planning Primitive cannot be activated through the
-  public agent API**. ``test_plan_write_allowlist_survives_agent_creation``
-  is the strict-xfail tripwire pinning the defect (it XPASSes — failing
-  the suite and forcing marker removal — the moment canonicalization is
-  fixed). The populated-shape test below seeds ``allowed_tools`` directly
-  in the agents row as a documented workaround so P1's tool path and P3's
-  projection are still proven end-to-end through the real worker +
-  Postgres checkpoints.
+  The activation defect (P5 finding) where ``AgentService.canonicalizeConfig``
+  silently stripped ``plan_write`` has been fixed: ``ValidationConstants``
+  now defines ``OPT_IN_TOOLS`` and ``canonicalizeConfig`` preserves any
+  opt-in tool explicitly requested by the caller.
+  ``test_plan_write_allowlist_survives_agent_creation`` is a plain passing
+  test that verifies this path (no longer a strict-xfail tripwire).
+  The populated-shape test creates its agent through the real API with
+  ``allowed_tools: ["plan_write"]``.
 * **Empty:** a task whose agent never calls ``plan_write`` returns
   200 ``{plan: []}`` — never a 404. (Also covers supervisor-style tasks
   that have checkpoints but no ``plan`` channel.)
@@ -106,49 +99,19 @@ def plan_write_then_final(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFECT (P5 finding): AgentService.canonicalizeConfig replaces the "
-        "requested allowed_tools with BASE_PLATFORM_TOOLS, silently dropping "
-        "plan_write — the Planning Primitive cannot be activated through the "
-        "public agent API. Fix canonicalizeConfig to preserve validated "
-        "non-base entries (or add an explicit opt-in), then this test XPASSes "
-        "and the marker must be removed."
-    ),
-)
 @pytest.mark.asyncio
 async def test_plan_write_allowlist_survives_agent_creation(e2e):
-    """Public-path tripwire: ``POST /v1/agents`` with
+    """Public-path verification: ``POST /v1/agents`` with
     ``allowed_tools: ["plan_write"]`` must round-trip the entry into the
     stored agent config (the plan's §A6 activation path: "the Planning
     Primitive activates only when plan_write is in an agent's tool
-    allowlist")."""
+    allowlist"). Fixed by adding OPT_IN_TOOLS to canonicalizeConfig
+    (activation defect resolved 2026-06-06)."""
     resp = e2e.ensure_agent(agent_config=PLANNING_AGENT_CONFIG)
     agent_id = resp["body"]["agent_id"]
     stored = e2e.api.get_agent(agent_id)["body"]["agent_config"]
     assert "plan_write" in stored.get("allowed_tools", []), (
         f"plan_write stripped by canonicalization: {stored.get('allowed_tools')}"
-    )
-
-
-async def _seed_plan_write_allowlist(e2e, agent_id: str) -> None:
-    """Workaround for the canonicalization defect documented above: put
-    ``plan_write`` into the stored agent row directly so the task snapshot
-    (taken from the row at submit time) carries it to the worker. Remove
-    once ``test_plan_write_allowlist_survives_agent_creation`` XPASSes."""
-    import json
-
-    await e2e.db.execute(
-        """
-        UPDATE agents
-        SET agent_config = jsonb_set(
-            agent_config::jsonb, '{allowed_tools}', $1::jsonb
-        )
-        WHERE agent_id = $2
-        """,
-        json.dumps(["plan_write"]),
-        agent_id,
     )
 
 
@@ -162,8 +125,8 @@ async def test_plan_populated_after_stub_agent_writes_plan(e2e):
     e2e.use_llm(plan_write_then_final(PLAN_ITEMS))
     await e2e.start_worker("e2e-plan-populated-worker")
 
-    resp = e2e.ensure_agent(agent_config=PLANNING_AGENT_CONFIG)
-    await _seed_plan_write_allowlist(e2e, resp["body"]["agent_id"])
+    # plan_write now survives canonicalization via OPT_IN_TOOLS — no DB workaround needed.
+    e2e.ensure_agent(agent_config=PLANNING_AGENT_CONFIG)
     task_id = e2e.submit_task(input="Plan the work, then do it.")
     await e2e.wait_for_status(task_id, "completed", timeout=30.0)
 

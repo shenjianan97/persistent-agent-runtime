@@ -36,6 +36,16 @@ public final class ValidationConstants {
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
 
+    /**
+     * Opt-in tools: validated (present in {@link #ALLOWED_TOOLS}) but NOT seeded by default.
+     * Unlike {@link #BASE_PLATFORM_TOOLS} (always present) and {@link #DEV_TASK_CONTROL_TOOLS}
+     * (require the dev flag), these are preserved by {@code canonicalizeConfig} only when the
+     * caller explicitly requests them. Opt-in tools activate optional platform capabilities
+     * (e.g., plan_write for the Planning Primitive) that should not appear on agents that have
+     * not opted in.
+     */
+    public static final Set<String> OPT_IN_TOOLS = Set.of("plan_write");
+
     /** Allowed dead-letter reasons matching the database constraint.
      *
      * <p>Must stay in sync with {@link DeadLetterReason} and with the latest
