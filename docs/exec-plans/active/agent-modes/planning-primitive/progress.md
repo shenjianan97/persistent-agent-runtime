@@ -6,7 +6,7 @@ Statuses: `Not started` · `In progress` · `Done` · `Blocked`.
 
 | Task | Description | Status | Note |
 |---|---|---|---|
-| P1 | `RuntimeState.plan` (full-replace reducer) + `plan_write` tool + v1 caps | Not started | blocker for P2/P3; low-risk, ready to start |
+| P1 | `RuntimeState.plan` (full-replace reducer) + `plan_write` tool + v1 caps | Done | 33 unit tests pass; state schema updated to 14 fields |
 | P2 | Post-compaction plan injection as a neutral Markdown `SystemMessage` | Not started | depends on P1 |
 | P3 | `GET /v1/tasks/{id}/plan` read-only projection | Not started | depends on P1 (item shape); Java-only |
 | P4 | Console plan checklist + `api.getTaskPlan` fetch hook | Not started | depends on P1..P3 |

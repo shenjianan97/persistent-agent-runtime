@@ -118,8 +118,8 @@ class TestRuntimeStateSchemaShape:
                 "the Track 7 Follow-up (Task 3) pipeline rewrite."
             )
 
-    def test_exactly_thirteen_fields(self) -> None:
-        """Shape: 5 Track 5 + 2 issue-#108 snapshots + 6 compaction = 13 total.
+    def test_exactly_fourteen_fields(self) -> None:
+        """Shape: 5 Track 5 + 2 issue-#108 snapshots + 6 compaction + 1 Planning Primitive = 14 total.
 
         Issue #102 added ``commit_rationales`` as a parallel channel to
         ``observations`` for ``commit_memory`` / ``save_memory`` reasons.
@@ -127,6 +127,8 @@ class TestRuntimeStateSchemaShape:
         ``projected_commit_rationales`` snapshots so the projected findings
         block (and thus the prompt-cache prefix) only changes when Tier-3
         fires, not on every ``note_finding``.
+        Planning Primitive (Task P1) added ``plan`` — the agent-owned
+        to-do-list scratchpad with full-list-replace semantics.
         """
         hints = get_type_hints(RuntimeState, include_extras=True)
         expected = {
@@ -145,6 +147,8 @@ class TestRuntimeStateSchemaShape:
             "summary", "summarized_through_turn_index",
             "memory_flush_fired_this_task", "last_super_step_message_count",
             "tier3_firings_count", "tier3_fatal_short_circuited",
+            # Planning Primitive (Task P1) — agent-owned to-do-list scratchpad.
+            "plan",
         }
         assert set(hints) == expected
 

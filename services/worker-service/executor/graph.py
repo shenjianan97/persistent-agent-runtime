@@ -132,6 +132,7 @@ from tools.memory_tools import (
     MemoryToolContext,
     build_memory_tools,
 )
+from tools.plan_tools import build_plan_write_tool
 from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
 from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
@@ -1053,6 +1054,12 @@ class GraphExecutor:
                 description=EXPORT_SANDBOX_FILE_TOOL.description,
                 args_schema=ExportSandboxFileArguments,
             ))
+
+        # Planning Primitive (Task P1) — agent-owned to-do-list scratchpad.
+        # Gated: only registered when "plan_write" is in the allowlist.
+        # Agents without this tool never see the plan channel.
+        if "plan_write" in allowed_tools:
+            tools.append(build_plan_write_tool())
 
         return tools
 
