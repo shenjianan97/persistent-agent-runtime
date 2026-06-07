@@ -1477,3 +1477,120 @@ async def test_memory_flush_projection_has_no_tail_system_message():
             f"{first_non_system}) will be rejected by "
             "langchain_anthropic._format_messages."
         )
+
+
+# ---------------------------------------------------------------------------
+# Planning Primitive (P1 PR-review follow-up) — ``reserved_tokens`` budget
+# accounting. agent_node appends the plan block AFTER this hook has run, so
+# the hook must reserve room for it in every comparison against
+# ``trigger_tokens`` / ``model_context_window``; otherwise a projection that
+# passes the hard-floor check can overflow the provider limit once the plan
+# block is injected (provider 400 instead of the intended
+# _ContextExceededIrrecoverableError dead-letter path).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reserved_tokens_overflow_emits_hard_floor_on_skip_path():
+    """Reviewer scenario: hook output just below the window + a reserve that
+    pushes the final request over it → HardFloorEvent (est includes the
+    reserve). Path: fatal short-circuit (summarisation unavailable)."""
+    msgs = _build_messages(n_pairs=8)
+    state = _fresh_state(msgs)
+    state["tier3_fatal_short_circuited"] = True
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=1_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(990),
+        reserved_tokens=50,
+    )
+
+    floors = [e for e in result.events if isinstance(e, HardFloorEvent)]
+    assert floors, (
+        "projection (990) + reserved plan block (50) exceeds the 1000-token "
+        "window — the hook must emit HardFloorEvent."
+    )
+    assert floors[0].est_tokens == 1_040
+
+
+@pytest.mark.asyncio
+async def test_reserved_tokens_default_zero_pins_prior_behavior():
+    """Same projection with the default reserve: 990 ≤ 1000 → silent, no
+    HardFloorEvent. This is the pre-fix exposure the reserve closes — an
+    unaccounted post-hook addendum would overflow with no event."""
+    msgs = _build_messages(n_pairs=8)
+    state = _fresh_state(msgs)
+    state["tier3_fatal_short_circuited"] = True
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(),
+        model_context_window=1_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(990),
+    )
+
+    assert not any(isinstance(e, HardFloorEvent) for e in result.events)
+
+
+@pytest.mark.asyncio
+async def test_reserved_tokens_count_toward_the_compaction_trigger():
+    """The reserve also counts toward ``trigger_tokens`` — a projection that
+    only crosses 0.85×window once the plan block is accounted for must take
+    the summarisation path (observable via the cap_reached skip event), not
+    return below_threshold."""
+    msgs = _build_messages(n_pairs=8)
+
+    async def _run(**kwargs):
+        state = _fresh_state(msgs)
+        state["tier3_firings_count"] = 10  # cap reached → deterministic event
+        return await compaction_pre_model_hook(
+            raw_messages=msgs,
+            state=state,
+            agent_config=_agent_config(),
+            model_context_window=1_000,  # trigger = 850
+            task_context=_task_context(),
+            summarizer=_make_summarizer(),
+            estimate_tokens_fn=_fixed_estimator(845),
+            **kwargs,
+        )
+
+    without_reserve = await _run()
+    assert not without_reserve.events  # 845 < 850 → below_threshold, silent
+
+    with_reserve = await _run(reserved_tokens=10)  # 855 ≥ 850 → tier3 path
+    assert any(
+        isinstance(e, Tier3SkippedEvent) and e.reason == "cap_reached"
+        for e in with_reserve.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_reserved_tokens_counted_on_memory_flush_path():
+    """The flush path re-estimates ``[*projection, flush_message]`` — the
+    reserve must be included there too, since the plan block is appended
+    after the flush message as well."""
+    msgs = _build_messages(n_pairs=8)
+    state = _fresh_state(msgs)
+
+    result = await compaction_pre_model_hook(
+        raw_messages=msgs,
+        state=state,
+        agent_config=_agent_config(memory_enabled=True),
+        model_context_window=1_000,
+        task_context=_task_context(),
+        summarizer=_make_summarizer(),
+        estimate_tokens_fn=_fixed_estimator(900),
+        reserved_tokens=150,
+    )
+
+    assert any(isinstance(e, MemoryFlushFiredEvent) for e in result.events)
+    floors = [e for e in result.events if isinstance(e, HardFloorEvent)]
+    assert floors and floors[0].est_tokens == 1_050

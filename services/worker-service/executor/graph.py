@@ -55,7 +55,10 @@ from executor.compaction.tokens import (
     extract_text_content as _extract_message_text,
 )
 from executor.compaction.summarizer import summarize_slice
-from executor.plan_injection import inject_plan_block
+from executor.plan_injection import (
+    inject_plan_block,
+    plan_block_reserved_tokens,
+)
 from executor.prompt_cache import TokenUsage, get_strategy as _get_cache_strategy
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
@@ -1384,6 +1387,26 @@ class GraphExecutor:
             # deterministic placeholder so the INSERT still dedups correctly).
             _per_call_task_context = {**task_context, "checkpoint_id": _current_ckpt_id}
 
+            # Single estimator for the hook AND the plan-block reserve below
+            # — both must use identical math or the reserve drifts from what
+            # the hook compares against.
+            def _estimate_for_model(msgs: list) -> int:
+                return _estimate_tokens(msgs, provider=provider)
+
+            # Planning Primitive (P1 PR-review finding) — the plan block is
+            # appended AFTER the hook has estimated the projection and run
+            # its trigger / hard-floor checks, so reserve its tokens in the
+            # hook's budget math up front. Otherwise a projection that
+            # passes the hard-floor check (est ≤ window, no HardFloorEvent)
+            # can overflow the provider limit once the block (≤ ~3.5k
+            # estimate-tokens at P1's caps) is injected — a provider 400
+            # instead of the intended irrecoverable-context dead-letter.
+            # Empty plan → 0 with no estimator call (byte-identical math
+            # for non-planning agents).
+            _plan_reserved_tokens = plan_block_reserved_tokens(
+                state.get("plan"), _estimate_for_model
+            )
+
             # Track 7 Follow-up (Task 3) — run the pre_model_hook before every
             # LLM call. The hook is pure w.r.t. the journal (never mutates
             # ``state["messages"]``); it returns the three-region projection
@@ -1395,10 +1418,11 @@ class GraphExecutor:
                 model_context_window=model_context_window,
                 task_context=_per_call_task_context,
                 summarizer=summarize_slice,
-                estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+                estimate_tokens_fn=_estimate_for_model,
                 system_prompt=system_prompt if system_prompt else None,
                 platform_system_message=platform_system_msg if platform_system_msg else None,
                 summarizer_context_window=_summarizer_context_window,
+                reserved_tokens=_plan_reserved_tokens,
             )
             # Planning Primitive (Task P2) — re-inject the agent's durable
             # plan channel into the projection. AFTER the compaction hook

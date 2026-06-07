@@ -50,6 +50,7 @@ from executor.plan_injection import (
     inject_plan_block,
     is_plan_block,
     make_plan_block_message,
+    plan_block_reserved_tokens,
     render_plan_block,
 )
 from executor.prompt_cache import _REGISTRY
@@ -258,6 +259,58 @@ def test_inject_does_not_mutate_inputs():
     assert projection == snapshot  # same length, same objects
     assert all(a is b for a, b in zip(projection, snapshot))
     assert plan == plan_snapshot
+
+
+# ---------------------------------------------------------------------------
+# plan_block_reserved_tokens — hard-floor budget accounting (P1 PR-review
+# follow-up): the hook must reserve room for the post-hook plan block so a
+# projection that passes the hard-floor check can't overflow the provider
+# limit once the block is injected.
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_tokens_empty_plan_is_zero_without_estimator_call():
+    """Empty/absent plan → 0, and the estimator is provably never invoked —
+    non-planning agents pay nothing."""
+
+    def _exploding_estimator(_msgs):
+        raise AssertionError("estimator must not be called for empty plans")
+
+    assert plan_block_reserved_tokens([], _exploding_estimator) == 0
+    assert plan_block_reserved_tokens(None, _exploding_estimator) == 0
+
+
+def test_reserved_tokens_estimates_the_exact_injected_block():
+    """The reserve is the estimate of the SAME message inject_plan_block
+    appends (same renderer, same message shape), under the caller-supplied
+    estimator."""
+    seen: list = []
+
+    def _estimator(msgs):
+        seen.extend(msgs)
+        return 123
+
+    assert plan_block_reserved_tokens(_plan(), _estimator) == 123
+    assert len(seen) == 1
+    assert is_plan_block(seen[0])
+    assert seen[0].content == render_plan_block(_plan())
+
+
+def test_agent_node_reserves_plan_tokens_before_hook_call():
+    """agent_node computes the plan reserve BEFORE invoking the hook and
+    forwards it as ``reserved_tokens=`` so all trigger / hard-floor
+    comparisons account for the block injected afterwards."""
+    graph_path = pathlib.Path(__file__).parent.parent / "executor" / "graph.py"
+    src = graph_path.read_text()
+
+    reserve_call = src.index("plan_block_reserved_tokens(")
+    hook_call = src.index("pass_result = await compaction_pre_model_hook(")
+    assert reserve_call < hook_call, (
+        "the plan reserve must be computed before the hook call"
+    )
+    assert "reserved_tokens=" in src[hook_call : hook_call + 1200], (
+        "agent_node must forward reserved_tokens= to compaction_pre_model_hook"
+    )
 
 
 # ---------------------------------------------------------------------------

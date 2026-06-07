@@ -51,7 +51,7 @@ plans).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
@@ -140,11 +140,38 @@ def inject_plan_block(
     return [*messages, make_plan_block_message(plan_items)]
 
 
+def plan_block_reserved_tokens(
+    plan_items: Sequence[dict] | None,
+    estimate_tokens_fn: Callable[[list[BaseMessage]], int],
+) -> int:
+    """Tokens to reserve in compaction budget math for the plan block.
+
+    ``agent_node`` appends the plan block AFTER ``compaction_pre_model_hook``
+    has estimated the projection and run its trigger / hard-floor checks, so
+    the hook must reserve room for it up front (its ``reserved_tokens``
+    parameter — P1 PR-review finding: an unaccounted post-hook addendum can
+    push a projection that passed the hard-floor check over the provider
+    limit, yielding a provider error instead of the intended
+    irrecoverable-context dead-letter handling).  This helper estimates the
+    SAME message :func:`inject_plan_block` will append (same renderer, same
+    message shape) with the SAME estimator the hook uses, so the reserve and
+    the eventual addendum cannot drift.
+
+    Empty/absent plan → ``0`` without invoking the estimator — non-planning
+    agents pay no extra estimator call, and ``reserved_tokens=0`` keeps the
+    hook's math byte-identical to the pre-Planning behavior.
+    """
+    if not plan_items:
+        return 0
+    return estimate_tokens_fn([make_plan_block_message(plan_items)])
+
+
 __all__ = [
     "PLAN_BLOCK_KWARG",
     "PLAN_PREAMBLE",
     "inject_plan_block",
     "is_plan_block",
     "make_plan_block_message",
+    "plan_block_reserved_tokens",
     "render_plan_block",
 ]
