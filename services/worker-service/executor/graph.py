@@ -132,7 +132,6 @@ from tools.memory_tools import (
     MemoryToolContext,
     build_memory_tools,
 )
-from tools.errors import ToolExecutionError, ToolTransportError
 from executor.mcp_session import McpToolCallError
 from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
 from executor.compaction.ingestion import (
@@ -268,8 +267,22 @@ class _ContextExceededIrrecoverableError(Exception):
 
 def _handle_tool_error(e: Exception) -> str:
     """Route tool errors: re-raise infra failures for task-level retry,
-    return user-fixable errors as messages so the LLM can self-correct."""
-    if isinstance(e, (ToolTransportError, McpToolCallError)):
+    return agent-correctable errors as messages so the LLM can self-correct.
+
+    Classification principle: failures of an *agent-chosen target* (a URL
+    that doesn't resolve, an HTTP error status, a timed-out fetch, a search
+    backend rejecting the query) are content errors — the agent picked the
+    input, so the agent gets the error text and decides (different URL, fall
+    back to search results, proceed without the source). Only platform
+    infrastructure faults re-raise into the task-level retry classifier.
+
+    ``ToolTransportError`` is deliberately NOT re-raised: task-level retry
+    replays the same checkpointed pending tool call deterministically, so a
+    task that hit an unresolvable hostname burned all 10 retries in ~20
+    minutes and dead-lettered without the agent ever seeing the error
+    (task 2825e0ba…, 2026-06-07).
+    """
+    if isinstance(e, McpToolCallError):
         raise e
     return f"Error: {e}\nPlease fix the error and try again."
 
@@ -3748,8 +3761,15 @@ class GraphExecutor:
 
     def _is_retryable_error(self, e: Exception) -> bool:
         """Determines if the exception should trigger a retry or immediate dead letter."""
-        # Check exception type first (most reliable signal)
-        if isinstance(e, (ToolTransportError, McpToolCallError)):
+        # Check exception type first (most reliable signal).
+        # ``ToolTransportError`` is intentionally absent: its only raisers
+        # (tools/read_url.py, tools/providers/search.py) execute inside the
+        # ToolNode, whose ``handle_tool_errors=_handle_tool_error`` converts
+        # it to an agent-visible error ToolMessage instead of re-raising —
+        # so the type can no longer reach this classifier, and keeping a
+        # "retryable" entry for it would contradict those agent-correctable
+        # semantics for any future raiser.
+        if isinstance(e, McpToolCallError):
             return True
         if isinstance(e, (ConnectionError, TimeoutError)):
             return True

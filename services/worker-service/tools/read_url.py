@@ -21,6 +21,22 @@ from tools.errors import ToolExecutionError, ToolInputError, ToolTransportError
 MAX_BODY_BYTES: Final[int] = 1_000_000
 MAX_REDIRECTS: Final[int] = 3
 DEFAULT_TIMEOUT_SECONDS: Final[float] = 10.0
+# Single bounded in-tool retry for transient failures (transient DNS, fetch /
+# connect timeout) before the error surfaces to the LLM as a correctable
+# ToolMessage. A small fixed delay — deliberately no backoff machinery.
+TRANSIENT_RETRY_DELAY_SECONDS: Final[float] = 0.5
+# getaddrinfo errnos that mean the *name itself* is bad (NXDOMAIN-style) —
+# retrying cannot help, surface immediately. Anything else (EAI_AGAIN, bare
+# OSError, empty result) is indeterminate and treated as transient: one retry
+# costs little, while a wrong "permanent" call costs the agent a source.
+_PERMANENT_DNS_ERRNOS: Final[frozenset[int]] = frozenset(
+    errno
+    for errno in (
+        getattr(socket, "EAI_NONAME", None),  # name does not exist (NXDOMAIN)
+        getattr(socket, "EAI_NODATA", None),  # name exists, no address records
+    )
+    if errno is not None
+)
 DISALLOWED_HOST_SUFFIXES: Final[tuple[str, ...]] = (".localhost", ".local", ".internal")
 DEFAULT_REQUEST_HEADERS: Final[dict[str, str]] = {
     # Some news sites and CDNs block obvious bot headers but allow the same public
@@ -108,11 +124,15 @@ class ReadUrlFetcher:
 
             if response.status_code in {408, 429} or response.status_code >= 500:
                 raise ToolTransportError(
-                    f"URL fetch failed temporarily for {current_url} with status {response.status_code}."
+                    f"URL fetch failed temporarily for {current_url} with status "
+                    f"{response.status_code}. The site may be overloaded or temporarily "
+                    "unavailable. Try again later, or use a different URL or source."
                 )
             if response.status_code >= 400:
                 raise ToolExecutionError(
-                    f"URL fetch failed for {current_url} with status {response.status_code}."
+                    f"URL fetch failed for {current_url} with status "
+                    f"{response.status_code}. The URL may be wrong or the page "
+                    "inaccessible. Try a different URL or source."
                 )
 
             content_type = response.headers.get("content-type", "")
@@ -154,18 +174,55 @@ class ReadUrlFetcher:
             _assert_public_ip(literal_ip)
             return
 
-        try:
-            resolved_ips = await self._resolver(host, port)
-        except OSError as exc:
-            raise ToolTransportError(f"Hostname could not be resolved for {url}.") from exc
-
-        if not resolved_ips:
-            raise ToolTransportError(f"Hostname could not be resolved for {url}.")
+        resolved_ips = await self._resolve_with_retry(host, port, url)
 
         for ip_text in resolved_ips:
             _assert_public_ip(ipaddress.ip_address(ip_text))
 
+    async def _resolve_with_retry(self, host: str, port: int, url: str) -> list[str]:
+        """Resolve *host*, retrying once on transient (EAI_AGAIN-style) failures.
+
+        Permanent failures (NXDOMAIN / EAI_NONAME) surface immediately — the
+        agent chose the URL, so the actionable error text goes back to it.
+        """
+        dns_error_message = (
+            f"Hostname could not be resolved for {url}. The URL may be invalid "
+            "or the site unavailable. Try a different URL or source."
+        )
+        for attempt in (0, 1):
+            try:
+                resolved_ips = await self._resolver(host, port)
+            except OSError as exc:
+                permanent = (
+                    isinstance(exc, socket.gaierror)
+                    and exc.errno in _PERMANENT_DNS_ERRNOS
+                )
+                if permanent or attempt == 1:
+                    raise ToolTransportError(dns_error_message) from exc
+                await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+                continue
+            if resolved_ips:
+                return resolved_ips
+            if attempt == 0:
+                await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+        raise ToolTransportError(dns_error_message)
+
     async def _request_once(self, url: str) -> _FetchedResponse:
+        """Issue one logical request, retrying once on fetch/connect timeout.
+
+        Only timeouts get the single in-tool retry; other request failures
+        (connection refused/reset, protocol errors) surface immediately with
+        an actionable message for the LLM.
+        """
+        try:
+            return await self._request_attempt(url)
+        except ToolTransportError as exc:
+            if not isinstance(exc.__cause__, httpx.TimeoutException):
+                raise
+            await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
+            return await self._request_attempt(url)
+
+    async def _request_attempt(self, url: str) -> _FetchedResponse:
         if self._client is not None:
             return await _stream_response(
                 self._client,
@@ -220,9 +277,15 @@ async def _stream_response(
                 body_truncated=body_truncated,
             )
     except httpx.TimeoutException as exc:
-        raise ToolTransportError(f"URL fetch timed out for {url}.") from exc
+        raise ToolTransportError(
+            f"URL fetch timed out for {url}. The site may be slow or "
+            "unreachable. Try a different URL or source."
+        ) from exc
     except httpx.HTTPError as exc:
-        raise ToolTransportError(f"URL fetch request failed for {url}: {exc}") from exc
+        raise ToolTransportError(
+            f"URL fetch request failed for {url}: {exc}. The site may be "
+            "unreachable. Try a different URL or source."
+        ) from exc
 
 
 async def _default_resolver(host: str, port: int) -> list[str]:
