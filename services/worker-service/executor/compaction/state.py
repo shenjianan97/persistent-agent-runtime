@@ -96,8 +96,9 @@ def _plan_replace_reducer(a: list, b: list) -> list:
     * Replace keeps the injected block **byte-stable** between unchanged
       writes (cache-friendly): if the agent re-emits the same plan, the
       checkpoint value is identical, and P2's post-compaction injection
-      produces the same ``SystemMessage`` bytes — the Anthropic prompt-cache
-      prefix survives.  This mirrors ``_list_replace_reducer``'s rationale
+      produces the same plan-block bytes (a tagged ``HumanMessage`` — see
+      ``executor/plan_injection.py`` for why not a ``SystemMessage``) — the
+      Anthropic prompt-cache prefix survives.  This mirrors ``_list_replace_reducer``'s rationale
       (see that docstring): a projected block that changes only when the data
       changes is the cache-stability pattern across this codebase.
     * Full-replace sidesteps patch-conflict semantics the plan simply does

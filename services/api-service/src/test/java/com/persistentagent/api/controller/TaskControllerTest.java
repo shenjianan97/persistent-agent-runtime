@@ -41,6 +41,9 @@ class TaskControllerTest {
         @MockitoBean
         private ActivityProjectionService activityProjectionService;
 
+        @MockitoBean
+        private com.persistentagent.api.service.TaskPlanService taskPlanService;
+
         // --- POST /v1/tasks ---
 
         @Test

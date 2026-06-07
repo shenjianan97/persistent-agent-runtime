@@ -156,7 +156,12 @@ export interface TaskObservabilityResponse {
     items: TaskObservabilityItemResponse[];
 }
 
-// Planning Primitive — P3 wire types (snake_case, mirrors Java DTO exactly)
+// Planning Primitive — P3 wire types (snake_case, mirrors the Java DTO's
+// happy path). The worker validates id/title/status at write time, but a
+// corrupted checkpoint can project null fields or an unknown status — the
+// API tolerates rather than 500s, so renderers must guard at runtime
+// (PlanChecklist normalizes unknown/null status and falls back on a
+// positional id) instead of trusting these declared types.
 export interface PlanItem {
     id: string;
     title: string;
