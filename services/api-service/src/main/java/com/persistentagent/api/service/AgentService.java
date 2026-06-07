@@ -138,12 +138,23 @@ public class AgentService {
 
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
-        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
-        String agentConfigJson = serializeConfig(canonicalized);
-
         // For update, we need current values as defaults if not provided
         Map<String, Object> existing = agentRepository.findByIdAndTenant(tenantId, agentId)
                 .orElseThrow(() -> new AgentNotFoundException(agentId));
+
+        // Opt-in grant preservation (PR-review finding): allowed_tools is not client-owned
+        // round-trip state — it is auto-determined plus explicit opt-in grants. An update
+        // payload that OMITS allowed_tools entirely (e.g. the Console agent editor) makes
+        // "no statement about grants", so the agent's existing opt-in grants carry forward.
+        // A PRESENT allowed_tools list is authoritative: a list without an opt-in tool
+        // revokes that grant.
+        java.util.Set<String> existingOptInGrants = java.util.Set.of();
+        if (request.agentConfig().allowedTools() == null) {
+            existingOptInGrants = extractStoredOptInGrants(existing.get("agent_config"), agentId);
+        }
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig(), existingOptInGrants);
+        String agentConfigJson = serializeConfig(canonicalized);
 
         int maxConcurrentTasks = request.maxConcurrentTasks() != null
                 ? request.maxConcurrentTasks()
@@ -165,7 +176,31 @@ public class AgentService {
 
     // --- Config canonicalization ---
 
+    /**
+     * Reads the stored canonical config's allowed_tools and returns the subset that are
+     * opt-in grants ({@link ValidationConstants#OPT_IN_TOOLS}). Used by updateAgent to
+     * carry existing grants forward when the update payload omits allowed_tools.
+     */
+    private java.util.Set<String> extractStoredOptInGrants(Object storedConfig, String agentId) {
+        Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, storedConfig);
+        if (parsed == null || !(parsed.get("allowed_tools") instanceof List<?> storedTools)) {
+            return java.util.Set.of();
+        }
+        java.util.Set<String> grants = new java.util.LinkedHashSet<>();
+        for (Object tool : storedTools) {
+            if (tool instanceof String s && ValidationConstants.OPT_IN_TOOLS.contains(s)) {
+                grants.add(s);
+            }
+        }
+        return grants;
+    }
+
     private AgentConfigRequest canonicalizeConfig(AgentConfigRequest config) {
+        return canonicalizeConfig(config, java.util.Set.of());
+    }
+
+    private AgentConfigRequest canonicalizeConfig(AgentConfigRequest config,
+            java.util.Set<String> existingOptInGrants) {
         SandboxConfigRequest sandbox = config.sandbox();
         SandboxConfigRequest canonicalizedSandbox = null;
         if (sandbox != null) {
@@ -211,6 +246,14 @@ public class AgentService {
                         && !canonicalizedTools.contains(tool)) {
                     canonicalizedTools.add(tool);
                 }
+            }
+        }
+        // Carry forward existing opt-in grants when the caller made no statement about
+        // allowed_tools (updateAgent passes the stored grants only when the request's
+        // allowedTools is null; createAgent always passes an empty set).
+        for (String tool : existingOptInGrants) {
+            if (!canonicalizedTools.contains(tool)) {
+                canonicalizedTools.add(tool);
             }
         }
 

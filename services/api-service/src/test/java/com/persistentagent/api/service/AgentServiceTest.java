@@ -873,7 +873,133 @@ class AgentServiceTest {
                         + parsed.allowedTools());
     }
 
+    // --- opt-in grant preservation on updates omitting allowed_tools (PR-review finding) ---
+
+    /**
+     * Regression test for the PR-review finding: the Console agent editor
+     * (AgentDetailPage.tsx) sends an update payload whose agent_config has NO allowed_tools
+     * key at all (system_prompt/provider/model/temperature/tool_servers only). With
+     * allowedTools() == null, the opt-in preservation loop never ran and canonicalization
+     * silently stripped plan_write from a planning-enabled agent.
+     *
+     * <p>Decided semantics: allowed_tools is not client-owned round-trip state — absence
+     * means "no statement about grants", not revocation. The update must carry forward the
+     * stored config's existing opt-in grants.
+     */
+    @Test
+    void updateAgent_consoleShapedPayloadWithoutAllowedTools_preservesExistingPlanWriteGrant()
+            throws Exception {
+        // Console-shaped payload: no allowed_tools key (null), tool_servers present.
+        AgentConfigRequest config = new AgentConfigRequest(
+                "Edited prompt from Console.", "anthropic", "claude-sonnet-4-6", 0.3,
+                null, List.of(), null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        // Stored agent already has the plan_write opt-in grant.
+        Map<String, Object> existingRow = buildAgentRowWithConfig("planning-agent", "Planning Agent", "active",
+                "{\"system_prompt\":\"prompt\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-6\","
+                        + "\"temperature\":0.0,\"allowed_tools\":[\"web_search\",\"read_url\","
+                        + "\"create_text_artifact\",\"request_human_input\",\"plan_write\"]}");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "planning-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("planning-agent"), eq("Planning Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        agentService.updateAgent("planning-agent", request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "Console-shaped update (allowed_tools absent) must preserve the agent's existing "
+                        + "plan_write opt-in grant; got: " + parsed.allowedTools());
+        assertTrue(parsed.allowedTools().containsAll(
+                com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS),
+                "Base platform tools must still be auto-determined; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * Revocation path stays intact: an update whose allowed_tools is PRESENT is
+     * authoritative — an explicit list without plan_write removes the grant from a
+     * previously-granted agent.
+     */
+    @Test
+    void updateAgent_explicitAllowedToolsWithoutPlanWrite_revokesGrant() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "No more planning.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("web_search"), null, null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        // Stored agent currently has the plan_write grant.
+        Map<String, Object> existingRow = buildAgentRowWithConfig("planning-agent", "Planning Agent", "active",
+                "{\"system_prompt\":\"prompt\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-6\","
+                        + "\"temperature\":0.0,\"allowed_tools\":[\"web_search\",\"plan_write\"]}");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "planning-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("planning-agent"), eq("Planning Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        agentService.updateAgent("planning-agent", request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertFalse(parsed.allowedTools().contains("plan_write"),
+                "Explicit allowed_tools without plan_write must revoke the grant; got: "
+                        + parsed.allowedTools());
+    }
+
+    /**
+     * Create-path semantics pinned unchanged: null allowed_tools on CREATE means no opt-in
+     * grants (there is no pre-existing config to carry grants from).
+     */
+    @Test
+    void createAgent_nullAllowedTools_noOptInToolsGranted() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Test Agent"), jsonCaptor.capture(),
+                eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        for (String optIn : com.persistentagent.api.config.ValidationConstants.OPT_IN_TOOLS) {
+            assertFalse(parsed.allowedTools().contains(optIn),
+                    "Opt-in tool " + optIn + " must not be granted on create with null allowed_tools; got: "
+                            + parsed.allowedTools());
+        }
+    }
+
     // --- helpers ---
+
+    private Map<String, Object> buildAgentRowWithConfig(String agentId, String displayName,
+            String status, String agentConfigJson) {
+        Map<String, Object> row = buildAgentRow(agentId, displayName, status);
+        row.put("agent_config", agentConfigJson);
+        return row;
+    }
 
     private Map<String, Object> buildAgentRow(String agentId, String displayName, String status) {
         Map<String, Object> row = new LinkedHashMap<>();
