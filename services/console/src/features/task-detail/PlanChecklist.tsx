@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import type { PlanItem, TaskStatus } from '@/types';
@@ -122,18 +123,34 @@ interface PlanChecklistProps {
  * query cadence) so a plan written mid-run appears without a reload.
  */
 export function PlanChecklist({ taskId, status }: PlanChecklistProps) {
-    const { data, isLoading } = useQuery({
+    const query = useQuery({
         queryKey: ['task-plan', taskId],
         queryFn: () => api.getTaskPlan(taskId),
         enabled: !!taskId,
         refetchInterval: isTerminalStatus(status) ? false : 5_000,
     });
 
-    if (isLoading) {
+    // When the task transitions from non-terminal to terminal, the poll
+    // loop stops immediately — but the last actual fetch happened up to
+    // 5s before the final checkpoint landed, so the checklist renders a
+    // stale plan missing any final plan_write until the user refreshes.
+    // Force one refetch on the transition to pick up the terminal-state
+    // plan. We track the previous status in a ref to fire exactly once
+    // per transition, not on every re-render. (Mirrors ActivityPane.)
+    const prevStatusRef = useRef<TaskStatus | undefined>(status);
+    useEffect(() => {
+        const prev = prevStatusRef.current;
+        if (prev && !isTerminalStatus(prev) && isTerminalStatus(status)) {
+            query.refetch();
+        }
+        prevStatusRef.current = status;
+    }, [status, query]);
+
+    if (query.isLoading) {
         return null;
     }
 
-    const plan = data?.plan ?? [];
+    const plan = query.data?.plan ?? [];
 
     if (plan.length === 0) {
         // Empty plan — render nothing (common case: agent never called plan_write)

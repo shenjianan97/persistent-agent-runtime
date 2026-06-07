@@ -263,4 +263,48 @@ describe('PlanChecklist', () => {
             vi.useRealTimers();
         }
     });
+
+    it('fires exactly one extra refetch on the non-terminal → terminal transition', async () => {
+        // Without the transition refetch, flipping to terminal stops the
+        // poll loop immediately and a plan rewritten in the final ≤5s
+        // window stays stale until reload (PR-review finding; mirrors
+        // ActivityPane's prevStatusRef pattern).
+        vi.useFakeTimers();
+        try {
+            getTaskPlanMock.mockResolvedValue(POPULATED_PLAN);
+            const client = new QueryClient({
+                defaultOptions: {
+                    queries: { retry: false },
+                },
+            });
+            const { rerender } = render(
+                <QueryClientProvider client={client}>
+                    <PlanChecklist taskId="task-123" status="running" />
+                </QueryClientProvider>,
+            );
+
+            await vi.advanceTimersByTimeAsync(0);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(1);
+
+            // One poll cycle while running.
+            await vi.advanceTimersByTimeAsync(5_000);
+            const callsAfterPoll = getTaskPlanMock.mock.calls.length;
+            expect(callsAfterPoll).toBeGreaterThanOrEqual(2);
+
+            // Transition running → completed: exactly one forced refetch.
+            rerender(
+                <QueryClientProvider client={client}>
+                    <PlanChecklist taskId="task-123" status="completed" />
+                </QueryClientProvider>,
+            );
+            await vi.advanceTimersByTimeAsync(0);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(callsAfterPoll + 1);
+
+            // No further polling after the transition.
+            await vi.advanceTimersByTimeAsync(15_000);
+            expect(getTaskPlanMock).toHaveBeenCalledTimes(callsAfterPoll + 1);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });
