@@ -136,12 +136,27 @@ class PlanItem(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# Leads with WHEN-to-use trigger language, then the mechanical contract — a
+# live probe showed a vanilla agent never calling the tool on a multi-step
+# task when the description covered mechanics only. The exactly-one-
+# ``in_progress`` guidance below deliberately mirrors P2's injected preamble
+# (``executor/plan_injection.py::PLAN_PREAMBLE``): both are prompt-layer
+# surfaces per plan §A0.4 (never tool-layer enforcement); keep the wording
+# consistent if either changes. Contract pinned by
+# ``tests/test_plan_tools.py::TestPlanWriteDescription``.
 PLAN_WRITE_DESCRIPTION: str = (
-    "Rewrite your entire plan. Each call replaces the plan channel wholesale "
-    "(full-list replace — always supply ALL items, not a delta). Items are "
-    "{id, title, status}; status must be one of: pending, in_progress, "
-    "completed. The plan survives context compaction and is injected back "
-    "into your prompt so you never lose your to-do list. "
+    "Use this tool to plan and track your work on any task with multiple "
+    "steps or phases. Write the plan BEFORE starting work; keep exactly "
+    "one item in_progress at a time; update statuses as you work — mark "
+    "each item completed immediately when it is done (do not batch "
+    "updates). Rewrite the plan whenever new steps emerge so it stays "
+    "current. Skip it only for trivial single-step tasks. "
+    "Mechanics: each call replaces your entire plan (full-list replace — "
+    "always supply ALL items, not a delta; pass [] explicitly to clear). "
+    "Items are {id, title, status}; status must be one of: pending, "
+    "in_progress, completed. The plan is durable — it survives context "
+    "compaction and is re-injected into your prompt, so you never lose "
+    "your to-do list. "
     f"Caps: max {PLAN_MAX_ITEMS} items; titles max {PLAN_MAX_TITLE_CHARS} chars. "
     "Call freely — zero cost, no I/O."
 )

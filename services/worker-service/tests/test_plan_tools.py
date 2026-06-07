@@ -40,6 +40,7 @@ from pydantic import ValidationError
 from executor.compaction.state import RuntimeState, _plan_replace_reducer
 from tools.plan_tools import (
     PLAN_MAX_ITEMS,
+    PLAN_WRITE_DESCRIPTION,
     PLAN_MAX_TITLE_CHARS,
     VALID_STATUSES,
     PlanItem,
@@ -472,3 +473,57 @@ class TestValidatePlanItems:
         items = [{"id": "a", "status": "pending"}]
         with pytest.raises(PlanWriteError):
             validate_plan_items(items)
+
+
+# ---------------------------------------------------------------------------
+# PLAN_WRITE_DESCRIPTION contract — when-to-use trigger language (base-tool
+# follow-up: a live probe showed a vanilla agent never calling plan_write on
+# a multi-step task when the description covered mechanics only). These pins
+# stop a future edit from silently dropping the trigger language.
+# ---------------------------------------------------------------------------
+
+
+class TestPlanWriteDescription:
+    def test_leads_with_when_to_use_trigger_language(self) -> None:
+        """The description must open with WHEN to use the tool — before any
+        mechanics — or generic-prompt agents skip it on multi-step work."""
+        lowered = PLAN_WRITE_DESCRIPTION.lower()
+        assert "multiple steps" in lowered
+        # The trigger language leads; the mechanical contract follows.
+        assert lowered.index("multiple steps") < lowered.index(
+            "full-list replace"
+        )
+
+    def test_instructs_planning_before_starting_work(self) -> None:
+        assert "before starting work" in PLAN_WRITE_DESCRIPTION.lower()
+
+    def test_one_in_progress_wording_matches_injection_preamble(self) -> None:
+        """Both prompt-layer surfaces (this description + P2's injected
+        preamble) carry the exactly-one-in_progress guidance with consistent
+        wording — plan §A0.4 (prompt-layer, never tool-layer)."""
+        from executor.plan_injection import PLAN_PREAMBLE
+
+        shared = "exactly one item in_progress"
+        assert shared in PLAN_WRITE_DESCRIPTION
+        assert shared in PLAN_PREAMBLE
+
+    def test_instructs_immediate_unbatched_completion_updates(self) -> None:
+        lowered = PLAN_WRITE_DESCRIPTION.lower()
+        assert "completed immediately" in lowered
+        assert "batch" in lowered
+
+    def test_keeps_the_mechanical_contract(self) -> None:
+        """Mechanics retained: full-list replace, item shape, status enum,
+        durability across compaction, caps, zero cost."""
+        desc = PLAN_WRITE_DESCRIPTION
+        assert "full-list replace" in desc
+        assert "{id, title, status}" in desc
+        for status in sorted(VALID_STATUSES):
+            assert status in desc
+        assert "compaction" in desc
+        assert str(PLAN_MAX_ITEMS) in desc
+        assert str(PLAN_MAX_TITLE_CHARS) in desc
+        assert "zero cost" in desc
+
+    def test_tool_factory_uses_the_constant(self) -> None:
+        assert build_plan_write_tool().description == PLAN_WRITE_DESCRIPTION
