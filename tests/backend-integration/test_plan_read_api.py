@@ -5,22 +5,20 @@ Postgres checkpoints, in-process worker with the mocked-LLM provider — same
 ``e2e`` fixture every backend-integration scenario uses) and asserts P3's
 read-only projection contract:
 
-* **Populated:** an agent with ``plan_write`` allowlisted writes a known
-  plan via a deterministic stub-LLM tool call; the endpoint returns
+* **Populated:** an agent writes a known plan via a deterministic stub-LLM
+  ``plan_write`` tool call; the endpoint returns
   ``{task_id, plan: [{id, title, status}, ...], updated_at}`` with items in
   written order and fields verbatim.
 
-  The activation defect (P5 finding) where ``AgentService.canonicalizeConfig``
-  silently stripped ``plan_write`` has been fixed: ``ValidationConstants``
-  now defines ``OPT_IN_TOOLS`` and ``canonicalizeConfig`` preserves any
-  opt-in tool explicitly requested by the caller.
-  ``test_plan_write_allowlist_survives_agent_creation`` is a plain passing
-  test that verifies this path (no longer a strict-xfail tripwire).
-  The populated-shape test creates its agent through the real API with
-  ``allowed_tools: ["plan_write"]``.
-* **Empty:** a task whose agent never calls ``plan_write`` returns
-  200 ``{plan: []}`` — never a 404. (Also covers supervisor-style tasks
-  that have checkpoints but no ``plan`` channel.)
+  ``plan_write`` is a BASE platform tool (product decision 2026-06-06,
+  superseding the track's §A6 opt-in design): ``canonicalizeConfig`` seeds
+  it into every agent via ``ValidationConstants.BASE_PLATFORM_TOOLS``, like
+  web_search. ``test_plan_write_allowlist_survives_agent_creation`` pins
+  that every created agent's stored config carries it.
+* **Empty:** a task whose stub model never calls ``plan_write`` (the tool is
+  allowlisted on every agent, but unused → no ``plan`` channel in the
+  checkpoints) returns 200 ``{plan: []}`` — never a 404. (Also covers
+  supervisor-style tasks that have checkpoints but no ``plan`` channel.)
 * **No checkpoint yet:** a queued task (no worker started) returns
   200 ``{plan: []}`` with ``updated_at`` OMITTED from the JSON entirely
   (P3's ``@JsonInclude(NON_NULL)`` contract — clients type it optional).
@@ -69,6 +67,9 @@ PLANNING_AGENT_CONFIG: dict = {
     "allowed_tools": ["plan_write"],
 }
 
+#: "Planless" fixture: plan_write IS in this agent's stored config too (it is a
+#: base platform tool seeded on every agent), but its scripted stub model never
+#: calls it — so its tasks have no ``plan`` channel and exercise the empty shape.
 NO_TOOLS_AGENT_CONFIG: dict = {
     "system_prompt": "You are a planless test agent.",
     "provider": "anthropic",
@@ -101,12 +102,10 @@ def plan_write_then_final(
 
 @pytest.mark.asyncio
 async def test_plan_write_allowlist_survives_agent_creation(e2e):
-    """Public-path verification: ``POST /v1/agents`` with
-    ``allowed_tools: ["plan_write"]`` must round-trip the entry into the
-    stored agent config (the plan's §A6 activation path: "the Planning
-    Primitive activates only when plan_write is in an agent's tool
-    allowlist"). Fixed by adding OPT_IN_TOOLS to canonicalizeConfig
-    (activation defect resolved 2026-06-06)."""
+    """Public-path verification: every agent created through ``POST
+    /v1/agents`` carries ``plan_write`` in its stored config — it is a base
+    platform tool seeded by canonicalization (product decision 2026-06-06,
+    superseding the §A6 opt-in activation path)."""
     resp = e2e.ensure_agent(agent_config=PLANNING_AGENT_CONFIG)
     agent_id = resp["body"]["agent_id"]
     stored = e2e.api.get_agent(agent_id)["body"]["agent_config"]
@@ -125,7 +124,7 @@ async def test_plan_populated_after_stub_agent_writes_plan(e2e):
     e2e.use_llm(plan_write_then_final(PLAN_ITEMS))
     await e2e.start_worker("e2e-plan-populated-worker")
 
-    # plan_write now survives canonicalization via OPT_IN_TOOLS — no DB workaround needed.
+    # plan_write is a base platform tool — every agent gets it at creation.
     e2e.ensure_agent(agent_config=PLANNING_AGENT_CONFIG)
     task_id = e2e.submit_task(input="Plan the work, then do it.")
     await e2e.wait_for_status(task_id, "completed", timeout=30.0)
@@ -150,8 +149,9 @@ async def test_plan_populated_after_stub_agent_writes_plan(e2e):
 
 @pytest.mark.asyncio
 async def test_plan_empty_for_task_that_never_wrote_one(e2e):
-    """A completed task whose agent has no ``plan_write`` (and therefore no
-    ``plan`` channel in its checkpoints) → 200 ``{plan: []}``, not 404."""
+    """A completed task whose stub model never calls ``plan_write`` (the base
+    tool is allowlisted but unused, so its checkpoints have no ``plan``
+    channel) → 200 ``{plan: []}``, not 404."""
     e2e.use_llm(simple_response("All done, no plan needed."))
     await e2e.start_worker("e2e-plan-empty-worker")
 

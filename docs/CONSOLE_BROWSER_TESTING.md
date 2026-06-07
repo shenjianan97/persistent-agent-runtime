@@ -418,21 +418,20 @@ Preconditions:
 - `make start` running; API at `:8080`, Console at `:5173`.
 - One completed task whose agent called `plan_write` at least once (produces a non-empty `GET /v1/tasks/:taskId/plan` response) **with items in at least two distinct statuses**, and one completed task whose agent never called `plan_write` (produces `plan: []`). Seed both via the API (finalized by P5 — these exact steps are executable against the live stack):
 
-  1. **Planning agent** — create an agent with `plan_write` allowlisted and a prompt that scripts the exact plan (a live LLM follows this reliably; statuses cover all three badges):
+  1. **Planning agent** — create an agent with a prompt that scripts the exact plan (`plan_write` is a base platform tool, present on every agent — no allowlist entry needed; a live LLM follows this reliably; statuses cover all three badges):
 
      ```bash
      curl -s -X POST localhost:8080/v1/agents -H 'Content-Type: application/json' -d '{
        "display_name": "Scenario 20 Planning Agent",
        "agent_config": {
          "system_prompt": "Before doing anything else, call the plan_write tool exactly once with exactly these items: [{\"id\": \"step-1\", \"title\": \"Collect the inputs\", \"status\": \"completed\"}, {\"id\": \"step-2\", \"title\": \"Analyze the data\", \"status\": \"in_progress\"}, {\"id\": \"step-3\", \"title\": \"Write the summary\", \"status\": \"pending\"}]. Then reply with the single word: done.",
-         "provider": "anthropic", "model": "claude-haiku-4-5-20251001", "temperature": 0.0,
-         "allowed_tools": ["plan_write"]
+         "provider": "anthropic", "model": "claude-haiku-4-5-20251001", "temperature": 0.0
        }
      }' | jq -r .agent_id
      ```
 
   2. **Plan task** — submit `{"agent_id": "<id from step 1>", "input": "Follow your instructions."}` to `POST localhost:8080/v1/tasks`, capture `task_id`, then poll `GET localhost:8080/v1/tasks/<task_id>/plan` until `plan` is non-empty (a few seconds once a worker picks it up). If the model produced different items (rare at temperature 0), re-submit once. If agent creation 400s with "Unsupported model or provider", pick a current `model_id` from `GET /v1/models` — the registry uses dated ids.
-  3. **Empty-plan task** — create a second agent identical to step 1 but with `"allowed_tools": []` and a plain prompt ("Reply with the single word: done."), submit a task against it, and wait for `completed`. Its `GET .../plan` returns `{"plan": []}` and is the Scenario's empty-render fixture.
+  3. **Empty-plan task** — create a second agent identical to step 1 but with a plain prompt ("Reply with the single word: done.") that never calls `plan_write`, submit a task against it, and wait for `completed`. Its `GET .../plan` returns `{"plan": []}` and is the Scenario's empty-render fixture.
   4. The backend-integration test `tests/backend-integration/test_plan_read_api.py` (run via `make e2e-test PYTEST_ARGS='-k plan_read_api'`) asserts the same two API shapes deterministically with a stub LLM — if the live seeding misbehaves, that test localizes whether the API or the live model is at fault.
 
 What to verify:

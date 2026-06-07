@@ -25,9 +25,15 @@ public final class ValidationConstants {
             // plans into the LangGraph checkpoint so GET /v1/tasks/{id}/plan can project them.
             "plan_write");
 
-    /** Platform tools auto-enabled for every agent. */
+    /** Platform tools auto-enabled for every agent.
+     *
+     * <p>{@code plan_write} is a base tool by product decision (2026-06-06, supersedes
+     * the Planning Primitive track's §A6 "ships dark via config opt-in" design):
+     * planning is a default agent capability like web_search — customers should not
+     * need to know about it as a config concern. */
     public static final List<String> BASE_PLATFORM_TOOLS = List.of(
-            "web_search", "read_url", "create_text_artifact", "request_human_input");
+            "web_search", "read_url", "create_text_artifact", "request_human_input",
+            "plan_write");
 
     /** Sandbox tools auto-enabled when sandbox.enabled is true. */
     public static final List<String> SANDBOX_TOOLS = List.of(
@@ -35,16 +41,6 @@ public final class ValidationConstants {
 
     /** Dev-only task-control tools, enabled behind app.dev-task-controls.enabled. */
     public static final Set<String> DEV_TASK_CONTROL_TOOLS = Set.of("dev_sleep");
-
-    /**
-     * Opt-in tools: validated (present in {@link #ALLOWED_TOOLS}) but NOT seeded by default.
-     * Unlike {@link #BASE_PLATFORM_TOOLS} (always present) and {@link #DEV_TASK_CONTROL_TOOLS}
-     * (require the dev flag), these are preserved by {@code canonicalizeConfig} only when the
-     * caller explicitly requests them. Opt-in tools activate optional platform capabilities
-     * (e.g., plan_write for the Planning Primitive) that should not appear on agents that have
-     * not opted in.
-     */
-    public static final Set<String> OPT_IN_TOOLS = Set.of("plan_write");
 
     /** Allowed dead-letter reasons matching the database constraint.
      *
