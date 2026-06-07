@@ -117,11 +117,19 @@ class TavilySearchProvider:
                 timeout=self._timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
-            raise ToolTransportError("Search request timed out.") from exc
+            raise ToolTransportError(
+                f"Search request timed out for query: {query!r}. The search "
+                "backend may be slow or overloaded. Try again later, rephrase "
+                "the query, or proceed without search results."
+            ) from exc
         except ToolTransportError:
             raise
         except Exception as exc:  # noqa: BLE001 — normalise provider errors
-            raise ToolTransportError(f"Tavily search failed: {exc}") from exc
+            raise ToolTransportError(
+                f"Tavily search failed for query {query!r}: {exc}. The search "
+                "backend may be unavailable. Try again later, rephrase the "
+                "query, or proceed without search results."
+            ) from exc
 
         raw_results = (payload or {}).get("results") or []
         results: list[SearchResult] = []

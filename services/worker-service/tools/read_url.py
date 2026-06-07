@@ -24,6 +24,8 @@ DEFAULT_TIMEOUT_SECONDS: Final[float] = 10.0
 # Single bounded in-tool retry for transient failures (transient DNS, fetch /
 # connect timeout) before the error surfaces to the LLM as a correctable
 # ToolMessage. A small fixed delay — deliberately no backoff machinery.
+# The retry budget is per resolve/request attempt, so a redirect chain may
+# retry once per hop (max MAX_REDIRECTS + 1 hops).
 TRANSIENT_RETRY_DELAY_SECONDS: Final[float] = 0.5
 # getaddrinfo errnos that mean the *name itself* is bad (NXDOMAIN-style) —
 # retrying cannot help, surface immediately. Anything else (EAI_AGAIN, bare
@@ -111,7 +113,7 @@ class ReadUrlFetcher:
 
         for _ in range(self._max_redirects + 1):
             await self._validate_public_url(current_url)
-            response = await self._request_once(current_url)
+            response = await self._request_with_retry(current_url)
 
             if response.status_code in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
@@ -207,7 +209,7 @@ class ReadUrlFetcher:
                 await asyncio.sleep(TRANSIENT_RETRY_DELAY_SECONDS)
         raise ToolTransportError(dns_error_message)
 
-    async def _request_once(self, url: str) -> _FetchedResponse:
+    async def _request_with_retry(self, url: str) -> _FetchedResponse:
         """Issue one logical request, retrying once on fetch/connect timeout.
 
         Only timeouts get the single in-tool retry; other request failures

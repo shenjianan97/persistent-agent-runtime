@@ -20,5 +20,8 @@ class ToolTransportError(ToolExecutionError):
     correctable error ToolMessage so the agent can adapt — it does NOT
     trigger a task-level retry. Raisers should make the message actionable
     (include the target and a hint), and may perform a single bounded
-    in-tool retry for transient flavors before raising.
+    in-tool retry for transient flavors before raising. When the same
+    exception is raised inside the external MCP tool server, it surfaces
+    worker-side as ``McpToolCallError`` instead, which keeps task-retry
+    semantics.
     """

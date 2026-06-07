@@ -235,6 +235,7 @@ class TestReadUrlTransientRetry:
 
         async def resolver(host: str, port: int) -> list[str]:
             calls["count"] += 1
+            assert outcomes, "resolver called more times than scripted"
             outcome = outcomes.pop(0)
             if isinstance(outcome, Exception):
                 raise outcome
