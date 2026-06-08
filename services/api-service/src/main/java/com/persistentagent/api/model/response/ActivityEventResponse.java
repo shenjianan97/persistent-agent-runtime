@@ -70,7 +70,8 @@ public record ActivityEventResponse(
         // Pre-truncation byte count on `turn.tool` events when the worker
         // truncated a large tool output. Null on other kinds / untruncated.
         @JsonProperty("orig_bytes") Long origBytes,
-        // Sub-agent fan-out observability (S9): iteration round (0-based) and
+        // Sub-agent fan-out observability (S9): iteration round (1-based; supervisor_iteration
+        // cap/no-op events may carry 0) and
         // stable logical sub-agent id. Present only on marker.subagent.* and
         // marker.supervisor.iteration kinds; null on all other kinds.
         // @JsonInclude(NON_NULL) on the record ensures existing kinds serialise

@@ -248,7 +248,7 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
         checkpointer=deps["checkpointer"],
         thread_id=parent_thread,
         checkpoint_ns=sub_checkpoint_ns,
-        emit=deps.get("emit"),
+        emit=emit,
     )
 
     # Parse the sub-agent's distilled summary into the parent ``findings`` channel

@@ -543,7 +543,8 @@ public class ActivityProjectionService {
                  "task_redriven", "task_completed", "task_cancelled",
                  "task_follow_up" -> "marker.lifecycle";
             // S9 sub-agent fan-out observability markers.
-            // These carry iteration (round, 0-based) and subtask (stable logical
+            // These carry iteration (round, 1-based; supervisor_iteration cap/no-op
+            // events may carry 0) and subtask (stable logical
             // id) from the details JSONB so the Console can group by round then
             // sub-agent. Marker skeleton only — sub-agent turn-by-turn reasoning
             // lives in Langfuse spans (E5, plan §A11-E5).
