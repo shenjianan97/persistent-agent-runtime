@@ -1,7 +1,7 @@
 import asyncio
 import json
 import pytest
-from unittest.mock import ANY, AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 
 from core.worker import WorkerService
 from core.config import WorkerConfig
@@ -168,10 +168,26 @@ def test_handle_tool_error_returns_message_for_validation_errors():
     assert "fix the error" in result.lower()
 
 
-def test_handle_tool_error_reraises_transport_errors():
-    """Infrastructure errors propagate for task-level retry."""
-    with pytest.raises(ToolTransportError):
-        _handle_tool_error(ToolTransportError("S3 unreachable"))
+def test_handle_tool_error_returns_message_for_transport_errors():
+    """Transport failures of an agent-chosen target (URL, search query) are
+    content errors: returned to the LLM as a correctable ToolMessage so the
+    agent can adapt (different URL, fall back to search, proceed without the
+    source). Task-level retry would replay the same checkpointed tool call
+    deterministically — see the dead-letter incident pinned in
+    test_tool_error_routing.py."""
+    result = _handle_tool_error(
+        ToolTransportError("Hostname could not be resolved for https://atb.nrel.gov/.")
+    )
+    assert "Hostname could not be resolved" in result
+    assert "https://atb.nrel.gov/" in result
+
+
+def test_handle_tool_error_reraises_mcp_tool_call_errors():
+    """McpToolCallError keeps task-level retry semantics (separate, undecided)."""
+    with pytest.raises(McpToolCallError):
+        _handle_tool_error(
+            McpToolCallError("some-server", "some_tool", "Tool call timed out after 30s")
+        )
 
 
 def test_handle_tool_error_returns_message_for_tool_execution_errors():
@@ -601,59 +617,17 @@ async def test_cancellation_awareness(mock_worker, task_data):
             mock_worker.pool.acquire.return_value.__aenter__.return_value.execute.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_read_url_failure_preserves_failing_url_on_retryable_requeue(mock_worker, task_data):
-    executor = GraphExecutor(mock_worker.config, mock_worker.pool)
-
-    with patch.object(executor, "_build_graph") as mock_build:
-        mock_graph = MagicMock()
-        mock_compiled = AsyncMock()
-        mock_graph.compile.return_value = mock_compiled
-        mock_build.return_value = mock_graph
-
-        with patch("executor.graph.PostgresDurableCheckpointer") as MockCheckpointer:
-            mock_ckpt = AsyncMock()
-            mock_ckpt.aget_tuple.return_value = None
-            MockCheckpointer.return_value = mock_ckpt
-
-            async def failing_astream(*args, **kwargs):
-                raise ToolTransportError("URL fetch request failed for https://bad.example/fail: network down")
-                yield {}
-
-            mock_compiled.astream = failing_astream
-
-            await executor.execute_task(task_data, mock_worker.heartbeat.start_heartbeat.return_value.cancel_event)
-
-    # Retry requeue now uses conn.fetchval with lease guard
-    mock_worker.pool.acquire.return_value.__aenter__.return_value.fetchval.assert_any_call(
-        '''UPDATE tasks
-                       SET status='queued',
-                           retry_count=$1,
-                           retry_after=$2,
-                           retry_history=COALESCE(retry_history, '[]'::jsonb) || jsonb_build_array(NOW()),
-                           last_error_code='retryable_error',
-                           last_error_message=$3,
-                           version=version+1,
-                           lease_owner=NULL,
-                           lease_expiry=NULL
-                       WHERE task_id=$4::uuid
-                         AND status='running'
-                         AND lease_owner=$5
-                       RETURNING task_id''',
-        1,
-        ANY,
-        "URL fetch request failed for https://bad.example/fail: network down",
-        task_data["task_id"],
-        "test-worker",
-    )
-
-
-def test_tool_transport_error_is_retryable(mock_worker):
+def test_tool_transport_error_is_not_task_level_retryable(mock_worker):
+    """ToolTransportError can no longer escape the graph (ToolNode's
+    handle_tool_errors converts it to an agent-visible ToolMessage), so the
+    task-level classifier must not carry a dead "retryable" entry for it —
+    that classification contradicts the agent-correctable semantics and is a
+    trap for future raisers of the type."""
     executor = GraphExecutor(mock_worker.config, mock_worker.pool)
 
     assert executor._is_retryable_error(
-        ToolTransportError("URL fetch request failed for https://bad.example/fail: network down")
-    ) is True
+        ToolTransportError("Hostname could not be resolved for https://bad.example/fail.")
+    ) is False
 
 
 def test_mcp_tool_call_error_is_retryable(mock_worker):

@@ -136,8 +136,14 @@ class TestTavilySearchProviderConcurrency:
         provider = TavilySearchProvider(timeout_seconds=0.1)
         _inject(provider, _HangingClient())
 
-        with pytest.raises(ToolTransportError, match="timed out"):
+        with pytest.raises(ToolTransportError, match="timed out") as excinfo:
             await provider.search("hang", 1)
+
+        # The error routes to the LLM as a correctable ToolMessage — it must
+        # include the agent-chosen query and an actionable hint.
+        message = str(excinfo.value)
+        assert "'hang'" in message
+        assert "rephrase" in message
 
     @pytest.mark.asyncio
     async def test_provider_error_is_wrapped_in_tool_transport_error(self) -> None:
@@ -148,5 +154,10 @@ class TestTavilySearchProviderConcurrency:
         provider = TavilySearchProvider()
         _inject(provider, _ExplodingClient())
 
-        with pytest.raises(ToolTransportError, match="tavily boom"):
+        with pytest.raises(ToolTransportError, match="tavily boom") as excinfo:
             await provider.search("boom", 1)
+
+        # Same actionable-message contract as the timeout path.
+        message = str(excinfo.value)
+        assert "'boom'" in message
+        assert "rephrase" in message

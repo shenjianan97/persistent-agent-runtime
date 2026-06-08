@@ -12,4 +12,16 @@ class ToolInputError(ToolExecutionError):
 
 
 class ToolTransportError(ToolExecutionError):
-    """Raised when a transient backend or network dependency fails."""
+    """Raised when a tool's network fetch fails (DNS, timeout, HTTP 5xx, …).
+
+    These are failures of an *agent-chosen target* (a URL, a search query),
+    not platform infrastructure: the worker's ToolNode error handler
+    (``executor.graph._handle_tool_error``) surfaces them to the LLM as a
+    correctable error ToolMessage so the agent can adapt — it does NOT
+    trigger a task-level retry. Raisers should make the message actionable
+    (include the target and a hint), and may perform a single bounded
+    in-tool retry for transient flavors before raising. When the same
+    exception is raised inside the external MCP tool server, it surfaces
+    worker-side as ``McpToolCallError`` instead, which keeps task-retry
+    semantics.
+    """
