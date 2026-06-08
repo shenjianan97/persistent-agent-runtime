@@ -281,7 +281,13 @@ class ReadUrlFetcher:
                 self._max_body_bytes,
             )
 
-        async with httpx.AsyncClient() as client:
+        # trust_env=False: we do our own resolve→validate→pin, so egress must
+        # not be silently redirected through an env proxy (HTTPS_PROXY/ALL_PROXY)
+        # that performs its own DNS — that would re-open the rebinding window the
+        # pinning closes. It also avoids the proxy CONNECT path using the pinned
+        # IP as the TLS server_hostname (ignoring our sni_hostname extension),
+        # which would fail cert verification closed and break env-proxy fetches.
+        async with httpx.AsyncClient(trust_env=False) as client:
             return await _stream_response(
                 client,
                 url,

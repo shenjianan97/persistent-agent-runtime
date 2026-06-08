@@ -161,7 +161,7 @@ async def test_cert_hostname_mismatch_is_rejected(tmp_path) -> None:
     try:
         # Cert is for pinned.test; verify against wrong.test → must be rejected.
         pinned = _PinnedTarget(connect_ip="127.0.0.1", sni_hostname="wrong.test")
-        with pytest.raises(ToolTransportError):
+        with pytest.raises(ToolTransportError) as excinfo:
             await _stream_response(
                 client,
                 f"https://wrong.test:{port}/",
@@ -170,6 +170,18 @@ async def test_cert_hostname_mismatch_is_rejected(tmp_path) -> None:
                 5.0,
                 1_000_000,
             )
+
+        # Assert the rejection is specifically a cert hostname-verification
+        # failure — not an unrelated error (e.g. connection refused) that would
+        # let this test pass for the wrong reason in a future regression.
+        cause_chain: list[BaseException] = []
+        cause: BaseException | None = excinfo.value.__cause__
+        while cause is not None and cause not in cause_chain:
+            cause_chain.append(cause)
+            cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
+        assert any(
+            isinstance(c, ssl.SSLCertVerificationError) for c in cause_chain
+        ), f"expected an SSLCertVerificationError in the cause chain, got: {cause_chain}"
     finally:
         await client.aclose()
         server.close()
