@@ -146,6 +146,134 @@ def build_supervisor_prompt(
     )
 
 
+# --------------------------------------------------------------------------- #
+# Subagent — structured-findings emission (S7).
+# --------------------------------------------------------------------------- #
+# A sub-agent's output is PARSED into structured findings, each
+# ``{claim, source_url, supporting_quote}`` — NOT freeform prose with inline
+# links (design "Citation binding" step 1). The runtime mints the stable
+# ``finding_id`` (``parse_findings``), so the template deliberately does NOT ask
+# the model to assign ids. The ``supporting_quote`` MUST be copied verbatim from
+# the source — it is immutable downstream (§A0 inv. 4) and is what the verify
+# pass checks the claim against. This template is the *instruction* the fan-out
+# helper seeds as the sub-agent's research prompt; the sub-agent's distilled
+# ``summary`` (the SubagentResult cross-back value) is then parsed by
+# ``parse_findings``.
+SUBAGENT_FINDINGS_PROMPT = """\
+You are a focused research sub-agent. Carry out the sub-task below using your \
+tools, then report your findings as structured data the supervisor can cite \
+precisely.
+
+Sub-task:
+{subtask_prompt}
+
+When you are done researching, produce your FINAL answer as a single JSON object \
+and nothing else, listing every distinct finding you can support with a source:
+
+  {{"findings": [
+    {{"claim": "a single factual statement you found",
+      "source_url": "the URL of the source that backs this claim",
+      "supporting_quote": "the exact text from the source that supports the claim"}},
+    ...
+  ]}}
+
+Rules:
+- Copy each `supporting_quote` VERBATIM from the source — do not paraphrase, \
+trim, or edit it. It is quoted directly downstream.
+- Every finding MUST have a real `source_url` you actually consulted. Do not \
+invent sources or quotes. If you could not verify a claim, omit it.
+- Do NOT assign ids — the runtime assigns them.
+- If you found nothing you can support with a source, return {{"findings": []}}."""
+
+
+# --------------------------------------------------------------------------- #
+# Writer — one-shot final report, cite by finding_id ONLY (S7).
+# --------------------------------------------------------------------------- #
+# A SINGLE Writer call over the (reduced) finding corpus + the brief (design
+# "Pattern provenance" → one-shot Writer: LangChain's hard-learned *"restrict
+# multi-agent to research, and write the report in one-shot"*). The Writer cites
+# by ``finding_id`` ONLY — it never emits an inline source URL, so it cannot
+# fabricate a source; the runtime resolves ids → citations at render
+# (``citations.resolve``). ``writer_style`` selects the output shape.
+_WRITER_STYLE_INSTRUCTIONS = {
+    "formal_report": (
+        "Write a formal research report in well-structured prose with clear "
+        "section headings. It should read as a polished, publishable document."
+    ),
+    "annotated_bullets": (
+        "Write an annotated bullet-point summary: concise bullets grouped under "
+        "short headings, each bullet a single annotated point. Do not write long "
+        "prose paragraphs."
+    ),
+}
+# v1 default style when the agent config omits ``writer_style``. The ``research``
+# preset (S2) seeds ``formal_report``.
+DEFAULT_WRITER_STYLE = "formal_report"
+
+WRITER_PROMPT = """\
+You are the writer of a deep-research agent. Using ONLY the findings below, \
+write the final answer to the research brief. {style_instruction}
+
+Research brief (the north star — answer it):
+{brief}
+
+Findings (cite these by their id):
+{findings_block}
+
+Citation rules (STRICT):
+- Cite a finding by writing its id in square brackets immediately after the \
+sentence it supports, e.g. "The market grew 12% in 2024 [{example_id}]."
+- Cite by `finding_id` ONLY. Do NOT write source URLs, link text, or footnotes \
+in your output — the runtime resolves each id to its full citation at render.
+- Only cite ids that appear in the findings list above. Do not invent ids.
+- Every substantive claim should be backed by at least one finding id.
+
+Write the final answer now."""
+
+
+def _render_findings_block(findings: list[dict]) -> str:
+    """Render the reduced finding corpus for the Writer.
+
+    Each line is ``[<finding_id>] <claim> — "<supporting_quote>"`` so the Writer
+    sees the id it must cite by, the claim, and the verbatim quote (read-only —
+    the Writer must not alter it). The ``source_url`` is intentionally rendered
+    too so the model can weigh sources, but the Writer is instructed never to
+    *emit* it (binding is by id)."""
+    if not findings:
+        return "(no findings were gathered)"
+    lines: list[str] = []
+    for f in findings:
+        fid = f.get("finding_id", "")
+        claim = str(f.get("claim") or "").strip()
+        quote = str(f.get("supporting_quote") or "").strip()
+        url = str(f.get("source_url") or "").strip()
+        lines.append(f'[{fid}] {claim} — "{quote}" (source: {url})')
+    return "\n".join(lines)
+
+
+def build_subagent_prompt(subtask_prompt: str) -> str:
+    """Render the structured-findings instruction for one sub-agent's sub-task."""
+    return SUBAGENT_FINDINGS_PROMPT.format(subtask_prompt=subtask_prompt)
+
+
+def build_writer_prompt(
+    brief: str, findings: list[dict], *, writer_style: str | None = None
+) -> str:
+    """Render the one-shot Writer prompt honoring ``writer_style``.
+
+    ``writer_style`` ∈ {``formal_report``, ``annotated_bullets``} (bounds-validated
+    by S1); an unknown / absent value falls back to :data:`DEFAULT_WRITER_STYLE`.
+    """
+    style = writer_style if writer_style in _WRITER_STYLE_INSTRUCTIONS else DEFAULT_WRITER_STYLE
+    example_id = findings[0]["finding_id"] if findings else "1.0-abcd"
+    return WRITER_PROMPT.format(
+        style_instruction=_WRITER_STYLE_INSTRUCTIONS[style],
+        brief=brief,
+        findings_block=_render_findings_block(findings),
+        example_id=example_id,
+    )
+
+
 def build_clarity_assessment_prompt(query: str) -> str:
     """Render the clarity-assessment prompt for ``query``."""
     return SCOPE_CLARITY_ASSESSMENT_PROMPT.format(query=query)

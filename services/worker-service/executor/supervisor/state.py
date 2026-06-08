@@ -128,3 +128,15 @@ class SupervisorState(RuntimeState, total=False):
     # the edge that runs in the *same* super-step downstream reads the current
     # round's decision — never a stale one.
     supervisor_decision: str
+
+    # --- Writer output channels (S7) -------------------------------------- #
+    # writer_node (S7) writes these ONCE at the terminal Writer phase; no later
+    # node writes them (the Writer is the graph's last LLM node). Last-write-wins
+    # (no reducer) — there is a single Writer super-step. ``report`` is the
+    # one-shot final report (citing by ``finding_id`` only); ``citations`` is the
+    # render-time resolution of each cited id → {source_url, supporting_quote}
+    # (or a render error flag for an unresolved id); ``verify_flags`` is the thin
+    # verify pass's per-citation support flags. S9 renders these on the Console.
+    report: str
+    citations: list[dict]
+    verify_flags: list[dict]

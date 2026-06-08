@@ -59,8 +59,10 @@ from executor.subagents import SubagentResult, run_subagent
 from executor.supervisor.nodes import (
     DECISION_CONTINUE,
     DECISION_STOP,
+    parse_findings,
     supervisor_node,
 )
+from executor.supervisor.prompts import build_subagent_prompt
 from executor.supervisor.state import SupervisorState
 
 logger = logging.getLogger(__name__)
@@ -203,8 +205,12 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
 
     sub_thread = f"{configurable.get('thread_id', '')}:subagent:{subtask}"
 
+    # Wrap the Supervisor's focused sub-task instruction in S7's Subagent
+    # findings template so the sub-agent emits structured
+    # {claim, source_url, supporting_quote} findings (NOT freeform prose) — the
+    # contract ``parse_findings`` + the citation binding consume.
     result = await run_subagent(
-        prompt,
+        build_subagent_prompt(prompt),
         deps.get("tools", []),
         ceiling=deps.get("ceiling"),
         depth=SUPERVISOR_FANOUT_DEPTH,
@@ -214,13 +220,33 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
         emit=deps.get("emit"),
     )
 
+    # Parse the sub-agent's distilled summary into the parent ``findings`` channel
+    # (S7). Only a successful sub-agent contributes findings; a failure marker
+    # rides ``subagent_results`` and yields no findings (parse of a non-JSON /
+    # empty summary returns []). ``findings`` is the append-only channel S5
+    # declared — LangGraph concatenates every branch's list (§A0 inv. 4: the
+    # append reducer never rewrites an existing entry; quotes are immutable).
+    iteration = int(configurable.get("iteration", 0) or 0)
+    findings: list[dict] = []
+    if result.ok:
+        findings = await parse_findings(
+            result.summary,
+            iteration=iteration,
+            subtask=subtask,
+            emit=deps.get("emit"),
+        )
+
     logger.info(
-        "supervisor.subagent_completed subtask=%s ok=%s reason=%s",
+        "supervisor.subagent_completed subtask=%s ok=%s reason=%s findings=%s",
         subtask,
         result.ok,
         result.reason,
+        len(findings),
     )
-    return {"subagent_results": {subtask: _result_to_dict(result, subtask)}}
+    return {
+        "subagent_results": {subtask: _result_to_dict(result, subtask)},
+        "findings": findings,
+    }
 
 
 async def _gather_node(state: SupervisorState) -> dict:

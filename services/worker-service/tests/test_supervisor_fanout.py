@@ -224,7 +224,11 @@ async def test_within_iteration_collision_both_results_survive():
     )
 
     async def fake_run(prompt, tools, **kwargs):
-        return SubagentResult.success(f"summary for {prompt}")
+        # S7 wraps the raw subtask prompt in the Subagent findings template, so
+        # the raw subtask ("first" / "second") is now EMBEDDED in ``prompt`` —
+        # assert containment, then echo it back so the per-key result is distinct.
+        which = "first" if "first" in prompt else "second"
+        return SubagentResult.success(f"summary for {which}")
 
     emit = RecordingEmit()
     cfg = _supervisor_config(model=model, emit=emit, fanout_deps=_FANOUT_DEPS)
@@ -439,7 +443,15 @@ async def test_send_fanout_dispatches_n_subagents():
             config={"configurable": cfg["configurable"]},
             durability="sync",
         )
-    assert sorted(dispatched) == ["p0", "p1", "p2"]
+    # S7 wraps each raw subtask prompt in the Subagent findings template, so each
+    # raw subtask ("p0".."p2") is EMBEDDED in the dispatched prompt (not equal).
+    # All three branches still fan out (the S6 structural assertion).
+    assert len(dispatched) == 3
+    assert sorted(p.split("Sub-task:\n")[1].split("\n")[0] for p in dispatched) == [
+        "p0",
+        "p1",
+        "p2",
+    ]
     assert set(out["subagent_results"].keys()) == {"1.0", "1.1", "1.2"}
 
 
@@ -460,10 +472,13 @@ async def test_crash_resume_forward_restores_completed_siblings():
     crash = {"on": True}
 
     async def fake_run(prompt, tools, **kwargs):
-        run_counts[prompt] = run_counts.get(prompt, 0) + 1
-        if crash["on"] and prompt == "p1":
+        # S7 wraps the raw subtask in the Subagent template, so key the counters
+        # on the embedded raw subtask ("p0" / "p1"), not the full prompt string.
+        raw = prompt.split("Sub-task:\n")[1].split("\n")[0]
+        run_counts[raw] = run_counts.get(raw, 0) + 1
+        if crash["on"] and raw == "p1":
             raise RuntimeError("worker crash mid-fan-out")
-        return SubagentResult.success(f"done {prompt}")
+        return SubagentResult.success(f"done {raw}")
 
     cfg = _supervisor_config(model=model, fanout_deps=_FANOUT_DEPS)
     checkpointer = MemorySaver()

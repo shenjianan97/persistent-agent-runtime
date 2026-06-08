@@ -44,6 +44,11 @@ SUPERVISOR_ITERATION_EVENT = "supervisor_iteration"
 """``task_events.event_type`` value for a Supervisor loop decision / cap hit.
 S9 adds this to the migration-``0025`` CHECK constraint."""
 
+SUBAGENT_FINDING_EVENT = "subagent_finding"
+"""``task_events.event_type`` value for a single structured finding emitted by a
+sub-agent (Task S7). S9 adds this to the migration-``0025`` CHECK constraint and
+wires the real ``_insert_task_event`` body."""
+
 # The injected sink shape: ``await emit(event_type, details)``. Deliberately
 # NARROWER than the fan-out helper's ``Callable[..., Awaitable[None]]``
 # (``executor/subagents/fanout.py``): every call here is exactly
@@ -85,5 +90,46 @@ async def emit_supervisor_iteration(
         logger.exception(
             "%s emit failed (non-fatal) details=%s",
             SUPERVISOR_ITERATION_EVENT,
+            details,
+        )
+
+
+async def emit_subagent_finding(
+    emit: EmitCallable | None,
+    *,
+    iteration: int,
+    subtask: str,
+    finding_id: str,
+    source_url: str,
+) -> None:
+    """Emit a ``subagent_finding`` event with the canonical payload.
+
+    Payload (plan §A7): ``{iteration, subtask, finding_id, source_url}``. The
+    ``claim`` and ``supporting_quote`` are DELIBERATELY excluded from the row —
+    they ride the Langfuse span instead, to bound the ``task_events`` row size on
+    a wide fan-out × many-findings run (§A7). ``emit`` is the injected sink; when
+    ``None`` this degrades to a structured log so the finding is still observable
+    and never raises into the graph.
+
+    Stub-forwarding-to-injected-sink, identical to
+    :func:`emit_supervisor_iteration`. S9 owns the migration-``0025`` CHECK value
+    + the real ``_insert_task_event`` body and the projection; S7 only calls this
+    helper.
+    """
+    details = {
+        "iteration": iteration,
+        "subtask": subtask,
+        "finding_id": finding_id,
+        "source_url": source_url,
+    }
+    if emit is None:
+        logger.info("%s %s", SUBAGENT_FINDING_EVENT, details)
+        return
+    try:
+        await emit(SUBAGENT_FINDING_EVENT, details)
+    except Exception:  # noqa: BLE001 — observability must never sink the run.
+        logger.exception(
+            "%s emit failed (non-fatal) details=%s",
+            SUBAGENT_FINDING_EVENT,
             details,
         )

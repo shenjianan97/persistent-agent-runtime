@@ -12,9 +12,13 @@ from __future__ import annotations
 from executor.supervisor.nodes import (
     DECISION_CONTINUE,
     DECISION_STOP,
+    WRITER_FINDINGS_CAP,
     SupervisorAllFailedError,
+    parse_findings,
+    reduce_findings,
     scope_node,
     supervisor_node,
+    writer_node,
 )
 from executor.supervisor.state import SupervisorState, _merge_subagent_results
 
@@ -22,6 +26,10 @@ __all__ = [
     "SupervisorState",
     "scope_node",
     "supervisor_node",
+    "writer_node",
+    "parse_findings",
+    "reduce_findings",
+    "WRITER_FINDINGS_CAP",
     "SupervisorAllFailedError",
     "DECISION_CONTINUE",
     "DECISION_STOP",

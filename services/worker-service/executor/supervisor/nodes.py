@@ -14,6 +14,7 @@ follow the repo's ``async`` convention (see the ReAct nodes in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any
@@ -22,11 +23,13 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
-from core.subagent_events import emit_supervisor_iteration
+from core.subagent_events import emit_subagent_finding, emit_supervisor_iteration
+from executor.supervisor import citations
 from executor.supervisor.prompts import (
     build_brief_prompt,
     build_clarity_assessment_prompt,
     build_supervisor_prompt,
+    build_writer_prompt,
 )
 from executor.supervisor.state import SupervisorState
 from executor.text import flatten_text as _flatten_text
@@ -395,3 +398,220 @@ def _carry_forward_id(entry: dict, results: dict) -> str | None:
     if isinstance(prior, dict) and not prior.get("ok"):
         return candidate
     return None
+
+
+# =========================================================================== #
+# Phase 3/4 — subagent findings parse + one-shot Writer + citation binding (S7)
+# =========================================================================== #
+
+# D2 (DEFERRED — one-shot Writer reduction *algorithm*; design "Open decisions",
+# plan §A8/D2, ledger §A12 row D2). This is the **open-decision flag** for the v1
+# reduction. When the accumulated finding corpus exceeds this cap, the v1
+# behavior is a HARD CAP: select the first ``WRITER_FINDINGS_CAP`` findings by
+# the channel's append order (see ``reduce_findings`` for the ordering rationale),
+# drop the rest, and ``log()`` the dropped ids + count (no silent truncation —
+# §A7). Selection/reorder ONLY — ``supporting_quote`` is NEVER mutated (§A0 inv.4),
+# so ``citations.resolve`` + ``citations.verify`` still work on the kept set.
+#
+# DEFERRED ALTERNATIVES (NOT built here — §"Open decisions"): map-reduce
+# summarization of the corpus, or running Track-7 context compaction on the
+# Writer input. v1 ships the cap + log; the better algorithm is gated on the S11
+# cap-hit-rate + report-quality metrics (ledger D2). Tune this constant from that
+# data — it is intentionally a single, clearly-commented knob.
+WRITER_FINDINGS_CAP = 50
+
+
+def _mint_finding_id(subtask: str, index: int, claim: str, quote: str) -> str:
+    """Mint a stable, run-unique ``finding_id``.
+
+    Deterministic (same subtask + index + claim + quote → same id, so a replayed
+    super-step on resume re-mints identical ids and the append-only ``findings``
+    channel stays idempotent under the projection's dedup) and scoped by
+    ``subtask`` + ``index`` so two findings in the run never collide. The id is
+    minted by the runtime, NEVER trusted from the model (mirrors the §A11-E8
+    subtask-id discipline)."""
+    digest = hashlib.sha1(
+        f"{subtask}\x00{index}\x00{claim}\x00{quote}".encode("utf-8")
+    ).hexdigest()[:8]
+    return f"{subtask}-{digest}"
+
+
+def _parse_findings_payload(summary: Any) -> list[dict]:
+    """Parse a sub-agent ``summary`` into raw ``{claim, source_url,
+    supporting_quote}`` dicts (no ids yet).
+
+    The Subagent template instructs a ``{"findings": [...]}`` JSON object as the
+    final answer. Robust to fenced / surrounded JSON (reuses ``_loads_lenient``).
+    On any parse failure → ``[]`` (a sub-agent that returned freeform prose
+    contributes no structured findings — never raises into the graph). Only
+    entries carrying a non-empty ``supporting_quote`` are kept (a finding with no
+    quote cannot be cited or verified)."""
+    text = _flatten_text(summary).strip()
+    obj = _loads_lenient(text)
+    if not isinstance(obj, dict):
+        return []
+    raw = obj.get("findings")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        quote = str(entry.get("supporting_quote") or "")
+        if not quote.strip():
+            continue
+        out.append(
+            {
+                "claim": str(entry.get("claim") or "").strip(),
+                "source_url": str(entry.get("source_url") or "").strip(),
+                # Quote stored VERBATIM (no strip / normalize) — immutable (§A0
+                # inv. 4); the verify pass + resolve read it exactly.
+                "supporting_quote": quote,
+            }
+        )
+    return out
+
+
+async def parse_findings(
+    summary: Any,
+    *,
+    iteration: int,
+    subtask: str,
+    emit: Any = None,
+) -> list[dict]:
+    """Parse one sub-agent's ``summary`` into structured findings + emit events.
+
+    Returns a list of ``{finding_id, claim, source_url, supporting_quote}`` — the
+    contract the Writer + ``citations`` consume. ``finding_id`` is minted by the
+    runtime (``_mint_finding_id``), stable + run-unique, NEVER trusted from the
+    model. Each finding emits a ``subagent_finding`` event
+    ``{iteration, subtask, finding_id, source_url}`` via the S9 emit helper
+    (claim / quote ride the Langfuse span, not the row — §A7).
+
+    This is the bridge from S3's ``SubagentResult.summary`` (a freeform string)
+    into the parent ``findings`` channel: S6's ``_fanout_node`` calls it on the
+    successful sub-agent's summary and returns the result under ``{"findings":
+    [...]}`` (the append-only channel S5 declared). A failed / empty sub-agent
+    contributes ``[]`` and the ``subagent_results`` failure marker is unaffected.
+    """
+    raw = _parse_findings_payload(summary)
+    findings: list[dict] = []
+    for index, entry in enumerate(raw):
+        finding_id = _mint_finding_id(
+            subtask, index, entry["claim"], entry["supporting_quote"]
+        )
+        finding = {"finding_id": finding_id, **entry}
+        findings.append(finding)
+        await emit_subagent_finding(
+            emit,
+            iteration=iteration,
+            subtask=subtask,
+            finding_id=finding_id,
+            source_url=entry["source_url"],
+        )
+    return findings
+
+
+def reduce_findings(findings: list[dict]) -> list[dict]:
+    """v1 Writer-context reduction — HARD CAP + log; select/reorder ONLY (D2).
+
+    When ``len(findings) > WRITER_FINDINGS_CAP`` keep the FIRST
+    ``WRITER_FINDINGS_CAP`` by the ``findings`` channel's natural **append
+    order** (earliest iteration → earliest sub-agent → earliest finding, since
+    the channel is ``operator.add`` and the fan-out appends per round) and drop
+    the rest. Rationale for that ordering: append order is the recency/iteration
+    order — earlier rounds laid the foundational findings the later rounds refine,
+    so prefer-earliest keeps the corpus the Supervisor built on. (One documented
+    ordering — see §"Open decisions" for the deferred richer alternatives.)
+
+    Dropped findings are ``log()``ed (ids + count) — NO silent truncation (§A7).
+    ``supporting_quote`` is NEVER mutated: this only selects a sub-list of the
+    SAME finding dicts, so every kept quote is byte-identical to its input (§A0
+    inv. 4, the core S7 invariant). Returns the input unchanged when under cap.
+    """
+    if len(findings) <= WRITER_FINDINGS_CAP:
+        return findings
+    kept = findings[:WRITER_FINDINGS_CAP]
+    dropped = findings[WRITER_FINDINGS_CAP:]
+    dropped_ids = [f.get("finding_id") for f in dropped]
+    logger.info(
+        "writer.findings_reduced cap=%s total=%s kept=%s dropped=%s dropped_ids=%s "
+        "(D2 v1 hard-cap reduction — see WRITER_FINDINGS_CAP / design Open decisions)",
+        WRITER_FINDINGS_CAP,
+        len(findings),
+        len(kept),
+        len(dropped),
+        dropped_ids,
+    )
+    return kept
+
+
+async def writer_node(state: SupervisorState, config: RunnableConfig) -> dict:
+    """Phase 4 — the ONE-SHOT Writer + citation binding (Task S7).
+
+    Contract (plan §A4.1 S7 / design "Citation binding"):
+
+    1. Reduce the accumulated ``findings`` to the Writer's context budget
+       (``reduce_findings`` — v1 hard cap, select/reorder only, quotes immutable).
+    2. ONE Writer LLM call over the reduced corpus + the ``brief``, honoring
+       ``writer_style`` (``formal_report`` | ``annotated_bullets``). The Writer
+       cites by ``finding_id`` ONLY — never inline source URLs (it cannot
+       fabricate a source). This is a SINGLE call — NOT parallel section-writing
+       (the design's load-bearing reason for one-shot).
+    3. ``citations.verify`` — one verify LLM call per cited finding, run
+       concurrently, flagging cited sentences whose finding quote does not
+       support them (never rewrites the report / invents a source; a single
+       flaky call degrades fail-safe for that one citation, not the report).
+    4. ``citations.resolve`` each cited ``finding_id`` → a full citation at render
+       (deterministic, no LLM; an unknown id → a render error flag, never a
+       fabricated source).
+
+    Returns ``{report, citations, verify_flags}`` for downstream rendering (S8
+    wires this node as the iteration ``stop`` target; S9 renders the bound
+    citations + verify flags on the Console).
+
+    Dependencies are read from ``config["configurable"]`` (same convention as the
+    other supervisor nodes): ``writer_model`` + ``verify_model`` (chat models with
+    ``ainvoke``) and ``agent_config`` (the loaded snapshot, for ``writer_style``).
+    """
+    configurable = (config or {}).get("configurable", {}) if config else {}
+    writer_model = configurable["writer_model"]
+    verify_model = configurable.get("verify_model") or writer_model
+    agent_config: dict = configurable.get("agent_config") or {}
+    supervisor_cfg: dict = agent_config.get("supervisor") or {}
+    writer_style = supervisor_cfg.get("writer_style")
+
+    brief = state.get("brief", "") or ""
+    all_findings: list[dict] = list(state.get("findings") or [])
+
+    # (1) v1 reduction — cap + log; quotes immutable.
+    reduced = reduce_findings(all_findings)
+
+    # (2) One-shot Writer call.
+    writer_msg = await writer_model.ainvoke(
+        build_writer_prompt(brief, reduced, writer_style=writer_style)
+    )
+    report = _flatten_text(writer_msg.content)
+
+    # (3) Verify pass — one concurrent call per cited finding (flags only; never
+    # rewrites / fabricates; a flaky call degrades fail-safe per citation).
+    verify_flags = await citations.verify(report, reduced, model=verify_model)
+
+    # (4) Resolve each cited id → a full citation (deterministic, no LLM).
+    cited_ids = citations.extract_citations(report)
+    resolved = [citations.resolve(fid, reduced) for fid in cited_ids]
+
+    unsupported = sum(
+        1 for f in verify_flags if f.get("supported") is False or f.get("error")
+    )
+    logger.info(
+        "writer.report_generated findings_total=%s findings_used=%s cited=%s "
+        "verify_flagged=%s writer_style=%s report_chars=%s",
+        len(all_findings),
+        len(reduced),
+        len(cited_ids),
+        unsupported,
+        writer_style,
+        len(report),
+    )
+    return {"report": report, "citations": resolved, "verify_flags": verify_flags}
