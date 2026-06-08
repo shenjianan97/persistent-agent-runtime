@@ -10,6 +10,8 @@ import { formatUsd } from '@/lib/utils';
 import { useToolServers } from '../tool-servers/useToolServers';
 import { ContextManagementSection } from './ContextManagementSection';
 import type { ContextManagementConfig } from './ContextManagementSection';
+import { SupervisorConfigSection } from './SupervisorConfigSection';
+import type { SupervisorConfig } from './SupervisorConfigSection';
 
 import {
     Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogFooter,
@@ -29,6 +31,11 @@ const createAgentSchema = z.object({
     provider: z.string().min(1, 'Provider is required'),
     model: z.string().min(1, 'Model is required'),
     temperature: z.number().min(0).max(2).default(0.7),
+    // Customer-facing topology preset selector. `research` derives the internal
+    // `topology = supervisor` (Deep Research); the others map to `react`. The
+    // server derives topology from the preset (S1) — the client sends `preset`,
+    // not `topology`.
+    preset: z.enum(['chat', 'coding', 'investigation', 'research']).default('chat'),
     tool_servers: z.array(z.string()).default([]),
     max_concurrent_tasks: z.number().int().min(1).default(5),
     budget_max_per_task: z.number().int().min(1).default(500000),
@@ -57,6 +64,32 @@ interface CreateAgentDialogProps {
     onOpenChange: (open: boolean) => void;
 }
 
+/**
+ * Two-layer naming: the customer picks a preset; the internal `topology` is
+ * derived from it. Only the `research` preset maps to the Supervisor shape
+ * ("Deep Research"); everything else is the ReAct graph.
+ */
+function topologyForPreset(preset: string): 'react' | 'supervisor' {
+    return preset === 'research' ? 'supervisor' : 'react';
+}
+
+function topologyLabel(topology: 'react' | 'supervisor'): string {
+    return topology === 'supervisor' ? 'Deep Research' : 'ReAct';
+}
+
+/** only-send-what-was-set: drop undefined / empty fields from the sub-object. */
+function buildSupervisorPayload(config: SupervisorConfig | undefined): SupervisorConfig | undefined {
+    if (!config) return undefined;
+    const payload: SupervisorConfig = {
+        ...(config.max_fanout_per_iteration != null ? { max_fanout_per_iteration: config.max_fanout_per_iteration } : {}),
+        ...(config.max_iterations != null ? { max_iterations: config.max_iterations } : {}),
+        ...(config.source_allowlist && config.source_allowlist.length ? { source_allowlist: config.source_allowlist } : {}),
+        ...(config.writer_style ? { writer_style: config.writer_style } : {}),
+        ...(config.scope_clarification_enabled != null ? { scope_clarification_enabled: config.scope_clarification_enabled } : {}),
+    };
+    return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
 function buildContextManagementPayload(
     config: ContextManagementConfig | undefined,
 ): ContextManagementConfig {
@@ -78,6 +111,8 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const { data: toolServers = [] } = useToolServers('active');
     const [ctxMgmt, setCtxMgmt] = useState<ContextManagementConfig | undefined>(undefined);
     const ctxMgmtDirty = useRef(false);
+    const [supervisor, setSupervisor] = useState<SupervisorConfig | undefined>(undefined);
+    const supervisorDirty = useRef(false);
 
     const form = useForm<CreateAgentFormValues>({
         resolver: zodResolver(createAgentSchema),
@@ -87,6 +122,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
             provider: '',
             model: '',
             temperature: 0.7,
+            preset: 'chat',
             tool_servers: [],
             max_concurrent_tasks: 5,
             budget_max_per_task: 500000,
@@ -106,6 +142,9 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
     const sandboxEnabled = form.watch('sandbox_enabled');
     const memoryEnabled = form.watch('memory_enabled');
     const selectedModel = form.watch('model');
+    const selectedPreset = form.watch('preset');
+    const derivedTopology = topologyForPreset(selectedPreset);
+    const isSupervisor = derivedTopology === 'supervisor';
 
     useEffect(() => {
         if (models.length === 0) return;
@@ -135,6 +174,11 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
         setCtxMgmt(next);
     }, []);
 
+    const handleSupervisorChange = useCallback((next: SupervisorConfig) => {
+        supervisorDirty.current = true;
+        setSupervisor(next);
+    }, []);
+
     function onSubmit(data: CreateAgentFormValues) {
         const sandboxConfig = data.sandbox_enabled
             ? {
@@ -160,6 +204,13 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
         const contextManagementPayload = ctxMgmtDirty.current
             ? buildContextManagementPayload(ctxMgmt)
             : undefined;
+        // Supervisor sub-object: only-send-what-was-set. Sent only when the
+        // Deep Research preset is selected AND a field was changed. The server
+        // derives `topology` from `preset` (S1) — we send `preset`, not
+        // `topology`.
+        const supervisorPayload = topologyForPreset(data.preset) === 'supervisor' && supervisorDirty.current
+            ? buildSupervisorPayload(supervisor)
+            : undefined;
 
         mutation.mutate(
             {
@@ -169,10 +220,12 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                     provider: data.provider,
                     model: data.model,
                     temperature: data.temperature,
+                    preset: data.preset,
                     tool_servers: data.tool_servers,
                     ...(sandboxConfig ? { sandbox: sandboxConfig } : {}),
                     ...(memoryConfig ? { memory: memoryConfig } : {}),
                     ...(contextManagementPayload ? { context_management: contextManagementPayload } : {}),
+                    ...(supervisorPayload ? { supervisor: supervisorPayload } : {}),
                 },
                 max_concurrent_tasks: data.max_concurrent_tasks,
                 budget_max_per_task: data.budget_max_per_task,
@@ -186,6 +239,8 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                     form.reset();
                     setCtxMgmt(undefined);
                     ctxMgmtDirty.current = false;
+                    setSupervisor(undefined);
+                    supervisorDirty.current = false;
                     onOpenChange(false);
                 },
                 onError: (error: Error) => {
@@ -307,6 +362,42 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                                     <FormMessage className="text-destructive font-bold text-xs" />
                                 </FormItem>
                             )}
+                        />
+
+                        <FormField
+                            control={form.control}
+                            name="preset"
+                            render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Preset</FormLabel>
+                                    <FormControl>
+                                        <select
+                                            data-testid="agent-config-preset"
+                                            className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 rounded-none appearance-none"
+                                            value={field.value}
+                                            onChange={field.onChange}
+                                        >
+                                            <option value="chat">Chat</option>
+                                            <option value="coding">Coding</option>
+                                            <option value="investigation">Investigation</option>
+                                            <option value="research">Deep Research</option>
+                                        </select>
+                                    </FormControl>
+                                    <p
+                                        data-testid="agent-config-topology"
+                                        className="text-xs text-muted-foreground mt-1"
+                                    >
+                                        Mode: {topologyLabel(derivedTopology)}
+                                    </p>
+                                    <FormMessage className="text-destructive font-bold text-xs" />
+                                </FormItem>
+                            )}
+                        />
+
+                        <SupervisorConfigSection
+                            value={supervisor}
+                            onChange={handleSupervisorChange}
+                            applicable={isSupervisor}
                         />
 
                         <div className="space-y-3">

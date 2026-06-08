@@ -290,6 +290,21 @@ export interface ContextManagementConfig {
     offload_tool_results?: boolean;
 }
 
+/**
+ * Agent Modes — Supervisor Topology ("Deep Research") tuning sub-object.
+ * Customer-facing name is **Deep Research**; the internal `topology` value is
+ * `supervisor` (two-layer naming). Field names match the S1 API contract
+ * (`SupervisorConfigRequest`) verbatim. All fields optional — partial payloads
+ * accepted, absence is always valid (defaults applied server-side at read time).
+ */
+export interface SupervisorConfig {
+    max_fanout_per_iteration?: number;
+    max_iterations?: number;
+    source_allowlist?: string[];
+    writer_style?: 'formal_report' | 'annotated_bullets';
+    scope_clarification_enabled?: boolean;
+}
+
 export interface AgentConfig {
     system_prompt: string;
     provider: string;
@@ -300,6 +315,14 @@ export interface AgentConfig {
     sandbox?: SandboxConfig;
     memory?: MemoryConfig;
     context_management?: ContextManagementConfig;
+    // Agent Modes — Supervisor Topology (S1). `topology` is the internal
+    // graph-shape selector (`react` default | `supervisor`); `preset` is the
+    // customer-facing selector that derives it. Both are immutable after agent
+    // creation (rendered read-only on the Detail page). `supervisor` is the
+    // Deep Research tuning sub-object, present only on supervisor-topology agents.
+    topology?: 'react' | 'supervisor';
+    preset?: string;
+    supervisor?: SupervisorConfig;
 }
 
 export interface AgentResponse {
@@ -477,7 +500,16 @@ export type ActivityEventKind =
     | 'marker.hitl.approved'
     | 'marker.hitl.rejected'
     | 'marker.hitl.input_received'
-    | 'marker.hitl.resumed';
+    | 'marker.hitl.resumed'
+    // Agent Modes — Supervisor Topology (S9). Sub-agent fan-out observability
+    // markers projected from `task_events`. Carry `iteration` (1-based round)
+    // and `subtask` (stable logical id, `"<iter>.<idx>"`) so the Console can
+    // group round → sub-agent → step. Marker SKELETON only — sub-agent
+    // turn-by-turn reasoning lives in Langfuse, not these rows (E5).
+    | 'marker.supervisor.iteration'
+    | 'marker.subagent.started'
+    | 'marker.subagent.finding'
+    | 'marker.subagent.failed';
 
 export interface ActivityToolCall {
     id?: string;
@@ -517,6 +549,12 @@ export interface ActivityEvent {
     // greater than the length of `content`, the server capped the tool output
     // to a head+tail view (same view the model saw).
     orig_bytes?: number | null;
+    // Agent Modes — Supervisor Topology (S9). Lifted out of `details` by the
+    // server on `marker.subagent.*` / `marker.supervisor.iteration` kinds.
+    // `iteration` is 1-based (cap/no-op supervisor.iteration events may carry 0);
+    // `subtask` is present on subagent.* markers, null on supervisor.iteration.
+    iteration?: number | null;
+    subtask?: string | null;
 }
 
 export interface ActivityListResponse {

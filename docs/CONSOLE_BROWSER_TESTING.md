@@ -50,6 +50,7 @@ Adding a new sub-object or surface adds a row/column and populates every cell (s
 | `memory` | 2 | 11 | 2 + 11 | 12, 13, 14 | 12, 13 |
 | `context_management` | 2 + 16 | 2 | 2 + 15 | — | 17 |
 | `sandbox` | 2 | 2 | 2 | 10 (gating only) | — |
+| `supervisor` / `agent_mode` | 21 | 21 (read-only) | 21 (read-only) | — | 21 (sub-agent tree) |
 | `budget` | 2 | 2 | 2 | 3 | 6 |
 | `HITL` (task-level, not agent-config) | — | — | — | — | 8 |
 | `max_concurrent_tasks` | 2 | 2 | 2 | 3 | — |
@@ -448,6 +449,37 @@ What to verify:
 
 6. `browser_console_messages` shows no uncaught exceptions across the full walkthrough.
 
+### Scenario 21: Deep Research Preset + Sub-agent Activity Tree (Supervisor Topology — S10)
+
+Covers the Supervisor Topology track's Console surface (S10): the customer-facing **Deep Research** preset selector and its **Deep Research Configuration** section on the Create dialog, the **read-only-on-edit** rendering of preset/topology + the Deep Research sub-object on Agent Detail (invariant #2 — topology is immutable after creation), and the **sub-agent fan-out activity tree** on Task Detail. Templates **B** (new dialog control + new activity tree) **and D** (preset/topology + the `supervisor` sub-object render on Create + Agent Detail → cross-cutting parity).
+
+**Two-layer naming guard (assert throughout):** the customer-visible label is **"Deep Research"** everywhere; the word **"Supervisor"** must NEVER appear in visible copy. It is allowed only inside `data-testid`s / payload keys / network bodies. After each surface renders, scan the visible text for `/supervisor/i` and assert it is absent.
+
+**Scope guard (E5 — marker skeleton, not a transcript):** the tree leaves are **markers** (finding id + source url, failure reason, dispatch prompt preview), NOT a sub-agent turn-by-turn conversation. Assert the tree does NOT render a nested sub-agent message log; full sub-agent traces live in Langfuse. The scenario must not claim otherwise.
+
+Preconditions:
+
+- `make start` stack running; API at `:8080`, Console at `:5173`.
+- A completed (or in-flight) **Deep Research** task whose run produced sub-agent fan-out markers in `task_events` (`supervisor_iteration`, `subagent_finding`, `subagent_failed`, and — visible only under "Show details" — `subagent_started`), ideally across **two iterations with one subtask that failed in round 1 and was re-dispatched in round 2**. Seed by creating a `research`-preset agent and submitting a research task, or run the S11 fixture. If no live fan-out is available, the `ActivityPane` sub-agent-tree unit tests (`src/features/task-detail/__tests__/ActivityPane.test.tsx`) assert the same grouping deterministically.
+
+What to verify:
+
+1. **Preset selector renders (Create).** Open `Create Agent`. Assert `[data-testid="agent-config-preset"]` is a `<select>` with exactly the options `chat`, `coding`, `investigation`, `research`; the default selection is `chat`; the `research` option's visible label reads **"Deep Research"**. Assert `[data-testid="agent-config-topology"]` shows the derived mode read-only ("ReAct" while `chat`/`coding`/`investigation` is selected).
+
+2. **Research reveals the Deep Research section.** Select `research`. Assert `[data-testid="agent-config-topology"]` now reads **"Deep Research"** and the section reveals all five fields, each at the field + `data-testid` level: `supervisor-config-max-fanout` (number), `supervisor-config-max-iterations` (number), `supervisor-config-source-allowlist` (chip input — adding a 51st entry shows inline "Maximum 50 entries"), `supervisor-config-writer-style` (`<select>` with exactly **"Formal report"** / **"Annotated bullets"** options), `supervisor-config-scope-clarification` (checkbox). Selecting any non-research preset hides the section again.
+
+3. **Round-trip on create.** Fill the five fields, set the preset to `research`, create the agent. Via `browser_network_requests`, assert the `POST /v1/agents` body carries `agent_config.preset = "research"` and an `agent_config.supervisor` sub-object with only the fields that were set (only-send-what-was-set), and that the body does NOT carry a synthesized `agent_config.topology` (the server derives it from the preset). The new agent appears in the list.
+
+4. **Read-only-on-edit parity (Template D — four assertions).** Open the new agent's Detail page (read-only view): assert `[data-testid="agent-config-preset"]` shows "Deep Research", `[data-testid="agent-config-topology"]` shows "Deep Research", a note reads "Mode is fixed at agent creation; create a new agent to change it.", and the Deep Research Configuration section renders the five field values read-only (no add-chip input, no remove buttons). Click `Edit`. Assert: (a) the same sub-object renders on the edit form with **identical labels + values** as the read-only view and the Create dialog; (b) `[data-testid="agent-config-preset"]` and `[data-testid="agent-config-topology"]` are present but **`disabled` / non-editable** — there is NO working change handler (changing them is impossible); (c) every Deep Research field is `disabled` (round-trip is read-only — the write surface is Create only); (d) visibility rule is identical everywhere (section shows iff topology is supervisor). There is no editable preset/topology control anywhere on Detail.
+
+5. **Sub-agent activity tree (Task Detail).** Navigate to the Deep Research task's detail page. Assert `[data-testid="activity-subagent-tree"]` is present. Assert one `[data-testid="activity-round-{i}-toggle"]` per distinct iteration round, each header showing the round number + the `supervisor.iteration` decision/sub-agent-count summary. Expand a round; assert one `[data-testid="activity-subagent-{subtask}"]` fold per distinct subtask, each with a `[data-testid="activity-subagent-{subtask}-status"]` chip ("finding" / "failed" / "running"). Expand a sub-agent; assert leaf rows render the markers: a finding leaf shows its `finding_id` + a clickable `source_url`, a failure leaf shows its `reason`. The per-leaf `[data-testid="activity-row-{i}-expand"]` reveals the raw `details` payload.
+
+6. **Failed-then-retried linkage.** For the round-2 retry of a subtask that failed in round 1, assert the round-2 group carries `[data-testid="activity-subagent-{subtask}-retry"]` reading "retried from round 1" — it reads as a continuation of the earlier attempt, not two unrelated entries.
+
+7. **No regression + dispatch markers gated.** Assert non-sub-agent rows (`turn.user` / `turn.assistant` / `turn.tool` / lifecycle / HITL markers) still render as flat rows exactly as in Scenario 19. By default the `subagent.started` dispatch markers are hidden (server-side detail-only); toggling `[data-testid="activity-details-toggle"]` (`include_details=true`) surfaces the dispatch leaf rows (prompt preview) inside their sub-agent groups.
+
+8. **Clean console.** `browser_console_messages` shows zero uncaught exceptions across the create flow, the read-only/edit Detail walkthrough, and the Task Detail tree expansion.
+
 ## When to Run Which Scenarios
 
 | Change type | Required scenarios |
@@ -471,6 +503,7 @@ What to verify:
 | Task detail conversation log feature | 1, 18 |
 | Task detail unified Activity view | 1, 4, 18, 19 |
 | Task detail plan checklist feature | 1, 4, 20 |
+| Agent supervisor / Deep-Research feature | 1, 2, 21 |
 | Dashboard feature | 1 |
 | Cross-cutting layout, sidebar, routing, or API client changes | All |
 | Backend-only change with no UI impact | None |
