@@ -7,6 +7,7 @@ import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.ValidationException;
 import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.AgentCreateRequest;
+import com.persistentagent.api.model.request.SandboxConfigRequest;
 import com.persistentagent.api.model.request.SupervisorConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
 import org.junit.jupiter.api.BeforeEach;
@@ -117,6 +118,68 @@ class PresetDefaultsTest {
 
         verify(agentRepository).insert(eq(TENANT_ID), anyString(), eq("Agent"), anyString(),
                 eq(5), eq(500000L), eq(5000000L));
+    }
+
+    @Test
+    void noPreset_canonicalizedToolsEqualBaseToolsExactly() throws Exception {
+        // PINS the no-preset canonicalization contract (must stay byte-for-byte identical to
+        // pre-S2, commit e61337d): with no preset and no sandbox, the persisted allowed_tools
+        // is EXACTLY BASE_PLATFORM_TOOLS — no more, no less.
+        AgentConfigRequest config = minimalConfig(null, null, null);
+        List<String> persistedTools = createAgentAndCapturePersistedTools(config);
+
+        assertEquals(ValidationConstants.BASE_PLATFORM_TOOLS, persistedTools,
+                "no-preset, no-sandbox agent must persist exactly BASE_PLATFORM_TOOLS; got: " + persistedTools);
+    }
+
+    @Test
+    void noPreset_customerSuppliedNonBaseToolIsDropped() throws Exception {
+        // PINS that the no-preset path still DROPS a caller-supplied tool that the derivation
+        // does not produce — exactly as pre-S2 (e61337d). canonicalizeConfig rebuilds the tool
+        // list from config flags; it does not echo back arbitrary allowed_tools entries.
+        // (In production validateAllowedTools would let sandbox_exec pass — it is in
+        // ALLOWED_TOOLS — but canonicalize drops it because sandbox.enabled is unset. This test
+        // stubs out validation to isolate canonicalizeConfig's dropping behavior.)
+        //
+        // sandbox_exec is deliberately chosen because it IS in PresetDefaults.PRESET_INJECTED_TOOLS
+        // (via CODING_EXTRA_TOOLS): it would survive canonicalization if the carry-through loop
+        // weren't gated on config.preset() != null. With no preset here, the gate keeps it out —
+        // this is the regression guard for that gate.
+        AgentConfigRequest config = new AgentConfigRequest(
+                "system prompt", "openai", "gpt-4o", 0.7,
+                List.of("sandbox_exec"), // caller lists a sandbox tool but sandbox is NOT enabled
+                null, null, null, null, null, null, null, null);
+
+        List<String> persistedTools = createAgentAndCapturePersistedTools(config);
+
+        assertFalse(persistedTools.contains("sandbox_exec"),
+                "no-preset path must DROP a sandbox tool when sandbox.enabled is not set "
+                + "(pre-S2 derivation behavior); got: " + persistedTools);
+        assertEquals(ValidationConstants.BASE_PLATFORM_TOOLS, persistedTools,
+                "no-preset path must persist exactly BASE_PLATFORM_TOOLS; got: " + persistedTools);
+    }
+
+    @Test
+    void noPreset_sandboxEnabled_addsSandboxToolsOnly() throws Exception {
+        // PINS the no-preset + sandbox-enabled derivation: BASE + SANDBOX tools, nothing else.
+        SandboxConfigRequest sandbox = new SandboxConfigRequest(true, null, null, null, null);
+        AgentConfigRequest config = new AgentConfigRequest(
+                "system prompt", "openai", "gpt-4o", 0.7,
+                null, null, sandbox, null, null, null, null, null, null);
+
+        List<String> persistedTools = createAgentAndCapturePersistedTools(config);
+
+        for (String base : ValidationConstants.BASE_PLATFORM_TOOLS) {
+            assertTrue(persistedTools.contains(base), "must contain base tool " + base);
+        }
+        for (String sb : ValidationConstants.SANDBOX_TOOLS) {
+            assertTrue(persistedTools.contains(sb), "must contain sandbox tool " + sb);
+        }
+        assertFalse(persistedTools.contains("dispatch_subagent"),
+                "no-preset path must never inject preset-only tools; got: " + persistedTools);
+        assertEquals(ValidationConstants.BASE_PLATFORM_TOOLS.size() + ValidationConstants.SANDBOX_TOOLS.size(),
+                persistedTools.size(),
+                "no-preset + sandbox must persist exactly BASE + SANDBOX (no extras); got: " + persistedTools);
     }
 
     // -----------------------------------------------------------------------
@@ -760,7 +823,7 @@ class PresetDefaultsTest {
     }
 
     // -----------------------------------------------------------------------
-    // firstNonNull / firstNonNullLong / firstNonNullString helpers
+    // firstNonNull / firstNonNullLong helpers
     // -----------------------------------------------------------------------
 
     @Test
@@ -830,7 +893,6 @@ class PresetDefaultsTest {
      * Applies the preset with the given name to a minimal request (no explicit overrides).
      */
     private AgentCreateRequest applyPreset(String presetName) {
-        String topology = PresetDefaults.presetTopology(presetName); // use preset's own topology
         AgentConfigRequest config = minimalConfig(null, presetName, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
         return PresetDefaults.applyPreset(request);
@@ -844,7 +906,26 @@ class PresetDefaultsTest {
      */
     private List<String> createAgentAndCapturePersistedTools(String presetName, String expectedTopology)
             throws Exception {
-        AgentConfigRequest config = minimalConfig(expectedTopology, presetName, null);
+        return createAgentAndCapturePersistedTools(minimalConfig(expectedTopology, presetName, null));
+    }
+
+    /**
+     * Builds a real ConfigValidationHelper for validation tests (using mocked repositories).
+     */
+    private ConfigValidationHelper buildHelper() {
+        com.persistentagent.api.repository.ModelRepository modelRepo =
+                mock(com.persistentagent.api.repository.ModelRepository.class);
+        com.persistentagent.api.repository.ToolServerRepository toolServerRepo =
+                mock(com.persistentagent.api.repository.ToolServerRepository.class);
+        return new ConfigValidationHelper(modelRepo, toolServerRepo, agentRepository, new ObjectMapper(), false);
+    }
+
+    /**
+     * Creates an agent through the full {@link AgentService#createAgent} path for an explicit
+     * config (no helper-imposed preset/topology) and returns the canonicalized {@code allowed_tools}.
+     * Used to pin the no-preset canonicalization behavior.
+     */
+    private List<String> createAgentAndCapturePersistedTools(AgentConfigRequest config) throws Exception {
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -866,23 +947,5 @@ class PresetDefaultsTest {
         List<String> tools = parsed.allowedTools();
         assertNotNull(tools, "persisted allowed_tools must be non-null after canonicalization; got: " + persistedJson);
         return tools;
-    }
-
-    /**
-     * Builds a real ConfigValidationHelper for validation tests (using mocked repositories).
-     */
-    private ConfigValidationHelper buildHelper() {
-        com.persistentagent.api.repository.ModelRepository modelRepo =
-                mock(com.persistentagent.api.repository.ModelRepository.class);
-        com.persistentagent.api.repository.ToolServerRepository toolServerRepo =
-                mock(com.persistentagent.api.repository.ToolServerRepository.class);
-        return new ConfigValidationHelper(modelRepo, toolServerRepo, agentRepository, new ObjectMapper(), false);
-    }
-
-    /**
-     * Alias for buildHelper — used where we need the "real" helper with no mocks for validation.
-     */
-    private ConfigValidationHelper buildRealHelper() {
-        return buildHelper();
     }
 }

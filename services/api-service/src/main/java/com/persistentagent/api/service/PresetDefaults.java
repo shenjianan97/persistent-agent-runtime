@@ -6,8 +6,9 @@ import com.persistentagent.api.model.request.AgentCreateRequest;
 import com.persistentagent.api.model.request.SupervisorConfigRequest;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Set;
 
 /**
  * Platform-owned preset bundles for the Agent Modes / Supervisor Topology track (S2).
@@ -170,6 +171,8 @@ public final class PresetDefaults {
     // -----------------------------------------------------------------------
     // research preset constants (design-pinned — exact values, do not change without spec update)
     // -----------------------------------------------------------------------
+    // (PRESET_INJECTED_TOOLS is declared after RESEARCH_TOOLS, once all the EXTRA-tool
+    //  lists it unions over are defined — see below.)
 
     /**
      * {@code research} sets {@code topology=supervisor}: the only platform preset that
@@ -233,6 +236,38 @@ public final class PresetDefaults {
      * {@code web_search} at line 165 and {@code read_url} at line 171.
      */
     static final List<String> RESEARCH_TOOLS = List.of("web_search", "read_url");
+
+    // -----------------------------------------------------------------------
+    // Preset-injected tool names (carry-through allowlist for canonicalizeConfig)
+    // -----------------------------------------------------------------------
+
+    /**
+     * The union of every tool name a preset can inject into {@code allowed_tools}.
+     *
+     * <p>{@code AgentService.canonicalizeConfig} rebuilds {@code allowed_tools}
+     * deterministically from config flags (BASE + SANDBOX-if-enabled + DEV-if-enabled).
+     * Pre-S2 that derivation <em>dropped</em> any other name in {@code allowed_tools}
+     * (validation is a closed allowlist, so only known platform tools ever reach it, and
+     * tool-server/BYOT tools travel through the separate {@code tool_servers} field — they
+     * never appear here). To keep the <strong>no-preset path byte-for-byte unchanged</strong>,
+     * canonicalisation carries through <em>only</em> the names in this set — the tools a
+     * preset injects post-validation (e.g. {@code dispatch_subagent}, which is not yet in
+     * {@code ValidationConstants.ALLOWED_TOOLS}; Track-7 precedent). Tools already produced
+     * by the base/sandbox derivation (e.g. the research preset's {@code web_search}/{@code read_url},
+     * the coding preset's sandbox tools) are not listed here because the derivation already
+     * emits them.
+     *
+     * <p>When a preset starts injecting a brand-new tool name, add it here (and to that
+     * preset's {@code *_EXTRA_TOOLS}); otherwise canonicalisation will silently drop it.
+     */
+    static final Set<String> PRESET_INJECTED_TOOLS;
+    static {
+        Set<String> injected = new LinkedHashSet<>();
+        injected.addAll(CODING_EXTRA_TOOLS);
+        injected.addAll(INVESTIGATION_EXTRA_TOOLS);
+        injected.addAll(RESEARCH_TOOLS);
+        PRESET_INJECTED_TOOLS = Set.copyOf(injected);
+    }
 
     // -----------------------------------------------------------------------
     // workflow_runner preset — declared, not wired (Phase 3)
@@ -374,8 +409,9 @@ public final class PresetDefaults {
     }
 
     private static AgentCreateRequest applyCodingPreset(AgentCreateRequest request, AgentConfigRequest cfg) {
-        // coding: topology=react, dispatch_subagent + sandbox tools + plan_write in allowlist,
-        // larger per-task budget.
+        // coding: topology=react, dispatch_subagent + sandbox tools in allowlist, larger
+        // per-task budget. (plan_write is NOT seeded here — it arrives via the
+        // BASE_PLATFORM_TOOLS merge in canonicalizeConfig; see CODING_EXTRA_TOOLS Javadoc.)
         AgentConfigRequest mergedConfig = mergeTopologyAndExtraTools(cfg, "react", CODING_EXTRA_TOOLS);
 
         int maxConcurrentTasks = firstNonNull(request.maxConcurrentTasks(), CODING_MAX_CONCURRENT_TASKS);
@@ -387,9 +423,10 @@ public final class PresetDefaults {
     }
 
     private static AgentCreateRequest applyInvestigationPreset(AgentCreateRequest request, AgentConfigRequest cfg) {
-        // investigation: topology=react, broad allowlist (dispatch_subagent + plan_write + web tools).
-        // Base tools (web_search, read_url, etc.) are already in BASE_PLATFORM_TOOLS;
-        // only extra tools not covered by the base list need seeding.
+        // investigation: topology=react, broad allowlist (dispatch_subagent + web tools).
+        // Base tools (web_search, read_url, plan_write, etc.) are already in BASE_PLATFORM_TOOLS
+        // and arrive via the canonicalizeConfig merge; only extra tools not covered by the base
+        // list need seeding here (just dispatch_subagent).
         AgentConfigRequest mergedConfig = mergeTopologyAndExtraTools(cfg, "react", INVESTIGATION_EXTRA_TOOLS);
 
         int maxConcurrentTasks = firstNonNull(request.maxConcurrentTasks(), INVESTIGATION_MAX_CONCURRENT_TASKS);
@@ -440,7 +477,7 @@ public final class PresetDefaults {
                 cfg.contextManagement(),
                 // topology: preset seeds "supervisor"; explicit contradictions already rejected by
                 // validatePresetTopologyConsistency in ConfigValidationHelper.
-                firstNonNullString(cfg.topology(), RESEARCH_TOPOLOGY),
+                firstNonNull(cfg.topology(), RESEARCH_TOPOLOGY),
                 cfg.preset(),
                 seededSupervisor,
                 taskTimeoutSeconds);
@@ -478,7 +515,7 @@ public final class PresetDefaults {
                 cfg.systemPrompt(), cfg.provider(), cfg.model(), cfg.temperature(),
                 cfg.allowedTools(), cfg.toolServers(), cfg.sandbox(),
                 cfg.memory(), cfg.contextManagement(),
-                firstNonNullString(cfg.topology(), presetTopology),
+                firstNonNull(cfg.topology(), presetTopology),
                 cfg.preset(), cfg.supervisor(), cfg.taskTimeoutSeconds());
     }
 
@@ -494,7 +531,7 @@ public final class PresetDefaults {
                 mergeExtraTools(cfg.allowedTools(), extraTools),
                 cfg.toolServers(), cfg.sandbox(),
                 cfg.memory(), cfg.contextManagement(),
-                firstNonNullString(cfg.topology(), presetTopology),
+                firstNonNull(cfg.topology(), presetTopology),
                 cfg.preset(), cfg.supervisor(), cfg.taskTimeoutSeconds());
     }
 
@@ -525,11 +562,9 @@ public final class PresetDefaults {
         return explicit != null ? explicit : presetDefault;
     }
 
+    // firstNonNullLong is kept (not collapsed into the generic firstNonNull<T>) because the
+    // primitive-long preset default avoids autoboxing the constant on every call.
     static long firstNonNullLong(Long explicit, long presetDefault) {
-        return explicit != null ? explicit : presetDefault;
-    }
-
-    static String firstNonNullString(String explicit, String presetDefault) {
         return explicit != null ? explicit : presetDefault;
     }
 }

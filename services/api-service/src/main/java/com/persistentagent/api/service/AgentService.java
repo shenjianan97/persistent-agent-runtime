@@ -58,6 +58,15 @@ public class AgentService {
         // Agent Modes — S2: apply preset defaults AFTER S1 validation, BEFORE canonicalize.
         // Unknown-preset 400 is checked in validateAgentConfig (ConfigValidationHelper).
         // Topology-vs-preset contradiction is also checked there.
+        //
+        // ORDERING IS DELIBERATE: applyPreset runs AFTER validateAllowedTools (inside
+        // validateAgentConfig). Preset-injected tools (e.g. dispatch_subagent) are NOT in
+        // ValidationConstants.ALLOWED_TOOLS yet (Track-7 precedent: seeded ahead of S4
+        // runtime), so they intentionally bypass the closed validation allowlist by being
+        // injected post-validation. This means a customer who lists "dispatch_subagent"
+        // themselves still gets a 400 (it isn't in ALLOWED_TOOLS), while the preset may seed
+        // it — the asymmetry is on purpose, not a bug to "fix". canonicalizeConfig re-admits
+        // these names via PresetDefaults.PRESET_INJECTED_TOOLS.
         AgentCreateRequest seeded = PresetDefaults.applyPreset(request);
 
         AgentConfigRequest canonicalized = canonicalizeConfig(seeded.agentConfig());
@@ -242,14 +251,26 @@ public class AgentService {
         String canonicalizedPreset = config.preset();
         SupervisorConfigRequest canonicalizedSupervisor = config.supervisor();
 
-        // Agent Modes — Supervisor Topology (S2): merge any preset-seeded extra tools into
-        // the canonical tool list. Preset tools that are not base/sandbox tools (e.g.
-        // dispatch_subagent) are carried here because they were injected by PresetDefaults
-        // into config.allowedTools() before canonicalizeConfig runs.
-        if (config.allowedTools() != null) {
+        // Agent Modes — Supervisor Topology (S2): carry preset-injected tool names through
+        // canonicalisation. Two guards keep the no-preset path byte-for-byte identical to
+        // pre-S2 (e61337d):
+        //   1. The whole block is gated on config.preset() != null — with no preset the loop
+        //      never runs, so canonicalizeConfig rebuilds allowed_tools purely from config
+        //      flags (BASE + SANDBOX-if-enabled + DEV-if-enabled) and drops everything else,
+        //      exactly as before. (Pre-S2 the closed validation allowlist guaranteed only
+        //      known platform tools reached allowed_tools, and tool-server/BYOT tools travel
+        //      through the separate tool_servers field — they never appear here.)
+        //   2. Even WITH a preset, only names in PresetDefaults.PRESET_INJECTED_TOOLS are
+        //      admitted — not arbitrary allowed_tools entries — so an unrelated tool a caller
+        //      smuggled past validation on a preset request still can't survive.
+        // PresetDefaults injects its extra names AFTER validation (Track-7 precedent:
+        // dispatch_subagent is not yet in ALLOWED_TOOLS), so they must be re-admitted here;
+        // the coding preset's sandbox tools are also injected directly (rather than via
+        // sandbox.enabled) and are re-admitted the same way.
+        if (config.preset() != null && config.allowedTools() != null) {
             for (String tool : config.allowedTools()) {
-                if (!canonicalizedTools.contains(tool)
-                        && !ValidationConstants.DEV_TASK_CONTROL_TOOLS.contains(tool)) {
+                if (PresetDefaults.PRESET_INJECTED_TOOLS.contains(tool)
+                        && !canonicalizedTools.contains(tool)) {
                     canonicalizedTools.add(tool);
                 }
             }
