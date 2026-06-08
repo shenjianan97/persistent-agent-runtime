@@ -72,6 +72,9 @@ COMPOSE_FILE := $(ROOT_DIR)/docker-compose.yml
 # (whose directory name differs) adopt the same stack instead of colliding on
 # container_name with a directory-derived project.
 COMPOSE_PROJECT ?= persistent-agent-runtime
+# Export so the e2e helper scripts (scripts/e2e/common.sh:e2e_compose_project)
+# read the same value and never target a different project than the Makefile.
+export COMPOSE_PROJECT
 LOCALSTACK_CONTAINER_NAME ?= persistent-agent-runtime-localstack
 S3_ENDPOINT_URL ?= http://localhost:4566
 S3_BUCKET_NAME ?= platform-artifacts

@@ -114,9 +114,13 @@ e2e_compose_file() {
 
 # Compose project name for the shared dev stack. MUST be pinned: from a git
 # worktree, compose would otherwise derive the project from the directory name
-# and collide on the fixed container_name owned by the real project.
+# and collide on the fixed container_name owned by the real project. Honor an
+# exported COMPOSE_PROJECT override so this stays in lockstep with the Makefile's
+# `COMPOSE_PROJECT ?= persistent-agent-runtime` (otherwise an override there and
+# the hardcoded name here would target two different projects that both claim the
+# fixed `persistent-agent-runtime-localstack` container).
 e2e_compose_project() {
-  printf 'persistent-agent-runtime'
+  printf '%s' "${COMPOSE_PROJECT:-persistent-agent-runtime}"
 }
 
 # Discover the host port mapped to a container's 5432/tcp. Handles IPv4+IPv6
