@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
@@ -23,6 +24,11 @@ from langgraph.checkpoint.base import (
 from langchain_core.load.dump import dumps as langchain_dumps
 from langchain_core.load.load import loads as langchain_loads
 from langgraph.checkpoint.serde.base import SerializerProtocol
+
+
+# JSON-safe envelope key for a serde-encoded ``Send`` parked on the LangGraph
+# ``__pregel_tasks`` channel (see ``_encode_pregel_tasks``).
+_SEND_ENVELOPE_KEY = "__par_send_serde__"
 
 
 LEASE_VALIDATION_QUERY = """
@@ -175,7 +181,7 @@ class PostgresDurableCheckpointer(BaseCheckpointSaver[str]):
         thread_id, checkpoint_ns, parent_checkpoint_id = self._extract_checkpoint_target(
             config
         )
-        checkpoint_payload = langchain_dumps(checkpoint)
+        checkpoint_payload = langchain_dumps(self._encode_pregel_tasks(checkpoint))
         metadata_payload = langchain_dumps(get_serializable_checkpoint_metadata(config, metadata))
 
         async with self._connection() as conn:
@@ -472,10 +478,77 @@ LIMIT 1
         if value is None:
             return {}
         if isinstance(value, str):
-            return langchain_loads(value)
+            return self._decode_pregel_tasks(langchain_loads(value))
         elif isinstance(value, dict):
-            return langchain_loads(json.dumps(value))
-        return dict(value)
+            return self._decode_pregel_tasks(langchain_loads(json.dumps(value)))
+        return self._decode_pregel_tasks(dict(value))
+
+    # ------------------------------------------------------------------ #
+    # ``Send`` round-tripping for the LangGraph ``__pregel_tasks`` channel.
+    #
+    # The checkpoint payload is serialised with ``langchain_dumps`` so raw
+    # provider-shaped message content round-trips unchanged (CLAUDE.md §LLM
+    # Provider Support). But ``langchain_dumps`` cannot serialise a ``Send``
+    # (the pending-fan-out value LangGraph parks on the ``__pregel_tasks``
+    # channel) — it emits a ``not_implemented`` marker that raises on load.
+    # The in-process fan-out (Agent Modes / Supervisor topology — Task S3+)
+    # depends on a pending ``Send`` surviving a crash/resume, so we route just
+    # that channel's values through the JsonPlus ``serde`` (which DOES support
+    # ``Send``), wrapping each in a JSON-safe envelope. All other channels are
+    # untouched, preserving the message round-tripping invariant.
+    # ------------------------------------------------------------------ #
+    def _encode_pregel_tasks(self, checkpoint: Checkpoint) -> Checkpoint:
+        from langgraph.constants import TASKS
+        from langgraph.types import Send
+
+        channel_values = checkpoint.get("channel_values") or {}
+        tasks = channel_values.get(TASKS)
+        if not tasks or not any(isinstance(t, Send) for t in tasks):
+            return checkpoint
+
+        encoded: list[Any] = []
+        for task in tasks:
+            if isinstance(task, Send):
+                serde_type, serde_blob = self.serde.dumps_typed(task)
+                encoded.append({
+                    _SEND_ENVELOPE_KEY: {
+                        "type": serde_type,
+                        "blob": base64.b64encode(serde_blob).decode("ascii"),
+                    }
+                })
+            else:
+                encoded.append(task)
+        # Shallow-copy so the live checkpoint object is not mutated.
+        new_channel_values = dict(channel_values)
+        new_channel_values[TASKS] = encoded
+        new_checkpoint = dict(checkpoint)
+        new_checkpoint["channel_values"] = new_channel_values
+        return new_checkpoint  # type: ignore[return-value]
+
+    def _decode_pregel_tasks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from langgraph.constants import TASKS
+
+        if not isinstance(payload, dict):
+            return payload
+        channel_values = payload.get("channel_values")
+        if not isinstance(channel_values, dict):
+            return payload
+        tasks = channel_values.get(TASKS)
+        if not isinstance(tasks, list) or not any(
+            isinstance(t, dict) and _SEND_ENVELOPE_KEY in t for t in tasks
+        ):
+            return payload
+
+        decoded: list[Any] = []
+        for task in tasks:
+            if isinstance(task, dict) and _SEND_ENVELOPE_KEY in task:
+                env = task[_SEND_ENVELOPE_KEY]
+                blob = base64.b64decode(env["blob"])
+                decoded.append(self.serde.loads_typed((env["type"], blob)))
+            else:
+                decoded.append(task)
+        channel_values[TASKS] = decoded
+        return payload
 
     @asynccontextmanager
     async def _connection(self) -> AsyncIterator[asyncpg.Connection]:

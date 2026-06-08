@@ -1,0 +1,413 @@
+"""Shared in-process fan-out helper — ``run_subagent`` (Agent Modes, Pattern A).
+
+This is the **single** primitive both delegation drivers route through (the
+``dispatch_subagent`` tool — S4 — and the Supervisor graph — S6). Built once,
+used by both; neither driver forks a second copy.
+
+Load-bearing wiring (verified against ``langgraph==1.0.5``; spikes #2–#5,
+2026-06-05): a sub-agent is a **compiled ReAct subgraph declared as a node**,
+reached from the parent graph **via ``Send``**, **sharing the parent
+checkpointer** (a namespaced sub-checkpoint per branch). That — *not* an
+imperatively ``ainvoke``d subgraph — is what gives:
+
+* **per-inner-turn crash resume** — a worker crash mid-sub-agent resumes the
+  parent's run at the inner turn it died on, restoring earlier turns rather
+  than re-spending their tokens; and
+* a **persisted sub-agent transcript** — the sub-agent's working messages are
+  checkpointed under its ``subagent:<id>`` namespace (the E5 / Console drill-in
+  read path), reachable from the shared checkpointer via ``alist`` filtered by
+  ``checkpoint_ns``.
+
+The helper itself owns the **per-sub-agent guardrails** (in graph state, never
+the task/lease layer):
+
+* a **token + turn ceiling** — on exhaustion the call STOPS and returns a
+  ``ceiling`` failure marker (never raises);
+* a **wall-clock timeout** — on expiry returns a ``timeout`` failure marker;
+* a **depth counter** capped at :data:`MAX_SUBAGENT_DEPTH` — ``depth`` over the
+  cap returns a ``depth`` failure marker with no spawn;
+* a **headless filter** — any ``interrupt()``-bearing tool
+  (``request_human_input`` and any future pause tool) is dropped from the
+  allowlist before binding, because ≥2 sub-agents calling ``interrupt()`` in
+  one ``Send`` super-step makes the worker's scalar ``Command(resume=...)``
+  path raise ``RuntimeError`` (verified, LangGraph 1.0.5); and
+* a **``subagent.heartbeat`` span event** emitted via the injected ``emit``
+  callable — the design's *only* wedged-branch detector (the parent lease stays
+  healthy while it ``await``s the fan-out, so silence is the only signal). It
+  is a Langfuse span event ONLY: never an append-only task-event row, never a
+  lease-expiry touch, never a call into the worker's lease-heartbeat manager.
+
+Failure is **always a returned value** (:class:`SubagentResult` with a
+``reason``), never an exception that aborts the parent graph — the driver (S4
+threads a ``ToolMessage``; S6 merges into its results reducer) decides what to
+do with it.
+
+Cost rolls into the parent (Pattern A): no per-sub-agent cost-ledger row, and
+none of Pattern B's cross-task spawn-and-await identifiers exist here (this
+module is verified free of them by ``test_no_pattern_b_symbols_in_module``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Annotated, Any, Awaitable, Callable, Iterable, TypedDict
+
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Send
+
+logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Public constants
+# --------------------------------------------------------------------------- #
+MAX_SUBAGENT_DEPTH = 2
+"""Hard structural nesting cap. A Supervisor's structural fan-out consumes one
+level just as a ``dispatch_subagent`` call does, so a Supervisor → ReAct-sub →
+``dispatch_subagent`` chain reaches the cap. Budget caps bound *cost*; depth
+needs its own structural limit so a buggy prompt cannot fork-bomb before the
+budget trips."""
+
+SUBAGENT_HEARTBEAT_EVENT = "subagent.heartbeat"
+"""Langfuse span-event name. NOT a ``task_events`` CHECK value (S9 must not add
+``subagent_heartbeat`` to migration 0025) and NOT a lease touch."""
+
+# Tools that call ``interrupt()`` — sub-agents are headless and must never bind
+# these (≥2 pending interrupts in one Send super-step → RuntimeError on the
+# worker's scalar ``Command(resume=...)`` path; LangGraph 1.0.5). Extend this
+# set when a new pause-bearing tool ships.
+INTERRUPT_BEARING_TOOL_NAMES = frozenset({"request_human_input"})
+
+# Failure reasons (the discriminator on a failed SubagentResult).
+REASON_CEILING = "ceiling"
+REASON_TIMEOUT = "timeout"
+REASON_ERROR = "error"
+REASON_DEPTH = "depth"
+
+_DEFAULT_TIMEOUT_SECONDS = 4 * 60 * 60  # research timeout ceiling (§A11 decision)
+
+EmitCallable = Callable[..., Awaitable[None]]
+
+
+def _max_reducer(a: int, b: int) -> int:
+    """Monotone watermark reducer for the per-sub-agent counters.
+
+    A stale super-step replayed on resume cannot regress the turn / token
+    counts. Mirrors ``executor.compaction.state._max_reducer``. (LangGraph's
+    channel introspection cannot read the builtin ``max``'s signature, so a
+    named wrapper is required.)"""
+    return max(a, b)
+
+
+def _append(left: list, right: list) -> list:
+    """Append reducer for the cross-back ``results`` channel."""
+    return list(left) + list(right)
+
+
+# --------------------------------------------------------------------------- #
+# Public shapes
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class SubagentCeiling:
+    """Per-sub-agent token + turn budget, enforced in graph state.
+
+    Either bound trips the ceiling. ``max_turns`` also bounds the emergent
+    width of a sub-agent's own ``dispatch_subagent`` fan-out (closing the
+    depth-2 *width* question)."""
+
+    max_turns: int
+    max_tokens: int
+
+
+@dataclass(frozen=True)
+class SubagentResult:
+    """The fan-out return shape — a value, never an exception.
+
+    ``ok=True`` carries the distilled ``summary`` the driver injects. ``ok=False``
+    carries a ``reason`` in {``ceiling``, ``timeout``, ``error``, ``depth``}.
+    """
+
+    ok: bool
+    summary: str = ""
+    reason: str | None = None
+
+    @classmethod
+    def success(cls, summary: str) -> "SubagentResult":
+        return cls(ok=True, summary=summary, reason=None)
+
+    @classmethod
+    def failure(cls, reason: str, *, detail: str = "") -> "SubagentResult":
+        return cls(ok=False, summary=detail, reason=reason)
+
+
+# --------------------------------------------------------------------------- #
+# Headless filter
+# --------------------------------------------------------------------------- #
+def filter_headless_tools(tools: Iterable[Any]) -> list[Any]:
+    """Drop any ``interrupt()``-bearing tool from a sub-agent's allowlist.
+
+    Matches by tool ``name`` (the public, stable identifier on
+    ``StructuredTool`` / ``BaseTool``). Silently dropped — never bound."""
+    kept: list[Any] = []
+    for tool in tools:
+        name = getattr(tool, "name", None)
+        if name in INTERRUPT_BEARING_TOOL_NAMES:
+            logger.debug("subagent.headless_filter dropped tool=%s", name)
+            continue
+        kept.append(tool)
+    return kept
+
+
+# --------------------------------------------------------------------------- #
+# Sub-agent state — slim, isolated, on its OWN internal channel
+# --------------------------------------------------------------------------- #
+class _SubagentState(TypedDict, total=False):
+    """Isolated sub-agent working state.
+
+    ``sub_messages`` is the sub-agent's *own* context window — NOT the parent's
+    ``messages`` channel — so its working turns never leak into the parent
+    context while still being checkpointed under the sub-checkpoint namespace.
+    Counters use a monotone ``max`` reducer so a replayed super-step on resume
+    cannot regress them (mirrors ``RuntimeState``'s watermark convention)."""
+
+    sub_messages: Annotated[list[BaseMessage], add_messages]
+    turn_count: Annotated[int, _max_reducer]
+    tokens_used: Annotated[int, _max_reducer]
+    depth: int
+    stopped_reason: str
+    # The single channel that crosses BACK to the parent. LangGraph maps a
+    # subgraph node's output to the parent's same-named channel, so the
+    # parent's ``results`` reducer receives this one entry — while
+    # ``sub_messages`` (a parent-absent channel) stays isolated.
+    results: Annotated[list, _append]
+
+
+def _message_tokens(msg: BaseMessage) -> int:
+    usage = getattr(msg, "usage_metadata", None)
+    if isinstance(usage, dict):
+        total = usage.get("total_tokens")
+        if isinstance(total, int):
+            return total
+        return int(usage.get("input_tokens", 0) or 0) + int(
+            usage.get("output_tokens", 0) or 0
+        )
+    # No usage_metadata (some providers / streaming paths omit it) → 0 tokens
+    # counted. The token ceiling then never advances, so the TURN ceiling
+    # becomes the binding budget guard for this sub-agent. Intentional: a turn
+    # cap always bounds the loop even when a provider reports no token usage.
+    return 0
+
+
+def build_subagent_node(
+    *,
+    model: Any,
+    tools: list[Any],
+    ceiling: SubagentCeiling,
+    emit: EmitCallable,
+):
+    """Compile the sub-agent ReAct loop as a subgraph (to be added as a NODE).
+
+    Returns a compiled subgraph with **no own checkpointer** so it inherits the
+    parent's (the namespaced sub-checkpoint). The caller wires it as a node and
+    reaches it via ``Send`` — *that* is what makes its inner turns checkpointed
+    super-steps (per-inner-turn resume + persisted transcript)."""
+
+    headless_tools = filter_headless_tools(tools)
+    bound_model = model.bind_tools(headless_tools) if headless_tools else model
+    tools_by_name = {t.name: t for t in headless_tools}
+
+    async def agent(state: _SubagentState) -> dict:
+        turn = int(state.get("turn_count", 0))
+        tokens = int(state.get("tokens_used", 0))
+
+        # Ceiling check BEFORE spending another turn / tokens. On exhaustion,
+        # stop the loop and mark the reason — never raise.
+        if turn >= ceiling.max_turns or tokens >= ceiling.max_tokens:
+            return {"stopped_reason": REASON_CEILING}
+
+        # Wedged-branch liveness: a span event only (never a lease/task_events).
+        await emit(SUBAGENT_HEARTBEAT_EVENT, {"turn": turn, "tokens": tokens})
+
+        response: AIMessage = await bound_model.ainvoke(state.get("sub_messages", []))
+        spent = _message_tokens(response)
+        return {
+            "sub_messages": [response],
+            "turn_count": turn + 1,
+            "tokens_used": tokens + spent,
+        }
+
+    async def tool_node(state: _SubagentState) -> dict:
+        last = state["sub_messages"][-1]
+        out: list[ToolMessage] = []
+        for call in getattr(last, "tool_calls", None) or []:
+            tool = tools_by_name.get(call["name"])
+            if tool is None:
+                out.append(
+                    ToolMessage(
+                        content=f"error: tool {call['name']!r} not available",
+                        tool_call_id=call["id"],
+                    )
+                )
+                continue
+            result = await tool.ainvoke(call["args"])
+            out.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+        return {"sub_messages": out}
+
+    def route(state: _SubagentState) -> str:
+        if state.get("stopped_reason"):
+            return "finalize"
+        last = state["sub_messages"][-1] if state.get("sub_messages") else None
+        if isinstance(last, AIMessage) and getattr(last, "tool_calls", None):
+            return "tools"
+        return "finalize"
+
+    async def finalize(state: _SubagentState) -> dict:
+        # Distil the outcome the driver injects and write it to the cross-back
+        # ``results`` channel (the ONLY thing that reaches the parent). On a
+        # clean stop the summary is the last AI text; on ceiling exhaustion the
+        # reason marker carries the meaning and the summary is empty.
+        reason = state.get("stopped_reason", "")
+        summary = ""
+        if not reason:
+            for msg in reversed(state.get("sub_messages", [])):
+                if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
+                    summary = _flatten_text(msg.content)
+                    break
+        return {"results": [{"summary": summary, "stopped_reason": reason}]}
+
+    sub = StateGraph(_SubagentState)
+    sub.add_node("agent", agent)
+    sub.add_node("tools", tool_node)
+    sub.add_node("finalize", finalize)
+    sub.add_edge(START, "agent")
+    sub.add_conditional_edges("agent", route, ["tools", "finalize"])
+    sub.add_edge("tools", "agent")
+    sub.add_edge("finalize", END)
+    return sub.compile()  # no own checkpointer -> inherits the parent's
+
+
+class _ParentFanoutState(TypedDict, total=False):
+    """Minimal parent graph state for a single-branch fan-out.
+
+    ``results`` is the bridge channel the sub-agent's outcome lands on — NOT the
+    sub-agent's internal ``sub_messages`` — so nothing of the sub-agent's
+    working context reaches the parent. (S4/S6 use richer parent states; this
+    helper owns only the single-branch driver.)"""
+
+    results: Annotated[list, _append]
+
+
+def _flatten_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return str(content)
+
+
+# --------------------------------------------------------------------------- #
+# run_subagent — the shared driver entry point
+# --------------------------------------------------------------------------- #
+async def run_subagent(
+    prompt: str,
+    tools: list[Any],
+    *,
+    ceiling: SubagentCeiling,
+    depth: int,
+    model: Any,
+    checkpointer: BaseCheckpointSaver,
+    thread_id: str,
+    emit: EmitCallable,
+    timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+    subagent_node_name: str = "subagent",
+) -> SubagentResult:
+    """Run one focused ReAct sub-agent in-process and return a structured result.
+
+    The sub-agent is a compiled ReAct subgraph declared as the
+    ``subagent_node_name`` node of a tiny parent graph and reached via ``Send``,
+    sharing the passed ``checkpointer``. The parent fan-out is driven with
+    ``durability="sync"`` (matching the worker runtime) so every inner super-step
+    is persisted before the next — the basis of per-inner-turn crash resume.
+
+    Always returns a :class:`SubagentResult`; never raises ceiling / timeout /
+    error / depth out to the caller's graph.
+    """
+    # Depth guard FIRST — reject before any spawn (no model bind, no invoke).
+    if depth > MAX_SUBAGENT_DEPTH:
+        return SubagentResult.failure(
+            REASON_DEPTH,
+            detail=f"depth {depth} exceeds MAX_SUBAGENT_DEPTH={MAX_SUBAGENT_DEPTH}",
+        )
+
+    try:
+        subagent = build_subagent_node(
+            model=model, tools=tools, ceiling=ceiling, emit=emit
+        )
+
+        # Tiny parent graph: a dispatch node Sends the seeded sub-agent state to
+        # the shared subagent NODE. This Send-reached-node wiring (NOT an
+        # imperative ainvoke of the subgraph) is the load-bearing durability
+        # story — the sub-agent's inner turns become checkpointed super-steps
+        # under the ``subagent:<id>`` namespace.
+        def _dispatch(_state):
+            return [
+                Send(
+                    subagent_node_name,
+                    {
+                        "sub_messages": [HumanMessage(content=prompt)],
+                        "turn_count": 0,
+                        "tokens_used": 0,
+                        "depth": depth,
+                    },
+                )
+            ]
+
+        # The subagent node writes its outcome to the ``results`` channel, which
+        # LangGraph maps to the parent's same-named channel — the only thing
+        # that crosses back. Its internal ``sub_messages`` are a parent-absent
+        # channel, so they never leak into the parent context.
+        parent = StateGraph(_ParentFanoutState)
+        parent.add_node("dispatch", lambda s: {})
+        parent.add_node(subagent_node_name, subagent)
+        parent.add_edge(START, "dispatch")
+        parent.add_conditional_edges("dispatch", _dispatch, [subagent_node_name])
+        parent.add_edge(subagent_node_name, END)
+        compiled = parent.compile(checkpointer=checkpointer)
+
+        # Size the recursion limit so the per-sub-agent TURN ceiling is the
+        # binding stop — never LangGraph's default (25). Each turn is ~2 inner
+        # super-steps (agent + tools); add headroom for dispatch / finalize.
+        recursion_limit = max(25, ceiling.max_turns * 2 + 5)
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": recursion_limit,
+        }
+
+        try:
+            final = await asyncio.wait_for(
+                compiled.ainvoke({}, config=config, durability="sync"),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("subagent.timeout thread_id=%s", thread_id)
+            return SubagentResult.failure(REASON_TIMEOUT)
+
+        results = final.get("results") or []
+        outcome = results[0] if results else {}
+        if outcome.get("stopped_reason") == REASON_CEILING:
+            return SubagentResult.failure(REASON_CEILING)
+        return SubagentResult.success(outcome.get("summary", ""))
+
+    except Exception:  # noqa: BLE001 — failure is a return value, never a raise.
+        logger.exception("subagent.unexpected_error thread_id=%s", thread_id)
+        return SubagentResult.failure(REASON_ERROR)
