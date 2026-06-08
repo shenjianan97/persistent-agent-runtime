@@ -1,7 +1,7 @@
 # Agent Modes — Supervisor Topology — Progress
 
 Status tracking for the Supervisor Topology track ([plan.md](./plan.md)).
-Sibling track: [Planning Primitive](../planning-primitive/progress.md).
+Sibling track: [Planning Primitive](../../../completed/agent-modes/planning-primitive/progress.md).
 Statuses: `Not started` · `In progress` · `Done` · `Blocked`.
 
 | Task | Description | Status | Note |
