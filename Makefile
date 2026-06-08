@@ -67,6 +67,14 @@ PYTHON ?= $(shell \
 
 DB_CONTAINER_NAME ?= persistent-agent-runtime-postgres
 COMPOSE_FILE := $(ROOT_DIR)/docker-compose.yml
+# The dev stack (postgres :55432 + LocalStack :4566) is one shared global stack with
+# fixed container names. Pin the compose project name so invocations from git worktrees
+# (whose directory name differs) adopt the same stack instead of colliding on
+# container_name with a directory-derived project.
+COMPOSE_PROJECT ?= persistent-agent-runtime
+# Export so the e2e helper scripts (scripts/e2e/common.sh:e2e_compose_project)
+# read the same value and never target a different project than the Makefile.
+export COMPOSE_PROJECT
 LOCALSTACK_CONTAINER_NAME ?= persistent-agent-runtime-localstack
 S3_ENDPOINT_URL ?= http://localhost:4566
 S3_BUCKET_NAME ?= platform-artifacts
@@ -767,7 +775,7 @@ db-up:
 		exit 1; \
 	fi
 	@DB_USER="$(DB_USER)" DB_PASSWORD="$(DB_PASSWORD)" DB_NAME="$(DB_NAME)" DB_PORT="$(DB_PORT)" \
-		docker compose -f $(COMPOSE_FILE) up -d postgres localstack
+		docker compose -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT) up -d postgres localstack
 	@echo "$(YELLOW)⏳ Waiting for PostgreSQL to accept connections...$(NC)"
 	@attempts=0; \
 	until docker exec $(DB_CONTAINER_NAME) env PGPASSWORD="$(DB_PASSWORD)" pg_isready -h 127.0.0.1 -p 5432 -U "$(DB_USER)" -d "$(DB_NAME)" >/dev/null 2>&1; do \
@@ -792,11 +800,11 @@ db-up:
 
 db-down:
 	@echo "$(YELLOW)🛑 Stopping Database and LocalStack containers...$(NC)"
-	@docker compose -f $(COMPOSE_FILE) down
+	@docker compose -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT) down
 	@echo "$(GREEN)✅ Containers stopped$(NC)"
 
 db-status:
-	@docker compose -f $(COMPOSE_FILE) ps
+	@docker compose -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT) ps
 
 db-migrate: db-up
 	@echo "$(YELLOW)🛠️  Applying migrations to Database...$(NC)"
@@ -926,7 +934,7 @@ test-db-up:
 		true; \
 	else \
 		DB_USER="$(DB_USER)" DB_PASSWORD="$(DB_PASSWORD)" DB_NAME="$(DB_NAME)" DB_PORT="$(DB_PORT)" \
-			docker compose -f $(COMPOSE_FILE) up -d localstack; \
+			docker compose -f $(COMPOSE_FILE) -p $(COMPOSE_PROJECT) up -d localstack; \
 		attempts=0; \
 		until docker exec $(LOCALSTACK_CONTAINER_NAME) awslocal s3 ls >/dev/null 2>&1; do \
 			attempts=$$((attempts + 1)); \

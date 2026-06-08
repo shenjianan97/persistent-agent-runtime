@@ -112,6 +112,17 @@ e2e_compose_file() {
   printf '%s/docker-compose.yml' "$(e2e_root_dir)"
 }
 
+# Compose project name for the shared dev stack. MUST be pinned: from a git
+# worktree, compose would otherwise derive the project from the directory name
+# and collide on the fixed container_name owned by the real project. Honor an
+# exported COMPOSE_PROJECT override so this stays in lockstep with the Makefile's
+# `COMPOSE_PROJECT ?= persistent-agent-runtime` (otherwise an override there and
+# the hardcoded name here would target two different projects that both claim the
+# fixed `persistent-agent-runtime-localstack` container).
+e2e_compose_project() {
+  printf '%s' "${COMPOSE_PROJECT:-persistent-agent-runtime}"
+}
+
 # Discover the host port mapped to a container's 5432/tcp. Handles IPv4+IPv6
 # lines (takes the first) on both Docker Desktop (macOS) and Linux.
 e2e_discover_pg_port() {
@@ -126,7 +137,7 @@ e2e_ensure_localstack() {
     # `|| true`: two concurrent cold provisions may both race `compose up` on the
     # shared fixed container_name and one returns non-zero — tolerate it and let
     # the readiness loop below be the real gate.
-    docker compose -f "$(e2e_compose_file)" up -d localstack >/dev/null 2>&1 || true
+    docker compose -f "$(e2e_compose_file)" -p "$(e2e_compose_project)" up -d localstack >/dev/null 2>&1 || true
   fi
   # ALWAYS wait for S3 to actually answer — a running container does NOT imply a
   # ready S3 endpoint. If a concurrent provision just started LocalStack, the

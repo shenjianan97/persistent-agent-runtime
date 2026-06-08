@@ -38,6 +38,15 @@ services:
       timeout: 10s
       retries: 10
 
+# Explicit, project-independent volume names. The services already use fixed
+# container_names; pin the volumes the same way so the dev stack's data identity
+# does not depend on the Compose project name. Without this, Compose prefixes
+# unnamed volumes with the project (e.g. <dir-basename>_pgdata from a worktree),
+# so a project change would silently start PostgreSQL on a fresh empty volume.
+# These names match the canonical `persistent-agent-runtime_*` volumes that
+# existing default installs already have, so this is a no-op for them.
 volumes:
   pgdata:
+    name: persistent-agent-runtime_pgdata
   localstackdata:
+    name: persistent-agent-runtime_localstackdata
