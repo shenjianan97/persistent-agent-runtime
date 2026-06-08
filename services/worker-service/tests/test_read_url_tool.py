@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import socket
+
 import httpx
 import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from tools.definitions import ToolDependencies
-from tools.errors import ToolExecutionError, ToolInputError
+from tools.errors import ToolExecutionError, ToolInputError, ToolTransportError
 from tools.providers.search import SearchResult
 from tools.read_url import ReadUrlFetcher
 from tools.server import create_mcp_server
@@ -38,6 +40,15 @@ async def _private_resolver(host: str, port: int) -> list[str]:
 
 def _build_client(handler) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _ok_handler(request: httpx.Request) -> httpx.Response:
+    del request
+    return httpx.Response(
+        200,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        content="<html><head><title>OK</title></head><body><main><p>Recovered content.</p></main></body></html>",
+    )
 
 
 class TestReadUrlFetcher:
@@ -205,3 +216,163 @@ class TestReadUrlFetcher:
 
         with pytest.raises(ToolExecutionError, match=r"https://example.com/fail"):
             await fetcher.fetch("https://example.com/fail", 5000)
+
+
+class TestReadUrlTransientRetry:
+    """ONE bounded in-tool retry for transient failures, none for permanent.
+
+    The error text the LLM eventually sees must be actionable: include the
+    URL and a hint so the agent can choose a different URL or source.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_real_sleep(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("tools.read_url.TRANSIENT_RETRY_DELAY_SECONDS", 0.0)
+
+    def _counting_resolver(self, outcomes: list):
+        """Resolver popping scripted outcomes (exception or list of IPs)."""
+        calls = {"count": 0}
+
+        async def resolver(host: str, port: int) -> list[str]:
+            calls["count"] += 1
+            assert outcomes, "resolver called more times than scripted"
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        return resolver, calls
+
+    @pytest.mark.asyncio
+    async def test_transient_dns_failure_retries_once_then_surfaces(self) -> None:
+        resolver, calls = self._counting_resolver(
+            [
+                socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution"),
+                socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution"),
+            ]
+        )
+        fetcher = ReadUrlFetcher(client=_build_client(_ok_handler), resolver=resolver)
+
+        with pytest.raises(ToolTransportError) as excinfo:
+            await fetcher.fetch("https://flaky.example/page", 5000)
+
+        assert calls["count"] == 2
+        message = str(excinfo.value)
+        assert "https://flaky.example/page" in message
+        assert "could not be resolved" in message
+        assert "different URL" in message
+
+    @pytest.mark.asyncio
+    async def test_transient_dns_failure_succeeds_on_retry(self) -> None:
+        resolver, calls = self._counting_resolver(
+            [
+                socket.gaierror(socket.EAI_AGAIN, "temporary failure in name resolution"),
+                ["93.184.216.34"],
+            ]
+        )
+        fetcher = ReadUrlFetcher(client=_build_client(_ok_handler), resolver=resolver)
+
+        result = await fetcher.fetch("https://flaky.example/page", 5000)
+
+        assert calls["count"] == 2
+        assert "Recovered content." in result.content
+
+    @pytest.mark.asyncio
+    async def test_permanent_dns_failure_is_not_retried(self) -> None:
+        resolver, calls = self._counting_resolver(
+            [socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided")]
+        )
+        fetcher = ReadUrlFetcher(client=_build_client(_ok_handler), resolver=resolver)
+
+        with pytest.raises(ToolTransportError) as excinfo:
+            await fetcher.fetch("https://nxdomain.example/page", 5000)
+
+        assert calls["count"] == 1
+        message = str(excinfo.value)
+        assert "https://nxdomain.example/page" in message
+        assert "different URL" in message
+
+    @pytest.mark.asyncio
+    async def test_indeterminate_resolution_failure_is_treated_as_transient(self) -> None:
+        # A bare OSError carries no gaierror errno — when indeterminate,
+        # retry once: a wrong "permanent" call costs the agent a source.
+        resolver, calls = self._counting_resolver(
+            [OSError("resolver subsystem hiccup"), ["93.184.216.34"]]
+        )
+        fetcher = ReadUrlFetcher(client=_build_client(_ok_handler), resolver=resolver)
+
+        result = await fetcher.fetch("https://hiccup.example/page", 5000)
+
+        assert calls["count"] == 2
+        assert "Recovered content." in result.content
+
+    @pytest.mark.asyncio
+    async def test_timeout_retries_once_then_surfaces(self) -> None:
+        attempts = {"count": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            attempts["count"] += 1
+            raise httpx.ReadTimeout("read timed out", request=request)
+
+        fetcher = ReadUrlFetcher(client=_build_client(handler), resolver=_public_resolver)
+
+        with pytest.raises(ToolTransportError) as excinfo:
+            await fetcher.fetch("https://slow.example/page", 5000)
+
+        assert attempts["count"] == 2
+        message = str(excinfo.value)
+        assert "https://slow.example/page" in message
+        assert "timed out" in message
+        assert "different URL" in message
+
+    @pytest.mark.asyncio
+    async def test_timeout_succeeds_on_retry(self) -> None:
+        attempts = {"count": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise httpx.ConnectTimeout("connect timed out", request=request)
+            return await _ok_handler(request)
+
+        fetcher = ReadUrlFetcher(client=_build_client(handler), resolver=_public_resolver)
+
+        result = await fetcher.fetch("https://slow.example/page", 5000)
+
+        assert attempts["count"] == 2
+        assert "Recovered content." in result.content
+
+    @pytest.mark.asyncio
+    async def test_http_404_is_not_retried_and_message_is_actionable(self) -> None:
+        attempts = {"count": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            attempts["count"] += 1
+            return httpx.Response(404, headers={"Content-Type": "text/html"}, content="nope")
+
+        fetcher = ReadUrlFetcher(client=_build_client(handler), resolver=_public_resolver)
+
+        with pytest.raises(ToolExecutionError) as excinfo:
+            await fetcher.fetch("https://gone.example/page", 5000)
+
+        assert attempts["count"] == 1
+        message = str(excinfo.value)
+        assert "https://gone.example/page" in message
+        assert "404" in message
+        assert "different URL" in message
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_request_failure_is_not_retried(self) -> None:
+        attempts = {"count": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            attempts["count"] += 1
+            raise httpx.ConnectError("network down", request=request)
+
+        fetcher = ReadUrlFetcher(client=_build_client(handler), resolver=_public_resolver)
+
+        with pytest.raises(ToolTransportError) as excinfo:
+            await fetcher.fetch("https://down.example/page", 5000)
+
+        assert attempts["count"] == 1
+        assert "different URL" in str(excinfo.value)
