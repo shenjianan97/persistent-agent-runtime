@@ -31,7 +31,15 @@ async def _public_resolver(host: str, port: int) -> list[str]:
 
 
 def _mock_handler(request: httpx.Request) -> httpx.Response:
-    if str(request.url) == "https://example.com/article":
+    # Match the way a real origin routes — by Host header + path — not by the
+    # connection URL. read_url's SSRF IP-pinning rewrites the request URL host
+    # to the validated IP and carries the original authority in the Host
+    # header, so a match on ``str(request.url) == "https://example.com/..."``
+    # would miss the pinned request (it arrives as https://<ip>/article with
+    # Host: example.com). Host+path matches both the pinned and un-pinned
+    # shapes.
+    host = request.headers.get("Host", request.url.host)
+    if host == "example.com" and request.url.path == "/article":
         html = """
             <html>
                 <head><title>Fixture Article</title></head>
