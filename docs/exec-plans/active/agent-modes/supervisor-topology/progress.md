@@ -6,7 +6,7 @@ Statuses: `Not started` · `In progress` · `Done` · `Blocked`.
 
 | Task | Description | Status | Note |
 |---|---|---|---|
-| S1 | API: `topology` (immutable) + `preset` + `supervisor` sub-object; validation; canonicalisation | Not started | low-risk, ready to start |
+| S1 | API: `topology` (immutable) + `preset` + `supervisor` sub-object; validation; canonicalisation | Done | `SupervisorConfigRequest` + `AgentConfigRequest` fields + `ConfigValidationHelper` + `AgentService` immutability gate; 35 new `SupervisorConfigValidationTest` cases + 11 new `AgentServiceTest` cases; all 513 Java unit tests pass |
 | S2 | `PresetDefaults` bundles applied at creation; `research` low-concurrency default | Not started | depends on S1 |
 | S3 | Shared fan-out helper (`run_subagent`): isolated context + ceiling + heartbeat + timeout + depth cap | Not started | hard blocker for S4–S7 |
 | S4 | `dispatch_subagent` ReAct tool wrapping the helper | Not started | depends on S3 |

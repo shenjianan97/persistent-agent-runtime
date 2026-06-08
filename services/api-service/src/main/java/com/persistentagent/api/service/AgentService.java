@@ -1,6 +1,7 @@
 package com.persistentagent.api.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.AgentNotFoundException;
@@ -11,11 +12,13 @@ import com.persistentagent.api.model.request.AgentUpdateRequest;
 import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
+import com.persistentagent.api.model.request.SupervisorConfigRequest;
 import com.persistentagent.api.model.response.AgentResponse;
 import com.persistentagent.api.model.response.AgentSummaryResponse;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
+import org.postgresql.util.PGobject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -145,6 +148,16 @@ public class AgentService {
         Map<String, Object> existing = agentRepository.findByIdAndTenant(tenantId, agentId)
                 .orElseThrow(() -> new AgentNotFoundException(agentId));
 
+        // Topology immutability gate (Agent Modes — S1).
+        // Compare the canonicalised topology of the incoming request against the
+        // canonicalised topology of the current persisted row. "react" is the
+        // read-time default for absent topology (it is never written into the row).
+        String incomingTopology = canonicalizeTopology(request.agentConfig().topology());
+        String persistedTopology = readPersistedTopology(existing.get("agent_config"));
+        if (!incomingTopology.equals(persistedTopology)) {
+            throw new ValidationException("topology is immutable after agent creation");
+        }
+
         int maxConcurrentTasks = request.maxConcurrentTasks() != null
                 ? request.maxConcurrentTasks()
                 : ((Number) existing.get("max_concurrent_tasks")).intValue();
@@ -213,6 +226,13 @@ public class AgentService {
         // worker (Task 3) per Phase 2 Track 7 design.
         ContextManagementConfigRequest canonicalizedContextManagement = config.contextManagement();
 
+        // Agent Modes — Supervisor Topology (S1): round-trip topology, preset, and
+        // supervisor verbatim. Absent keys stay absent — the "react" default for
+        // absent topology is a read-time convention only, never written into the row.
+        String canonicalizedTopology = config.topology();
+        String canonicalizedPreset = config.preset();
+        SupervisorConfigRequest canonicalizedSupervisor = config.supervisor();
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -226,7 +246,10 @@ public class AgentService {
                         : List.of(),
                 canonicalizedSandbox,
                 canonicalizedMemory,
-                canonicalizedContextManagement);
+                canonicalizedContextManagement,
+                canonicalizedTopology,
+                canonicalizedPreset,
+                canonicalizedSupervisor);
     }
 
     private String serializeConfig(AgentConfigRequest config) {
@@ -234,6 +257,49 @@ public class AgentService {
             return objectMapper.writeValueAsString(config);
         } catch (JsonProcessingException e) {
             throw new ValidationException("Failed to serialize agent_config: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Returns the canonical topology string for a given raw value.
+     * {@code null} → {@code "react"} (read-time default; never written to the row).
+     */
+    static String canonicalizeTopology(String topology) {
+        return topology != null ? topology : "react";
+    }
+
+    /**
+     * Reads the {@code topology} key out of the persisted {@code agent_config} JSONB,
+     * canonicalising absent / null / unreadable values to {@code "react"}.
+     *
+     * @param rawAgentConfig the raw value from the DB row (may be {@code String},
+     *                       {@code PGobject}, or some other wrapper)
+     */
+    private String readPersistedTopology(Object rawAgentConfig) {
+        if (rawAgentConfig == null) {
+            return "react";
+        }
+        String json;
+        if (rawAgentConfig instanceof String s) {
+            json = s;
+        } else if (rawAgentConfig instanceof PGobject pg) {
+            json = pg.getValue();
+        } else {
+            json = rawAgentConfig.toString();
+        }
+        if (json == null || json.isBlank()) {
+            return "react";
+        }
+        try {
+            JsonNode root = objectMapper.readTree(json);
+            JsonNode topologyNode = root == null ? null : root.get("topology");
+            if (topologyNode == null || topologyNode.isNull()) {
+                return "react";
+            }
+            String val = topologyNode.asText(null);
+            return val != null ? val : "react";
+        } catch (Exception e) {
+            return "react";
         }
     }
 

@@ -9,6 +9,7 @@ import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
+import com.persistentagent.api.model.request.SupervisorConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
@@ -311,6 +312,70 @@ public class ConfigValidationHelper {
         // value passes this validator.
     }
 
+    /**
+     * Validates the optional {@code supervisor} sub-object on
+     * {@link AgentConfigRequest}. Absence is always valid.
+     *
+     * <ul>
+     *   <li>{@code maxFanoutPerIteration}, when non-null: must be in [1, 20].</li>
+     *   <li>{@code maxIterations}, when non-null: must be in [1, 10].</li>
+     *   <li>{@code sourceAllowlist}, when non-null: at most 50 entries. Entry
+     *       contents are NOT validated — customers may name tools / stores not yet wired.</li>
+     *   <li>{@code writerStyle}, when non-null: must be one of
+     *       {@code {formal_report, annotated_bullets}}.</li>
+     *   <li>{@code scopeClarificationEnabled}: pure boolean toggle — no further validation.</li>
+     *   <li>No cross-field validation with {@code topology} — a {@code supervisor}
+     *       sub-object on a {@code react} agent is accepted but inert.</li>
+     * </ul>
+     *
+     * @param s supervisor sub-object (may be {@code null})
+     */
+    public void validateSupervisorConfig(SupervisorConfigRequest s) {
+        if (s == null) {
+            return; // Absent supervisor sub-object is valid.
+        }
+
+        if (s.maxFanoutPerIteration() != null) {
+            int val = s.maxFanoutPerIteration();
+            if (val < ValidationConstants.SUPERVISOR_MAX_FANOUT_MIN
+                    || val > ValidationConstants.SUPERVISOR_MAX_FANOUT_MAX) {
+                throw new ValidationException(
+                        "supervisor.max_fanout_per_iteration must be between "
+                                + ValidationConstants.SUPERVISOR_MAX_FANOUT_MIN + " and "
+                                + ValidationConstants.SUPERVISOR_MAX_FANOUT_MAX);
+            }
+        }
+
+        if (s.maxIterations() != null) {
+            int val = s.maxIterations();
+            if (val < ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MIN
+                    || val > ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MAX) {
+                throw new ValidationException(
+                        "supervisor.max_iterations must be between "
+                                + ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MIN + " and "
+                                + ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MAX);
+            }
+        }
+
+        if (s.sourceAllowlist() != null
+                && s.sourceAllowlist().size() > ValidationConstants.SUPERVISOR_SOURCE_ALLOWLIST_MAX) {
+            throw new ValidationException(
+                    "supervisor.source_allowlist must not exceed "
+                            + ValidationConstants.SUPERVISOR_SOURCE_ALLOWLIST_MAX + " entries "
+                            + "(got " + s.sourceAllowlist().size() + ")");
+        }
+
+        if (s.writerStyle() != null
+                && !ValidationConstants.VALID_WRITER_STYLES.contains(s.writerStyle())) {
+            throw new ValidationException(
+                    "Invalid supervisor.writer_style: '" + s.writerStyle()
+                            + "'. Valid values: " + ValidationConstants.VALID_WRITER_STYLES);
+        }
+
+        // scopeClarificationEnabled: pure boolean toggle — record typing enforces it;
+        // no further validation needed.
+    }
+
     public void validateAgentConfig(AgentConfigRequest config) {
         validateModel(config.provider(), config.model());
         validateAllowedTools(config.allowedTools());
@@ -318,6 +383,15 @@ public class ConfigValidationHelper {
         validateSandboxConfig(config.sandbox());
         validateMemoryConfig(config.memory(), config.provider());
         validateContextManagementConfig(config.contextManagement(), config.provider(), config.model());
+
+        // Agent Modes — Supervisor Topology (S1): topology enum + supervisor sub-object.
+        if (config.topology() != null
+                && !ValidationConstants.VALID_TOPOLOGIES.contains(config.topology())) {
+            throw new ValidationException(
+                    "Invalid topology: '" + config.topology()
+                            + "'. Valid values: " + ValidationConstants.VALID_TOPOLOGIES);
+        }
+        validateSupervisorConfig(config.supervisor());
     }
 
     /**

@@ -540,7 +540,7 @@ class ConfigValidationHelperTest {
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest("bad-cm-model", null, null, null, null);
         com.persistentagent.api.model.request.AgentConfigRequest config =
                 new com.persistentagent.api.model.request.AgentConfigRequest(
-                        "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
+                        "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null);
 
         assertThrows(ValidationException.class, () -> helper.validateAgentConfig(config),
                 "validateAgentConfig must propagate context_management validation errors");

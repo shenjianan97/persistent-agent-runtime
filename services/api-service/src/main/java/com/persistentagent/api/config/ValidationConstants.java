@@ -126,4 +126,19 @@ public final class ValidationConstants {
     public static final int MAX_TOOL_SERVER_LIST_LIMIT = 200;
     public static final int TOOL_SERVER_DISCOVER_TIMEOUT_MS = 10000;
 
+    // Agent topology (Agent Modes — Supervisor Topology track, S1).
+    // The only stored graph-shape selector. Absent → treated as "react" at read time;
+    // never written as a default into the persisted config row.
+    public static final Set<String> VALID_TOPOLOGIES = Set.of("react", "supervisor");
+
+    // Supervisor sub-object bounds (plan §A4).
+    public static final int SUPERVISOR_MAX_FANOUT_MIN = 1;
+    public static final int SUPERVISOR_MAX_FANOUT_MAX = 20;
+    public static final int SUPERVISOR_MAX_ITERATIONS_MIN = 1;
+    public static final int SUPERVISOR_MAX_ITERATIONS_MAX = 10;
+    public static final int SUPERVISOR_SOURCE_ALLOWLIST_MAX = 50;
+
+    // writer_style enum values for the Supervisor sub-object.
+    public static final Set<String> VALID_WRITER_STYLES = Set.of("formal_report", "annotated_bullets");
+
 }
