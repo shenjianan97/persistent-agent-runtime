@@ -89,6 +89,15 @@ public final class ValidationConstants {
     public static final int DEFAULT_TASK_TIMEOUT_SECONDS = 3600;
     public static final double DEFAULT_TEMPERATURE = 0.7;
 
+    // Agent concurrency / budget defaults — mirror the private constants in AgentService
+    // so PresetDefaults (and future callers) can reference them without coupling to the service.
+    // Kept in sync with infrastructure/database/migrations/0007_scheduler_and_budgets.sql
+    // (max_concurrent_tasks DEFAULT 5, budget_max_per_task DEFAULT 500000,
+    // budget_max_per_hour DEFAULT 5000000).
+    public static final int DEFAULT_MAX_CONCURRENT_TASKS = 5;
+    public static final long DEFAULT_BUDGET_MAX_PER_TASK = 500_000L;
+    public static final long DEFAULT_BUDGET_MAX_PER_HOUR = 5_000_000L;
+
     // Task listing defaults
     public static final int DEFAULT_TASK_LIST_LIMIT = 50;
     public static final int MAX_TASK_LIST_LIMIT = 200;

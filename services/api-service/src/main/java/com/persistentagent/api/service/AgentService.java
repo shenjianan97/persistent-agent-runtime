@@ -52,20 +52,29 @@ public class AgentService {
 
     @Transactional
     public AgentResponse createAgent(AgentCreateRequest request) {
+        // S1 validation: topology/supervisor bounds + enum.
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
-        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
+        // Agent Modes — S2: apply preset defaults AFTER S1 validation, BEFORE canonicalize.
+        // Unknown-preset 400 is checked in validateAgentConfig (ConfigValidationHelper).
+        // Topology-vs-preset contradiction is also checked there.
+        AgentCreateRequest seeded = PresetDefaults.applyPreset(request);
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(seeded.agentConfig());
         String agentConfigJson = serializeConfig(canonicalized);
 
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String agentId = UUID.randomUUID().toString();
 
-        int maxConcurrentTasks = request.maxConcurrentTasks() != null
-                ? request.maxConcurrentTasks() : DEFAULT_MAX_CONCURRENT_TASKS;
-        long budgetMaxPerTask = request.budgetMaxPerTask() != null
-                ? request.budgetMaxPerTask() : DEFAULT_BUDGET_MAX_PER_TASK;
-        long budgetMaxPerHour = request.budgetMaxPerHour() != null
-                ? request.budgetMaxPerHour() : DEFAULT_BUDGET_MAX_PER_HOUR;
+        // Preset seeding inserts the preset value as the fallback between "request explicit"
+        // and DEFAULT_*. Since applyPreset already applied the preset fallbacks into the
+        // seeded request, we use DEFAULT_* here only as the final backstop.
+        int maxConcurrentTasks = seeded.maxConcurrentTasks() != null
+                ? seeded.maxConcurrentTasks() : DEFAULT_MAX_CONCURRENT_TASKS;
+        long budgetMaxPerTask = seeded.budgetMaxPerTask() != null
+                ? seeded.budgetMaxPerTask() : DEFAULT_BUDGET_MAX_PER_TASK;
+        long budgetMaxPerHour = seeded.budgetMaxPerHour() != null
+                ? seeded.budgetMaxPerHour() : DEFAULT_BUDGET_MAX_PER_HOUR;
 
         Map<String, Object> result = agentRepository.insert(
                 tenantId, agentId, request.displayName(), agentConfigJson,
@@ -233,6 +242,23 @@ public class AgentService {
         String canonicalizedPreset = config.preset();
         SupervisorConfigRequest canonicalizedSupervisor = config.supervisor();
 
+        // Agent Modes — Supervisor Topology (S2): merge any preset-seeded extra tools into
+        // the canonical tool list. Preset tools that are not base/sandbox tools (e.g.
+        // dispatch_subagent) are carried here because they were injected by PresetDefaults
+        // into config.allowedTools() before canonicalizeConfig runs.
+        if (config.allowedTools() != null) {
+            for (String tool : config.allowedTools()) {
+                if (!canonicalizedTools.contains(tool)
+                        && !ValidationConstants.DEV_TASK_CONTROL_TOOLS.contains(tool)) {
+                    canonicalizedTools.add(tool);
+                }
+            }
+        }
+
+        // Agent Modes — Supervisor Topology (S2): task_timeout_seconds as agent-level JSONB
+        // default. Absent stays absent (platform default applied at submission time).
+        Integer canonicalizedTaskTimeoutSeconds = config.taskTimeoutSeconds();
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -249,7 +275,8 @@ public class AgentService {
                 canonicalizedContextManagement,
                 canonicalizedTopology,
                 canonicalizedPreset,
-                canonicalizedSupervisor);
+                canonicalizedSupervisor,
+                canonicalizedTaskTimeoutSeconds);
     }
 
     private String serializeConfig(AgentConfigRequest config) {

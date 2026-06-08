@@ -7,7 +7,7 @@ Statuses: `Not started` · `In progress` · `Done` · `Blocked`.
 | Task | Description | Status | Note |
 |---|---|---|---|
 | S1 | API: `topology` (immutable) + `preset` + `supervisor` sub-object; validation; canonicalisation | Done | `SupervisorConfigRequest` + `AgentConfigRequest` fields + `ConfigValidationHelper` + `AgentService` immutability gate; 35 new `SupervisorConfigValidationTest` cases + 11 new `AgentServiceTest` cases; all 513 Java unit tests pass |
-| S2 | `PresetDefaults` bundles applied at creation; `research` low-concurrency default | Not started | depends on S1 |
+| S2 | `PresetDefaults` bundles applied at creation; `research` low-concurrency default | Done | `PresetDefaults.java` (5 preset bundles) + `ConfigValidationHelper.validatePreset` + `AgentService.createAgent` seeding + `taskTimeoutSeconds` on `AgentConfigRequest`; `canonicalizeConfig` preserves preset-injected extra tools; 63 new `PresetDefaultsTest` cases; all Java+Console tests pass. **TaskService submission-time fallback for `agent_config.task_timeout_seconds` DEFERRED** (extra DB query on every task submission — follow-up task needed before `research` preset is fully wired end-to-end). |
 | S3 | Shared fan-out helper (`run_subagent`): isolated context + ceiling + heartbeat + timeout + depth cap | Not started | hard blocker for S4–S7 |
 | S4 | `dispatch_subagent` ReAct tool wrapping the helper | Not started | depends on S3 |
 | S5 | Supervisor Scope node: clarity + conditional clarify + immutable brief | Not started | depends on S3 |

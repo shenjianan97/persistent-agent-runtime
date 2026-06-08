@@ -59,7 +59,7 @@ class AgentServiceTest {
     @Test
     void createAgent_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null, null, null, null, null, null, null);
+                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -89,7 +89,7 @@ class AgentServiceTest {
     @Test
     void createAgent_withCustomBudgetFields_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null, null, null, null, null, null, null);
+                "You are a helpful assistant.", "openai", "gpt-4o", 0.7, List.of("web_search"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, 10, 1000000L, 10000000L);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -113,7 +113,7 @@ class AgentServiceTest {
     @Test
     void createAgent_invalidModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doThrow(new ValidationException("Unsupported model or provider: bad-provider/bad-model"))
@@ -126,7 +126,7 @@ class AgentServiceTest {
     @Test
     void createAgent_invalidTool_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of("unsupported_tool"), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of("unsupported_tool"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doThrow(new ValidationException("Unsupported tool: unsupported_tool"))
@@ -141,7 +141,7 @@ class AgentServiceTest {
     @Test
     void createAgent_nullTemperature_defaultsTo0_7() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", null, List.of("web_search"), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", null, List.of("web_search"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -164,7 +164,7 @@ class AgentServiceTest {
     @Test
     void createAgent_nullAllowedTools_defaultsToEmptyList() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -271,7 +271,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null, null, null, null, null, null, null);
+                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -295,7 +295,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_withBudgetFields_success() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null, null, null, null, null, null, null);
+                "Updated prompt.", "openai", "gpt-4o", 0.5, List.of(), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", 10, 1000000L, 10000000L);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -323,7 +323,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_notFound_throwsAgentNotFoundException() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Updated Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -338,7 +338,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_invalidStatus_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "invalid_status", null, null, null);
 
         assertThrows(ValidationException.class,
@@ -348,7 +348,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_invalidModel_throwsValidation() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "bad-provider", "bad-model", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doThrow(new ValidationException("Unsupported model or provider"))
@@ -361,7 +361,7 @@ class AgentServiceTest {
     @Test
     void updateAgent_configCanonicalization_appliesDefaults() {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", null, null, null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", null, null, null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -391,7 +391,7 @@ class AgentServiceTest {
         // No memory sub-object on the request — persisted JSON must omit the
         // "memory" key entirely. No silent defaults.
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -420,7 +420,7 @@ class AgentServiceTest {
         // (or null; defaults are applied at read time).
         MemoryConfigRequest memory = new MemoryConfigRequest(true, null, null);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -451,7 +451,7 @@ class AgentServiceTest {
         // All three fields set — persisted JSON preserves them exactly.
         MemoryConfigRequest memory = new MemoryConfigRequest(true, "claude-haiku-4-5", 25_000);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -489,7 +489,7 @@ class AgentServiceTest {
         // the sub-object; downstream code distinguishes explicit-false from absent.
         MemoryConfigRequest memory = new MemoryConfigRequest(false, null, null);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -517,7 +517,7 @@ class AgentServiceTest {
         // PUT path must canonicalize memory identically to POST.
         MemoryConfigRequest memory = new MemoryConfigRequest(true, null, 500);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, memory, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -575,7 +575,7 @@ class AgentServiceTest {
         // No context_management sub-object on the request — persisted JSON must omit
         // the "context_management" key entirely. No silent defaults.
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -603,7 +603,7 @@ class AgentServiceTest {
         // context_management key with null fields, but the sub-object itself is present.
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, null, null, null);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -638,7 +638,7 @@ class AgentServiceTest {
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(
                 "claude-haiku-4-5", null, excludeTools, true, false);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -680,7 +680,7 @@ class AgentServiceTest {
         // PUT path must canonicalize context_management identically to POST.
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest(null, null, List.of("custom_tool"), false, null);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -757,7 +757,7 @@ class AgentServiceTest {
     @Test
     void createAgent_nullAllowedTools_planWriteSeededAsBaseTool() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null, null, null, null);
+                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -793,7 +793,7 @@ class AgentServiceTest {
     void createAgent_explicitAllowedToolsOmittingPlanWrite_stillPresent() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
                 "A plain agent.", "anthropic", "claude-sonnet-4-6", 0.0,
-                List.of("web_search"), null, null, null, null, null, null, null);
+                List.of("web_search"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Plain Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -825,7 +825,7 @@ class AgentServiceTest {
     void createAgent_planWriteExplicitlyRequested_presentWithoutDuplicates() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
                 "You are a planning agent.", "anthropic", "claude-sonnet-4-6", 0.0,
-                List.of("plan_write"), null, null, null, null, null, null, null);
+                List.of("plan_write"), null, null, null, null, null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Planning Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -862,7 +862,7 @@ class AgentServiceTest {
     void updateAgent_consoleShapedPayloadWithoutAllowedTools_planWritePresent() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
                 "Edited prompt from Console.", "anthropic", "claude-sonnet-4-6", 0.3,
-                null, List.of(), null, null, null, null, null, null);
+                null, List.of(), null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -897,7 +897,7 @@ class AgentServiceTest {
     void updateAgent_explicitAllowedToolsOmittingPlanWrite_stillPresent() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
                 "Try to drop planning.", "anthropic", "claude-sonnet-4-6", 0.0,
-                List.of("web_search"), null, null, null, null, null, null, null);
+                List.of("web_search"), null, null, null, null, null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -947,7 +947,7 @@ class AgentServiceTest {
         // Existing row has no topology key (treated as "react" at read time).
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                "supervisor", null, null); // incoming topology = supervisor
+                "supervisor", null, null, null); // incoming topology = supervisor
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -972,7 +972,7 @@ class AgentServiceTest {
         // Existing row has topology = "supervisor".
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                "react", null, null); // incoming topology = react (explicit)
+                "react", null, null, null); // incoming topology = react (explicit)
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -995,7 +995,7 @@ class AgentServiceTest {
     void updateAgent_topologyOmitted_reactAgent_succeeds() {
         AgentConfigRequest config = new AgentConfigRequest(
                 "updated prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                null, null, null); // topology absent → canonicalises to "react"
+                null, null, null, null); // topology absent → canonicalises to "react"
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -1021,7 +1021,7 @@ class AgentServiceTest {
     void updateAgent_topologyIdentical_supervisor_succeeds() {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                "supervisor", null, null); // same topology as persisted
+                "supervisor", null, null, null); // same topology as persisted
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -1045,7 +1045,7 @@ class AgentServiceTest {
     void updateAgent_otherFieldsChange_topologyUnchanged_succeeds() {
         AgentConfigRequest config = new AgentConfigRequest(
                 "totally new system prompt", "openai", "gpt-4o", 0.5, List.of(), null, null, null, null,
-                null, null, null); // topology absent → "react"
+                null, null, null, null); // topology absent → "react"
         AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -1071,7 +1071,7 @@ class AgentServiceTest {
         // Legacy agent: agent_config has no topology key at all.
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                null, null, null);
+                null, null, null, null);
         AgentUpdateRequest request = new AgentUpdateRequest("Legacy Agent", config, "active", null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -1102,7 +1102,7 @@ class AgentServiceTest {
                         5, 3, List.of("web_search", "my_docs"), "formal_report", true);
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                "supervisor", "research", supervisor);
+                "supervisor", "research", supervisor, null);
         AgentCreateRequest request = new AgentCreateRequest("Research Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());
@@ -1112,9 +1112,11 @@ class AgentServiceTest {
         repoResult.put("created_at", now);
         repoResult.put("updated_at", now);
 
+        // S2: research preset seeds max_concurrent_tasks=2 (per-agent admission — see E6 NOTE)
+        // and task_timeout_seconds=14400. The agentRepository.insert call reflects seeded values.
         ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
         when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Research Agent"),
-                jsonCaptor.capture(), eq(5), eq(500000L), eq(5000000L)))
+                jsonCaptor.capture(), eq(2), eq(500000L), eq(5000000L)))
                 .thenReturn(repoResult);
 
         agentService.createAgent(request);
@@ -1127,11 +1129,16 @@ class AgentServiceTest {
         assertEquals("research", parsed.preset(),
                 "preset must round-trip verbatim: " + persistedJson);
         assertNotNull(parsed.supervisor(), "supervisor sub-object must round-trip");
+        // Explicit max_fanout_per_iteration=5 in the request overrides the preset's seeded 5 → still 5.
         assertEquals(Integer.valueOf(5), parsed.supervisor().maxFanoutPerIteration());
         assertEquals(Integer.valueOf(3), parsed.supervisor().maxIterations());
+        // source_allowlist set explicitly on the request → preserved verbatim.
         assertEquals(List.of("web_search", "my_docs"), parsed.supervisor().sourceAllowlist());
         assertEquals("formal_report", parsed.supervisor().writerStyle());
         assertEquals(Boolean.TRUE, parsed.supervisor().scopeClarificationEnabled());
+        // S2: research preset seeds task_timeout_seconds=14400 into agent_config JSONB.
+        assertEquals(Integer.valueOf(14400), parsed.taskTimeoutSeconds(),
+                "research preset must seed task_timeout_seconds=14400: " + persistedJson);
 
         // Verify snake_case keys are used in the persisted JSON.
         assertTrue(persistedJson.contains("\"topology\":\"supervisor\""), persistedJson);
@@ -1141,6 +1148,7 @@ class AgentServiceTest {
         assertTrue(persistedJson.contains("\"source_allowlist\""), persistedJson);
         assertTrue(persistedJson.contains("\"writer_style\":\"formal_report\""), persistedJson);
         assertTrue(persistedJson.contains("\"scope_clarification_enabled\":true"), persistedJson);
+        assertTrue(persistedJson.contains("\"task_timeout_seconds\":14400"), persistedJson);
     }
 
     /**
@@ -1151,7 +1159,7 @@ class AgentServiceTest {
     void createAgent_topologyAbsent_notWrittenToConfig() throws Exception {
         AgentConfigRequest config = new AgentConfigRequest(
                 "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                null, null, null);
+                null, null, null, null);
         AgentCreateRequest request = new AgentCreateRequest("Agent", config, null, null, null);
 
         doNothing().when(configValidationHelper).validateAgentConfig(any());

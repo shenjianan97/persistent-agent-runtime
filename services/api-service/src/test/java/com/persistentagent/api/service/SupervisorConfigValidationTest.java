@@ -296,7 +296,7 @@ class SupervisorConfigValidationTest {
         when(modelRepository.isModelActive("openai", "gpt-4o")).thenReturn(true);
         SupervisorConfigRequest s = new SupervisorConfigRequest(25, null, null, null, null); // 25 > 20
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, "supervisor", null, s);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, "supervisor", null, s, null);
         assertThrows(ValidationException.class, () -> helper.validateAgentConfig(config),
                 "validateAgentConfig must propagate supervisor validation errors");
     }
@@ -307,7 +307,7 @@ class SupervisorConfigValidationTest {
         when(modelRepository.isModelActive("openai", "gpt-4o")).thenReturn(true);
         SupervisorConfigRequest s = new SupervisorConfigRequest(5, 3, null, "formal_report", true);
         AgentConfigRequest config = new AgentConfigRequest(
-                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, "react", null, s);
+                "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null, "react", null, s, null);
         assertDoesNotThrow(() -> helper.validateAgentConfig(config));
     }
 
@@ -444,6 +444,6 @@ class SupervisorConfigValidationTest {
     private AgentConfigRequest reactConfig(String topology) {
         return new AgentConfigRequest(
                 "system prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
-                topology, null, null);
+                topology, null, null, null);
     }
 }

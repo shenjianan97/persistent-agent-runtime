@@ -54,5 +54,15 @@ public record AgentConfigRequest(
                 // When absent, the persisted JSON omits the key entirely.
                 @JsonInclude(JsonInclude.Include.NON_NULL)
                 @JsonProperty("supervisor")
-                SupervisorConfigRequest supervisor) {
+                SupervisorConfigRequest supervisor,
+
+                // Agent Modes — Supervisor Topology (S2). Agent-level default for
+                // task_timeout_seconds, seeded by the research preset (14400 s = 4 h).
+                // Stored in agent_config JSONB (not a DB column). When present, TaskService
+                // uses this value as the fallback when the task submission omits
+                // task_timeout_seconds (request value → agent config default → DEFAULT_TASK_TIMEOUT_SECONDS).
+                // Absent means: use the platform default at submission time.
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("task_timeout_seconds")
+                Integer taskTimeoutSeconds) {
 }

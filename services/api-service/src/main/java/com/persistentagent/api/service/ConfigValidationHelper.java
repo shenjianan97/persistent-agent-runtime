@@ -392,6 +392,39 @@ public class ConfigValidationHelper {
                             + "'. Valid values: " + ValidationConstants.VALID_TOPOLOGIES);
         }
         validateSupervisorConfig(config.supervisor());
+
+        // Agent Modes — Supervisor Topology (S2): preset validation.
+        // Unknown preset → 400 naming the valid presets.
+        // Topology-vs-preset contradiction → 400 (explicit topology that conflicts with
+        // the preset's seeded topology).
+        validatePreset(config.preset(), config.topology());
+    }
+
+    /**
+     * Validates the optional {@code preset} field and the topology-vs-preset consistency.
+     *
+     * <ul>
+     *   <li>A {@code null} / absent preset is always valid (direct topology config).</li>
+     *   <li>An unrecognised preset name → 400 naming the valid presets.</li>
+     *   <li>A preset combined with an explicit {@code topology} that contradicts the
+     *       preset's seeded topology → 400 (documented decision in
+     *       {@link PresetDefaults#validatePresetTopologyConsistency}).</li>
+     * </ul>
+     *
+     * @param preset   the preset value from the request (may be null)
+     * @param topology the topology value from the request (may be null)
+     */
+    public void validatePreset(String preset, String topology) {
+        if (preset == null) {
+            return; // No preset — no seeding. Valid.
+        }
+        if (!PresetDefaults.KNOWN_PRESETS.contains(preset)) {
+            throw new ValidationException(
+                    "Unknown preset: '" + preset
+                            + "'. Valid presets: " + PresetDefaults.KNOWN_PRESETS);
+        }
+        // Topology-vs-preset contradiction check.
+        PresetDefaults.validatePresetTopologyConsistency(preset, topology);
     }
 
     /**
