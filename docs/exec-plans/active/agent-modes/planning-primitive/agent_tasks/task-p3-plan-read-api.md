@@ -67,12 +67,16 @@ The Console (P4) and operators need to read an agent's current plan without pars
 ### Modify: `TaskController`
 - Add `@GetMapping("/{taskId}/plan")` returning `ResponseEntity<TaskPlanResponse>`, delegating to `taskPlanService.getPlan(taskId)`. Mirror `getTaskActivity`'s structure (constructor-inject the service; thin method).
 
+### Modify: `ValidationConstants.ALLOWED_TOOLS` (added scope — P1 review finding, 2026-06-06)
+- Add `"plan_write"` to `ValidationConstants.ALLOWED_TOOLS` (`services/api-service/.../config/ValidationConstants.java`). Without it, `ConfigValidationHelper.validateAllowedTools` rejects any agent config that allowlists `plan_write`, making the tool unreachable in production and dead-ending P5's "agent created with `plan_write` allowlisted" acceptance criterion. Add/extend the validation test asserting an agent config with `plan_write` in `allowed_tools` is accepted. (No other task owned this line; assigned to P3 as the track's Java task.)
+
 ## Acceptance Criteria
 
 - [ ] `GET /v1/tasks/{taskId}/plan` for a task whose latest checkpoint has a populated `plan` channel returns 200 with `{task_id, plan:[{id,title,status},...], updated_at}` mirroring the worker-written items in order.
 - [ ] `GET /v1/tasks/{taskId}/plan` for an existing task with no `plan` channel (or no checkpoint) returns 200 with `{plan: []}` (NOT 404).
 - [ ] `GET /v1/tasks/{taskId}/plan` for a nonexistent task returns 404 (matching `getActivity` semantics).
 - [ ] There is **no** mutation endpoint (no POST/PUT/PATCH/DELETE on `/{taskId}/plan`).
+- [ ] `plan_write` is accepted by agent-config validation: it is present in `ValidationConstants.ALLOWED_TOOLS` and a test asserts an agent config allowlisting `plan_write` validates (added scope — see Implementation Specification).
 - [ ] `updated_at` reflects the projected checkpoint's timestamp when a plan exists.
 - [ ] Targeted Java tests pass for the populated / empty / 404 cases.
 

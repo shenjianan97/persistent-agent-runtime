@@ -742,6 +742,199 @@ class AgentServiceTest {
                 "Jackson must reject unknown 'enabled' field inside context_management");
     }
 
+    // --- plan_write base-tool canonicalization tests ---
+    //
+    // Product decision (2026-06-06, supersedes the track's §A6 opt-in design):
+    // plan_write is a default agent capability for ALL agents, like web_search.
+    // It lives in BASE_PLATFORM_TOOLS, so every canonicalized config contains it
+    // and — like all base tools — it is non-removable via allowed_tools.
+
+    /**
+     * Create with NO allowed_tools (null) → plan_write is present: it is a base
+     * platform tool seeded into every agent.
+     */
+    @Test
+    void createAgent_nullAllowedTools_planWriteSeededAsBaseTool() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "prompt", "openai", "gpt-4o", 0.7, null, null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Test Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Test Agent"), jsonCaptor.capture(),
+                eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "plan_write is a base platform tool and must be seeded on every agent; got: "
+                        + parsed.allowedTools());
+        assertTrue(parsed.allowedTools().containsAll(
+                com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS),
+                "All base platform tools must be present; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * Create with an explicit allowed_tools list that OMITS plan_write → it is STILL
+     * present: base tools are non-removable (same as web_search — the caller's list
+     * cannot strip platform capabilities).
+     */
+    @Test
+    void createAgent_explicitAllowedToolsOmittingPlanWrite_stillPresent() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "A plain agent.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("web_search"), null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Plain Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Plain Agent"),
+                jsonCaptor.capture(), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "plan_write is a non-removable base tool — present even when the caller's "
+                        + "explicit allowed_tools omits it; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * Create with plan_write explicitly listed → present exactly once (the base-tool
+     * seeding and the caller's request must not produce a duplicate).
+     */
+    @Test
+    void createAgent_planWriteExplicitlyRequested_presentWithoutDuplicates() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "You are a planning agent.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("plan_write"), null, null, null, null);
+        AgentCreateRequest request = new AgentCreateRequest("Planning Agent", config, null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> repoResult = new LinkedHashMap<>();
+        repoResult.put("created_at", now);
+        repoResult.put("updated_at", now);
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.insert(eq(TENANT_ID), anyString(), eq("Planning Agent"),
+                jsonCaptor.capture(), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(repoResult);
+
+        agentService.createAgent(request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        long occurrences = parsed.allowedTools().stream()
+                .filter("plan_write"::equals)
+                .count();
+        assertEquals(1, occurrences,
+                "plan_write must appear exactly once (base-seeded, never duplicated); got: "
+                        + parsed.allowedTools());
+    }
+
+    /**
+     * Console-shaped update payload (agent_config with system_prompt/provider/model/
+     * temperature/tool_servers, NO allowed_tools key — see AgentDetailPage.tsx) →
+     * plan_write present in the stored config. As a base tool it is re-seeded at every
+     * canonicalization regardless of what the client sends.
+     */
+    @Test
+    void updateAgent_consoleShapedPayloadWithoutAllowedTools_planWritePresent() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "Edited prompt from Console.", "anthropic", "claude-sonnet-4-6", 0.3,
+                null, List.of(), null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Map<String, Object> existingRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "planning-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("planning-agent"), eq("Planning Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        agentService.updateAgent("planning-agent", request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "Console-shaped update (allowed_tools absent) must still produce a config "
+                        + "containing the base tool plan_write; got: " + parsed.allowedTools());
+        assertTrue(parsed.allowedTools().containsAll(
+                com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS),
+                "Base platform tools must still be auto-determined; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * Update with an explicit allowed_tools list that OMITS plan_write → STILL present.
+     * Base tools cannot be removed via allowed_tools (same as web_search).
+     */
+    @Test
+    void updateAgent_explicitAllowedToolsOmittingPlanWrite_stillPresent() throws Exception {
+        AgentConfigRequest config = new AgentConfigRequest(
+                "Try to drop planning.", "anthropic", "claude-sonnet-4-6", 0.0,
+                List.of("web_search"), null, null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Planning Agent", config, "active", null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Map<String, Object> existingRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "planning-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRow("planning-agent", "Planning Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("planning-agent"), eq("Planning Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        agentService.updateAgent("planning-agent", request);
+
+        String persistedJson = jsonCaptor.getValue();
+        AgentConfigRequest parsed = objectMapper.readValue(persistedJson, AgentConfigRequest.class);
+        assertTrue(parsed.allowedTools().contains("plan_write"),
+                "plan_write is a non-removable base tool — an explicit allowed_tools list "
+                        + "omitting it must not strip it; got: " + parsed.allowedTools());
+    }
+
+    /**
+     * Constants pin: every base platform tool (including plan_write) must be in the
+     * validation universe, or canonicalized configs would fail their own validation.
+     */
+    @Test
+    void validationConstants_basePlatformToolsSubsetOfAllowedTools() {
+        assertTrue(
+                com.persistentagent.api.config.ValidationConstants.ALLOWED_TOOLS.containsAll(
+                        com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS),
+                "BASE_PLATFORM_TOOLS must be a subset of ALLOWED_TOOLS");
+        assertTrue(
+                com.persistentagent.api.config.ValidationConstants.BASE_PLATFORM_TOOLS.contains("plan_write"),
+                "plan_write is a base platform tool by product decision (2026-06-06)");
+    }
+
     // --- helpers ---
 
     private Map<String, Object> buildAgentRow(String agentId, String displayName, String status) {

@@ -20,11 +20,20 @@ public final class ValidationConstants {
     /** All valid tool names accepted by the API (for validation only). */
     public static final Set<String> ALLOWED_TOOLS = Set.of(
             "web_search", "read_url", "request_human_input", "create_text_artifact",
-            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file");
+            "sandbox_exec", "sandbox_read_file", "sandbox_write_file", "export_sandbox_file",
+            // Planning Primitive (agent-modes) — allows agents to write structured
+            // plans into the LangGraph checkpoint so GET /v1/tasks/{id}/plan can project them.
+            "plan_write");
 
-    /** Platform tools auto-enabled for every agent. */
+    /** Platform tools auto-enabled for every agent.
+     *
+     * <p>{@code plan_write} is a base tool by product decision (2026-06-06, supersedes
+     * the Planning Primitive track's §A6 "ships dark via config opt-in" design):
+     * planning is a default agent capability like web_search — customers should not
+     * need to know about it as a config concern. */
     public static final List<String> BASE_PLATFORM_TOOLS = List.of(
-            "web_search", "read_url", "create_text_artifact", "request_human_input");
+            "web_search", "read_url", "create_text_artifact", "request_human_input",
+            "plan_write");
 
     /** Sandbox tools auto-enabled when sandbox.enabled is true. */
     public static final List<String> SANDBOX_TOOLS = List.of(

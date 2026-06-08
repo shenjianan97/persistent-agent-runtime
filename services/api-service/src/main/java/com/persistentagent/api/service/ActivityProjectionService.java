@@ -8,6 +8,7 @@ import com.persistentagent.api.model.response.TaskEventResponse;
 import com.persistentagent.api.repository.TaskEventRepository;
 import com.persistentagent.api.repository.TaskRepository;
 import com.persistentagent.api.util.DateTimeUtil;
+import com.persistentagent.api.util.JsonParseUtil;
 import com.persistentagent.api.util.MessageContentExtractor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -189,7 +190,7 @@ public class ActivityProjectionService {
             }
             String rowWorkerId = asString(row.get("worker_id"));
             Object payload = row.get("checkpoint_payload");
-            Map<String, Object> parsed = parsePayload(payload);
+            Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, payload);
             if (parsed == null) {
                 continue;
             }
@@ -246,7 +247,7 @@ public class ActivityProjectionService {
             OffsetDateTime fallbackTs,
             TurnAttribution attribution) {
         List<ActivityEventResponse> turns = new ArrayList<>();
-        Map<String, Object> parsed = parsePayload(payload);
+        Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, payload);
         if (parsed == null) {
             return turns;
         }
@@ -435,31 +436,6 @@ public class ActivityProjectionService {
             return OffsetDateTime.parse(raw);
         } catch (DateTimeParseException e) {
             log.debug("Unparseable emitted_at: {}", raw);
-            return null;
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> parsePayload(Object payload) {
-        if (payload == null) {
-            return null;
-        }
-        if (payload instanceof Map<?, ?> map) {
-            return (Map<String, Object>) map;
-        }
-        String json;
-        if (payload instanceof org.postgresql.util.PGobject pg) {
-            json = pg.getValue();
-        } else {
-            json = payload.toString();
-        }
-        if (json == null || json.isBlank()) {
-            return null;
-        }
-        try {
-            return objectMapper.readValue(json, Map.class);
-        } catch (Exception e) {
-            log.warn("Failed to parse checkpoint_payload JSON: {}", e.getMessage());
             return null;
         }
     }

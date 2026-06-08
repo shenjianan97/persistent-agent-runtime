@@ -158,6 +158,10 @@ class ApiClient:
     def get_observability(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
         return self._request("GET", f"/tasks/{task_id}/observability", expected_status=expected_status, raise_for_status=raise_for_status)
 
+    def get_task_plan(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
+        """GET /v1/tasks/{task_id}/plan (Planning Primitive P3)."""
+        return self._request("GET", f"/tasks/{task_id}/plan", expected_status=expected_status, raise_for_status=raise_for_status)
+
     def cancel_task(self, task_id: str, *, expected_status: int | tuple[int, ...] = 200, raise_for_status: bool = True) -> dict[str, Any]:
         return self._request("POST", f"/tasks/{task_id}/cancel", expected_status=expected_status, raise_for_status=raise_for_status)
 

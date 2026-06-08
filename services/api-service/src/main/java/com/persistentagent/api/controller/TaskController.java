@@ -8,6 +8,7 @@ import com.persistentagent.api.model.request.TaskSubmissionRequest;
 import com.persistentagent.api.model.response.*;
 import com.persistentagent.api.service.ActivityProjectionService;
 import com.persistentagent.api.service.TaskEventService;
+import com.persistentagent.api.service.TaskPlanService;
 import com.persistentagent.api.service.TaskService;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Valid;
@@ -30,15 +31,18 @@ public class TaskController {
     private final TaskService taskService;
     private final TaskEventService taskEventService;
     private final ActivityProjectionService activityProjectionService;
+    private final TaskPlanService taskPlanService;
     private final ObjectMapper objectMapper;
     private final Validator validator;
 
     public TaskController(TaskService taskService, TaskEventService taskEventService,
                           ActivityProjectionService activityProjectionService,
+                          TaskPlanService taskPlanService,
                           ObjectMapper objectMapper, Validator validator) {
         this.taskService = taskService;
         this.taskEventService = taskEventService;
         this.activityProjectionService = activityProjectionService;
+        this.taskPlanService = taskPlanService;
         this.objectMapper = objectMapper;
         this.validator = validator;
     }
@@ -195,5 +199,23 @@ public class TaskController {
         ActivityEventResponse.Page page =
                 activityProjectionService.getActivity(taskId, includeDetails);
         return ResponseEntity.ok(page);
+    }
+
+    /**
+     * Planning Primitive (agent-modes) — read-only plan projection.
+     *
+     * <p>Projects {@code checkpoint_payload.channel_values.plan} from the latest
+     * root checkpoint. Returns {@code {plan: []}} when the task exists but the
+     * agent has not called {@code plan_write} yet (or no checkpoint written).
+     *
+     * <p>404 when the task does not exist OR belongs to another tenant.
+     * No POST/PUT/PATCH/DELETE counterpart — plan mutation is Workflow's
+     * surface (Phase 3); the worker's {@code plan_write} tool is the
+     * agent-write path.
+     */
+    @GetMapping("/{taskId}/plan")
+    public ResponseEntity<TaskPlanResponse> getTaskPlan(@PathVariable UUID taskId) {
+        TaskPlanResponse response = taskPlanService.getPlan(taskId);
+        return ResponseEntity.ok(response);
     }
 }

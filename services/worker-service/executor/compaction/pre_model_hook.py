@@ -693,6 +693,7 @@ async def compaction_pre_model_hook(
     system_prompt: str | None = None,
     platform_system_message: str | None = None,
     summarizer_context_window: int | None = None,
+    reserved_tokens: int = 0,
 ) -> CompactionPassResult:
     """Track 7 Follow-up pre-model hook — replaces Track 7's ``compact_for_llm``.
 
@@ -728,6 +729,16 @@ async def compaction_pre_model_hook(
         Optional summariser model context window; forwarded to
         :func:`summarize_slice` so Task 2's recursive chunking engages when
         ``prior_summary + middle`` is too large for the summariser model.
+    reserved_tokens:
+        Planning Primitive (P1 PR-review finding) — token headroom to
+        reserve for projection addenda the caller appends AFTER this hook
+        returns (today: the plan block, sized via
+        ``executor.plan_injection.plan_block_reserved_tokens``).  Added to
+        every internal estimate before it is compared against
+        ``trigger_tokens`` / ``model_context_window``, so the trigger fires
+        early enough to make room and ``HardFloorEvent.est_tokens`` reports
+        the projected FINAL request size (projection + addendum).  Default
+        ``0`` keeps the math byte-identical for callers without addenda.
 
     Returns
     -------
@@ -833,16 +844,21 @@ async def compaction_pre_model_hook(
 
     if not middle:
         _tool_count = sum(1 for _m in raw_messages if isinstance(_m, ToolMessage))
-        _probe_est = estimate_tokens_fn(
-            _build_projection(
-                system_prompt=system_prompt,
-                platform_system_message=platform_system_message,
-                summary=summary,
-                middle=[],
-                keep_window=keep_window,
-                observations=observations,
-                commit_rationales=commit_rationales,
+        # ``reserved_tokens`` (post-hook addenda, e.g. the plan block) counts
+        # here and at every comparison below — see the parameter docstring.
+        _probe_est = (
+            estimate_tokens_fn(
+                _build_projection(
+                    system_prompt=system_prompt,
+                    platform_system_message=platform_system_message,
+                    summary=summary,
+                    middle=[],
+                    keep_window=keep_window,
+                    observations=observations,
+                    commit_rationales=commit_rationales,
+                )
             )
+            + reserved_tokens
         )
         if _probe_est > model_context_window and _tool_count >= 2:
             # Shrink to the minimum viable keep (1 pair) and re-derive the
@@ -876,7 +892,7 @@ async def compaction_pre_model_hook(
         observations=observations,
         commit_rationales=commit_rationales,
     )
-    est_tokens = estimate_tokens_fn(projection)
+    est_tokens = estimate_tokens_fn(projection) + reserved_tokens
 
     # Resolve context_management-owned summarizer model id and memory-flush
     # preconditions up front so we can decide whether to fire.
@@ -1042,7 +1058,9 @@ async def compaction_pre_model_hook(
             )
         )
         flush_projection = [*projection, flush_message]
-        est_tokens_with_flush = estimate_tokens_fn(flush_projection)
+        est_tokens_with_flush = (
+            estimate_tokens_fn(flush_projection) + reserved_tokens
+        )
         if est_tokens_with_flush > model_context_window:
             events.append(
                 HardFloorEvent(
@@ -1281,7 +1299,7 @@ async def compaction_pre_model_hook(
         observations=live_observations,
         commit_rationales=live_commit_rationales,
     )
-    post_est = estimate_tokens_fn(post_projection)
+    post_est = estimate_tokens_fn(post_projection) + reserved_tokens
     if post_est > model_context_window:
         events.append(
             HardFloorEvent(

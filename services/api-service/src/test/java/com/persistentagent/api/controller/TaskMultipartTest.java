@@ -39,6 +39,9 @@ class TaskMultipartTest {
     @MockitoBean
     private ActivityProjectionService activityProjectionService;
 
+    @MockitoBean
+    private com.persistentagent.api.service.TaskPlanService taskPlanService;
+
     @Autowired
     private ObjectMapper objectMapper;
 

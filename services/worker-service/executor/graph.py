@@ -55,6 +55,10 @@ from executor.compaction.tokens import (
     extract_text_content as _extract_message_text,
 )
 from executor.compaction.summarizer import summarize_slice
+from executor.plan_injection import (
+    inject_plan_block,
+    plan_block_reserved_tokens,
+)
 from executor.prompt_cache import TokenUsage, get_strategy as _get_cache_strategy
 from executor.memory_graph import (
     DEAD_LETTER_REASON_CANCELLED_BY_USER,
@@ -132,6 +136,7 @@ from tools.memory_tools import (
     MemoryToolContext,
     build_memory_tools,
 )
+from tools.plan_tools import build_plan_write_tool
 from executor.mcp_session import McpToolCallError
 from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
 from executor.compaction.ingestion import (
@@ -1067,6 +1072,12 @@ class GraphExecutor:
                 args_schema=ExportSandboxFileArguments,
             ))
 
+        # Planning Primitive (Task P1) — agent-owned to-do-list scratchpad.
+        # Gated: only registered when "plan_write" is in the allowlist.
+        # Agents without this tool never see the plan channel.
+        if "plan_write" in allowed_tools:
+            tools.append(build_plan_write_tool())
+
         return tools
 
     async def _build_graph(
@@ -1389,6 +1400,26 @@ class GraphExecutor:
             # deterministic placeholder so the INSERT still dedups correctly).
             _per_call_task_context = {**task_context, "checkpoint_id": _current_ckpt_id}
 
+            # Single estimator for the hook AND the plan-block reserve below
+            # — both must use identical math or the reserve drifts from what
+            # the hook compares against.
+            def _estimate_for_model(msgs: list) -> int:
+                return _estimate_tokens(msgs, provider=provider)
+
+            # Planning Primitive (P1 PR-review finding) — the plan block is
+            # appended AFTER the hook has estimated the projection and run
+            # its trigger / hard-floor checks, so reserve its tokens in the
+            # hook's budget math up front. Otherwise a projection that
+            # passes the hard-floor check (est ≤ window, no HardFloorEvent)
+            # can overflow the provider limit once the block (≤ ~3.5k
+            # estimate-tokens at P1's caps) is injected — a provider 400
+            # instead of the intended irrecoverable-context dead-letter.
+            # Empty plan → 0 with no estimator call (byte-identical math
+            # for non-planning agents).
+            _plan_reserved_tokens = plan_block_reserved_tokens(
+                state.get("plan"), _estimate_for_model
+            )
+
             # Track 7 Follow-up (Task 3) — run the pre_model_hook before every
             # LLM call. The hook is pure w.r.t. the journal (never mutates
             # ``state["messages"]``); it returns the three-region projection
@@ -1400,10 +1431,23 @@ class GraphExecutor:
                 model_context_window=model_context_window,
                 task_context=_per_call_task_context,
                 summarizer=summarize_slice,
-                estimate_tokens_fn=lambda msgs: _estimate_tokens(msgs, provider=provider),
+                estimate_tokens_fn=_estimate_for_model,
                 system_prompt=system_prompt if system_prompt else None,
                 platform_system_message=platform_system_msg if platform_system_msg else None,
                 summarizer_context_window=_summarizer_context_window,
+                reserved_tokens=_plan_reserved_tokens,
+            )
+            # Planning Primitive (Task P2) — re-inject the agent's durable
+            # plan channel into the projection. AFTER the compaction hook
+            # (the block is rebuilt from state every turn, so Tier 1/3 can
+            # never summarise it away) and BEFORE cache markers (the
+            # strategies skip the tagged block when placing breakpoints, so
+            # it sits in the uncached suffix and a plan edit re-prefills
+            # only the block itself — see executor/plan_injection.py).
+            # Empty/absent plan → byte-identical pass-through. Projection-
+            # only: ``state["messages"]`` (the journal) is never touched.
+            projected_messages = inject_plan_block(
+                pass_result.messages, state.get("plan")
             )
             # The compaction hook produced the final projection; layer
             # provider-specific prompt-cache markers on top before the LLM
@@ -1416,10 +1460,10 @@ class GraphExecutor:
             # correctly.
             if _apply_cache_markers:
                 messages_for_llm = _cache_strategy.apply_cache_markers(
-                    pass_result.messages
+                    projected_messages
                 )
             else:
-                messages_for_llm = list(pass_result.messages)
+                messages_for_llm = list(projected_messages)
             compaction_state_updates = pass_result.state_updates
 
             # Emit structured-log events from the hook and raise immediately

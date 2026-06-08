@@ -80,6 +80,43 @@ def _list_replace_reducer(a: list[str], b: list[str]) -> list[str]:
     return b
 
 
+def _plan_replace_reducer(a: list, b: list) -> list:
+    """Replace semantics for the Planning Primitive ``plan`` scratchpad channel.
+
+    **Write semantics — full-list replace (Claude Code ``TodoWrite`` shape).**
+    Each ``plan_write`` call carries the *entire* plan and overwrites the
+    channel verbatim.  This is NOT a patch / delta operation.
+
+    Rationale for the choice, resolving the design's open item
+    ("Write semantics: full-list replace vs. patch ops"):
+
+    * A flat self-reminder has no merge concerns — the agent owns the whole
+      list and rewrites it on every call.  Patch-conflict semantics would add
+      complexity the plan does not need.
+    * Replace keeps the injected block **byte-stable** between unchanged
+      writes (cache-friendly): if the agent re-emits the same plan, the
+      checkpoint value is identical, and P2's post-compaction injection
+      produces the same plan-block bytes (a tagged ``HumanMessage`` — see
+      ``executor/plan_injection.py`` for why not a ``SystemMessage``) — the
+      Anthropic prompt-cache prefix survives.  This mirrors ``_list_replace_reducer``'s rationale
+      (see that docstring): a projected block that changes only when the data
+      changes is the cache-stability pattern across this codebase.
+    * Full-replace sidesteps patch-conflict semantics the plan simply does
+      not need (it is a self-reminder, not load-bearing state).
+
+    A node that does NOT return ``plan`` leaves the prior value intact.
+    A node that returns ``plan`` replaces it wholesale.
+
+    Default is ``[]``, following the "no ``Optional[T]`` on reducer-annotated
+    fields" discipline in this module's design notes — the sentinel is a
+    reducer-safe empty list.
+
+    Cross-reference: ``_list_replace_reducer`` (same pattern, findings
+    channel); Planning Primitive task P1 spec (size caps, item shape).
+    """
+    return b
+
+
 def _summary_replace_reducer(a: str, b: str) -> str:
     """Replace semantics for the Track 7 Follow-up ``summary`` field.
 
@@ -182,6 +219,27 @@ class RuntimeState(TypedDict, total=False):
         One-shot flag (``_any_reducer``) set True when the summariser reports
         ``skipped_reason='fatal'``.  Prevents re-attempting a fatally-broken
         summariser on every agent-node call.
+
+    plan:
+        Planning Primitive (Task P1) — the agent's own to-do-list scratchpad.
+        Each item is a plain dict ``{id: str, title: str, status: str}``
+        (``status ∈ pending | in_progress | completed``).  Items are plain
+        dicts so they serialize into the checkpoint JSONB without custom
+        codecs.
+
+        Write semantics: **full-list replace** (Claude Code ``TodoWrite``
+        shape).  Every ``plan_write`` call carries the entire plan; the
+        reducer overwrites the channel verbatim.  A node that does NOT return
+        ``plan`` leaves the prior value intact (LangGraph's default for
+        reducer-annotated fields).
+
+        Reducer: ``_plan_replace_reducer`` — see that docstring for the full
+        rationale (cache stability, no merge concerns, mirrors
+        ``_list_replace_reducer``).
+
+        Default is ``[]`` (reducer-safe sentinel; not ``Optional``).  Agents
+        without ``plan_write`` in their tool allowlist never write this field;
+        it stays ``[]`` throughout the task lifecycle.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -207,3 +265,7 @@ class RuntimeState(TypedDict, total=False):
     last_super_step_message_count: Annotated[int, _max_reducer]
     tier3_firings_count: Annotated[int, _max_reducer]
     tier3_fatal_short_circuited: Annotated[bool, _any_reducer]
+
+    # Planning Primitive (Task P1) — agent-owned to-do-list scratchpad.
+    # Full-list replace semantics; default is reducer-safe [].
+    plan: Annotated[list[dict], _plan_replace_reducer]

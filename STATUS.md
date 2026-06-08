@@ -35,7 +35,7 @@ Tracks 9 (Planning Primitive) and 10 (Deep Research Mode) were removed on 2026-0
 | Track | Name | Status | Plan | Progress |
 |-------|------|--------|------|----------|
 | 1 | Supervisor Topology (Deep Research) | Planned (not started); blockers spiked & resolved; **3 deferred decisions (D1–D3) gated to S11/pre-GA — track not "done" until dispositioned ([§A12 ledger](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md#a12-deferred-decisions-ledger-definition-of-done-gate))** | [plan](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md) | [progress](docs/exec-plans/active/agent-modes/supervisor-topology/progress.md) |
-| 2 | Planning Primitive | Planned (not started); low-risk, no open blockers | [plan](docs/exec-plans/active/agent-modes/planning-primitive/plan.md) | [progress](docs/exec-plans/active/agent-modes/planning-primitive/progress.md) |
+| 2 | Planning Primitive | **Implemented & verified (2026-06-06)** — P1–P5 done, two-stage reviewed, browser gate passed; includes the `plan_write` activation fix (`OPT_IN_TOOLS` canonicalization). Outstanding named follow-ups (non-blocking, recorded in progress.md): prompt-cache scan dedup; API-wide 405 hygiene | [plan](docs/exec-plans/active/agent-modes/planning-primitive/plan.md) | [progress](docs/exec-plans/active/agent-modes/planning-primitive/progress.md) |
 
 Workflow resource and additional presets remain Phase-3 / deferred. The two planned tracks are independent and separately archivable. See the [tracks index](docs/exec-plans/active/agent-modes/README.md).
 

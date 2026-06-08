@@ -215,6 +215,7 @@ vi.mock('@/api/client', async () => {
             ...actual.api,
             followUpTask: vi.fn(),
             getTaskEvents: vi.fn().mockResolvedValue({ events: [] }),
+            getTaskPlan: vi.fn().mockResolvedValue({ task_id: 'task-1', plan: [] }),
         },
     };
 });
