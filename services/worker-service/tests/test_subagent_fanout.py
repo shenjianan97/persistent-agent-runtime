@@ -152,6 +152,51 @@ async def test_success_returns_structured_summary():
     assert "42" in result.summary
 
 
+async def test_success_carries_accumulated_usage():
+    # S8 (§A11-E1): run_subagent must surface the sub-agent's accumulated
+    # usage so the fan-out node can bill it to the parent super-step. Two LLM
+    # turns (tool call + final), each 10 in / 7 out → 20 in / 14 out total.
+    model = FakeModel([
+        _ai_tool_call("c1", "echo", {"text": "hi"}, tokens=0),
+        _ai_final("done", tokens=0),
+    ])
+    # Override usage_metadata explicitly to known asymmetric values.
+    model._scripted = [
+        AIMessage(content="", tool_calls=[{"name": "echo", "args": {"text": "x"}, "id": "c1"}],
+                  usage_metadata={"input_tokens": 10, "output_tokens": 7, "total_tokens": 17}),
+        AIMessage(content="done",
+                  usage_metadata={"input_tokens": 10, "output_tokens": 7, "total_tokens": 17}),
+    ]
+    result = await run_subagent(
+        prompt="use the tool then answer",
+        tools=[_echo_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=_saver(),
+        thread_id="t-usage",
+        emit=SpyEmit(),
+    )
+    assert result.ok is True
+    assert result.usage == {"input_tokens": 20, "output_tokens": 14}
+
+
+async def test_failure_marker_has_empty_usage():
+    # A depth-rejected sub-agent never invokes a model → empty usage.
+    result = await run_subagent(
+        prompt="x",
+        tools=[],
+        ceiling=_ceiling(),
+        depth=MAX_SUBAGENT_DEPTH + 1,
+        model=FakeModel([_ai_final("never")]),
+        checkpointer=_saver(),
+        thread_id="t-depth",
+        emit=SpyEmit(),
+    )
+    assert result.ok is False
+    assert result.usage == {}
+
+
 async def test_success_runs_a_tool_then_answers():
     model = FakeModel([
         _ai_tool_call("c1", "echo", {"text": "hi"}),

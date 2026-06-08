@@ -52,7 +52,7 @@ import logging
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 from executor.subagents import SubagentResult, run_subagent
@@ -60,7 +60,9 @@ from executor.supervisor.nodes import (
     DECISION_CONTINUE,
     DECISION_STOP,
     parse_findings,
+    scope_node,
     supervisor_node,
+    writer_node,
 )
 from executor.supervisor.prompts import build_subagent_prompt
 from executor.supervisor.state import SupervisorState
@@ -83,9 +85,11 @@ class SupervisorFanoutConfigError(RuntimeError):
     """
 
 # Node names (the structural fan-out wiring; S8 references these when splicing).
+SCOPE_NODE_NAME = "scope"
 SUPERVISOR_NODE_NAME = "supervisor"
 FANOUT_NODE_NAME = "supervisor_fanout"
 GATHER_NODE_NAME = "supervisor_gather"
+WRITER_NODE_NAME = "writer"
 
 # The Supervisor itself is depth 0; its first fan-out level is depth 1 (so the
 # depth-2 cap enforced inside ``run_subagent`` is not ambiguously read as depth-3
@@ -203,7 +207,12 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
                 f"(expected in config['configurable']['supervisor_fanout_deps'])"
             )
 
-    sub_thread = f"{configurable.get('thread_id', '')}:subagent:{subtask}"
+    # The sub-agent shares the parent task's UUID thread_id (the repo's
+    # PostgresDurableCheckpointer maps thread_id → task_id::uuid and lease-gates
+    # every write against that task row — a derived non-UUID thread id fails
+    # Postgres coercion). Per-subtask isolation rides ``checkpoint_ns`` instead.
+    parent_thread = configurable.get("thread_id", "")
+    sub_checkpoint_ns = f"subagent:{subtask}"
 
     # Wrap the Supervisor's focused sub-task instruction in S7's Subagent
     # findings template so the sub-agent emits structured
@@ -216,7 +225,8 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
         depth=SUPERVISOR_FANOUT_DEPTH,
         model=deps["model"],
         checkpointer=deps["checkpointer"],
-        thread_id=sub_thread,
+        thread_id=parent_thread,
+        checkpoint_ns=sub_checkpoint_ns,
         emit=deps.get("emit"),
     )
 
@@ -246,6 +256,13 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
     return {
         "subagent_results": {subtask: _result_to_dict(result, subtask)},
         "findings": findings,
+        # S8 (§A11-E1) — fold this branch's accumulated sub-agent LLM spend into
+        # the additive ``step_usage`` channel. The outer ``astream`` cannot see
+        # the nested ``run_subagent`` ``ainvoke``, so the spend MUST travel back
+        # through state; each parallel ``Send`` branch writes a delta into the
+        # same channel and the SUM reducer keeps every branch's spend (Pattern A
+        # — billed to the PARENT task, no per-sub-agent ledger row).
+        "step_usage": dict(result.usage or {}),
     }
 
 
@@ -338,12 +355,63 @@ def add_supervisor_fanout(
     return graph
 
 
+def build_supervisor_graph() -> StateGraph:
+    """Assemble the full Supervisor ("Deep Research") topology (Task S8).
+
+    Returns an UNCOMPILED ``StateGraph`` so the caller (``_build_graph`` →
+    ``execute_task``) compiles it with the SAME shared Postgres checkpointer and
+    ``durability="sync"`` the ReAct path uses (Pattern A — one task / one
+    ``thread_id`` / one checkpoint stream). Mirrors the ReAct ``_build_graph``
+    contract, which also returns an uncompiled ``StateGraph``.
+
+    Shape::
+
+        START → scope → supervisor ──(Send map)──► supervisor_fanout
+                          ▲                              │
+                          │                              ▼
+                          └──── supervisor_gather ◄──────┘
+                                     │
+                          (continue → supervisor / stop → writer) → END
+
+    Every LLM-bearing node reads its deps from ``config["configurable"]`` — S8
+    injects ``scope_model`` / ``supervisor_model`` / ``writer_model`` /
+    ``verify_model`` / ``agent_config`` / ``supervisor_emit`` /
+    ``supervisor_fanout_deps`` / ``iteration`` at ``execute_task`` time. NO node
+    is named ``"agent"`` — the ReAct cost-loop gate keys on that name, and reusing
+    it here would let the *unextended* loop capture spend and mask the exact E1
+    gap S8 builds the cost mechanism for (the §A11-E1 guardrail).
+
+    DEFERRED (§A8/D3 — "finer in-flight cost metering"): S8 meters at the fan-out
+    super-step boundary; the per-sub-agent ceiling bounds the per-task overshoot
+    to ``max_fanout × ceiling``. A finer in-flight meter is deferred post-GA — do
+    NOT build it here. (§A11-E7 task-timeout headroom is owned by S2's ``research``
+    preset bump, NOT a per-super-step ``timeout_reference_at`` reset here.)
+    """
+    graph = StateGraph(SupervisorState)
+    graph.add_node(SCOPE_NODE_NAME, scope_node)
+    graph.add_node(WRITER_NODE_NAME, writer_node)
+
+    # The Supervisor↔fan-out↔Supervisor sub-wiring (S6) — registers supervisor /
+    # supervisor_fanout / supervisor_gather, the Send map, the gather join, and
+    # the iteration edge (continue → supervisor, stop → writer).
+    add_supervisor_fanout(graph, writer_node_name=WRITER_NODE_NAME)
+
+    # Entry: START → scope → supervisor; terminal: writer → END.
+    graph.add_edge(START, SCOPE_NODE_NAME)
+    graph.add_edge(SCOPE_NODE_NAME, SUPERVISOR_NODE_NAME)
+    graph.add_edge(WRITER_NODE_NAME, END)
+    return graph
+
+
 __all__ = [
+    "SCOPE_NODE_NAME",
     "SUPERVISOR_NODE_NAME",
     "FANOUT_NODE_NAME",
     "GATHER_NODE_NAME",
+    "WRITER_NODE_NAME",
     "SUPERVISOR_FANOUT_DEPTH",
     "OVERSIZED_PAYLOAD_THRESHOLD_BYTES",
     "SupervisorFanoutConfigError",
     "add_supervisor_fanout",
+    "build_supervisor_graph",
 ]

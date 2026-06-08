@@ -25,6 +25,11 @@ from langgraph.types import interrupt
 
 from core.subagent_events import emit_subagent_finding, emit_supervisor_iteration
 from executor.supervisor import citations
+from executor.supervisor.cost import (
+    UsageAccumulatingModel,
+    merge_step_usage,
+    usage_from_message,
+)
 from executor.supervisor.prompts import (
     build_brief_prompt,
     build_clarity_assessment_prompt,
@@ -172,7 +177,18 @@ async def scope_node(state: SupervisorState, config: RunnableConfig) -> dict:
         len(brief),
     )
 
-    return {"brief": brief, "iteration": 0, "subtasks": []}
+    # S8 (§A11-E1) — surface this node's LLM spend through the cost channel so
+    # the parent cost loop bills it additively to the parent super-step. Both
+    # LLM calls (clarity assessment + brief) count.
+    step_usage = merge_step_usage(
+        usage_from_message(assessment_msg), usage_from_message(brief_msg)
+    )
+    return {
+        "brief": brief,
+        "iteration": 0,
+        "subtasks": [],
+        "step_usage": step_usage,
+    }
 
 
 # =========================================================================== #
@@ -324,6 +340,9 @@ async def supervisor_node(state: SupervisorState, config: RunnableConfig) -> dic
         decision_msg.content
     )
 
+    # S8 (§A11-E1) — the decision call's spend rides the cost channel.
+    decision_usage = usage_from_message(decision_msg)
+
     if decision == DECISION_STOP or not raw_subtasks:
         # Nothing to fan out → route to the Writer. ``iteration`` is NOT bumped
         # (no round runs), so the cap math stays honest.
@@ -334,7 +353,11 @@ async def supervisor_node(state: SupervisorState, config: RunnableConfig) -> dic
             decision=DECISION_STOP,
             reason=llm_reason,
         )
-        return {"supervisor_decision": DECISION_STOP, "subtasks": []}
+        return {
+            "supervisor_decision": DECISION_STOP,
+            "subtasks": [],
+            "step_usage": decision_usage,
+        }
 
     # (6) Clamp BEFORE minting so ids are contiguous within the kept set.
     cap_reason = ""
@@ -375,6 +398,7 @@ async def supervisor_node(state: SupervisorState, config: RunnableConfig) -> dic
         "iteration": iteration,
         "subtasks": minted,
         "supervisor_decision": DECISION_CONTINUE,
+        "step_usage": decision_usage,
     }
 
 
@@ -595,7 +619,11 @@ async def writer_node(state: SupervisorState, config: RunnableConfig) -> dict:
 
     # (3) Verify pass — one concurrent call per cited finding (flags only; never
     # rewrites / fabricates; a flaky call degrades fail-safe per citation).
-    verify_flags = await citations.verify(report, reduced, model=verify_model)
+    # S8 (§A11-E1) — wrap the verify model so its per-citation call spend is
+    # captured (``citations.verify`` returns only flags, discarding usage). This
+    # avoids reshaping S7's verify contract.
+    verify_wrapped = UsageAccumulatingModel(verify_model)
+    verify_flags = await citations.verify(report, reduced, model=verify_wrapped)
 
     # (4) Resolve each cited id → a full citation (deterministic, no LLM).
     cited_ids = citations.extract_citations(report)
@@ -614,4 +642,13 @@ async def writer_node(state: SupervisorState, config: RunnableConfig) -> dict:
         writer_style,
         len(report),
     )
-    return {"report": report, "citations": resolved, "verify_flags": verify_flags}
+    # S8 (§A11-E1) — surface writer + verify spend through the cost channel.
+    step_usage = merge_step_usage(
+        usage_from_message(writer_msg), verify_wrapped.usage
+    )
+    return {
+        "report": report,
+        "citations": resolved,
+        "verify_flags": verify_flags,
+        "step_usage": step_usage,
+    }

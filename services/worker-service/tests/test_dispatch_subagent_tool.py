@@ -402,9 +402,12 @@ class TestSubagentNodeThreading:
         assert isinstance(kwargs["ceiling"], SubagentCeiling)
         assert kwargs["ceiling"].max_turns == 9
         assert kwargs["depth"] == 2
-        # Sub-thread derived off the parent thread for the namespaced checkpoint.
-        assert "parent-thread" in kwargs["thread_id"]
-        assert "d1" in kwargs["thread_id"]
+        # S8 durability fix: the sub-agent shares the parent task's UUID
+        # thread_id (the PostgresDurableCheckpointer maps thread_id → task_id and
+        # lease-gates writes against it). Per-subtask isolation rides
+        # ``checkpoint_ns``, not a derived non-UUID thread id.
+        assert kwargs["thread_id"] == "parent-thread"
+        assert "d1" in kwargs["checkpoint_ns"]
 
     async def test_node_delegates_only_parent_tools_and_drops_dispatch(self) -> None:
         """A sub-agent can only use tools the parent has; dispatch_subagent is

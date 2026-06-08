@@ -456,6 +456,45 @@ async def test_send_fanout_dispatches_n_subagents():
 
 
 # --------------------------------------------------------------------------- #
+# 9b. Fan-out node folds each sub-agent's usage into the step_usage channel
+#     (§A11-E1) — the spend that would otherwise be silently dropped.
+# --------------------------------------------------------------------------- #
+async def test_fanout_node_accumulates_subagent_usage_into_step_usage():
+    model = ScriptedSupervisorModel(
+        [
+            _decision(
+                decision="continue",
+                subtasks=[{"prompt": "p0"}, {"prompt": "p1"}, {"prompt": "p2"}],
+            ),
+            _decision(decision="stop"),
+        ]
+    )
+
+    async def fake_run(prompt, tools, **kwargs):
+        # Each sub-agent reports 200 in / 100 out.
+        return SubagentResult.success(
+            f"done {prompt}", usage={"input_tokens": 200, "output_tokens": 100}
+        )
+
+    cfg = _supervisor_config(model=model, fanout_deps=_FANOUT_DEPS)
+    graph = _one_round_graph(cfg)
+    with patch(
+        "executor.supervisor.graph.run_subagent",
+        AsyncMock(side_effect=fake_run),
+    ):
+        out = await graph.ainvoke(
+            {"brief": "b", "iteration": 0, "subagent_results": {}},
+            config={"configurable": cfg["configurable"]},
+            durability="sync",
+        )
+    # 3 sub-agents × (200 in / 100 out) accumulate into the additive channel,
+    # PLUS the two supervisor decision calls (the ScriptedSupervisorModel here
+    # carries no usage_metadata → 0). So step_usage == 600 in / 300 out.
+    assert out["step_usage"]["input_tokens"] == 600
+    assert out["step_usage"]["output_tokens"] == 300
+
+
+# --------------------------------------------------------------------------- #
 # 10. Crash resume-forward — completed siblings restored, only unfinished re-run
 # --------------------------------------------------------------------------- #
 async def test_crash_resume_forward_restores_completed_siblings():

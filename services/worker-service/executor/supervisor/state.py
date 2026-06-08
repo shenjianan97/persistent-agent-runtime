@@ -62,6 +62,7 @@ import operator
 from typing import Annotated
 
 from executor.compaction.state import RuntimeState, _max_reducer
+from executor.supervisor.cost import merge_step_usage
 
 
 def _merge_subagent_results(a: dict, b: dict) -> dict:
@@ -128,6 +129,20 @@ class SupervisorState(RuntimeState, total=False):
     # the edge that runs in the *same* super-step downstream reads the current
     # round's decision — never a stale one.
     supervisor_decision: str
+
+    # S8 (§A11-E1) — the cost-attribution channel. EVERY LLM-bearing supervisor
+    # node (scope/supervisor/writer) accumulates its own ``usage_metadata`` here,
+    # and ``supervisor_fanout`` accumulates its nested sub-agents' usage (surfaced
+    # by ``run_subagent``). The parent ``execute_task`` cost loop reads this
+    # channel off each super-step's astream ``updates`` event and writes it
+    # ADDITIVELY to the parent's super-step ``checkpoint_id`` (the E1 mechanism;
+    # spike-verified the nested-``ainvoke`` sub-agents are invisible to
+    # ``subgraphs=True``, so usage must travel through state). The reducer SUMS
+    # per field — the fan-out ``Send`` branches each write a delta into this one
+    # channel in a single super-step, so last-write-wins would drop all-but-one
+    # branch's spend. Pattern A: this is the PARENT task's cost — no
+    # ``sub_agent_id``, no per-sub-agent rows.
+    step_usage: Annotated[dict, merge_step_usage]
 
     # --- Writer output channels (S7) -------------------------------------- #
     # writer_node (S7) writes these ONCE at the terminal Writer phase; no later

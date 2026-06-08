@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Awaitable, Callable, Iterable, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -61,6 +61,8 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Send
 
 from executor.text import flatten_text as _flatten_text
+from executor.usage import merge_usage as _merge_usage
+from executor.usage import usage_from_message as _usage_from_message
 
 logger = logging.getLogger(__name__)
 
@@ -131,19 +133,34 @@ class SubagentResult:
 
     ``ok=True`` carries the distilled ``summary`` the driver injects. ``ok=False``
     carries a ``reason`` in {``ceiling``, ``timeout``, ``error``, ``depth``}.
+
+    ``usage`` is the sub-agent's ACCUMULATED LLM ``usage_metadata`` (flat token
+    fields), surfaced so the caller can attribute the spend to the PARENT task
+    (§A11-E1 — the outer ``astream(subgraphs=True)`` cannot see this nested
+    ``ainvoke``, so usage must travel back through the return value). A failure
+    that never invoked a model (e.g. depth reject) carries ``{}``; a ceiling /
+    timeout / mid-run error still surfaces whatever was spent before stopping.
+    Pattern A: this is the parent's cost, not a per-sub-agent ledger row.
     """
 
     ok: bool
     summary: str = ""
     reason: str | None = None
+    usage: dict[str, int] = field(default_factory=dict)
 
     @classmethod
-    def success(cls, summary: str) -> "SubagentResult":
-        return cls(ok=True, summary=summary, reason=None)
+    def success(
+        cls, summary: str, *, usage: dict[str, int] | None = None
+    ) -> "SubagentResult":
+        return cls(ok=True, summary=summary, reason=None, usage=dict(usage or {}))
 
     @classmethod
-    def failure(cls, reason: str, *, detail: str = "") -> "SubagentResult":
-        return cls(ok=False, summary=detail, reason=reason)
+    def failure(
+        cls, reason: str, *, detail: str = "", usage: dict[str, int] | None = None
+    ) -> "SubagentResult":
+        return cls(
+            ok=False, summary=detail, reason=reason, usage=dict(usage or {})
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -179,6 +196,12 @@ class _SubagentState(TypedDict, total=False):
     sub_messages: Annotated[list[BaseMessage], add_messages]
     turn_count: Annotated[int, _max_reducer]
     tokens_used: Annotated[int, _max_reducer]
+    # S8 (§A11-E1) — full per-call usage breakdown (input/output/cache tokens)
+    # accumulated across the sub-agent's inner turns. Distinct from
+    # ``tokens_used`` (a single monotone watermark for the TOKEN ceiling): the
+    # cost path needs the per-field breakdown the provider extractor reads, and
+    # this is summed (not max'd) so every turn's spend is billed to the parent.
+    sub_usage: Annotated[dict, _merge_usage]
     depth: int
     stopped_reason: str
     # The single channel that crosses BACK to the parent. LangGraph maps a
@@ -232,7 +255,10 @@ def build_subagent_node(
             return {"stopped_reason": REASON_CEILING}
 
         # Wedged-branch liveness: a span event only (never a lease/task_events).
-        await emit(SUBAGENT_HEARTBEAT_EVENT, {"turn": turn, "tokens": tokens})
+        # Tolerate a missing sink (``emit=None``) — observability must never sink
+        # the run (mirrors the None-tolerant helpers in core/subagent_events.py).
+        if emit is not None:
+            await emit(SUBAGENT_HEARTBEAT_EVENT, {"turn": turn, "tokens": tokens})
 
         response: AIMessage = await bound_model.ainvoke(state.get("sub_messages", []))
         spent = _message_tokens(response)
@@ -240,6 +266,10 @@ def build_subagent_node(
             "sub_messages": [response],
             "turn_count": turn + 1,
             "tokens_used": tokens + spent,
+            # S8 (§A11-E1) — accumulate the full per-call usage breakdown so the
+            # sub-agent's spend can be billed to the PARENT super-step. Summed
+            # via the channel's _merge_usage reducer across every inner turn.
+            "sub_usage": _usage_from_message(response),
         }
 
     async def tool_node(state: _SubagentState) -> dict:
@@ -279,7 +309,18 @@ def build_subagent_node(
                 if isinstance(msg, AIMessage) and not getattr(msg, "tool_calls", None):
                     summary = _flatten_text(msg.content)
                     break
-        return {"results": [{"summary": summary, "stopped_reason": reason}]}
+        # S8 (§A11-E1) — cross the accumulated usage back on the results channel
+        # (the only channel that reaches the parent). On a ceiling/error stop the
+        # usage spent before stopping is still billed.
+        return {
+            "results": [
+                {
+                    "summary": summary,
+                    "stopped_reason": reason,
+                    "usage": dict(state.get("sub_usage") or {}),
+                }
+            ]
+        }
 
     sub = StateGraph(_SubagentState)
     sub.add_node("agent", agent)
@@ -316,6 +357,7 @@ async def run_subagent(
     checkpointer: BaseCheckpointSaver,
     thread_id: str,
     emit: EmitCallable,
+    checkpoint_ns: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     subagent_node_name: str = "subagent",
 ) -> SubagentResult:
@@ -326,6 +368,17 @@ async def run_subagent(
     sharing the passed ``checkpointer``. The parent fan-out is driven with
     ``durability="sync"`` (matching the worker runtime) so every inner super-step
     is persisted before the next — the basis of per-inner-turn crash resume.
+
+    ``thread_id`` / ``checkpoint_ns`` durability contract (S8 hardening): the
+    repo's ``PostgresDurableCheckpointer`` maps ``thread_id`` → ``task_id::uuid``
+    and lease-gates every write against that task row, so a sub-agent sharing the
+    parent's checkpointer MUST run on the PARENT's UUID ``thread_id`` — a derived
+    non-UUID thread id (the old ``f"{parent}:subagent:{id}"`` form) fails Postgres
+    UUID coercion. Pass the parent task UUID as ``thread_id`` and the per-subtask
+    isolation key as ``checkpoint_ns`` (LangGraph keys the inner sub-checkpoint by
+    namespace under the same task row). When ``checkpoint_ns`` is omitted the
+    inner config carries ``thread_id`` only (the MemorySaver unit-test path, which
+    does not validate UUIDs).
 
     Always returns a :class:`SubagentResult`; never raises ceiling / timeout /
     error / depth out to the caller's graph.
@@ -376,8 +429,13 @@ async def run_subagent(
         # binding stop — never LangGraph's default (25). Each turn is ~2 inner
         # super-steps (agent + tools); add headroom for dispatch / finalize.
         recursion_limit = max(25, ceiling.max_turns * 2 + 5)
+        _configurable: dict[str, Any] = {"thread_id": thread_id}
+        if checkpoint_ns is not None:
+            # Isolate this sub-agent's sub-checkpoint under the parent task's
+            # thread (UUID) by namespace — see the thread_id/checkpoint_ns note.
+            _configurable["checkpoint_ns"] = checkpoint_ns
         config = {
-            "configurable": {"thread_id": thread_id},
+            "configurable": _configurable,
             "recursion_limit": recursion_limit,
         }
 
@@ -392,9 +450,11 @@ async def run_subagent(
 
         results = final.get("results") or []
         outcome = results[0] if results else {}
+        usage = outcome.get("usage") or {}
         if outcome.get("stopped_reason") == REASON_CEILING:
-            return SubagentResult.failure(REASON_CEILING)
-        return SubagentResult.success(outcome.get("summary", ""))
+            # A ceiling stop still spent tokens before stopping — bill them.
+            return SubagentResult.failure(REASON_CEILING, usage=usage)
+        return SubagentResult.success(outcome.get("summary", ""), usage=usage)
 
     except Exception:  # noqa: BLE001 — failure is a return value, never a raise.
         logger.exception("subagent.unexpected_error thread_id=%s", thread_id)
