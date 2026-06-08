@@ -431,6 +431,23 @@ class TestSubagentNodeThreading:
         names = {getattr(t, "name", None) for t in delegated}
         assert names == {"echo"}
 
+    @pytest.mark.parametrize("bad_id", [None, "", 0])
+    async def test_missing_tool_call_id_does_not_raise(self, bad_id) -> None:
+        """A dispatch payload with a missing or falsy tool_call_id must NOT
+        raise (constructing ToolMessage(tool_call_id=None) raises a pydantic
+        ValidationError). The node's 'never raises' contract is absolute."""
+        node = await self._node()
+        with patch(
+            "executor.graph.run_subagent",
+            AsyncMock(return_value=SubagentResult.success("ok")),
+        ):
+            out = await node.ainvoke(
+                {"tool_call_id": bad_id, "prompt": "q", "tools": [], "budget": 5, "depth": 1},
+                {"configurable": {"thread_id": "t"}},
+            )
+        # Returns an empty messages list — does not raise.
+        assert out == {"messages": []}
+
 
 # --------------------------------------------------------------------------- #
 # 6. MAX_TOOLS_PER_AGENT respected

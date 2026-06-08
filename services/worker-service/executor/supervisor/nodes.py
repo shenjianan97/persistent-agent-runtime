@@ -26,6 +26,8 @@ from executor.supervisor.prompts import (
     build_brief_prompt,
     build_clarity_assessment_prompt,
 )
+from executor.supervisor.state import SupervisorState
+from executor.text import flatten_text as _flatten_text
 
 logger = logging.getLogger(__name__)
 
@@ -53,26 +55,6 @@ def _extract_query(messages: list[BaseMessage]) -> str:
     if messages:
         return _flatten_text(messages[0].content)
     return ""
-
-
-def _flatten_text(content: Any) -> str:
-    """Flatten LangChain message content (str | list[block]) to plain text.
-
-    Mirrors ``executor/subagents/fanout._flatten_text`` — provider-shaped block
-    lists carry text under ``{"type": "text", "text": ...}`` or bare
-    ``{"text": ...}``; everything else stringifies. Read-boundary only.
-    """
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-        return "".join(parts)
-    return str(content)
 
 
 def _parse_assessment(content: Any) -> tuple[bool, str]:
@@ -112,7 +94,7 @@ def _loads_lenient(text: str) -> Any:
     return None
 
 
-async def scope_node(state: dict, config: RunnableConfig) -> dict:
+async def scope_node(state: SupervisorState, config: RunnableConfig) -> dict:
     """Phase 1 — assess clarity, conditionally clarify, produce the brief.
 
     Contract (plan §A4.1 S5):

@@ -60,6 +60,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Send
 
+from executor.text import flatten_text as _flatten_text
+
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
@@ -299,20 +301,6 @@ class _ParentFanoutState(TypedDict, total=False):
     helper owns only the single-branch driver.)"""
 
     results: Annotated[list, _append]
-
-
-def _flatten_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-        return "".join(parts)
-    return str(content)
 
 
 # --------------------------------------------------------------------------- #

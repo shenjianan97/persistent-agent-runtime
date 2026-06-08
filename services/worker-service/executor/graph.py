@@ -1833,6 +1833,16 @@ class GraphExecutor:
             # working turns live on ``run_subagent``'s separate channel — only
             # the summary ToolMessage written here crosses back.
             tool_call_id = state.get("tool_call_id")
+            if not tool_call_id:
+                # Unreachable via real LLMs (they always populate tool call ids),
+                # but the "never raises" node contract is absolute — constructing
+                # ToolMessage(tool_call_id=None) would raise a pydantic
+                # ValidationError. Skip gracefully so the parent loop can continue.
+                logger.warning(
+                    "subagent.missing_tool_call_id task_id=%s — skipping node",
+                    task_id,
+                )
+                return {"messages": []}
             prompt = state.get("prompt", "") or ""
             requested = state.get("tools", []) or []
             depth = int(state.get("depth", 1))

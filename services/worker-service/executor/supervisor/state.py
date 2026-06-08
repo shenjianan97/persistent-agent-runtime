@@ -53,8 +53,7 @@ Design-note compliance (mirrors ``executor/compaction/state.py``)
 * Named reducer functions, never builtins: LangGraph 1.0.5 introspects a
   reducer's ``signature`` and raises ``ValueError: no signature found for
   builtin`` on ``max`` / ``dict.update`` (same reason
-  ``executor/compaction/state._max_reducer`` and
-  ``executor/subagents/fanout._max_reducer`` exist).
+  ``executor.compaction.state._max_reducer`` exists — imported directly here).
 """
 
 from __future__ import annotations
