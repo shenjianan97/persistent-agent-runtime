@@ -9,11 +9,21 @@ graph compile — all additive over what is exported here.
 
 from __future__ import annotations
 
-from executor.supervisor.nodes import scope_node
+from executor.supervisor.nodes import (
+    DECISION_CONTINUE,
+    DECISION_STOP,
+    SupervisorAllFailedError,
+    scope_node,
+    supervisor_node,
+)
 from executor.supervisor.state import SupervisorState, _merge_subagent_results
 
 __all__ = [
     "SupervisorState",
     "scope_node",
+    "supervisor_node",
+    "SupervisorAllFailedError",
+    "DECISION_CONTINUE",
+    "DECISION_STOP",
     "_merge_subagent_results",
 ]

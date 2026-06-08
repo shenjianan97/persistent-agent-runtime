@@ -66,6 +66,86 @@ The user's answer (incorporate it into the brief):
 """
 
 
+# --------------------------------------------------------------------------- #
+# Supervisor — iteration-decision protocol + structured subtask-emission (S6).
+# --------------------------------------------------------------------------- #
+# The Supervisor's output is PARSED into ``subtasks: [...]`` — never freeform
+# prose (design "What the Supervisor topology owns"). The Supervisor decides per
+# iteration how many subtasks to emit (dynamic within caps — design "Subagent
+# count — dynamic, capped"); the runtime mints the stable ``subtask`` id, so the
+# template deliberately does NOT ask the model to assign ids (§A11-E8). The only
+# id the model may name is an existing FAILED subtask it wants re-dispatched,
+# flagged ``redispatch: true``.
+SUPERVISOR_DECISION_PROMPT = """\
+You are the supervisor of a deep-research agent. Your north-star research brief \
+is below. After each round of parallel sub-agents returns, you decide whether \
+the research is complete or whether to dispatch another round of focused \
+sub-tasks.
+
+Research brief (the north star — refer back to it):
+{brief}
+
+Progress so far (sub-agent results keyed by sub-task id; ok=false marks a \
+sub-agent that did not complete):
+{results_block}
+
+This is research round {iteration}. Decide:
+- If the brief is sufficiently answered by the results so far, STOP (route to \
+the writer).
+- Otherwise, CONTINUE: decompose the remaining work into focused sub-tasks. \
+Emit only as many as the work genuinely needs — each runs as an isolated \
+parallel sub-agent with its own context.
+
+Respond with a single JSON object and nothing else:
+  {{"decision": "stop", "reason": "..."}}
+  {{"decision": "continue",
+    "subtasks": [
+      {{"prompt": "focused instruction for one sub-agent"}},
+      ...
+    ],
+    "reason": "..."}}
+
+To retry a sub-task that failed in a prior round, include it with its existing \
+id and a redispatch flag:
+  {{"prompt": "...", "subtask": "<failed sub-task id>", "redispatch": true}}
+Do NOT assign ids to brand-new sub-tasks — the runtime assigns them. Emit only \
+the `prompt` for new sub-tasks."""
+
+
+def _render_results_block(subagent_results: dict) -> str:
+    """Render the accumulated results into a compact, readable block.
+
+    Empty on the first round. Each line is ``<subtask>: <ok|FAILED:reason> —
+    <summary>`` so the Supervisor can see what each sub-task produced or why it
+    failed (the basis for a re-dispatch decision)."""
+    if not subagent_results:
+        return "(no results yet — this is the first round)"
+    lines: list[str] = []
+    for subtask, result in subagent_results.items():
+        if isinstance(result, dict) and result.get("ok"):
+            summary = str(result.get("summary") or "").strip()
+            lines.append(f"- {subtask}: ok — {summary}")
+        else:
+            reason = (
+                str(result.get("reason") or "error")
+                if isinstance(result, dict)
+                else "error"
+            )
+            lines.append(f"- {subtask}: FAILED ({reason})")
+    return "\n".join(lines)
+
+
+def build_supervisor_prompt(
+    brief: str, *, iteration: int, subagent_results: dict | None = None
+) -> str:
+    """Render the Supervisor iteration-decision prompt for ``iteration``."""
+    return SUPERVISOR_DECISION_PROMPT.format(
+        brief=brief,
+        iteration=iteration,
+        results_block=_render_results_block(subagent_results or {}),
+    )
+
+
 def build_clarity_assessment_prompt(query: str) -> str:
     """Render the clarity-assessment prompt for ``query``."""
     return SCOPE_CLARITY_ASSESSMENT_PROMPT.format(query=query)

@@ -121,3 +121,10 @@ class SupervisorState(RuntimeState, total=False):
     # S7 appends {finding_id, claim, source_url, supporting_quote} records.
     # Append-only (operator.add); quotes are immutable (§A0 inv. 4).
     findings: Annotated[list[dict], operator.add]
+
+    # supervisor_node (S6) writes the loop decision ("continue" | "stop") each
+    # round; the fan-out edge and the iteration conditional edge read it.
+    # Last-write-wins (no reducer): each Supervisor super-step sets it fresh, so
+    # the edge that runs in the *same* super-step downstream reads the current
+    # round's decision — never a stale one.
+    supervisor_decision: str
