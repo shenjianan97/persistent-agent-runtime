@@ -479,6 +479,59 @@ public class ConfigValidationHelper {
         return Optional.of(readMemoryEnabled(agentConfigJson));
     }
 
+    /**
+     * Looks up {@code agent_config.task_timeout_seconds} for the agent. Returns
+     * {@link Optional#empty()} when the agent cannot be resolved or when the
+     * field is absent / malformed — callers should fall through to
+     * {@link ValidationConstants#DEFAULT_TASK_TIMEOUT_SECONDS} in those cases.
+     *
+     * <p>Used by {@link com.persistentagent.api.service.TaskService} to apply
+     * the agent-level timeout default when the task-submission request omits
+     * {@code task_timeout_seconds} (resolution order: explicit request value →
+     * agent config default → platform default 3600).
+     *
+     * <p>A malformed or out-of-range value in the stored JSON is treated as
+     * absent — this method never throws, so an unexpected config state does not
+     * break task submission.
+     */
+    public Optional<Integer> getAgentTaskTimeoutSeconds(String tenantId, String agentId) {
+        Optional<Map<String, Object>> agentRow = agentRepository.findByIdAndTenant(tenantId, agentId);
+        if (agentRow.isEmpty()) {
+            return Optional.empty();
+        }
+        String agentConfigJson = extractAgentConfigJson(agentRow.get().get("agent_config"));
+        if (agentConfigJson == null || agentConfigJson.isBlank()) {
+            return Optional.empty();
+        }
+        return readTaskTimeoutSeconds(agentConfigJson);
+    }
+
+    /**
+     * Parses {@code agent_config.task_timeout_seconds} out of the stored JSON.
+     * Returns {@link Optional#empty()} when the key is absent, null, non-integer,
+     * or out of the legal range — never throws.
+     */
+    private Optional<Integer> readTaskTimeoutSeconds(String agentConfigJson) {
+        try {
+            JsonNode root = objectMapper.readTree(agentConfigJson);
+            if (root == null) {
+                return Optional.empty();
+            }
+            JsonNode node = root.get("task_timeout_seconds");
+            if (node == null || node.isNull() || !node.isInt()) {
+                return Optional.empty();
+            }
+            int value = node.intValue();
+            // Sanity-check: must be within the same range enforced at submission time.
+            if (value < 1 || value > 86400) {
+                return Optional.empty();
+            }
+            return Optional.of(value);
+        } catch (Exception e) {
+            return Optional.empty();
+        }
+    }
+
     private static String extractAgentConfigJson(Object rawAgentConfig) {
         if (rawAgentConfig == null) {
             return null;

@@ -132,8 +132,19 @@ public class TaskService {
         // 3. Apply task-level defaults
         int maxRetries = request.maxRetries() != null ? request.maxRetries() : ValidationConstants.DEFAULT_MAX_RETRIES;
         int maxSteps = request.maxSteps() != null ? request.maxSteps() : ValidationConstants.DEFAULT_MAX_STEPS;
-        int taskTimeoutSeconds = request.taskTimeoutSeconds() != null
-                ? request.taskTimeoutSeconds() : ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS;
+        // Resolution order for task_timeout_seconds:
+        //   1. explicit value on this request (wins),
+        //   2. agent_config.task_timeout_seconds (seeded by presets, e.g. research=14400),
+        //   3. DEFAULT_TASK_TIMEOUT_SECONDS (3600) — the unchanged platform default.
+        // A malformed or absent agent-config value falls through to the platform default.
+        int taskTimeoutSeconds;
+        if (request.taskTimeoutSeconds() != null) {
+            taskTimeoutSeconds = request.taskTimeoutSeconds();
+        } else {
+            taskTimeoutSeconds = configValidationHelper
+                    .getAgentTaskTimeoutSeconds(tenantId, request.agentId())
+                    .orElse(ValidationConstants.DEFAULT_TASK_TIMEOUT_SECONDS);
+        }
 
         // 4. Atomic agent resolution + model validation + task insertion (single SQL statement)
         //    The INSERT...SELECT joins agents with models to atomically enforce:
