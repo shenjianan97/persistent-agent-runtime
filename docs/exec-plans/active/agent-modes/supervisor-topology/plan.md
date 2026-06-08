@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **One of two tracks under [Agent Modes](../README.md).** Sibling track: [Planning Primitive](../planning-primitive/plan.md) (independent; shares only `RuntimeState`, the worker tool registry, and the Console Activity pane — see *Cross-track coordination* in §A3).
+> **One of two tracks under [Agent Modes](../README.md).** Sibling track: [Planning Primitive](../../../completed/agent-modes/planning-primitive/plan.md) (independent; shares only `RuntimeState`, the worker tool registry, and the Console Activity pane — see *Cross-track coordination* in §A3).
 
 **Goal:** Ship the **Supervisor topology** (customer-facing "Deep Research" — Scope → Supervisor → parallel Subagents → Writer, in-process fan-out) together with the small slices the design folds into it: the shared in-process fan-out helper, the `dispatch_subagent` ReAct tool, and presets. Governing design: [Agent Modes design](../../../../design-docs/agent-modes/design.md). The Planning Primitive is a **separate track** (sibling above); the Workflow resource is explicitly **out of scope** (Phase 3).
 
@@ -87,7 +87,7 @@ These invariants are **decided** (not open) and any deviation is a plan failure:
                           S1..S10 ──► S11 (Integration + E2E + browser, Supervisor)
 ```
 
-**Cross-track coordination (with the [Planning Primitive](../planning-primitive/plan.md) track):** the two tracks are independent but touch four shared files — `executor/compaction/state.py` (both add a `RuntimeState` field), `executor/graph.py::_get_tools` (both register a built-in tool), `services/console/src/features/task-detail/ActivityPane.tsx`, and `types/index.ts`. **If both tracks run concurrently, any agent editing one of these MUST use `isolation: "worktree"`** and merge after. Cleanest sequencing: land one track's `RuntimeState`/`_get_tools` change, rebase the other. None of the Supervisor tasks *depend* on a Planning task or vice versa.
+**Cross-track coordination (with the [Planning Primitive](../../../completed/agent-modes/planning-primitive/plan.md) track):** the two tracks are independent but touch four shared files — `executor/compaction/state.py` (both add a `RuntimeState` field), `executor/graph.py::_get_tools` (both register a built-in tool), `services/console/src/features/task-detail/ActivityPane.tsx`, and `types/index.ts`. **If both tracks run concurrently, any agent editing one of these MUST use `isolation: "worktree"`** and merge after. Cleanest sequencing: land one track's `RuntimeState`/`_get_tools` change, rebase the other. None of the Supervisor tasks *depend* on a Planning task or vice versa.
 
 **Parallelisation & worktree safety within this track (AGENTS.md §Parallel Subagent Safety):**
 
@@ -108,7 +108,7 @@ These invariants are **decided** (not open) and any deviation is a plan failure:
 
 **API surface:**
 - `POST /v1/agents` / `PUT /v1/agents/{id}` accept `topology`, `preset`, `supervisor`. `PUT` rejects a `topology` change with 400 (immutability). Validation bounds: `max_fanout_per_iteration ∈ [1, 20]`, `max_iterations ∈ [1, 10]`, `source_allowlist ≤ 50` entries (matches `exclude_tools`/`tool_servers` cap), `writer_style ∈ {formal_report, annotated_bullets}`, `scope_clarification_enabled` boolean. `topology ∈ {react, supervisor}`; absent → `react`.
-- **No task-submission payload change.** A task targets `agent_id`; the Supervisor shape is fixed by the agent's topology. (`workflow_id` target is Phase-3, not widened here.) The `GET /v1/tasks/{id}/plan` read endpoint belongs to the [Planning Primitive](../planning-primitive/plan.md) track, not this one.
+- **No task-submission payload change.** A task targets `agent_id`; the Supervisor shape is fixed by the agent's topology. (`workflow_id` target is Phase-3, not widened here.) The `GET /v1/tasks/{id}/plan` read endpoint belongs to the [Planning Primitive](../../../completed/agent-modes/planning-primitive/plan.md) track, not this one.
 
 **Cost ledger:** unchanged schema, but a **new attribution path** (S8) is required. The existing cost loop only records spend from the `event["agent"]` node; Supervisor/sub-agent nodes emit under other keys and would be dropped. S8 adds an **additive** `model_token_spend` ledger write at the parent's super-step `checkpoint_id` aggregating every LLM-bearing Supervisor node's `usage_metadata` (Pattern A — still no `sub_agent_id` column, no per-sub-agent rows). The `compaction.tier3` partial-unique index is *not* in play (it's scoped to `operation='compaction.tier3'`), so wide fan-out poses no ledger-idempotency hazard — but the per-checkpoint `checkpoints.cost_microdollars` write must be **additive** (`add_cost_and_preserve_metadata`), never overwrite. See **§A11-E1**.
 
@@ -197,7 +197,7 @@ These invariants are **decided** (not open) and any deviation is a plan failure:
 - **`durability="sync"`** for the Supervisor graph compile/invoke, matching `executor/graph.py:3127`. Do not switch to LangGraph's `"async"` default.
 - **Findings immutability:** the reduction step may select/reorder/summarize-for-selection but must never rewrite `supporting_quote`.
 - **Budget:** never add a refund path; cost is cumulative (design *Budget and redrive*). Carve-out only what Track 3 already carves; do not invent new exemptions.
-- **Worktree safety:** `executor/compaction/state.py`, `executor/graph.py::_get_tools`, `ActivityPane.tsx`, `types/index.ts` are shared with the [Planning Primitive](../planning-primitive/plan.md) track — if both run concurrently, worktree-isolate parallel edits and merge after (see *Cross-track coordination* in §A3).
+- **Worktree safety:** `executor/compaction/state.py`, `executor/graph.py::_get_tools`, `ActivityPane.tsx`, `types/index.ts` are shared with the [Planning Primitive](../../../completed/agent-modes/planning-primitive/plan.md) track — if both run concurrently, worktree-isolate parallel edits and merge after (see *Cross-track coordination* in §A3).
 - **Console gate:** subagents ship code + `make console-test` + scenario text only; the **orchestrator** runs Playwright once, serially, after merge (AGENTS.md). Read `docs/CONSOLE_TASK_CHECKLIST.md` before any Console task; update the agent-config coverage matrix in the same commit (add an `agent_mode` / `supervisor` row; `topology`/`preset` rendered on >1 surface → Template D parity assertions).
 - **Tests are worktree-concurrency-safe:** any test binding a port uses an ephemeral port (`scripts/e2e/free-port.py` / `:0`); never raw `pytest tests/backend-integration` in a worktree — use `make e2e-test PYTEST_ARGS='-k ...'`.
 - **Do NOT build (this plan):** Workflow resource / `execute_workflow` / direct `workflow_id` submission (Phase 3); Pattern B durable cross-task sub-agents; Plan-and-Execute / Reflexion / LLMCompiler topologies (design *Patterns not built*); any `agent_config.mode` field.
@@ -236,7 +236,7 @@ These invariants are **decided** (not open) and any deviation is a plan failure:
 | S10 | [task-s10-console-supervisor.md](agent_tasks/task-s10-console-supervisor.md) | Preset selector (locked on edit) + supervisor config section + sub-agent tree | S |
 | S11 | [task-s11-supervisor-integration-tests.md](agent_tasks/task-s11-supervisor-integration-tests.md) | Supervisor E2E + Playwright scenario | S |
 
-> Planning Primitive tasks (P1–P5) live in the sibling [Planning Primitive track](../planning-primitive/plan.md).
+> Planning Primitive tasks (P1–P5) live in the sibling [Planning Primitive track](../../../completed/agent-modes/planning-primitive/plan.md).
 
 ---
 
@@ -258,7 +258,7 @@ A four-lens review (design-fidelity, codebase-integration, completeness, adversa
 | **E8** | **✅ DECIDED** | **Within-iteration `subtask`-id collision loses work.** Reducer keyed by `subtask` is idempotent cross-round, but two same-round subtasks with a colliding (LLM-chosen) id silently overwrite → lost findings + burned tokens. | Ratify deterministic id minting in S6 (`f"{iteration}.{index}"`; carry-forward only on explicit re-dispatch). Add a within-iteration collision test. | S6 | S6 tested cross-round only. Adversarial reviewer. (Now in §A4.1 S6 row.) |
 | **E10** | **✅ DECIDED** | **Migration 0025 CHECK lock.** DROP + re-ADD CHECK takes `ACCESS EXCLUSIVE` + validates all rows → brief insert stall on a large `task_events`. | Use `ADD CONSTRAINT ... NOT VALID` then `VALIDATE CONSTRAINT` (weaker lock), or confirm `task_events` is small. | S9 | `0020`/`0024` pattern. Adversarial reviewer. |
 
-> **E9** (plan-injection KV-cache) belongs to the [Planning Primitive](../planning-primitive/plan.md) track and is tracked there.
+> **E9** (plan-injection KV-cache) belongs to the [Planning Primitive](../../../completed/agent-modes/planning-primitive/plan.md) track and is tracked there.
 
 **Wording/consistency minors folded in (no decision needed):** "six knobs" → **five** supervisor fields (budget is the agent-level Track-3 column, not the sub-object) in S5/S10; pin the starting `depth=1` the Supervisor `Send` passes (now in §A4.1 S6); promote `core/subagent_events.py` (+ the four `emit_*` signatures) to the shared contract so S6/S7 can import-stub before S9 lands; `coding`/`investigation` presets also seed `plan_write` (a Planning-Primitive-track tool — seeding an as-yet-unwired tool name is allowed, Track-7 precedent) in S2; off-by-one cite fixes (`createAgent :51`, `validateAgentConfig :315`).
 
