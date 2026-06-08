@@ -29,7 +29,7 @@ from langfuse.langchain import CallbackHandler
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError, GraphInterrupt
-from langgraph.types import Command
+from langgraph.types import Command, Send
 
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 from core.config import WorkerConfig
@@ -137,6 +137,12 @@ from tools.memory_tools import (
     build_memory_tools,
 )
 from tools.plan_tools import build_plan_write_tool
+from tools.subagent_tools import (
+    DISPATCH_SUBAGENT_TOOL_NAME,
+    budget_to_ceiling,
+    build_dispatch_subagent_tool,
+)
+from executor.subagents import run_subagent
 from executor.mcp_session import McpToolCallError
 from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
 from executor.compaction.ingestion import (
@@ -1078,6 +1084,17 @@ class GraphExecutor:
         if "plan_write" in allowed_tools:
             tools.append(build_plan_write_tool())
 
+        # Supervisor Topology (Task S4) — ``dispatch_subagent`` delegation tool.
+        # Gated: only registered when "dispatch_subagent" is in the allowlist
+        # (the ``coding`` / ``investigation`` presets seed it; S2 owns that —
+        # we gate purely on the resolved allowlist, never on preset names).
+        # This registers the LLM-facing SCHEMA only. The actual delegation is a
+        # post-agent routing edge in ``_build_graph`` that intercepts the call
+        # and ``Send``s it to the shared subagent node (S3) — it is NOT executed
+        # inside the ToolNode. Counts against MAX_TOOLS_PER_AGENT like any tool.
+        if DISPATCH_SUBAGENT_TOOL_NAME in allowed_tools:
+            tools.append(build_dispatch_subagent_tool())
+
         return tools
 
     async def _build_graph(
@@ -1643,16 +1660,45 @@ class GraphExecutor:
             workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
             workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
 
+        # Supervisor Topology (Task S4) — whether the LLM may emit
+        # ``dispatch_subagent``. When enabled, the post-agent routing edge
+        # below splits a turn's tool calls: each ``dispatch_subagent`` call is
+        # ``Send``-routed to the shared subagent node (S3) — NOT executed in
+        # the ToolNode — while every other tool call still goes to the ToolNode,
+        # in the same super-step. The subagent node threads its summary back as
+        # a ``ToolMessage`` keyed to the original ``tool_call_id``, so every
+        # emitted ``tool_call_id`` receives exactly one ``ToolMessage`` before
+        # the next agent-node call (an unanswered tool call → provider error).
+        _dispatch_enabled = DISPATCH_SUBAGENT_TOOL_NAME in allowed_tools
+
+        SUBAGENT_NODE_NAME = "subagent"
+
+        def _partition_tool_calls(last: Any) -> tuple[list[dict], bool]:
+            """Split the last AIMessage's tool calls into (dispatch, has_other).
+
+            Returns the list of ``dispatch_subagent`` tool-call dicts and whether
+            any non-dispatch (ToolNode-bound) tool call is present.
+            """
+            dispatch_calls: list[dict] = []
+            has_other = False
+            for call in getattr(last, "tool_calls", None) or []:
+                if call.get("name") == DISPATCH_SUBAGENT_TOOL_NAME:
+                    dispatch_calls.append(call)
+                else:
+                    has_other = True
+            return dispatch_calls, has_other
+
         # Phase 2 Track 5 Task 12 — unified routing function out of the
         # agent node. Replaces the pre-Task-12 ``tools_condition``-based
         # wiring so the decision tree is explicit:
         #
         # 1. Pending tool calls on the last AIMessage → ``tools`` (same as
-        #    stock ``tools_condition``).
+        #    stock ``tools_condition``); a ``dispatch_subagent`` call in the
+        #    turn is split out and ``Send``-routed to the subagent node (S4).
         # 2. ``auto_write`` OR the ``memory_opt_in`` state flag is True →
         #    ``memory_write`` (terminal memory branch).
         # 3. Otherwise → ``END`` (silent no-op in agent_decides-no-opt).
-        def route_after_agent(state: Any) -> str:
+        def route_after_agent(state: Any) -> Any:
             messages = state.get("messages") if isinstance(state, dict) else None
             if not messages:
                 messages = getattr(state, "messages", None)
@@ -1663,8 +1709,44 @@ class GraphExecutor:
                 if isinstance(state, dict)
                 else getattr(state, "memory_opt_in", False)
             )
+
             if pending:
-                decision = "tools"
+                # Split dispatch_subagent calls (→ Send to the subagent node)
+                # from normal tool calls (→ ToolNode), in one super-step. Depth
+                # is sourced from graph state (default 0 for a top-level ReAct
+                # agent) and incremented by one — never read from the LLM args,
+                # so a crafted call cannot escalate past MAX_SUBAGENT_DEPTH.
+                dispatch_calls, has_other = (
+                    _partition_tool_calls(last) if _dispatch_enabled else ([], True)
+                )
+                if dispatch_calls:
+                    parent_depth = int(
+                        state.get("depth", 0)
+                        if isinstance(state, dict)
+                        else getattr(state, "depth", 0) or 0
+                    )
+                    sends: list[Any] = [
+                        Send(
+                            SUBAGENT_NODE_NAME,
+                            {
+                                "tool_call_id": call.get("id"),
+                                "prompt": (call.get("args") or {}).get("prompt", ""),
+                                "tools": (call.get("args") or {}).get("tools", []),
+                                "budget": (call.get("args") or {}).get("budget"),
+                                "depth": parent_depth + 1,
+                            },
+                        )
+                        for call in dispatch_calls
+                    ]
+                    if has_other:
+                        sends.append("tools")
+                    logger.info(
+                        "subagent.route_after_agent task_id=%s dispatch_calls=%d "
+                        "has_other_tools=%s parent_depth=%d",
+                        task_id, len(dispatch_calls), has_other, parent_depth,
+                    )
+                    return sends
+                decision: Any = "tools"
             elif stack_enabled and (auto_write or opt_in):
                 decision = MEMORY_WRITE_NODE_NAME
             else:
@@ -1690,6 +1772,130 @@ class GraphExecutor:
             "task_id": task_id,
         }
 
+        # Supervisor Topology (Task S4) — the shared subagent node, reached only
+        # via ``Send`` from the post-agent routing edge above (NEVER from the
+        # ToolNode). It is a thin DRIVER over S3's ``run_subagent`` — it does not
+        # fork a second ReAct subgraph; ``run_subagent`` owns the subgraph node,
+        # the ceiling/timeout/depth enforcement, and the headless filter. The
+        # node's job is purely transport: map the LLM-supplied ``tools`` arg to
+        # the parent's own tool objects (so a sub-agent can never use a tool the
+        # parent lacks), translate ``budget`` → ``SubagentCeiling``, call
+        # ``run_subagent`` with the state-sourced (incremented) ``depth``, and
+        # thread the outcome back as a single ``ToolMessage`` keyed to the
+        # original ``tool_call_id``. Failure markers become a descriptive
+        # ``ToolMessage`` — never a raised graph error (the parent loop reacts).
+        _tools_by_name = {getattr(t, "name", None): t for t in tools}
+
+        def _strip_dispatch_tool_calls(state: Any) -> Any:
+            """Return a state view whose last AIMessage drops dispatch calls.
+
+            The ToolNode answers every tool call on the last AIMessage; a
+            ``dispatch_subagent`` call is answered by the subagent node instead,
+            so it must be removed from the message the ToolNode sees (otherwise
+            the id is answered twice — once with the unreachable-stub error,
+            once with the real summary — corrupting the message journal). When
+            the turn has no dispatch calls this is a passthrough.
+            """
+            messages = (
+                state.get("messages") if isinstance(state, dict)
+                else getattr(state, "messages", None)
+            )
+            if not messages:
+                return state
+            last = messages[-1]
+            calls = getattr(last, "tool_calls", None) or []
+            kept = [c for c in calls if c.get("name") != DISPATCH_SUBAGENT_TOOL_NAME]
+            if len(kept) == len(calls):
+                return state  # no dispatch calls — nothing to strip
+            trimmed = last.model_copy(update={"tool_calls": kept})
+            new_messages = list(messages[:-1]) + [trimmed]
+            if isinstance(state, dict):
+                return {**state, "messages": new_messages}
+            # RuntimeState is a TypedDict (dict at runtime); the dict branch
+            # covers it. Fall back to a dict view for any object-shaped state.
+            return {"messages": new_messages}
+
+        async def _subagent_emit(event_name, payload=None):
+            # S3's wedged-branch liveness signal is a span event ONLY. Full
+            # Langfuse span emission is wired with the rest of sub-agent
+            # observability (a later task); here it is a structured log line so
+            # the heartbeat is still observable and S3's ``emit`` contract is
+            # honoured. NEVER a task_events row, NEVER a lease touch.
+            logger.debug(
+                "subagent.emit task_id=%s event=%s payload=%s",
+                task_id, event_name, payload,
+            )
+
+        async def subagent_node(state: dict, config: RunnableConfig):
+            # ``state`` is the ``Send`` payload assembled by route_after_agent —
+            # the sub-agent's ENTIRE input. The parent's ``messages`` are NOT
+            # passed in (isolation holds at entry), and the sub-agent's internal
+            # working turns live on ``run_subagent``'s separate channel — only
+            # the summary ToolMessage written here crosses back.
+            tool_call_id = state.get("tool_call_id")
+            prompt = state.get("prompt", "") or ""
+            requested = state.get("tools", []) or []
+            depth = int(state.get("depth", 1))
+
+            # Bound the sub-agent's tools to the subset of the PARENT's tools the
+            # LLM named — it can never be granted a tool the parent itself lacks.
+            # ``dispatch_subagent`` itself is never delegated (no nested tool
+            # surface needed; S3's headless filter independently drops any
+            # interrupt-bearing tool by name).
+            delegated_tools = [
+                _tools_by_name[name]
+                for name in requested
+                if name in _tools_by_name
+                and name != DISPATCH_SUBAGENT_TOOL_NAME
+            ]
+
+            # Derive a sub-thread off the parent's thread_id so the sub-agent's
+            # inner super-steps are checkpointed under their own namespace while
+            # sharing the parent checkpointer (per-inner-turn crash resume).
+            parent_thread = ""
+            try:
+                parent_thread = (
+                    (config.get("configurable") or {}).get("thread_id", "")
+                    if isinstance(config, dict)
+                    else ""
+                )
+            except Exception:
+                parent_thread = ""
+            sub_thread_id = f"{parent_thread}:subagent:{tool_call_id}"
+
+            result = await run_subagent(
+                prompt,
+                delegated_tools,
+                ceiling=budget_to_ceiling(state.get("budget")),
+                depth=depth,
+                model=llm,
+                checkpointer=checkpointer,
+                thread_id=sub_thread_id,
+                emit=_subagent_emit,
+            )
+
+            if result.ok:
+                content = result.summary or "(sub-agent returned no summary)"
+            else:
+                reason = result.reason or "error"
+                detail = f": {result.summary}" if result.summary else ""
+                content = (
+                    f"sub-agent did not complete (reason: {reason}){detail}. "
+                    f"You may retry with a narrower prompt or smaller budget, "
+                    f"proceed without it, or stop."
+                )
+            logger.info(
+                "subagent.completed task_id=%s tool_call_id=%s ok=%s reason=%s "
+                "depth=%d delegated_tools=%d",
+                task_id, tool_call_id, result.ok, result.reason, depth,
+                len(delegated_tools),
+            )
+            return {
+                "messages": [
+                    ToolMessage(content=content, tool_call_id=tool_call_id)
+                ]
+            }
+
         if tools:
             _raw_tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
@@ -1714,7 +1920,18 @@ class GraphExecutor:
                 recall-pointer rewrite and the projection stub rule can
                 recognise it later.
                 """
-                out = await _raw_tool_node.ainvoke(state, config)
+                # Supervisor Topology (Task S4) — a mixed turn routes
+                # ``dispatch_subagent`` calls to the subagent node (via Send)
+                # AND the normal calls here, in the same super-step. The
+                # ToolNode must NOT also answer the dispatch calls — the
+                # subagent node owns those ``tool_call_id``s. Hide them from the
+                # ToolNode so each id is answered exactly once.
+                _tn_input = (
+                    _strip_dispatch_tool_calls(state)
+                    if _dispatch_enabled
+                    else state
+                )
+                out = await _raw_tool_node.ainvoke(_tn_input, config)
                 if not _offload_enabled or _offload_store is None:
                     # When the flag is off, still tag recall-tool outputs so
                     # the compaction hook's projection stub + recall-pointer
@@ -1779,15 +1996,34 @@ class GraphExecutor:
 
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
-            if stack_enabled:
+            # Supervisor Topology (Task S4) — register the shared subagent node
+            # and its return edge. It is reached ONLY via ``Send`` from
+            # route_after_agent (a dispatch_subagent call), in the same
+            # super-step as any sibling ToolNode call, and returns to the agent
+            # node so the parent loop continues with the summary ToolMessage.
+            if _dispatch_enabled:
+                workflow.add_node(SUBAGENT_NODE_NAME, subagent_node)
+                workflow.add_edge(SUBAGENT_NODE_NAME, "agent")
+            if stack_enabled or _dispatch_enabled:
+                # ``route_after_agent`` owns the split (dispatch → Send to the
+                # subagent node, others → ToolNode). The path map must name
+                # every reachable target; ``SUBAGENT_NODE_NAME`` is added when
+                # dispatch is enabled so a returned ``Send(SUBAGENT_NODE_NAME)``
+                # resolves.
+                _route_map: dict[Any, Any] = {
+                    "tools": "tools",
+                    END: END,
+                }
+                # The memory_write target only exists when the stack is enabled
+                # (that node is added in the ``stack_enabled`` block above).
+                if stack_enabled:
+                    _route_map[MEMORY_WRITE_NODE_NAME] = MEMORY_WRITE_NODE_NAME
+                if _dispatch_enabled:
+                    _route_map[SUBAGENT_NODE_NAME] = SUBAGENT_NODE_NAME
                 workflow.add_conditional_edges(
                     "agent",
                     route_after_agent,
-                    {
-                        "tools": "tools",
-                        MEMORY_WRITE_NODE_NAME: MEMORY_WRITE_NODE_NAME,
-                        END: END,
-                    },
+                    _route_map,
                 )
             else:
                 workflow.add_conditional_edges("agent", tools_condition)
