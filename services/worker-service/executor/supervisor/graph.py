@@ -55,6 +55,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
+from core.subagent_events import emit_subagent_failed, emit_subagent_started
 from executor.subagents import SubagentResult, run_subagent
 from executor.supervisor.nodes import (
     DECISION_CONTINUE,
@@ -214,6 +215,26 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
     parent_thread = configurable.get("thread_id", "")
     sub_checkpoint_ns = f"subagent:{subtask}"
 
+    # S9 observability — emit ``subagent_started`` at dispatch (BEFORE the run).
+    # iteration is the 1-based round S6's supervisor_node minted; subtask is the
+    # stable "<iteration>.<index>" id. tool_allowlist is the sub-agent's bound
+    # tool names (headless filtering happens inside run_subagent; the marker
+    # records the requested allowlist). prompt_preview is truncated in the helper.
+    # This is an observability addition ONLY — it does NOT change the fan-out
+    # logic, reducer, or super-step structure. At-least-once: a resumed branch
+    # re-emits; consumers dedup on (event_type, iteration, subtask).
+    iteration = int(configurable.get("iteration", 0) or 0)
+    emit = deps.get("emit")
+    tool_names = [getattr(t, "name", str(t)) for t in deps.get("tools", [])]
+    await emit_subagent_started(
+        emit,
+        iteration=iteration,
+        subtask=subtask,
+        prompt_preview=prompt,
+        tool_allowlist=tool_names,
+        depth=SUPERVISOR_FANOUT_DEPTH,
+    )
+
     # Wrap the Supervisor's focused sub-task instruction in S7's Subagent
     # findings template so the sub-agent emits structured
     # {claim, source_url, supporting_quote} findings (NOT freeform prose) — the
@@ -236,14 +257,25 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
     # empty summary returns []). ``findings`` is the append-only channel S5
     # declared — LangGraph concatenates every branch's list (§A0 inv. 4: the
     # append reducer never rewrites an existing entry; quotes are immutable).
-    iteration = int(configurable.get("iteration", 0) or 0)
     findings: list[dict] = []
     if result.ok:
         findings = await parse_findings(
             result.summary,
             iteration=iteration,
             subtask=subtask,
-            emit=deps.get("emit"),
+            emit=emit,
+        )
+    else:
+        # S9 observability — emit ``subagent_failed`` on a failure-marker result.
+        # reason ∈ {ceiling, timeout, error}; a structural ``depth`` reject (which
+        # the Supervisor fan-out never trips at depth 1) collapses to ``error``.
+        # Observability addition ONLY — does not change the reducer / super-step.
+        reason = result.reason if result.reason in ("ceiling", "timeout") else "error"
+        await emit_subagent_failed(
+            emit,
+            iteration=iteration,
+            subtask=subtask,
+            reason=reason,
         )
 
     logger.info(

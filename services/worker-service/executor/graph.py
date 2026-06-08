@@ -137,6 +137,7 @@ from tools.memory_tools import (
     build_memory_tools,
 )
 from tools.plan_tools import build_plan_write_tool
+from core.subagent_events import build_task_event_sink
 from tools.subagent_tools import (
     DISPATCH_SUBAGENT_TOOL_NAME,
     budget_to_ceiling,
@@ -4239,15 +4240,22 @@ class GraphExecutor:
             agent_id=agent_id,
         )
 
-        async def _supervisor_emit(event_type, details=None):
-            # S9 wires the real ``task_events`` insert + migration 0025 CHECK
-            # value; until then the sink is a structured log so a build shipped
-            # ahead of the migration cannot violate the constraint (§A6 deploy
-            # order). NEVER a lease touch, NEVER a checkpoint write.
-            logger.debug(
-                "supervisor.emit task_id=%s event=%s details=%s",
-                task_id, event_type, details,
-            )
+        # S9: the REAL sink. Per emit it acquires its OWN short-lived connection
+        # from the pool and writes a task_events row via _insert_task_event —
+        # at-least-once, NOT atomic with the checkpoint write (the checkpointer
+        # owns its own connections; checkpointer/postgres.py). A crashed-and-
+        # resumed inner step re-emits, so the (event_type, iteration, subtask)
+        # dedup key is the contract and the projection is duplicate-tolerant. The
+        # sink drops the subagent.heartbeat SPAN event (§A11-E4 — Langfuse only,
+        # never an admitted task_events type). NEVER a lease touch, NEVER a
+        # checkpoint write. Migration 0025 admits the four event_type values this
+        # sink writes (§A6 deploy order: 0025 must reach prod first).
+        _supervisor_emit = build_task_event_sink(
+            self.pool,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
 
         cfg = config["configurable"]
         cfg["scope_model"] = model
