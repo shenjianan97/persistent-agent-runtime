@@ -609,4 +609,418 @@ class ActivityProjectionServiceTest {
         assertEquals(1, turn.toolCalls().size());
         assertEquals("web_search", turn.toolCalls().get(0).name());
     }
+
+    // =========================================================================
+    // S9 — Sub-agent fan-out observability markers
+    // =========================================================================
+
+    // --- mapMarker for each new event_type ---
+
+    @Test
+    void mapMarker_subagentStarted_mapsToMarkerSubagentStarted() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+        // No findByIdAndTenant stub needed: markerRows is non-empty, so the 404 path is not reached.
+
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_started",
+                null, null, "worker-1", null, null,
+                Map.of("iteration", 1, "subtask", "1.0",
+                        "prompt_preview", "search for X", "tool_allowlist", List.of("web_search"),
+                        "depth", 1),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        // include_details=true: marker.subagent.started is visible
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.subagent.started", marker.kind());
+        assertEquals("subagent_started", marker.eventType());
+        assertEquals(1, marker.iteration());
+        assertEquals("1.0", marker.subtask());
+        assertNotNull(marker.details());
+
+        // include_details=false: marker.subagent.started is EXCLUDED (lifecycle telemetry)
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        assertTrue(userVisible.isEmpty(),
+                "marker.subagent.started should be hidden when include_details=false");
+    }
+
+    @Test
+    void mapMarker_subagentFinding_mapsToMarkerSubagentFinding() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_finding",
+                null, null, "worker-1", null, null,
+                Map.of("iteration", 0, "subtask", "0.1",
+                        "finding_id", "0.1-abc12345", "source_url", "https://example.com/doc"),
+                OffsetDateTime.parse("2026-06-08T10:01:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        // include_details=true
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.subagent.finding", marker.kind());
+        assertEquals(0, marker.iteration());
+        assertEquals("0.1", marker.subtask());
+
+        // include_details=false: marker.subagent.finding IS user-visible
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        assertEquals(1, userVisible.size());
+        assertEquals("marker.subagent.finding", userVisible.get(0).kind());
+    }
+
+    @Test
+    void mapMarker_subagentFailed_mapsToMarkerSubagentFailed() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_failed",
+                null, null, "worker-1", null, null,
+                Map.of("iteration", 2, "subtask", "2.0", "reason", "ceiling"),
+                OffsetDateTime.parse("2026-06-08T10:02:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        // include_details=true
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.subagent.failed", marker.kind());
+        assertEquals(2, marker.iteration());
+        assertEquals("2.0", marker.subtask());
+
+        // include_details=false: marker.subagent.failed IS user-visible
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        assertEquals(1, userVisible.size());
+        assertEquals("marker.subagent.failed", userVisible.get(0).kind());
+    }
+
+    @Test
+    void mapMarker_supervisorIteration_mapsToMarkerSupervisorIteration() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "supervisor_iteration",
+                null, null, "worker-1", null, null,
+                Map.of("iteration", 1, "subtasks_emitted", 3,
+                        "decision", "continue", "reason", "not enough findings yet"),
+                OffsetDateTime.parse("2026-06-08T10:03:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        // include_details=true
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.supervisor.iteration", marker.kind());
+        assertEquals(1, marker.iteration());
+        // supervisor_iteration has no per-sub-agent subtask
+        assertNull(marker.subtask());
+
+        // include_details=false: marker.supervisor.iteration IS user-visible
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        assertEquals(1, userVisible.size());
+        assertEquals("marker.supervisor.iteration", userVisible.get(0).kind());
+    }
+
+    // --- Missing / malformed iteration guard ---
+
+    @Test
+    void mapMarker_subagentStarted_missingIteration_iterationIsNull() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        // details map has no "iteration" key — guard must not throw
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_started",
+                null, null, "worker-1", null, null,
+                Map.of("subtask", "1.0", "prompt_preview", "do X"),
+                OffsetDateTime.parse("2026-06-08T10:04:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.subagent.started", marker.kind());
+        assertNull(marker.iteration(), "iteration must be null when missing from details");
+    }
+
+    @Test
+    void mapMarker_subagentStarted_nonNumberIteration_iterationIsNull() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        // details map has iteration as a non-Number — guard must not throw
+        Map<String, Object> details = new java.util.HashMap<>();
+        details.put("iteration", "not-a-number");
+        details.put("subtask", "1.0");
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_started",
+                null, null, "worker-1", null, null,
+                details,
+                OffsetDateTime.parse("2026-06-08T10:05:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        assertNull(allEvents.get(0).iteration(),
+                "iteration must be null when details value is not a Number");
+    }
+
+    // --- include_details=true/false filter for all four new kinds ---
+
+    @Test
+    void getActivity_subagentMarkers_includeDetailsFilter() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse started = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.0", "prompt_preview", "p", "depth", 1),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        TaskEventResponse finding = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_finding",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.0",
+                        "finding_id", "0.0-aabb1234", "source_url", "https://x.com"),
+                OffsetDateTime.parse("2026-06-08T10:01:00+00:00"));
+        TaskEventResponse failed = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_failed",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.1", "reason", "timeout"),
+                OffsetDateTime.parse("2026-06-08T10:02:00+00:00"));
+        TaskEventResponse iteration = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "supervisor_iteration",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtasks_emitted", 2, "decision", "stop", "reason", "done"),
+                OffsetDateTime.parse("2026-06-08T10:03:00+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(started, finding, failed, iteration));
+
+        // include_details=true → all four visible
+        List<ActivityEventResponse> all = service.getActivity(taskId, true).events();
+        List<String> allKinds = all.stream().map(ActivityEventResponse::kind).toList();
+        assertTrue(allKinds.contains("marker.subagent.started"));
+        assertTrue(allKinds.contains("marker.subagent.finding"));
+        assertTrue(allKinds.contains("marker.subagent.failed"));
+        assertTrue(allKinds.contains("marker.supervisor.iteration"));
+
+        // include_details=false → started excluded, the other three visible
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        List<String> userKinds = userVisible.stream().map(ActivityEventResponse::kind).toList();
+        assertFalse(userKinds.contains("marker.subagent.started"),
+                "marker.subagent.started must be hidden when include_details=false");
+        assertTrue(userKinds.contains("marker.subagent.finding"));
+        assertTrue(userKinds.contains("marker.subagent.failed"));
+        assertTrue(userKinds.contains("marker.supervisor.iteration"));
+    }
+
+    // --- Duplicate-tolerance (at-least-once contract) ---
+
+    @Test
+    void getActivity_duplicateSubagentStarted_firstWinsDedup() {
+        // Two rows with same (event_type, iteration, subtask) — first-wins for subagent_started.
+        // The final projected list should contain exactly ONE entry with the first row's data.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse first = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0", "prompt_preview", "FIRST", "depth", 1),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        // Duplicate row (re-emitted on resume) — same dedup key, different prompt_preview
+        TaskEventResponse duplicate = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0", "prompt_preview", "DUPLICATE", "depth", 1),
+                OffsetDateTime.parse("2026-06-08T10:00:01+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(first, duplicate));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        // Must deduplicate to exactly one entry
+        assertEquals(1, events.size(),
+                "Duplicate subagent_started rows with same (event_type, iteration, subtask) must deduplicate to 1");
+        ActivityEventResponse marker = events.get(0);
+        assertEquals("marker.subagent.started", marker.kind());
+        assertEquals(1, marker.iteration());
+        assertEquals("1.0", marker.subtask());
+        // first-wins: the FIRST row's details should survive
+        @SuppressWarnings("unchecked")
+        Map<String, Object> details = (Map<String, Object>) marker.details();
+        assertEquals("FIRST", details.get("prompt_preview"),
+                "first-wins dedup: first row's prompt_preview must survive");
+    }
+
+    @Test
+    void getActivity_duplicateSubagentFailed_lastWinsDedup() {
+        // Two rows with same (event_type, iteration, subtask) — last-wins for subagent_failed.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse first = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_failed",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.0", "reason", "timeout"),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        // Duplicate with updated reason (re-emit on resume)
+        TaskEventResponse last = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_failed",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.0", "reason", "error"),
+                OffsetDateTime.parse("2026-06-08T10:00:01+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(first, last));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        assertEquals(1, events.size(),
+                "Duplicate subagent_failed rows with same (event_type, iteration, subtask) must deduplicate to 1");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> details = (Map<String, Object>) events.get(0).details();
+        assertEquals("error", details.get("reason"),
+                "last-wins dedup: last row's reason must survive");
+    }
+
+    @Test
+    void getActivity_supervisorIterationDuplicate_lastWinsDedup() {
+        // supervisor_iteration also uses last-wins dedup.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse first = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "supervisor_iteration",
+                null, null, "w", null, null,
+                Map.of("iteration", 2, "subtasks_emitted", 2, "decision", "continue", "reason", "old"),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        TaskEventResponse last = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "supervisor_iteration",
+                null, null, "w", null, null,
+                Map.of("iteration", 2, "subtasks_emitted", 2, "decision", "stop", "reason", "updated"),
+                OffsetDateTime.parse("2026-06-08T10:00:01+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(first, last));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        assertEquals(1, events.size(),
+                "Duplicate supervisor_iteration rows must deduplicate to 1");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> details = (Map<String, Object>) events.get(0).details();
+        assertEquals("stop", details.get("decision"),
+                "last-wins dedup: last row's decision must survive");
+        assertEquals("updated", details.get("reason"));
+    }
+
+    // --- Regression: existing markers project unchanged ---
+
+    @Test
+    void getActivity_existingMarkers_projectUnchangedWithNullIterationSubtask() {
+        // Verifies that the two new iteration/subtask fields are absent (null)
+        // on pre-existing marker kinds — serialise byte-identically.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse compaction = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "task_compaction_fired",
+                null, null, "w", null, null,
+                Map.of("summary_text", "prior turns summarised", "tokens_in", 800),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        TaskEventResponse hitl = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "task_paused",
+                "running", "paused", "w", null, null,
+                Map.of("reason", "tool_requires_approval"),
+                OffsetDateTime.parse("2026-06-08T10:01:00+00:00"));
+        TaskEventResponse lifecycle = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "task_completed",
+                "running", "completed", "w", null, null,
+                Map.of(),
+                OffsetDateTime.parse("2026-06-08T10:02:00+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(compaction, hitl, lifecycle));
+
+        List<ActivityEventResponse> all = service.getActivity(taskId, true).events();
+        assertEquals(3, all.size());
+
+        ActivityEventResponse comp = all.stream()
+                .filter(e -> "marker.compaction_fired".equals(e.kind())).findFirst().orElseThrow();
+        assertNull(comp.iteration(), "iteration must be null on marker.compaction_fired");
+        assertNull(comp.subtask(), "subtask must be null on marker.compaction_fired");
+        assertEquals("prior turns summarised", comp.summaryText());
+
+        ActivityEventResponse hitlMarker = all.stream()
+                .filter(e -> "marker.hitl.paused".equals(e.kind())).findFirst().orElseThrow();
+        assertNull(hitlMarker.iteration(), "iteration must be null on marker.hitl.paused");
+        assertNull(hitlMarker.subtask(), "subtask must be null on marker.hitl.paused");
+
+        ActivityEventResponse lc = all.stream()
+                .filter(e -> "marker.lifecycle".equals(e.kind())).findFirst().orElseThrow();
+        assertNull(lc.iteration(), "iteration must be null on marker.lifecycle");
+        assertNull(lc.subtask(), "subtask must be null on marker.lifecycle");
+    }
+
+    // --- Unknown event_type is dropped (forward-compat) ---
+
+    @Test
+    void getActivity_unknownEventType_isDroppedNotErrored() {
+        // A row written by a newer worker with an event_type the API doesn't know
+        // must be silently dropped — not throw an exception.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+        // markerRows is non-empty (the unknown event row), so 404 path is not reached
+        // — no findByIdAndTenant stub needed.
+
+        TaskEventResponse unknown = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "future_event_type_unknown_to_this_api",
+                null, null, "w", null, null,
+                Map.of("some_key", "some_value"),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(unknown));
+
+        // Must return empty events list — no exception thrown
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        assertTrue(events.isEmpty(),
+                "Unknown event_type must be silently dropped, not errored");
+    }
 }

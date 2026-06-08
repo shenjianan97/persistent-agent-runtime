@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -66,7 +67,43 @@ public class ActivityProjectionService {
             // Issue #102 follow-up — surface successful memory commits as a
             // user-meaningful timeline event so customers see when persistent
             // memory was actually written for the task.
-            "marker.memory_written"
+            "marker.memory_written",
+            // S9 sub-agent fan-out observability — user-meaningful research progress:
+            //   marker.subagent.finding    — a sub-agent emitted a structured finding
+            //   marker.subagent.failed     — a sub-agent failed (customer sees failure)
+            //   marker.supervisor.iteration — supervisor closed a round (progress / stop)
+            // Excluded: marker.subagent.started — lifecycle telemetry, detail-only
+            "marker.subagent.finding",
+            "marker.subagent.failed",
+            "marker.supervisor.iteration"
+    );
+
+    /**
+     * Dedup key for sub-agent fan-out markers (at-least-once contract).
+     *
+     * <p>The worker emits these events at-least-once — a crashed-and-resumed
+     * inner step re-emits the same event on recovery, producing duplicate rows
+     * in {@code task_events}. The dedup key is {@code (event_type, iteration,
+     * subtask)} — the same triple the worker puts in the {@code details} JSONB.
+     *
+     * <p>Resolution policy per kind:
+     * <ul>
+     *   <li>{@code subagent_started} — first-wins (first row is authoritative)</li>
+     *   <li>{@code subagent_finding}, {@code subagent_failed},
+     *       {@code supervisor_iteration} — last-wins (final row has the
+     *       most-recent result/reason)</li>
+     * </ul>
+     */
+    private record SubagentDedupKey(String eventType, Integer iteration, String subtask) {}
+
+    /** Event types for which duplicates use last-wins dedup (most recent wins). */
+    private static final Set<String> SUBAGENT_LAST_WINS = Set.of(
+            "subagent_finding", "subagent_failed", "supervisor_iteration"
+    );
+
+    /** Event types subject to at-least-once dedup (includes first-wins types too). */
+    private static final Set<String> SUBAGENT_DEDUP_TYPES = Set.of(
+            "subagent_started", "subagent_finding", "subagent_failed", "supervisor_iteration"
     );
 
     private final TaskRepository taskRepository;
@@ -119,6 +156,23 @@ public class ActivityProjectionService {
             events.addAll(extractTurns(payload, checkpointCreatedAt, attribution));
         }
 
+        // At-least-once dedup for sub-agent fan-out markers (S9).
+        //
+        // The worker emits subagent_* / supervisor_iteration at-least-once:
+        // a crashed-and-resumed inner step re-emits its events on recovery,
+        // producing duplicate rows. We dedup by (event_type, iteration, subtask)
+        // using insertion-ordered maps so the final list preserves first-seen
+        // ordering. markerRows arrives in created_at ASC order from the DB.
+        //
+        // Resolution policy: first-wins for subagent_started (authoritative
+        // dispatch info); last-wins for subagent_finding / subagent_failed /
+        // supervisor_iteration (most-recent result/reason wins).
+        //
+        // Non-sub-agent markers are not subject to this dedup and flow through
+        // unchanged (they already have unique event ids from the DB).
+        Map<SubagentDedupKey, ActivityEventResponse> dedupMap = new LinkedHashMap<>();
+        List<ActivityEventResponse> nonDedupMarkers = new ArrayList<>();
+
         for (TaskEventResponse marker : markerRows) {
             ActivityEventResponse mapped = mapMarker(marker);
             if (mapped == null) {
@@ -127,8 +181,23 @@ public class ActivityProjectionService {
             if (!includeDetails && !USER_VISIBLE_MARKERS.contains(mapped.kind())) {
                 continue;
             }
-            events.add(mapped);
+            if (SUBAGENT_DEDUP_TYPES.contains(marker.eventType()) && mapped.iteration() != null) {
+                SubagentDedupKey key = new SubagentDedupKey(
+                        marker.eventType(), mapped.iteration(), mapped.subtask());
+                if (SUBAGENT_LAST_WINS.contains(marker.eventType())) {
+                    // last-wins: overwrite any prior entry
+                    dedupMap.put(key, mapped);
+                } else {
+                    // first-wins: only insert if key not yet seen
+                    dedupMap.putIfAbsent(key, mapped);
+                }
+            } else {
+                nonDedupMarkers.add(mapped);
+            }
         }
+
+        events.addAll(nonDedupMarkers);
+        events.addAll(dedupMap.values());
 
         // Stable sort by timestamp. Turn timestamps fall back to the
         // containing checkpoint's created_at when emitted_at is absent —
@@ -306,7 +375,8 @@ public class ActivityProjectionService {
                         null, null, null, null,
                         null, null, null, null, null,
                         null, null,
-                        workerId, null));
+                        workerId, null,
+                        null, null));
                 case "ai" -> turns.add(buildAssistantTurn(
                         kwargs, timestamp, attribution.costByAiMessageId(), workerId));
                 case "tool" -> turns.add(new ActivityEventResponse(
@@ -321,7 +391,8 @@ public class ActivityProjectionService {
                         null, null, null, null, null,
                         null, null,
                         workerId,
-                        readOrigBytes(kwargs)));
+                        readOrigBytes(kwargs),
+                        null, null));
                 case "system" -> {
                     // SystemMessages in state["messages"] are platform
                     // directives the worker put there intentionally
@@ -336,6 +407,7 @@ public class ActivityProjectionService {
                             MessageContentExtractor.extractText(kwargs.get("content")),
                             null, null, null, null,
                             "system_note", null, null, null, null,
+                            null, null,
                             null, null,
                             null, null));
                 }
@@ -387,7 +459,8 @@ public class ActivityProjectionService {
                 usage,
                 cost,
                 workerId,
-                null);
+                null,
+                null, null);
     }
 
     /**
@@ -444,6 +517,7 @@ public class ActivityProjectionService {
     // Marker mapping from task_events
     // ---------------------------------------------------------------------
 
+    @SuppressWarnings("unchecked")
     private ActivityEventResponse mapMarker(TaskEventResponse event) {
         String type = event.eventType();
         if (type == null) {
@@ -468,6 +542,17 @@ public class ActivityProjectionService {
                  "task_reclaimed_after_lease_expiry", "task_dead_lettered",
                  "task_redriven", "task_completed", "task_cancelled",
                  "task_follow_up" -> "marker.lifecycle";
+            // S9 sub-agent fan-out observability markers.
+            // These carry iteration (round, 0-based) and subtask (stable logical
+            // id) from the details JSONB so the Console can group by round then
+            // sub-agent. Marker skeleton only — sub-agent turn-by-turn reasoning
+            // lives in Langfuse spans (E5, plan §A11-E5).
+            case "subagent_started" -> "marker.subagent.started";
+            case "subagent_finding" -> "marker.subagent.finding";
+            case "subagent_failed" -> "marker.subagent.failed";
+            case "supervisor_iteration" -> "marker.supervisor.iteration";
+            // Forward-compat: unknown event_type written by a newer worker
+            // against an older API is silently dropped (not errored).
             default -> null;
         };
         if (kind == null) {
@@ -480,6 +565,25 @@ public class ActivityProjectionService {
                 summaryText = st.toString();
             }
         }
+
+        // Lift iteration / subtask out of details for the sub-agent marker kinds.
+        // Guard for missing keys and non-Number iteration, mirroring the summaryText
+        // guard pattern above. subtask is present on subagent_* but not on
+        // supervisor_iteration (which has no per-sub-agent scope).
+        Integer iteration = null;
+        String subtask = null;
+        if (SUBAGENT_DEDUP_TYPES.contains(type) && event.details() instanceof Map<?, ?> detailsMap) {
+            Map<String, Object> details = (Map<String, Object>) detailsMap;
+            Object iterObj = details.get("iteration");
+            if (iterObj instanceof Number n) {
+                iteration = n.intValue();
+            }
+            Object subtaskObj = details.get("subtask");
+            if (subtaskObj != null) {
+                subtask = subtaskObj.toString();
+            }
+        }
+
         return new ActivityEventResponse(
                 kind,
                 event.createdAt(),
@@ -492,7 +596,9 @@ public class ActivityProjectionService {
                 null,
                 null,
                 null,
-                null);
+                null,
+                iteration,
+                subtask);
     }
 
     /**
