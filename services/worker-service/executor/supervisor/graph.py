@@ -151,9 +151,27 @@ def _fanout_edge_factory(writer_node_name: str | None):
     parsed ``subtasks`` and ``Send``s each (in parallel, in one super-step) to
     the per-subtask fan-out node — Pattern A (one ``thread_id`` / one task / one
     checkpoint stream). Each ``Send`` carries the subtask's stable ``subtask`` id
-    + ``prompt`` (the fan-out node reads ``ceiling`` / ``depth`` / model /
-    checkpointer from the injected config — they are graph-build constants, not
-    per-branch payload).
+    + ``prompt`` + the **live current ``iteration``** (the fan-out node reads
+    ``ceiling`` / ``depth`` / model / checkpointer from the injected config —
+    they are graph-build constants, not per-branch payload).
+
+    Why ``iteration`` rides the ``Send`` payload (not the injected config): the
+    fan-out node is a ``Send`` target, so it only receives the payload — never the
+    full ``SupervisorState`` — and cannot read the live ``state["iteration"]``
+    itself. The static ``config['configurable']['iteration']`` is injected ONCE at
+    ``execute_task`` time and never advances per round, so reading it there stamped
+    every round's ``marker.subagent.*`` event with ``iteration=0`` and collapsed
+    the Console sub-agent tree into "Round 0". This edge DOES have the live
+    ``state`` (``supervisor_node`` minted/incremented ``state["iteration"]`` on the
+    same super-step), so the CURRENT round travels with each branch. Live state —
+    NOT the ``"<iteration>.<index>"`` subtask id — is authoritative: a re-dispatched
+    subtask carries its ORIGINAL id forward (cross-round linkage), so parsing the
+    id would yield the original round, not the current one. Putting ``iteration``
+    in the payload is benign for the ``_max_reducer`` channel: the payload is the
+    fan-out branch's INPUT state only — ``_fanout_node`` reads it and never returns
+    ``iteration`` on its output, so no branch writes the channel. The authoritative
+    channel value remains the one ``supervisor_node`` set before fan-out (verified
+    against ``langgraph==1.0.5``).
 
     On ``stop`` (or an empty subtask list — a degenerate ``continue`` that
     decomposed to nothing) it routes straight to the Writer / ``END`` so the
@@ -166,8 +184,16 @@ def _fanout_edge_factory(writer_node_name: str | None):
         decision = state.get("supervisor_decision", DECISION_STOP)
         if decision != DECISION_CONTINUE or not subtasks:
             return stop_target
+        iteration = state.get("iteration", 0)
         return [
-            Send(FANOUT_NODE_NAME, {"subtask": s["subtask"], "prompt": s["prompt"]})
+            Send(
+                FANOUT_NODE_NAME,
+                {
+                    "subtask": s["subtask"],
+                    "prompt": s["prompt"],
+                    "iteration": iteration,
+                },
+            )
             for s in subtasks
         ]
 
@@ -223,7 +249,15 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
     # This is an observability addition ONLY — it does NOT change the fan-out
     # logic, reducer, or super-step structure. At-least-once: a resumed branch
     # re-emits; consumers dedup on (event_type, iteration, subtask).
-    iteration = int(configurable.get("iteration", 0) or 0)
+    #
+    # iteration is read from the ``Send`` payload (``state``) — the LIVE current
+    # round ``_fanout_edge`` put there from ``state["iteration"]``. It is NOT read
+    # from ``config['configurable']['iteration']`` (injected ONCE at execute_task
+    # time and never advanced per round — that stamped every round's markers with 0
+    # and collapsed S10's Console tree into "Round 0"). NOT parsed from the subtask
+    # id either: a re-dispatched subtask carries its original-round id forward, so
+    # the id's round is the FIRST attempt, not the current one.
+    iteration = int(state.get("iteration", 0) or 0)
     emit = deps.get("emit")
     tool_names = [getattr(t, "name", str(t)) for t in deps.get("tools", [])]
     await emit_subagent_started(

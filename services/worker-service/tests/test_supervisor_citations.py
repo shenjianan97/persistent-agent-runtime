@@ -400,10 +400,14 @@ async def test_fanout_node_routes_findings_into_state(monkeypatch):
         "configurable": {
             "supervisor_fanout_deps": deps,
             "thread_id": "t",
-            "iteration": 2,
         }
     }
-    out = await sgraph._fanout_node({"subtask": "2.0", "prompt": "find things"}, config)
+    # iteration rides the Send payload (the live current round ``_fanout_edge`` puts
+    # there from ``state["iteration"]``), NOT config['configurable'] (which is the
+    # once-injected, never-advanced value that caused the round-0 grouping defect).
+    out = await sgraph._fanout_node(
+        {"subtask": "2.0", "prompt": "find things", "iteration": 2}, config
+    )
 
     # subagent_results marker still written (S6 contract intact).
     assert out["subagent_results"]["2.0"]["ok"] is True
