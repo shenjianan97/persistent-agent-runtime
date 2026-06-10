@@ -24,6 +24,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
@@ -884,6 +885,52 @@ class ActivityProjectionServiceTest {
     }
 
     @Test
+    void getActivity_distinctFindingsFromOneSubagent_allSurviveDedup() {
+        // Regression for task 03c4195e: one sub-agent emitted 16 DISTINCT
+        // findings but the (event_type, iteration, subtask) dedup key
+        // collapsed them last-wins to a single row in the Console. Distinct
+        // finding_ids must all survive; only true re-emits (same finding_id)
+        // deduplicate.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse findingA = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_finding",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.3",
+                        "finding_id", "1.3-aaaa1111", "source_url", "https://e.com/a"),
+                OffsetDateTime.parse("2026-06-09T10:00:00+00:00"));
+        TaskEventResponse findingB = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_finding",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.3",
+                        "finding_id", "1.3-bbbb2222", "source_url", "https://e.com/b"),
+                OffsetDateTime.parse("2026-06-09T10:00:01+00:00"));
+        // True at-least-once duplicate of finding A (crash-resume re-emit).
+        TaskEventResponse findingADup = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_finding",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.3",
+                        "finding_id", "1.3-aaaa1111", "source_url", "https://e.com/a"),
+                OffsetDateTime.parse("2026-06-09T10:00:02+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(findingA, findingB, findingADup));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        List<Object> findingIds = events.stream()
+                .filter(e -> "marker.subagent.finding".equals(e.kind()))
+                .<Object>map(e -> ((Map<?, ?>) e.details()).get("finding_id"))
+                .toList();
+        // Exactly once each (order follows last-wins timestamps, not emit order).
+        assertEquals(2, findingIds.size(),
+                "distinct findings must all project; only same-finding_id re-emits dedupe");
+        assertEquals(Set.of("1.3-aaaa1111", "1.3-bbbb2222"), Set.copyOf(findingIds));
+    }
+
+    @Test
     void getActivity_duplicateSubagentFailed_lastWinsDedup() {
         // Two rows with same (event_type, iteration, subtask) — last-wins for subagent_failed.
         UUID taskId = UUID.randomUUID();
@@ -1022,5 +1069,304 @@ class ActivityProjectionServiceTest {
         List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
         assertTrue(events.isEmpty(),
                 "Unknown event_type must be silently dropped, not errored");
+    }
+
+    // --- Supervisor topology: report channel → terminal assistant turn ---
+
+    @Test
+    void getActivity_supervisorReportChannel_becomesTerminalAssistantTurn() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // Supervisor root checkpoint: messages carries ONLY the task input;
+        // the Writer's deliverable lives in the report channel.
+        String payload = """
+                {"channel_values":{
+                   "messages":[
+                     {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                      "kwargs":{"type":"human","id":"m-input","content":"research X"}}
+                   ],
+                   "report":"## Report\\n\\nFindings with citations."
+                 }}
+                """;
+        Timestamp created = Timestamp.from(Instant.parse("2026-06-09T20:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+
+        assertEquals(2, events.size());
+        assertEquals("turn.user", events.get(0).kind());
+        ActivityEventResponse report = events.get(1);
+        assertEquals("turn.assistant", report.kind());
+        assertEquals("## Report\n\nFindings with citations.", report.content());
+        assertNull(report.subtask(), "the report is the MAIN agent's turn, not a sub-agent's");
+    }
+
+    @Test
+    void getActivity_blankOrAbsentReport_addsNoTerminalTurn() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String payload = """
+                {"channel_values":{
+                   "messages":[
+                     {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                      "kwargs":{"type":"human","id":"m-input","content":"hi"}}
+                   ],
+                   "report":"   "
+                 }}
+                """;
+        Timestamp created = Timestamp.from(Instant.parse("2026-06-09T20:00:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_1",
+                "checkpoint_payload", payload,
+                "created_at", created)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertEquals("turn.user", events.get(0).kind());
+    }
+
+    // --- Sub-agent transcripts: subagent:* namespaces → subtask-tagged turns ---
+
+    @Test
+    void getActivity_subagentNamespaces_projectTranscriptTurnsTaggedWithSubtask() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        String rootPayload = """
+                {"channel_values":{"messages":[
+                   {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                    "kwargs":{"type":"human","id":"m-input","content":"research X"}}
+                 ]}}
+                """;
+        Timestamp rootCreated = Timestamp.from(Instant.parse("2026-06-09T20:10:00Z"));
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.of(Map.of(
+                "checkpoint_id", "ckpt_root",
+                "checkpoint_payload", rootPayload,
+                "created_at", rootCreated)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        // Sub-agent transcript: the worker seeds the stable subtask id into the
+        // sub-checkpoint state (subtask channel). Tool turn included to prove
+        // the full turn taxonomy survives the sub-channel path.
+        String subPayload = """
+                {"channel_values":{
+                   "subtask":"1.0",
+                   "sub_messages":[
+                     {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                      "kwargs":{"type":"human","id":"s-prompt","content":"focused sub-task"}},
+                     {"lc":1,"type":"constructor","id":["_","AIMessage"],
+                      "kwargs":{"type":"ai","id":"s-ai-1","content":"searching",
+                                "tool_calls":[{"id":"c1","name":"web_search","args":{"q":"x"}}]}},
+                     {"lc":1,"type":"constructor","id":["_","ToolMessage"],
+                      "kwargs":{"type":"tool","id":"s-tool-1","content":"results","name":"web_search",
+                                "tool_call_id":"c1","status":"success"}},
+                     {"lc":1,"type":"constructor","id":["_","AIMessage"],
+                      "kwargs":{"type":"ai","id":"s-ai-2","content":"final findings"}}
+                   ]
+                 }}
+                """;
+        Timestamp subCreated = Timestamp.from(Instant.parse("2026-06-09T20:05:00Z"));
+        when(taskRepository.getSubagentCheckpoints(taskId, tenantId)).thenReturn(List.of(
+                Map.of(
+                        "checkpoint_ns", "subagent:467974c0-aa97-deba-a4f5-79886cd44660",
+                        "checkpoint_id", "ckpt_sub_1",
+                        "checkpoint_payload", subPayload,
+                        "created_at", subCreated)));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+
+        List<ActivityEventResponse> subTurns = events.stream()
+                .filter(e -> "1.0".equals(e.subtask()))
+                .toList();
+        assertEquals(4, subTurns.size(), "all four sub-agent messages project as turns");
+        assertEquals("turn.user", subTurns.get(0).kind());
+        assertEquals("turn.assistant", subTurns.get(1).kind());
+        assertEquals("web_search", subTurns.get(1).toolCalls().get(0).name());
+        assertEquals("turn.tool", subTurns.get(2).kind());
+        assertEquals("turn.assistant", subTurns.get(3).kind());
+        assertEquals("final findings", subTurns.get(3).content());
+
+        // The root input turn stays untagged.
+        ActivityEventResponse rootTurn = events.stream()
+                .filter(e -> "turn.user".equals(e.kind()) && e.subtask() == null)
+                .findFirst().orElseThrow();
+        assertEquals("research X", rootTurn.content());
+    }
+
+    @Test
+    void getActivity_historicSubagentCheckpoint_correlatesViaStartedMarkerPromptPreview() {
+        // Historic checkpoints (written before the worker seeded the subtask
+        // channel) must still merge into the marker tree: the subagent_started
+        // marker's prompt_preview is a verbatim prefix of the raw sub-task
+        // prompt, which the transcript's first HumanMessage embeds.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // markerRows is non-empty, so the missing-checkpoint 404 path (which
+        // would consult findByIdAndTenant) is never reached — don't stub it.
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse started = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0",
+                        "prompt_preview", "Identify the top 5 major political events"),
+                OffsetDateTime.parse("2026-06-09T20:00:00+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(started));
+
+        String subPayload = """
+                {"channel_values":{
+                   "sub_messages":[
+                     {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                      "kwargs":{"type":"human","id":"s-p","content":"You are a focused research sub-agent.\\n\\nSub-task:\\nIdentify the top 5 major political events of the past month."}},
+                     {"lc":1,"type":"constructor","id":["_","AIMessage"],
+                      "kwargs":{"type":"ai","id":"s-a","content":"findings"}}
+                   ]
+                 }}
+                """;
+        when(taskRepository.getSubagentCheckpoints(taskId, tenantId)).thenReturn(List.of(
+                Map.of("checkpoint_ns", "subagent:467974c0-aa97-deba",
+                        "checkpoint_id", "c1",
+                        "checkpoint_payload", subPayload,
+                        "created_at", Timestamp.from(Instant.parse("2026-06-09T20:05:00Z")))));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        List<ActivityEventResponse> turns = events.stream()
+                .filter(e -> e.kind().startsWith("turn.")).toList();
+        assertEquals(2, turns.size());
+        for (ActivityEventResponse turn : turns) {
+            assertEquals("1.0", turn.subtask(),
+                    "historic transcript must merge into the marker group via prompt_preview");
+        }
+    }
+
+    @Test
+    void getActivity_ambiguousPromptPreviews_fallBackToNamespaceLabel() {
+        // Two subtasks sharing the same preview prefix → correlation is
+        // ambiguous; keep the namespace fallback rather than guessing.
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        // markerRows is non-empty → 404 path unreachable; no findByIdAndTenant stub.
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse s1 = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0", "prompt_preview", "Research the topic"),
+                OffsetDateTime.parse("2026-06-09T20:00:00+00:00"));
+        TaskEventResponse s2 = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_started",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.1", "prompt_preview", "Research the topic"),
+                OffsetDateTime.parse("2026-06-09T20:00:01+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(s1, s2));
+
+        String subPayload = """
+                {"channel_values":{
+                   "sub_messages":[
+                     {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                      "kwargs":{"type":"human","id":"s-p","content":"Sub-task:\\nResearch the topic in depth."}}
+                   ]
+                 }}
+                """;
+        when(taskRepository.getSubagentCheckpoints(taskId, tenantId)).thenReturn(List.of(
+                Map.of("checkpoint_ns", "subagent:aaa-bbb",
+                        "checkpoint_id", "c1",
+                        "checkpoint_payload", subPayload,
+                        "created_at", Timestamp.from(Instant.parse("2026-06-09T20:05:00Z")))));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        ActivityEventResponse turn = events.stream()
+                .filter(e -> e.kind().startsWith("turn.")).findFirst().orElseThrow();
+        assertEquals("sub-aaa", turn.subtask());
+    }
+
+    @Test
+    void getActivity_historicSubagentCheckpointWithoutSubtask_fallsBackToNamespaceLabel() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+        when(taskRepository.findByIdAndTenant(taskId, tenantId))
+                .thenReturn(Optional.of(Map.of("task_id", taskId)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        String subPayload = """
+                {"channel_values":{
+                   "sub_messages":[
+                     {"lc":1,"type":"constructor","id":["_","AIMessage"],
+                      "kwargs":{"type":"ai","id":"s-ai","content":"historic turn"}}
+                   ]
+                 }}
+                """;
+        Timestamp subCreated = Timestamp.from(Instant.parse("2026-06-09T20:05:00Z"));
+        when(taskRepository.getSubagentCheckpoints(taskId, tenantId)).thenReturn(List.of(
+                Map.of(
+                        "checkpoint_ns", "subagent:467974c0-aa97-deba-a4f5-79886cd44660",
+                        "checkpoint_id", "ckpt_sub_1",
+                        "checkpoint_payload", subPayload,
+                        "created_at", subCreated)));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+        assertEquals(1, events.size());
+        assertEquals("turn.assistant", events.get(0).kind());
+        assertEquals("sub-467974c0", events.get(0).subtask(),
+                "pre-seed checkpoints get a namespace-derived fallback id");
+    }
+
+    @Test
+    void getActivity_multipleCheckpointsPerNamespace_projectsLatestTranscriptOnce() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+        when(taskRepository.findByIdAndTenant(taskId, tenantId))
+                .thenReturn(Optional.of(Map.of("task_id", taskId)));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt())).thenReturn(List.of());
+
+        String early = """
+                {"channel_values":{"subtask":"1.1","sub_messages":[
+                   {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                    "kwargs":{"type":"human","id":"s-p","content":"prompt"}}
+                 ]}}
+                """;
+        String late = """
+                {"channel_values":{"subtask":"1.1","sub_messages":[
+                   {"lc":1,"type":"constructor","id":["_","HumanMessage"],
+                    "kwargs":{"type":"human","id":"s-p","content":"prompt"}},
+                   {"lc":1,"type":"constructor","id":["_","AIMessage"],
+                    "kwargs":{"type":"ai","id":"s-a","content":"answer"}}
+                 ]}}
+                """;
+        when(taskRepository.getSubagentCheckpoints(taskId, tenantId)).thenReturn(List.of(
+                Map.of("checkpoint_ns", "subagent:aaa-bbb", "checkpoint_id", "c1",
+                        "checkpoint_payload", early,
+                        "created_at", Timestamp.from(Instant.parse("2026-06-09T20:01:00Z"))),
+                Map.of("checkpoint_ns", "subagent:aaa-bbb", "checkpoint_id", "c2",
+                        "checkpoint_payload", late,
+                        "created_at", Timestamp.from(Instant.parse("2026-06-09T20:02:00Z")))));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, false).events();
+
+        // Latest transcript only — two turns, not three (no duplicate prompt).
+        assertEquals(2, events.size());
+        assertEquals("turn.user", events.get(0).kind());
+        // First-seen attribution: the prompt's timestamp comes from the EARLY
+        // checkpoint even though the transcript is read from the latest.
+        assertEquals(OffsetDateTime.of(2026, 6, 9, 20, 1, 0, 0, ZoneOffset.UTC),
+                events.get(0).timestamp());
+        assertEquals("turn.assistant", events.get(1).kind());
+        assertEquals(OffsetDateTime.of(2026, 6, 9, 20, 2, 0, 0, ZoneOffset.UTC),
+                events.get(1).timestamp());
     }
 }

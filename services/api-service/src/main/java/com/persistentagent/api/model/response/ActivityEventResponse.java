@@ -72,8 +72,11 @@ public record ActivityEventResponse(
         @JsonProperty("orig_bytes") Long origBytes,
         // Sub-agent fan-out observability (S9): iteration round (1-based; supervisor_iteration
         // cap/no-op events may carry 0) and
-        // stable logical sub-agent id. Present only on marker.subagent.* and
-        // marker.supervisor.iteration kinds; null on all other kinds.
+        // stable logical sub-agent id. iteration is present only on
+        // marker.subagent.* / marker.supervisor.iteration kinds. subtask is
+        // additionally set on turn.* events projected from a sub-agent's
+        // checkpointed transcript (subagent:* namespaces) so the Console can
+        // nest those turns under the matching sub-agent group. Null elsewhere.
         // @JsonInclude(NON_NULL) on the record ensures existing kinds serialise
         // byte-identically (these fields are absent, not null-valued in JSON).
         @JsonProperty("iteration") Integer iteration,

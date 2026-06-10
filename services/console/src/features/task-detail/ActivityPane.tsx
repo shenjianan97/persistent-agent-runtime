@@ -119,9 +119,9 @@ function isHitlResume(kind: string): boolean {
 
 // Agent Modes — Supervisor Topology (S9). The four fan-out markers the server
 // projects from `task_events`. They render as an expandable tree grouped
-// round → sub-agent → step (NOT as flat rows). Marker SKELETON only — the
-// leaves are markers (finding / failure / dispatch), never a full sub-agent
-// transcript (those live in Langfuse — E5).
+// round → sub-agent → step (NOT as flat rows). Each sub-agent group also
+// nests its full checkpointed transcript — `turn.*` events tagged with the
+// group's `subtask` id, projected from the `subagent:*` namespaces.
 function isSubagentMarker(kind: string): boolean {
     return (
         kind === 'marker.supervisor.iteration' ||
@@ -884,9 +884,10 @@ function HitlResumeMarkerRow({ event, index }: RowProps) {
 
 // ─── Sub-agent fan-out tree (S9) ───────────────────────────────────
 //
-// The server projects four flat markers; the Console groups them client-side
-// into round → sub-agent → step. Marker SKELETON only — the leaves are
-// dispatch / finding / failure markers, NOT a sub-agent conversation (E5).
+// The server projects four flat markers plus, per sub-agent, the full
+// checkpointed transcript as `turn.*` events tagged with the sub-agent's
+// `subtask` id. The Console groups both client-side into
+// round → sub-agent → (steps + collapsible transcript).
 
 interface SubagentStep {
     event: ActivityEvent;
@@ -896,7 +897,13 @@ interface SubagentStep {
 interface SubagentGroup {
     subtask: string;
     steps: SubagentStep[];
+    // The sub-agent's own conversation turns (turn.user / turn.assistant /
+    // turn.tool tagged with this subtask), collapsed by default.
+    transcript: SubagentStep[];
     status: 'found' | 'failed' | 'running';
+    // True when at least one S9 marker contributed — transcript-only groups
+    // (historic tasks lacking marker correlation) suppress the status chip.
+    hasMarkers: boolean;
     // Earlier round in which this same subtask id failed (retry linkage).
     retriedFromRound: number | null;
 }
@@ -908,22 +915,58 @@ interface RoundGroup {
 }
 
 /**
+ * Round a transcript turn belongs to. Turns carry no `iteration`; the
+ * Supervisor's deterministic subtask ids are "<iteration>.<index>", so the
+ * prefix recovers the round. Historic fallback ids (`sub-xxxx`, minted by the
+ * server for pre-seed checkpoints) land in round 0, which the tree labels
+ * "Sub-agents" instead of "Round 0".
+ */
+function transcriptIteration(subtask: string): number {
+    const match = /^(\d+)\./.exec(subtask);
+    return match ? Number(match[1]) : 0;
+}
+
+/**
  * Partition the sub-agent markers (already filtered to `isSubagentMarker`)
- * into round → sub-agent groups, preserving stream order. Retry linkage: a
+ * and transcript turns (turn.* tagged with a `subtask`) into
+ * round → sub-agent groups, preserving stream order. Retry linkage: a
  * subtask id that carries a `failed` marker in an earlier round is flagged on
  * its later-round group so the UI reads "subtask X · retried from round M".
  */
-function buildSubagentTree(items: SubagentStep[]): RoundGroup[] {
+function buildSubagentTree(
+    items: SubagentStep[],
+    transcriptTurns: SubagentStep[],
+): RoundGroup[] {
     const rounds = new Map<number, RoundGroup>();
     const roundOrder: number[] = [];
 
-    for (const item of items) {
-        const iteration = item.event.iteration ?? 0;
+    const ensureRound = (iteration: number): RoundGroup => {
         if (!rounds.has(iteration)) {
             rounds.set(iteration, { iteration, iterationEvent: null, subagents: [] });
             roundOrder.push(iteration);
         }
-        const round = rounds.get(iteration)!;
+        return rounds.get(iteration)!;
+    };
+
+    const ensureGroup = (round: RoundGroup, subtask: string): SubagentGroup => {
+        let group = round.subagents.find((g) => g.subtask === subtask);
+        if (!group) {
+            group = {
+                subtask,
+                steps: [],
+                transcript: [],
+                status: 'running',
+                hasMarkers: false,
+                retriedFromRound: null,
+            };
+            round.subagents.push(group);
+        }
+        return group;
+    };
+
+    for (const item of items) {
+        const iteration = item.event.iteration ?? 0;
+        const round = ensureRound(iteration);
 
         if (item.event.kind === 'marker.supervisor.iteration') {
             round.iterationEvent = item.event;
@@ -931,17 +974,35 @@ function buildSubagentTree(items: SubagentStep[]): RoundGroup[] {
         }
 
         const subtask = item.event.subtask ?? '(unknown)';
-        let group = round.subagents.find((g) => g.subtask === subtask);
-        if (!group) {
-            group = { subtask, steps: [], status: 'running', retriedFromRound: null };
-            round.subagents.push(group);
-        }
+        const group = ensureGroup(round, subtask);
         group.steps.push(item);
+        group.hasMarkers = true;
         if (item.event.kind === 'marker.subagent.finding') {
             group.status = 'found';
         } else if (item.event.kind === 'marker.subagent.failed' && group.status !== 'found') {
             group.status = 'failed';
         }
+    }
+
+    // Attach each transcript turn to its sub-agent group. Prefer a group that
+    // already exists from the markers (any round — the transcript spans the
+    // sub-agent's whole life); otherwise create one in the id-derived round.
+    for (const turn of transcriptTurns) {
+        const subtask = turn.event.subtask ?? '(unknown)';
+        let group: SubagentGroup | null = null;
+        for (const iteration of roundOrder) {
+            const candidate = rounds
+                .get(iteration)!
+                .subagents.find((g) => g.subtask === subtask);
+            if (candidate) {
+                group = candidate;
+                break;
+            }
+        }
+        if (!group) {
+            group = ensureGroup(ensureRound(transcriptIteration(subtask)), subtask);
+        }
+        group.transcript.push(turn);
     }
 
     // Retry linkage: walk rounds in ascending iteration order; if a subtask id
@@ -997,8 +1058,24 @@ function SubagentStepRow({ event, index }: SubagentStep) {
         );
     } else if (event.kind === 'marker.subagent.failed') {
         const reason = (event.details?.reason as string | undefined) ?? 'failed';
+        // Human-readable cause (e.g. "ReadTimeoutError: …") carried by the
+        // worker since the marker-only "error" proved undiagnosable from the
+        // Console. Absent on historic rows.
+        const detail = (event.details?.detail as string | undefined) ?? null;
         icon = <AlertTriangle className="w-3 h-3 shrink-0 text-destructive" />;
-        line = <span className="flex-1 text-destructive">Failed — {reason}</span>;
+        line = (
+            <span className="flex-1 text-destructive">
+                Failed — {reason}
+                {detail && (
+                    <span
+                        data-testid={`activity-subagent-failed-detail-${event.subtask ?? 'unknown'}`}
+                        className="block text-destructive/80 font-normal break-words"
+                    >
+                        {detail}
+                    </span>
+                )}
+            </span>
+        );
     } else {
         // marker.subagent.started — dispatch marker (detail-only on the server,
         // visible here only when "Show details" is on). Skeleton: prompt preview.
@@ -1038,9 +1115,17 @@ function SubagentTree({ rounds }: { rounds: RoundGroup[] }) {
             {rounds.map((round) => {
                 const decision = (round.iterationEvent?.details?.decision as string | undefined) ?? null;
                 const emitted = (round.iterationEvent?.details?.subtasks_emitted as number | undefined) ?? null;
+                // Prefer the count of groups actually rendered: the round's
+                // supervisor.iteration marker is last-wins-deduped, so a
+                // closing "stop" decision (subtasks_emitted=0) would otherwise
+                // caption a round visibly full of sub-agents as "0 sub-agents".
+                const subagentCount = round.subagents.length > 0 ? round.subagents.length : emitted;
                 const summary = [
-                    `Round ${round.iteration}`,
-                    emitted != null ? `${emitted} sub-agent${emitted === 1 ? '' : 's'}` : null,
+                    // Round 0 holds transcript-only groups whose subtask id
+                    // carries no round (historic fallback ids) — "Round 0"
+                    // would be misleading there.
+                    round.iteration === 0 ? 'Sub-agents' : `Round ${round.iteration}`,
+                    subagentCount != null ? `${subagentCount} sub-agent${subagentCount === 1 ? '' : 's'}` : null,
                     decision ? `decision: ${decision}` : null,
                 ]
                     .filter(Boolean)
@@ -1082,12 +1167,14 @@ function SubagentTree({ rounds }: { rounds: RoundGroup[] }) {
                                                     <span className="font-mono normal-case tracking-normal">
                                                         Sub-agent {group.subtask}
                                                     </span>
-                                                    <span
-                                                        data-testid={`activity-subagent-${group.subtask}-status`}
-                                                        className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9px] normal-case tracking-normal border-current/40"
-                                                    >
-                                                        {statusChipLabel(group.status)}
-                                                    </span>
+                                                    {group.hasMarkers && (
+                                                        <span
+                                                            data-testid={`activity-subagent-${group.subtask}-status`}
+                                                            className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9px] normal-case tracking-normal border-current/40"
+                                                        >
+                                                            {statusChipLabel(group.status)}
+                                                        </span>
+                                                    )}
                                                     {group.retriedFromRound != null && (
                                                         <span
                                                             data-testid={`activity-subagent-${group.subtask}-retry`}
@@ -1107,6 +1194,37 @@ function SubagentTree({ rounds }: { rounds: RoundGroup[] }) {
                                                         index={step.index}
                                                     />
                                                 ))}
+                                                {group.transcript.length > 0 && (
+                                                    <li role="listitem" className="list-none pt-1">
+                                                        <Fold
+                                                            label={
+                                                                <span
+                                                                    data-testid={`activity-subagent-${group.subtask}-transcript-toggle`}
+                                                                >
+                                                                    Transcript ·{' '}
+                                                                    {group.transcript.length}{' '}
+                                                                    {group.transcript.length === 1
+                                                                        ? 'turn'
+                                                                        : 'turns'}
+                                                                </span>
+                                                            }
+                                                        >
+                                                            <ul
+                                                                role="list"
+                                                                data-testid={`activity-subagent-${group.subtask}-transcript`}
+                                                                className="space-y-3"
+                                                            >
+                                                                {group.transcript.map((turn) => (
+                                                                    <ActivityRow
+                                                                        key={turn.index}
+                                                                        event={turn.event}
+                                                                        index={turn.index}
+                                                                    />
+                                                                ))}
+                                                            </ul>
+                                                        </Fold>
+                                                    </li>
+                                                )}
                                             </ul>
                                         </Fold>
                                     </li>
@@ -1194,8 +1312,10 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     const visibleCount = events.length;
     const isEmpty = !query.isLoading && visibleCount === 0;
 
+    // Main-conversation turns only — sub-agent transcript turns (tagged with
+    // a `subtask`) are counted inside their tree groups, not here.
     const turnCount = useMemo(
-        () => events.reduce((n, e) => (isTurn(e.kind) ? n + 1 : n), 0),
+        () => events.reduce((n, e) => (isTurn(e.kind) && !e.subtask ? n + 1 : n), 0),
         [events],
     );
 
@@ -1225,25 +1345,43 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     }, [events]);
 
     // ─── Sub-agent fan-out tree (S9) ────────────────────────────────
-    // Collect the flat sub-agent / supervisor markers out of the stream and
-    // group them round → sub-agent → step. The tree renders once, at the
-    // position of the FIRST sub-agent marker; the rest are skipped in the flat
-    // render so they don't double-render as loose rows.
+    // Collect the flat sub-agent / supervisor markers AND the sub-agent
+    // transcript turns (turn.* tagged with a `subtask`) out of the stream and
+    // group them round → sub-agent → (steps + transcript). The tree renders
+    // once, at the position of the FIRST such event; the rest are skipped in
+    // the flat render so they don't double-render as loose rows.
     const subagentSteps = useMemo<SubagentStep[]>(() => {
         return events
             .map((event, index) => ({ event, index }))
             .filter(({ event }) => isSubagentMarker(event.kind));
     }, [events]);
 
+    const subagentTranscriptTurns = useMemo<SubagentStep[]>(() => {
+        return events
+            .map((event, index) => ({ event, index }))
+            .filter(({ event }) => isTurn(event.kind) && !!event.subtask);
+    }, [events]);
+
     const subagentTree = useMemo<RoundGroup[]>(
-        () => buildSubagentTree(subagentSteps),
-        [subagentSteps],
+        () => buildSubagentTree(subagentSteps, subagentTranscriptTurns),
+        [subagentSteps, subagentTranscriptTurns],
     );
 
-    const firstSubagentIndex = subagentSteps.length > 0 ? subagentSteps[0].index : -1;
+    const firstSubagentIndex = useMemo(() => {
+        const candidates = [
+            subagentSteps.length > 0 ? subagentSteps[0].index : -1,
+            subagentTranscriptTurns.length > 0 ? subagentTranscriptTurns[0].index : -1,
+        ].filter((i) => i >= 0);
+        return candidates.length > 0 ? Math.min(...candidates) : -1;
+    }, [subagentSteps, subagentTranscriptTurns]);
+
     const subagentIndexSet = useMemo<Set<number>>(
-        () => new Set(subagentSteps.map((s) => s.index)),
-        [subagentSteps],
+        () =>
+            new Set([
+                ...subagentSteps.map((s) => s.index),
+                ...subagentTranscriptTurns.map((s) => s.index),
+            ]),
+        [subagentSteps, subagentTranscriptTurns],
     );
 
     const handoffByIndex = useMemo<(string | null)[]>(() => {

@@ -504,8 +504,9 @@ export type ActivityEventKind =
     // Agent Modes — Supervisor Topology (S9). Sub-agent fan-out observability
     // markers projected from `task_events`. Carry `iteration` (1-based round)
     // and `subtask` (stable logical id, `"<iter>.<idx>"`) so the Console can
-    // group round → sub-agent → step. Marker SKELETON only — sub-agent
-    // turn-by-turn reasoning lives in Langfuse, not these rows (E5).
+    // group round → sub-agent → step. Sub-agent turn-by-turn transcripts are
+    // additionally projected from the `subagent:*` checkpoint namespaces as
+    // `turn.*` events tagged with the same `subtask` key.
     | 'marker.supervisor.iteration'
     | 'marker.subagent.started'
     | 'marker.subagent.finding'
@@ -553,6 +554,9 @@ export interface ActivityEvent {
     // server on `marker.subagent.*` / `marker.supervisor.iteration` kinds.
     // `iteration` is 1-based (cap/no-op supervisor.iteration events may carry 0);
     // `subtask` is present on subagent.* markers, null on supervisor.iteration.
+    // `subtask` is ALSO set on `turn.*` events projected from a sub-agent's
+    // checkpointed transcript, so those turns nest under the sub-agent group
+    // instead of rendering in the main conversation flow.
     iteration?: number | null;
     subtask?: string | null;
 }

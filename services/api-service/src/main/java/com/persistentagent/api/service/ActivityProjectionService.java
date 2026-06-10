@@ -94,7 +94,16 @@ public class ActivityProjectionService {
      *       most-recent result/reason)</li>
      * </ul>
      */
-    private record SubagentDedupKey(String eventType, Integer iteration, String subtask) {}
+    /**
+     * Dedup key for the at-least-once sub-agent markers. {@code findingId}
+     * discriminates {@code subagent_finding} rows: one sub-agent emits MANY
+     * distinct findings under the same (iteration, subtask), and only a true
+     * crash-resume re-emit (same finding_id) may collapse — without it a
+     * 16-finding sub-agent projected as a single last-wins row. Null for the
+     * other marker types.
+     */
+    private record SubagentDedupKey(
+            String eventType, Integer iteration, String subtask, String findingId) {}
 
     /** Event types for which duplicates use last-wins dedup (most recent wins). */
     private static final Set<String> SUBAGENT_LAST_WINS = Set.of(
@@ -154,7 +163,24 @@ public class ActivityProjectionService {
             }
             Object payload = row.get("checkpoint_payload");
             events.addAll(extractTurns(payload, checkpointCreatedAt, attribution));
+
+            // Supervisor topology: the Writer's deliverable lives in the
+            // ``report`` channel, not ``messages`` (which carries only the
+            // task input there) — surface it as the terminal assistant turn
+            // so the Activity stream ends with the agent's actual output.
+            ActivityEventResponse reportTurn = buildReportTurn(payload, checkpointCreatedAt);
+            if (reportTurn != null) {
+                events.add(reportTurn);
+            }
         }
+
+        // Sub-agent transcripts (fan-out topologies): each sub-agent's inner
+        // ReAct turns are checkpointed under its own ``subagent:*`` namespace.
+        // Project them as turn.* events tagged with the sub-agent's stable
+        // ``subtask`` id so the Console can nest them under the S9/S10 marker
+        // tree instead of pointing customers at Langfuse.
+        events.addAll(extractSubagentTurns(
+                taskId, tenantId, startedPreviewBySubtask(markerRows)));
 
         // At-least-once dedup for sub-agent fan-out markers (S9).
         //
@@ -182,8 +208,17 @@ public class ActivityProjectionService {
                 continue;
             }
             if (SUBAGENT_DEDUP_TYPES.contains(marker.eventType()) && mapped.iteration() != null) {
+                // finding rows carry their finding_id in the key — distinct
+                // findings from one sub-agent must NOT collapse (see the
+                // SubagentDedupKey javadoc).
+                String findingId = null;
+                if ("subagent_finding".equals(marker.eventType())
+                        && marker.details() instanceof Map<?, ?> detailsMap) {
+                    Object fid = detailsMap.get("finding_id");
+                    findingId = fid != null ? fid.toString() : null;
+                }
                 SubagentDedupKey key = new SubagentDedupKey(
-                        marker.eventType(), mapped.iteration(), mapped.subtask());
+                        marker.eventType(), mapped.iteration(), mapped.subtask(), findingId);
                 if (SUBAGENT_LAST_WINS.contains(marker.eventType())) {
                     // last-wins: overwrite any prior entry
                     dedupMap.put(key, mapped);
@@ -236,9 +271,19 @@ public class ActivityProjectionService {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private TurnAttribution walkCheckpoints(UUID taskId, String tenantId) {
         var all = taskRepository.getCheckpoints(taskId, tenantId).orElse(Collections.emptyList());
+        return walkRows(all, "messages");
+    }
+
+    /**
+     * Walks the given checkpoint rows in order, recording per-message first-seen
+     * timestamps, worker ids, and (AI messages only) minting-checkpoint cost.
+     * {@code channel} names the message-list channel to read — {@code messages}
+     * for the root namespace, {@code sub_messages} for sub-agent namespaces.
+     */
+    @SuppressWarnings("unchecked")
+    private TurnAttribution walkRows(List<Map<String, Object>> all, String channel) {
         if (all.isEmpty()) {
             return TurnAttribution.empty();
         }
@@ -267,7 +312,7 @@ public class ActivityProjectionService {
             if (!(channelValues instanceof Map<?, ?> channelMap)) {
                 continue;
             }
-            Object messages = ((Map<String, Object>) channelMap).get("messages");
+            Object messages = ((Map<String, Object>) channelMap).get(channel);
             if (!(messages instanceof List<?> messageList)) {
                 continue;
             }
@@ -310,24 +355,45 @@ public class ActivityProjectionService {
     // Turn extraction from checkpoint_payload.channel_values.messages
     // ---------------------------------------------------------------------
 
-    @SuppressWarnings("unchecked")
     private List<ActivityEventResponse> extractTurns(
             Object payload,
             OffsetDateTime fallbackTs,
             TurnAttribution attribution) {
-        List<ActivityEventResponse> turns = new ArrayList<>();
+        List<?> messageList = readMessageChannel(payload, "messages");
+        if (messageList == null) {
+            return new ArrayList<>();
+        }
+        return turnsFromMessageList(messageList, null, fallbackTs, attribution);
+    }
+
+    /** Parses a checkpoint payload and returns the named message-list channel, or null. */
+    @SuppressWarnings("unchecked")
+    private List<?> readMessageChannel(Object payload, String channel) {
         Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, payload);
         if (parsed == null) {
-            return turns;
+            return null;
         }
         Object channelValues = parsed.get("channel_values");
         if (!(channelValues instanceof Map<?, ?> channelMap)) {
-            return turns;
+            return null;
         }
-        Object messages = ((Map<String, Object>) channelMap).get("messages");
-        if (!(messages instanceof List<?> messageList)) {
-            return turns;
-        }
+        Object messages = ((Map<String, Object>) channelMap).get(channel);
+        return messages instanceof List<?> messageList ? messageList : null;
+    }
+
+    /**
+     * Maps a langchain-serialized message list to turn events. {@code subtask}
+     * is null for the root conversation; for sub-agent transcripts it carries
+     * the sub-agent's stable id so the Console can nest the turns under the
+     * fan-out marker tree.
+     */
+    @SuppressWarnings("unchecked")
+    private List<ActivityEventResponse> turnsFromMessageList(
+            List<?> messageList,
+            String subtask,
+            OffsetDateTime fallbackTs,
+            TurnAttribution attribution) {
+        List<ActivityEventResponse> turns = new ArrayList<>();
         for (Object rawMessage : messageList) {
             if (!(rawMessage instanceof Map<?, ?> messageWrapper)) {
                 continue;
@@ -376,9 +442,9 @@ public class ActivityProjectionService {
                         null, null, null, null, null,
                         null, null,
                         workerId, null,
-                        null, null));
+                        null, subtask));
                 case "ai" -> turns.add(buildAssistantTurn(
-                        kwargs, timestamp, attribution.costByAiMessageId(), workerId));
+                        kwargs, timestamp, attribution.costByAiMessageId(), workerId, subtask));
                 case "tool" -> turns.add(new ActivityEventResponse(
                         "turn.tool",
                         timestamp,
@@ -392,7 +458,7 @@ public class ActivityProjectionService {
                         null, null,
                         workerId,
                         readOrigBytes(kwargs),
-                        null, null));
+                        null, subtask));
                 case "system" -> {
                     // SystemMessages in state["messages"] are platform
                     // directives the worker put there intentionally
@@ -409,7 +475,7 @@ public class ActivityProjectionService {
                             "system_note", null, null, null, null,
                             null, null,
                             null, null,
-                            null, null));
+                            null, subtask));
                 }
                 default -> { /* unknown type — skip */ }
             }
@@ -422,7 +488,8 @@ public class ActivityProjectionService {
             Map<String, Object> kwargs,
             OffsetDateTime ts,
             Map<String, Long> costByAiMessageId,
-            String workerId) {
+            String workerId,
+            String subtask) {
         List<ActivityEventResponse.ToolCall> toolCalls = null;
         Object rawToolCalls = kwargs.get("tool_calls");
         if (rawToolCalls instanceof List<?> rawList && !rawList.isEmpty()) {
@@ -460,6 +527,180 @@ public class ActivityProjectionService {
                 cost,
                 workerId,
                 null,
+                null, subtask);
+    }
+
+    // ---------------------------------------------------------------------
+    // Supervisor topology projections — sub-agent transcripts + final report
+    // ---------------------------------------------------------------------
+
+    /**
+     * Builds {@code subtask → prompt_preview} from the {@code subagent_started}
+     * markers — the historic-correlation hint for sub-checkpoints written
+     * before the worker seeded the {@code subtask} channel. The preview is a
+     * verbatim prefix (≤200 chars) of the raw sub-task prompt, which the
+     * transcript's first HumanMessage embeds.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, String> startedPreviewBySubtask(List<TaskEventResponse> markerRows) {
+        Map<String, String> previewBySubtask = new LinkedHashMap<>();
+        for (TaskEventResponse marker : markerRows) {
+            if (!"subagent_started".equals(marker.eventType())) {
+                continue;
+            }
+            if (!(marker.details() instanceof Map<?, ?> detailsMap)) {
+                continue;
+            }
+            Map<String, Object> details = (Map<String, Object>) detailsMap;
+            Object subtask = details.get("subtask");
+            Object preview = details.get("prompt_preview");
+            if (subtask != null && preview instanceof String p && !p.isBlank()) {
+                previewBySubtask.putIfAbsent(subtask.toString(), p);
+            }
+        }
+        return previewBySubtask;
+    }
+
+    /**
+     * Resolves a historic (channel-less) transcript to its subtask id by
+     * matching the {@code subagent_started} prompt previews against the
+     * transcript's first HumanMessage. Returns {@code null} unless exactly one
+     * subtask's preview matches — ambiguity falls back to the namespace label
+     * rather than guessing.
+     */
+    @SuppressWarnings("unchecked")
+    private String correlateByPromptPreview(
+            List<?> messageList, Map<String, String> previewBySubtask) {
+        if (previewBySubtask.isEmpty()) {
+            return null;
+        }
+        String firstHuman = null;
+        for (Object rawMessage : messageList) {
+            if (!(rawMessage instanceof Map<?, ?> wrapper)) {
+                continue;
+            }
+            Object rawKwargs = ((Map<String, Object>) wrapper).get("kwargs");
+            if (!(rawKwargs instanceof Map<?, ?> kwargsMap)) {
+                continue;
+            }
+            Map<String, Object> kwargs = (Map<String, Object>) kwargsMap;
+            if ("human".equals(asString(kwargs.get("type")))) {
+                firstHuman = MessageContentExtractor.extractText(kwargs.get("content"));
+                break;
+            }
+        }
+        if (firstHuman == null || firstHuman.isBlank()) {
+            return null;
+        }
+        String matched = null;
+        for (Map.Entry<String, String> entry : previewBySubtask.entrySet()) {
+            if (firstHuman.contains(entry.getValue())) {
+                if (matched != null) {
+                    return null; // ambiguous — two subtasks share the preview
+                }
+                matched = entry.getKey();
+            }
+        }
+        return matched;
+    }
+
+    /**
+     * Projects every sub-agent's checkpointed transcript ({@code sub_messages}
+     * under its {@code subagent:*} namespace) into turn events tagged with the
+     * sub-agent's stable {@code subtask} id. The id is seeded into the
+     * sub-agent state by the worker; historic checkpoints written before that
+     * seed are correlated via the {@code subagent_started} prompt previews,
+     * falling back to a short namespace-derived label so the transcript still
+     * renders (just without marker-tree nesting).
+     */
+    @SuppressWarnings("unchecked")
+    private List<ActivityEventResponse> extractSubagentTurns(
+            UUID taskId, String tenantId, Map<String, String> previewBySubtask) {
+        List<Map<String, Object>> rows = taskRepository.getSubagentCheckpoints(taskId, tenantId);
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        Map<String, List<Map<String, Object>>> byNamespace = new LinkedHashMap<>();
+        for (Map<String, Object> row : rows) {
+            String ns = asString(row.get("checkpoint_ns"));
+            if (ns == null || ns.isBlank()) {
+                continue;
+            }
+            byNamespace.computeIfAbsent(ns, k -> new ArrayList<>()).add(row);
+        }
+
+        List<ActivityEventResponse> turns = new ArrayList<>();
+        for (Map.Entry<String, List<Map<String, Object>>> entry : byNamespace.entrySet()) {
+            List<Map<String, Object>> nsRows = entry.getValue();
+            TurnAttribution attribution = walkRows(nsRows, "sub_messages");
+            Map<String, Object> last = nsRows.get(nsRows.size() - 1);
+
+            OffsetDateTime fallbackTs = null;
+            if (last.get("created_at") instanceof Timestamp ts) {
+                fallbackTs = DateTimeUtil.toOffsetDateTime(ts);
+            }
+            Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, last.get("checkpoint_payload"));
+            if (parsed == null) {
+                continue;
+            }
+            Object channelValues = parsed.get("channel_values");
+            if (!(channelValues instanceof Map<?, ?> channelMap)) {
+                continue;
+            }
+            Map<String, Object> channels = (Map<String, Object>) channelMap;
+            Object messages = channels.get("sub_messages");
+            if (!(messages instanceof List<?> messageList)) {
+                continue;
+            }
+            String subtask = asString(channels.get("subtask"));
+            if (subtask == null || subtask.isBlank()) {
+                subtask = correlateByPromptPreview(messageList, previewBySubtask);
+            }
+            if (subtask == null || subtask.isBlank()) {
+                subtask = shortNamespaceLabel(entry.getKey());
+            }
+            turns.addAll(turnsFromMessageList(messageList, subtask, fallbackTs, attribution));
+        }
+        return turns;
+    }
+
+    /** {@code subagent:467974c0-aa97-...} → {@code sub-467974c0} (historic fallback id). */
+    private static String shortNamespaceLabel(String namespace) {
+        String suffix = namespace.substring(namespace.indexOf(':') + 1);
+        int dash = suffix.indexOf('-');
+        return "sub-" + (dash > 0 ? suffix.substring(0, dash) : suffix);
+    }
+
+    /**
+     * Builds the terminal assistant turn from the Supervisor topology's
+     * {@code report} channel, or returns {@code null} for ReAct tasks (no
+     * such channel) and unfinished supervisor runs (blank report). Timestamp
+     * is the final checkpoint's {@code created_at}, which sorts the report
+     * after every conversation turn.
+     */
+    @SuppressWarnings("unchecked")
+    private ActivityEventResponse buildReportTurn(Object payload, OffsetDateTime ts) {
+        Map<String, Object> parsed = JsonParseUtil.parseJsonMap(objectMapper, payload);
+        if (parsed == null) {
+            return null;
+        }
+        Object channelValues = parsed.get("channel_values");
+        if (!(channelValues instanceof Map<?, ?> channelMap)) {
+            return null;
+        }
+        Object report = ((Map<String, Object>) channelMap).get("report");
+        if (!(report instanceof String text) || text.isBlank()) {
+            return null;
+        }
+        return new ActivityEventResponse(
+                "turn.assistant",
+                ts,
+                "assistant",
+                text,
+                null, null, null, null,
+                null, null, null, null, null,
+                null, null,
+                null, null,
                 null, null);
     }
 
@@ -546,8 +787,9 @@ public class ActivityProjectionService {
             // These carry iteration (round, 1-based; supervisor_iteration cap/no-op
             // events may carry 0) and subtask (stable logical
             // id) from the details JSONB so the Console can group by round then
-            // sub-agent. Marker skeleton only — sub-agent turn-by-turn reasoning
-            // lives in Langfuse spans (E5, plan §A11-E5).
+            // sub-agent. Turn-by-turn sub-agent transcripts are projected
+            // separately from the subagent:* checkpoint namespaces (see
+            // extractSubagentTurns) and carry the same subtask key.
             case "subagent_started" -> "marker.subagent.started";
             case "subagent_finding" -> "marker.subagent.finding";
             case "subagent_failed" -> "marker.subagent.failed";
