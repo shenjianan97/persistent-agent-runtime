@@ -431,6 +431,7 @@ export function AgentDetailPage() {
                                         onChange={() => {}}
                                         applicable
                                         disabled
+                                        toolServers={toolServers}
                                     />
                                 </div>
                             )}
@@ -943,6 +944,7 @@ export function AgentDetailPage() {
                                         onChange={() => {}}
                                         applicable
                                         disabled
+                                        toolServers={toolServers}
                                     />
                                 )}
                             </CardContent>

@@ -402,8 +402,17 @@ describe('AgentDetailPage', () => {
             expect(screen.getByTestId('supervisor-config-max-iterations')).toBeDisabled();
             expect(screen.getByTestId('supervisor-config-writer-style')).toBeDisabled();
             expect(screen.getByTestId('supervisor-config-scope-clarification')).toBeDisabled();
-            expect(screen.getByText('web_search')).toBeInTheDocument();
-            expect(screen.getByText('internal_docs')).toBeInTheDocument();
+            // Allowed-Sources renders as a read-only checklist: persisted sources
+            // are shown checked + disabled. "web_search" is a base source ("Web
+            // search"); "internal_docs" is a persisted custom source.
+            const webSearch = screen.getByLabelText('Web search') as HTMLInputElement;
+            expect(webSearch).toBeChecked();
+            expect(webSearch).toBeDisabled();
+            const internalDocs = screen.getByLabelText('internal_docs') as HTMLInputElement;
+            expect(internalDocs).toBeChecked();
+            expect(internalDocs).toBeDisabled();
+            // "All available sources" is unchecked since specific sources are set.
+            expect(screen.getByLabelText('All available sources')).not.toBeChecked();
             // Read-only: no chip add-input.
             expect(screen.queryByPlaceholderText(/add source name/i)).not.toBeInTheDocument();
         });

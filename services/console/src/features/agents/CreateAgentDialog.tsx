@@ -77,6 +77,35 @@ function topologyLabel(topology: 'react' | 'supervisor'): string {
     return topology === 'supervisor' ? 'Deep Research' : 'ReAct';
 }
 
+/**
+ * Self-describing mode cards. The `value` is written verbatim to the `preset`
+ * form field (the server derives `topology` from it — S1). Customer-facing copy
+ * never says "Supervisor" — the Deep Research card maps to `research`.
+ */
+const PRESET_OPTIONS: {
+    value: CreateAgentFormValues['preset'];
+    title: string;
+    description: string;
+}[] = [
+    { value: 'chat', title: 'Chat', description: 'Quick Q&A. Base tools only.' },
+    {
+        value: 'coding',
+        title: 'Coding',
+        description: 'Writes & runs code in a sandbox; can delegate to sub-agents.',
+    },
+    {
+        value: 'investigation',
+        title: 'Investigation',
+        description: 'Multi-step research; can delegate to sub-agents.',
+    },
+    {
+        value: 'research',
+        title: 'Deep Research',
+        description:
+            'Autonomous multi-round research → one cited report. Runs sub-agents in parallel.',
+    },
+];
+
 /** only-send-what-was-set: drop undefined / empty fields from the sub-object. */
 function buildSupervisorPayload(config: SupervisorConfig | undefined): SupervisorConfig | undefined {
     if (!config) return undefined;
@@ -369,19 +398,45 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             name="preset"
                             render={({ field }) => (
                                 <FormItem>
-                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Preset</FormLabel>
+                                    <FormLabel className="uppercase tracking-widest text-muted-foreground text-xs">Mode</FormLabel>
                                     <FormControl>
-                                        <select
+                                        <div
                                             data-testid="agent-config-preset"
-                                            className="flex h-10 w-full border border-border bg-black/50 px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-0 rounded-none appearance-none"
-                                            value={field.value}
-                                            onChange={field.onChange}
+                                            role="radiogroup"
+                                            aria-label="Agent mode"
+                                            className="space-y-2"
                                         >
-                                            <option value="chat">Chat</option>
-                                            <option value="coding">Coding</option>
-                                            <option value="investigation">Investigation</option>
-                                            <option value="research">Deep Research</option>
-                                        </select>
+                                            {PRESET_OPTIONS.map((option) => {
+                                                const selected = field.value === option.value;
+                                                return (
+                                                    <label
+                                                        key={option.value}
+                                                        className={`flex items-start gap-3 p-3 rounded cursor-pointer border transition-colors ${
+                                                            selected
+                                                                ? 'border-primary bg-primary/10'
+                                                                : 'border-border hover:bg-white/5'
+                                                        }`}
+                                                    >
+                                                        <input
+                                                            type="radio"
+                                                            name="agent-mode"
+                                                            value={option.value}
+                                                            checked={selected}
+                                                            onChange={() => field.onChange(option.value)}
+                                                            className="accent-primary mt-0.5"
+                                                        />
+                                                        <div>
+                                                            <span className="text-sm font-medium block">
+                                                                {option.title}
+                                                            </span>
+                                                            <span className="text-muted-foreground text-xs">
+                                                                {option.description}
+                                                            </span>
+                                                        </div>
+                                                    </label>
+                                                );
+                                            })}
+                                        </div>
                                     </FormControl>
                                     <p
                                         data-testid="agent-config-topology"
@@ -398,6 +453,7 @@ export function CreateAgentDialog({ open, onOpenChange }: CreateAgentDialogProps
                             value={supervisor}
                             onChange={handleSupervisorChange}
                             applicable={isSupervisor}
+                            toolServers={toolServers}
                         />
 
                         <div className="space-y-3">
