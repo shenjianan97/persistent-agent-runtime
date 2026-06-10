@@ -43,4 +43,4 @@ This track is **not "complete" / archivable** until **both** hold:
 
 "v1 shipped" ≠ "fully optimized" — do not mark this track done while any §A12 row is OPEN.
 
-**Deferred decisions outstanding:** D1, D2, D3 — all **OPEN** (review gate: S11 acceptance → research pre-GA).
+**Deferred decisions outstanding:** none — D1, D2, D3 all **Closed at S11 acceptance (2026-06-09)**, v1 sufficient with the measured metric as evidence (D1 max payload 0.117 MB ≪ 1 MB; D2 cap-hit degrades to fewer-not-corrupted findings, drops logged; D3 boundary meter bills each sibling once, overshoot bounded by `max_fanout × ceiling`). See the plan's [§A12 ledger](./plan.md#a12-deferred-decisions-ledger-definition-of-done-gate) for the dispositions. Both definition-of-done conditions hold; remaining close-out is process only (final orchestrator browser pass — **done 2026-06-09/10**, STATUS.md flip, archive to `completed/`).
