@@ -215,22 +215,30 @@ async def emit_subagent_started(
         )
 
 
+FAILURE_DETAIL_MAX_CHARS = 300
+"""Cap on the ``detail`` carried in a ``subagent_failed`` row's payload."""
+
+
 async def emit_subagent_failed(
     emit: EmitCallable | None,
     *,
     iteration: int,
     subtask: str,
     reason: str,
+    detail: str | None = None,
 ) -> None:
     """Emit a ``subagent_failed`` event with the canonical payload.
 
-    Payload (plan §A7): ``{iteration, subtask, reason}`` where ``reason ∈
-    {ceiling, timeout, error}`` (the discriminator on a failed
+    Payload (plan §A7, additively extended): ``{iteration, subtask, reason}``
+    where ``reason ∈ {ceiling, timeout, error}`` (the discriminator on a failed
     ``SubagentResult``; ``depth`` rejects are a structural guard the Supervisor
     fan-out never trips, so they collapse to ``error`` at the call site if they
-    ever surface). ``emit`` is the injected sink; when ``None`` this degrades to
-    a structured log so the failure is still observable and never raises into the
-    graph.
+    ever surface), plus ``detail`` (the failure's human-readable cause,
+    truncated to :data:`FAILURE_DETAIL_MAX_CHARS`) when one is known — without
+    it the Console can only say "Failed — error" while the actual cause (e.g.
+    a provider read-timeout) is buried in the worker log. ``emit`` is the
+    injected sink; when ``None`` this degrades to a structured log so the
+    failure is still observable and never raises into the graph.
 
     User-meaningful (a customer should see a sub-agent failed even on the coarse
     view). The ``(event_type, iteration, subtask)`` dedup key makes a
@@ -241,6 +249,8 @@ async def emit_subagent_failed(
         "subtask": subtask,
         "reason": reason,
     }
+    if detail and detail.strip():
+        details["detail"] = detail.strip()[:FAILURE_DETAIL_MAX_CHARS]
     if emit is None:
         logger.info("%s %s", SUBAGENT_FAILED_EVENT, details)
         return

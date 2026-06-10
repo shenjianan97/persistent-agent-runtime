@@ -311,6 +311,30 @@ class TestEmitHelpersThroughRealSink:
             "reason": "timeout",
         }
 
+    @pytest.mark.asyncio
+    async def test_emit_subagent_failed_carries_truncated_detail(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        # Regression for task 0729e3a3 sub-agent 1.3: the marker said only
+        # "error" while the actual cause (a Bedrock read-timeout) lived in
+        # the worker log. The payload now carries the cause, capped.
+        from core.subagent_events import FAILURE_DETAIL_MAX_CHARS
+
+        async with integration_pool.acquire() as conn:
+            task_id = await _new_task(conn)
+        sink = build_task_event_sink(
+            integration_pool, task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID
+        )
+        long_detail = "ReadTimeoutError: Read timeout on endpoint URL " + "x" * 400
+        await emit_subagent_failed(
+            sink, iteration=1, subtask="1.3", reason="error", detail=long_detail
+        )
+        async with integration_pool.acquire() as conn:
+            ev = await _fetch_one_event(conn, task_id)
+        assert ev["details"]["reason"] == "error"
+        assert ev["details"]["detail"] == long_detail[:FAILURE_DETAIL_MAX_CHARS]
+        assert len(ev["details"]["detail"]) == FAILURE_DETAIL_MAX_CHARS
+
 
 # --------------------------------------------------------------------------- #
 # 3. The real sink drops the heartbeat span event (never an INSERT)

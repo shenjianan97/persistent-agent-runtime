@@ -58,8 +58,9 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.types import Send
+from langgraph.types import RetryPolicy, Send
 
+from executor.retry_classification import is_retryable_error
 from executor.text import flatten_text as _flatten_text
 from executor.usage import merge_usage as _merge_usage
 from executor.usage import usage_from_message as _usage_from_message
@@ -85,6 +86,34 @@ SUBAGENT_HEARTBEAT_EVENT = "subagent.heartbeat"
 # worker's scalar ``Command(resume=...)`` path; LangGraph 1.0.5). Extend this
 # set when a new pause-bearing tool ships.
 INTERRUPT_BEARING_TOOL_NAMES = frozenset({"request_human_input"})
+
+# Tools whose handler returns a LangGraph ``Command`` targeting PARENT-graph
+# channels (``plan`` / ``messages`` / ``observations``) and declares
+# ``InjectedToolCallId``. Neither works inside the isolated sub-agent subgraph:
+# ``_SubagentState`` has none of those channels, and the slim tool loop below
+# invokes by bare args (no ToolCall injection) — binding one crashes the
+# sub-agent (ValueError from langchain-core's ``_parse_input``). Extend this
+# set when a new parent-state-mutating tool ships.
+PARENT_STATE_TOOL_NAMES = frozenset(
+    {"plan_write", "note_finding", "remember_this_run"}
+)
+
+# Retry policy for the sub-agent's per-turn model call, gated on the SAME
+# transient classifier the task-level dead-letter decision uses
+# (executor/retry_classification.is_retryable_error) — run_subagent converts
+# exceptions to failure markers instead of raising, which cuts fan-out
+# branches off from the task-level retry path, so the in-place retry must
+# apply the identical classification. Custom predicate required: LangGraph's
+# ``default_retry_on`` REFUSES the exact failure observed live (task 0729e3a3
+# sub-agent 1.3) — botocore's ``ReadTimeoutError`` carries ``OSError`` in its
+# MRO, which the default blanket-rejects. Bounded and cheap relative to
+# forfeiting the branch: that live failure cost 17 turns of completed
+# research (and its findings) to ONE timed-out call.
+_SUBAGENT_LLM_RETRY = RetryPolicy(
+    retry_on=is_retryable_error,
+    max_attempts=3,
+    initial_interval=1.0,
+)
 
 # Failure reasons (the discriminator on a failed SubagentResult).
 REASON_CEILING = "ceiling"
@@ -167,14 +196,19 @@ class SubagentResult:
 # Headless filter
 # --------------------------------------------------------------------------- #
 def filter_headless_tools(tools: Iterable[Any]) -> list[Any]:
-    """Drop any ``interrupt()``-bearing tool from a sub-agent's allowlist.
+    """Drop tools a sub-agent can never run from its allowlist.
+
+    Two classes are excluded: ``interrupt()``-bearing tools (sub-agents are
+    headless, §A0 inv. 8) and parent-state-channel tools (their ``Command``
+    updates target channels absent from ``_SubagentState``).
 
     Matches by tool ``name`` (the public, stable identifier on
     ``StructuredTool`` / ``BaseTool``). Silently dropped — never bound."""
+    excluded = INTERRUPT_BEARING_TOOL_NAMES | PARENT_STATE_TOOL_NAMES
     kept: list[Any] = []
     for tool in tools:
         name = getattr(tool, "name", None)
-        if name in INTERRUPT_BEARING_TOOL_NAMES:
+        if name in excluded:
             logger.debug("subagent.headless_filter dropped tool=%s", name)
             continue
         kept.append(tool)
@@ -196,6 +230,12 @@ class _SubagentState(TypedDict, total=False):
     sub_messages: Annotated[list[BaseMessage], add_messages]
     turn_count: Annotated[int, _max_reducer]
     tokens_used: Annotated[int, _max_reducer]
+    # Stable caller-assigned identity (the Supervisor's "<iteration>.<index>"
+    # subtask id). Persisted in every sub-checkpoint so read-side projections
+    # (the Console's /activity sub-agent tree) can correlate this namespace's
+    # transcript with the subtask markers — the namespace itself is an opaque
+    # LangGraph task uuid, not the deterministic id the caller knows.
+    subtask: str
     # S8 (§A11-E1) — full per-call usage breakdown (input/output/cache tokens)
     # accumulated across the sub-agent's inner turns. Distinct from
     # ``tokens_used`` (a single monotone watermark for the TOKEN ceiling): the
@@ -285,7 +325,24 @@ def build_subagent_node(
                     )
                 )
                 continue
-            result = await tool.ainvoke(call["args"])
+            # Contain tool failures in-band (prebuilt-ToolNode parity): a
+            # raising tool becomes an error ToolMessage the LLM can route
+            # around — never an exception that kills the whole sub-agent
+            # (and, in round 1 of a fan-out, dead-letters the parent task).
+            try:
+                result = await tool.ainvoke(call["args"])
+            except Exception as exc:  # noqa: BLE001 — any tool error is in-band
+                logger.warning(
+                    "subagent.tool_error tool=%s: %s", call["name"], exc
+                )
+                out.append(
+                    ToolMessage(
+                        content=f"error: {exc}",
+                        tool_call_id=call["id"],
+                        status="error",
+                    )
+                )
+                continue
             out.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
         return {"sub_messages": out}
 
@@ -323,7 +380,10 @@ def build_subagent_node(
         }
 
     sub = StateGraph(_SubagentState)
-    sub.add_node("agent", agent)
+    # retry_policy: a transient provider error (timeout / throttle / 5xx) on
+    # one turn's model call retries in-place instead of failing the branch —
+    # the checkpointed transcript makes the retry cheap; forfeiting it is not.
+    sub.add_node("agent", agent, retry_policy=_SUBAGENT_LLM_RETRY)
     sub.add_node("tools", tool_node)
     sub.add_node("finalize", finalize)
     sub.add_edge(START, "agent")
@@ -360,6 +420,7 @@ async def run_subagent(
     checkpoint_ns: str | None = None,
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     subagent_node_name: str = "subagent",
+    subtask: str | None = None,
 ) -> SubagentResult:
     """Run one focused ReAct sub-agent in-process and return a structured result.
 
@@ -401,17 +462,17 @@ async def run_subagent(
         # story — the sub-agent's inner turns become checkpointed super-steps
         # under the ``subagent:<id>`` namespace.
         def _dispatch(_state):
-            return [
-                Send(
-                    subagent_node_name,
-                    {
-                        "sub_messages": [HumanMessage(content=prompt)],
-                        "turn_count": 0,
-                        "tokens_used": 0,
-                        "depth": depth,
-                    },
-                )
-            ]
+            seed: dict[str, Any] = {
+                "sub_messages": [HumanMessage(content=prompt)],
+                "turn_count": 0,
+                "tokens_used": 0,
+                "depth": depth,
+            }
+            if subtask is not None:
+                # Persist the caller's stable subtask id in the sub-checkpoint
+                # so read-side projections can correlate transcript ↔ markers.
+                seed["subtask"] = subtask
+            return [Send(subagent_node_name, seed)]
 
         # The subagent node writes its outcome to the ``results`` channel, which
         # LangGraph maps to the parent's same-named channel — the only thing
@@ -446,7 +507,10 @@ async def run_subagent(
             )
         except asyncio.TimeoutError:
             logger.warning("subagent.timeout thread_id=%s", thread_id)
-            return SubagentResult.failure(REASON_TIMEOUT)
+            return SubagentResult.failure(
+                REASON_TIMEOUT,
+                detail=f"sub-agent exceeded its {timeout_seconds:.0f}s research timeout",
+            )
 
         results = final.get("results") or []
         outcome = results[0] if results else {}
@@ -456,6 +520,11 @@ async def run_subagent(
             return SubagentResult.failure(REASON_CEILING, usage=usage)
         return SubagentResult.success(outcome.get("summary", ""), usage=usage)
 
-    except Exception:  # noqa: BLE001 — failure is a return value, never a raise.
+    except Exception as exc:  # noqa: BLE001 — failure is a return value, never a raise.
         logger.exception("subagent.unexpected_error thread_id=%s", thread_id)
-        return SubagentResult.failure(REASON_ERROR)
+        # Carry the cause in the marker (typed, truncated) — without it the
+        # Console can only say "Failed — error" while the real reason (e.g. a
+        # provider read-timeout) is buried in the worker log.
+        return SubagentResult.failure(
+            REASON_ERROR, detail=f"{type(exc).__name__}: {exc}"[:500]
+        )

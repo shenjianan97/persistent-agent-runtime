@@ -84,3 +84,35 @@ async def test_unknown_topology_fails_build():
         await _build(
             {"model": "claude-haiku-4-5", "topology": "mesh", "allowed_tools": []}
         )
+
+
+async def test_supervisor_subagent_ceiling_is_research_sized():
+    """Supervisor fan-out sub-agents get the platform MAX turn budget.
+
+    Regression for task 954b2811: with the 8-turn dispatch default, all 3
+    research sub-agents exhausted their ceiling mid-search (paywalled /
+    dead URLs burn turns) and returned zero findings, so round 1 all-failed
+    and the task dead-lettered. Deep-research sub-tasks need the platform
+    max; cost stays bounded by ``max_fanout × ceiling`` (§A5/§A8/D3).
+    """
+    from tools.subagent_tools import MAX_SUBAGENT_TURN_BUDGET
+
+    executor = _make_executor()
+    llm = MagicMock()
+    llm.bind_tools = MagicMock(return_value=llm)
+    config: dict = {"configurable": {}}
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)):
+        await executor._inject_supervisor_configurable(
+            config,
+            agent_config={
+                "model": "claude-haiku-4-5",
+                "allowed_tools": ["web_search"],
+                "topology": "supervisor",
+            },
+            checkpointer=MagicMock(),
+            task_id="t",
+            tenant_id="default",
+            agent_id="a",
+        )
+    ceiling = config["configurable"]["supervisor_fanout_deps"]["ceiling"]
+    assert ceiling.max_turns == MAX_SUBAGENT_TURN_BUDGET

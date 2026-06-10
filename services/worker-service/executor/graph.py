@@ -140,9 +140,12 @@ from tools.plan_tools import build_plan_write_tool
 from core.subagent_events import build_task_event_sink
 from tools.subagent_tools import (
     DISPATCH_SUBAGENT_TOOL_NAME,
+    MAX_SUBAGENT_TURN_BUDGET,
     budget_to_ceiling,
     build_dispatch_subagent_tool,
 )
+from executor.grounding import today_line
+from executor.retry_classification import is_retryable_error
 from executor.subagents import run_subagent
 from executor.supervisor.graph import (
     FANOUT_NODE_NAME as SUPERVISOR_FANOUT_NODE_NAME,
@@ -252,6 +255,22 @@ def _message_content_to_text(message: BaseMessage) -> str:
     if isinstance(raw, list):
         return _extract_message_text(raw, separator="\n\n")
     return raw if isinstance(raw, str) else str(raw)
+
+
+def _terminal_output_content(values: dict) -> Any:
+    """Terminal ``output.result`` content from the final graph state.
+
+    Supervisor topology: the user-visible deliverable is the Writer's
+    ``report`` channel — there the ``messages`` channel carries only the task
+    input, so the generic last-message extraction would echo the user's
+    prompt back as the Output card (observed live: task 0729e3a3). ReAct
+    state has no ``report`` channel and falls through to the last-message
+    flatten.
+    """
+    report = values.get("report")
+    if isinstance(report, str) and report.strip():
+        return report
+    return _finalize_output_content(values.get("messages", []))
 
 
 def _looks_like_future_work_promise(message: BaseMessage) -> bool:
@@ -1912,8 +1931,11 @@ class GraphExecutor:
             # so a derived non-UUID thread id fails Postgres coercion).
             sub_checkpoint_ns = f"subagent:{tool_call_id}"
 
+            # Current-date grounding: the sub-agent runs with no platform
+            # SystemMessage, so without this line it anchors relative
+            # timeframes on its training cutoff (see executor/grounding.py).
             result = await run_subagent(
-                prompt,
+                f"{today_line()}\n\n{prompt}",
                 delegated_tools,
                 ceiling=budget_to_ceiling(state.get("budget")),
                 depth=depth,
@@ -3019,7 +3041,7 @@ class GraphExecutor:
         """
         sections = []
 
-        sections.append(f"Today's date is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}.")
+        sections.append(today_line())
 
         if "request_human_input" in allowed_tools:
             sections.append(
@@ -3934,8 +3956,9 @@ class GraphExecutor:
                 # Anthropic multi-block, Gemini, etc.) to plain text so the
                 # Console can render markdown without provider-aware branching.
                 # Checkpoint persistence is unchanged — this normalizes only
-                # the terminal output.result artifact.
-                output_content = _finalize_output_content(messages)
+                # the terminal output.result artifact. Supervisor topology
+                # surfaces the Writer's ``report`` channel instead.
+                output_content = _terminal_output_content(final_state.values)
                 last_message = messages[-1] if messages else None
                 if last_message is not None and _looks_like_future_work_promise(last_message):
                     logger.warning(
@@ -4217,9 +4240,9 @@ class GraphExecutor:
         deferred refinement (the config carries no per-phase model field today).
         The fan-out sub-agents reuse the same model + the agent's own tool
         objects (a sub-agent can never use a tool the parent agent lacks). The
-        per-sub-agent ceiling is the platform default (no supervisor sub-field
-        configures it yet) — it bounds the per-task fan-out overshoot to
-        ``max_fanout × ceiling`` (§A5/§A8/D3).
+        per-sub-agent ceiling is the platform MAX turn budget (no supervisor
+        sub-field configures it yet) — it bounds the per-task fan-out
+        overshoot to ``max_fanout × ceiling`` (§A5/§A8/D3).
         """
         provider = agent_config.get("provider", "anthropic")
         model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
@@ -4269,7 +4292,12 @@ class GraphExecutor:
         cfg["supervisor_fanout_deps"] = {
             "model": model,
             "checkpointer": checkpointer,
-            "ceiling": budget_to_ceiling(None),
+            # Research-sized: the 8-turn dispatch default ceilings out mid-
+            # search on real research sub-tasks (paywalled/dead URLs burn
+            # turns) and a ceiling stop discards all partial work — observed
+            # live as an all-failed round-1 dead-letter. Per-task overshoot
+            # stays bounded by max_fanout × ceiling (§A5/§A8/D3).
+            "ceiling": budget_to_ceiling(MAX_SUBAGENT_TURN_BUDGET),
             "tools": sub_tools,
             "emit": _supervisor_emit,
         }
@@ -4417,58 +4445,13 @@ class GraphExecutor:
         return False
 
     def _is_retryable_error(self, e: Exception) -> bool:
-        """Determines if the exception should trigger a retry or immediate dead letter."""
-        # Check exception type first (most reliable signal).
-        # ``ToolTransportError`` is intentionally absent: its only raisers
-        # (tools/read_url.py, tools/providers/search.py) execute inside the
-        # ToolNode, whose ``handle_tool_errors=_handle_tool_error`` converts
-        # it to an agent-visible error ToolMessage instead of re-raising —
-        # so the type can no longer reach this classifier, and keeping a
-        # "retryable" entry for it would contradict those agent-correctable
-        # semantics for any future raiser.
-        if isinstance(e, McpToolCallError):
-            return True
-        if isinstance(e, (ConnectionError, TimeoutError)):
-            return True
-        # botocore timeouts: botocore.exceptions.ReadTimeoutError /
-        # ConnectTimeoutError do NOT inherit from Python's builtin
-        # TimeoutError (urllib3 defines its own same-named base). Import
-        # lazily to avoid coupling the generic classifier to a specific
-        # provider SDK at module-load time.
-        try:
-            from botocore.exceptions import ReadTimeoutError as _BotoReadTimeoutError
-            from botocore.exceptions import ConnectTimeoutError as _BotoConnectTimeoutError
+        """Determines if the exception should trigger a retry or immediate dead letter.
 
-            if isinstance(e, (_BotoReadTimeoutError, _BotoConnectTimeoutError)):
-                return True
-        except ImportError:
-            pass
-
-        # Use HTTP status code from the provider exception if available
-        status = self._extract_status_code(e)
-        if status is not None:
-            return status in self._RETRYABLE_STATUS_CODES
-
-        # Fallback: string heuristics for errors without a status code
-        error_str = str(e).lower()
-
-        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
-            return True
-        if re.search(r'\b50[0234]\b', error_str):
-            return True
-        # Network-timeout phrasing produced by botocore / httpx / urllib3
-        # when no HTTP status was received. Matches the exact prefixes
-        # "Read timeout" and "Connect timeout" to avoid overmatching
-        # unrelated error strings that happen to contain the word "timeout".
-        if "read timeout" in error_str or "connect timeout" in error_str:
-            return True
-        if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
-            return False
-        if re.search(r'\b40[0-4]\b', error_str):
-            return False
-
-        # Default unknown exceptions to non-retryable
-        return False
+        Delegates to the shared classifier (``executor/retry_classification``)
+        so the task-level dead-letter decision and the sub-agent per-turn
+        ``RetryPolicy`` (fanout) can never drift apart.
+        """
+        return is_retryable_error(e)
 
     async def _check_budget_and_pause(
         self,

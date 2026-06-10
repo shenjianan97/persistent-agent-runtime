@@ -47,6 +47,7 @@ from tools.subagent_tools import (
     DEFAULT_SUBAGENT_TURN_BUDGET,
     DISPATCH_SUBAGENT_TOOL_NAME,
     MAX_SUBAGENT_TURN_BUDGET,
+    SUBAGENT_TOKEN_CEILING_PER_TURN,
     budget_to_ceiling,
     build_dispatch_subagent_tool,
 )
@@ -164,6 +165,30 @@ class TestBudgetToCeiling:
         assert budget_to_ceiling(None).max_turns == DEFAULT_SUBAGENT_TURN_BUDGET
         assert budget_to_ceiling(0).max_turns == DEFAULT_SUBAGENT_TURN_BUDGET
         assert budget_to_ceiling("nope").max_turns == DEFAULT_SUBAGENT_TURN_BUDGET  # type: ignore[arg-type]
+
+    def test_token_backstop_scales_with_turn_budget(self) -> None:
+        # Regression for task 223b155c: a FIXED 200k cumulative-token backstop
+        # re-binds around turn 10 — the meter re-bills the growing transcript
+        # every call (~20k/turn observed for web research), so any turn budget
+        # above ~10 was unreachable and the turn budget stopped being the
+        # binding guard (contradicting the constant's documented intent). The
+        # backstop must scale with the granted turns.
+        assert (
+            budget_to_ceiling(8).max_tokens
+            == 8 * SUBAGENT_TOKEN_CEILING_PER_TURN
+        )
+        assert (
+            budget_to_ceiling(MAX_SUBAGENT_TURN_BUDGET).max_tokens
+            == MAX_SUBAGENT_TURN_BUDGET * SUBAGENT_TOKEN_CEILING_PER_TURN
+        )
+        # Clamped turns also clamp the token backstop (no 10_000-turn token grant).
+        assert (
+            budget_to_ceiling(10_000).max_tokens
+            == MAX_SUBAGENT_TURN_BUDGET * SUBAGENT_TOKEN_CEILING_PER_TURN
+        )
+        # Sized to comfortably exceed the observed ~20k/turn research average,
+        # so it stays a backstop rather than the binding constraint.
+        assert SUBAGENT_TOKEN_CEILING_PER_TURN >= 50_000
 
 
 # --------------------------------------------------------------------------- #
@@ -354,6 +379,26 @@ class TestSubagentNodeThreading:
         assert isinstance(msgs[0], ToolMessage)
         assert msgs[0].tool_call_id == "d1"
         assert "42" in msgs[0].content
+
+    async def test_prompt_carries_current_date_grounding(self) -> None:
+        """Regression (same class as the supervisor's "October 2024" report):
+        the sub-agent runs with no platform SystemMessage, so the driver must
+        prefix the LLM-authored prompt with today's date or relative
+        timeframes anchor on the model's training cutoff."""
+        from datetime import datetime, timezone
+
+        node = await self._node()
+        spy = AsyncMock(return_value=SubagentResult.success("ok"))
+        with patch("executor.graph.run_subagent", spy):
+            await node.ainvoke(
+                {"tool_call_id": "d1", "prompt": "find recent news", "tools": [],
+                 "budget": 5, "depth": 1},
+                {"configurable": {"thread_id": "t"}},
+            )
+        sent_prompt = spy.call_args.args[0]
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        assert sent_prompt.startswith(f"Today's date is {today}.")
+        assert "find recent news" in sent_prompt
 
     async def test_internal_messages_not_on_parent_channel(self) -> None:
         """Isolation: the node returns ONLY the summary ToolMessage — none of

@@ -283,6 +283,10 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
         thread_id=parent_thread,
         checkpoint_ns=sub_checkpoint_ns,
         emit=emit,
+        # Persisted into the sub-checkpoint state: the read-side /activity
+        # projection correlates the transcript namespace (an opaque LangGraph
+        # task uuid) back to this deterministic id and its S9 markers.
+        subtask=subtask,
     )
 
     # Parse the sub-agent's distilled summary into the parent ``findings`` channel
@@ -310,6 +314,11 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
             iteration=iteration,
             subtask=subtask,
             reason=reason,
+            # A failure marker's ``summary`` carries the human-readable cause
+            # (SubagentResult.failure detail) — surface it so the Console can
+            # show WHY, not just "error" (live gap: a Bedrock read-timeout was
+            # invisible outside the worker log).
+            detail=result.summary,
         )
 
     logger.info(

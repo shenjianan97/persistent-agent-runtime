@@ -39,13 +39,17 @@ from executor.subagents import SubagentCeiling
 
 DISPATCH_SUBAGENT_TOOL_NAME = "dispatch_subagent"
 
-# ``budget`` clamp bounds (turn budget). The default token ceiling is generous —
-# the turn budget is the binding cost guard the LLM controls; the token ceiling
-# is a backstop so a single pathological turn cannot run away.
+# ``budget`` clamp bounds (turn budget). The turn budget is the binding cost
+# guard the LLM controls; the token ceiling is a backstop so runaway context
+# growth cannot outspend the granted turns. The backstop scales PER TURN: the
+# sub-agent meter accumulates each call's TOTAL tokens, re-billing the growing
+# transcript every turn (~20k/turn observed for web research — task 223b155c),
+# so a fixed 200k backstop silently re-bound at ~turn 10 and made any larger
+# turn budget unreachable. 50k/turn keeps it a backstop, not the binding guard.
 MIN_SUBAGENT_TURN_BUDGET = 1
 MAX_SUBAGENT_TURN_BUDGET = 30
 DEFAULT_SUBAGENT_TURN_BUDGET = 8
-DEFAULT_SUBAGENT_TOKEN_CEILING = 200_000
+SUBAGENT_TOKEN_CEILING_PER_TURN = 50_000
 
 DISPATCH_SUBAGENT_DESCRIPTION = (
     "Delegate a focused subtask to a fresh sub-agent that runs in its own "
@@ -98,17 +102,19 @@ class DispatchSubagentArguments(BaseModel):
 def budget_to_ceiling(budget: int | None) -> SubagentCeiling:
     """Map the LLM-facing ``budget`` (turn budget) to a :class:`SubagentCeiling`.
 
-    ``budget`` is the turn cap, clamped to ``[MIN, MAX]``; the token ceiling is
-    the platform default backstop. ``None`` / non-positive falls back to the
-    default turn budget (the schema enforces ``ge=1`` for real calls, but the
-    routing edge must stay robust to a malformed args dict).
+    ``budget`` is the turn cap, clamped to ``[MIN, MAX]``; the token ceiling
+    is the per-turn backstop scaled by the granted turns (see the constants
+    block — a fixed backstop made large turn budgets unreachable). ``None`` /
+    non-positive falls back to the default turn budget (the schema enforces
+    ``ge=1`` for real calls, but the routing edge must stay robust to a
+    malformed args dict).
     """
     if not isinstance(budget, int) or budget < MIN_SUBAGENT_TURN_BUDGET:
         turns = DEFAULT_SUBAGENT_TURN_BUDGET
     else:
         turns = min(budget, MAX_SUBAGENT_TURN_BUDGET)
     return SubagentCeiling(
-        max_turns=turns, max_tokens=DEFAULT_SUBAGENT_TOKEN_CEILING
+        max_turns=turns, max_tokens=turns * SUBAGENT_TOKEN_CEILING_PER_TURN
     )
 
 

@@ -14,6 +14,10 @@ string builders, matching how the repo holds prompts elsewhere.
 
 from __future__ import annotations
 
+# Current-date grounding, prefixed to every builder below — see the module
+# docstring in executor/grounding.py for the live failure this prevents.
+from executor.grounding import today_line as _today_line
+
 # --------------------------------------------------------------------------- #
 # Clarity assessment — does the query carry enough context to research?
 # --------------------------------------------------------------------------- #
@@ -139,7 +143,7 @@ def build_supervisor_prompt(
     brief: str, *, iteration: int, subagent_results: dict | None = None
 ) -> str:
     """Render the Supervisor iteration-decision prompt for ``iteration``."""
-    return SUPERVISOR_DECISION_PROMPT.format(
+    return _today_line() + "\n\n" + SUPERVISOR_DECISION_PROMPT.format(
         brief=brief,
         iteration=iteration,
         results_block=_render_results_block(subagent_results or {}),
@@ -253,7 +257,9 @@ def _render_findings_block(findings: list[dict]) -> str:
 
 def build_subagent_prompt(subtask_prompt: str) -> str:
     """Render the structured-findings instruction for one sub-agent's sub-task."""
-    return SUBAGENT_FINDINGS_PROMPT.format(subtask_prompt=subtask_prompt)
+    return _today_line() + "\n\n" + SUBAGENT_FINDINGS_PROMPT.format(
+        subtask_prompt=subtask_prompt
+    )
 
 
 def build_writer_prompt(
@@ -266,7 +272,7 @@ def build_writer_prompt(
     """
     style = writer_style if writer_style in _WRITER_STYLE_INSTRUCTIONS else DEFAULT_WRITER_STYLE
     example_id = findings[0]["finding_id"] if findings else "1.0-abcd"
-    return WRITER_PROMPT.format(
+    return _today_line() + "\n\n" + WRITER_PROMPT.format(
         style_instruction=_WRITER_STYLE_INSTRUCTIONS[style],
         brief=brief,
         findings_block=_render_findings_block(findings),
@@ -276,7 +282,7 @@ def build_writer_prompt(
 
 def build_clarity_assessment_prompt(query: str) -> str:
     """Render the clarity-assessment prompt for ``query``."""
-    return SCOPE_CLARITY_ASSESSMENT_PROMPT.format(query=query)
+    return _today_line() + "\n\n" + SCOPE_CLARITY_ASSESSMENT_PROMPT.format(query=query)
 
 
 def build_brief_prompt(
@@ -295,4 +301,6 @@ def build_brief_prompt(
         )
     else:
         clarification_block = ""
-    return SCOPE_BRIEF_PROMPT.format(query=query, clarification_block=clarification_block)
+    return _today_line() + "\n\n" + SCOPE_BRIEF_PROMPT.format(
+        query=query, clarification_block=clarification_block
+    )

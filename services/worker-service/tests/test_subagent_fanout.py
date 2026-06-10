@@ -374,6 +374,258 @@ async def test_subagent_never_binds_interrupt_tool():
 
 
 # --------------------------------------------------------------------------- #
+# 6b. Headless filter — parent-state-channel tools are not bound
+#
+# ``plan_write`` / ``note_finding`` / ``remember_this_run`` return a LangGraph
+# ``Command`` targeting PARENT channels (``plan`` / ``messages`` /
+# ``observations``) that do not exist in the isolated ``_SubagentState``, and
+# declare ``InjectedToolCallId`` (which the slim sub-agent tool loop does not
+# inject). Regression for task d78a6d74: all 3 fanned-out sub-agents called
+# ``plan_write`` in round 1, each raised
+# ``ValueError: When tool includes an InjectedToolCallId argument ...``, and
+# the supervisor dead-lettered the task.
+# --------------------------------------------------------------------------- #
+def _real_plan_write_tool() -> StructuredTool:
+    from tools.plan_tools import build_plan_write_tool
+
+    return build_plan_write_tool()
+
+
+def _named_stub_tool(name: str) -> StructuredTool:
+    async def stub(text: str) -> str:
+        return "should never be bound in a sub-agent"
+
+    return StructuredTool.from_function(
+        coroutine=stub, name=name, description=f"stand-in for {name}"
+    )
+
+
+def test_filter_headless_drops_parent_state_tools():
+    tools = [
+        _echo_tool(),
+        _real_plan_write_tool(),
+        _named_stub_tool("note_finding"),
+        _named_stub_tool("remember_this_run"),
+    ]
+    filtered = filter_headless_tools(tools)
+    names = {t.name for t in filtered}
+    assert "plan_write" not in names
+    assert "note_finding" not in names
+    assert "remember_this_run" not in names
+    assert "echo" in names
+
+
+async def test_subagent_survives_scripted_plan_write_call():
+    # The model calls plan_write (as every research sub-agent did in the
+    # dead-lettered run); the tool must not be bound, the loop must answer the
+    # call with an in-band error ToolMessage, and the run must still succeed.
+    model = FakeModel([
+        _ai_tool_call(
+            "c1", "plan_write",
+            {"items": [{"id": "1", "title": "step", "status": "pending"}]},
+        ),
+        _ai_final("research summary"),
+    ])
+    result = await run_subagent(
+        prompt="research something",
+        tools=[_echo_tool(), _real_plan_write_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=_saver(),
+        thread_id="t-plan-write-regression",
+        emit=SpyEmit(),
+    )
+    assert model.bound_tools is not None
+    assert "plan_write" not in {t.name for t in model.bound_tools}
+    assert result.ok is True, f"reason={result.reason} summary={result.summary}"
+    assert "research summary" in result.summary
+
+
+# --------------------------------------------------------------------------- #
+# 6b'. Subtask identity — the caller's stable id is persisted in the
+# sub-checkpoint state so read-side projections (Console /activity sub-agent
+# tree) can correlate the opaque ``subagent:<uuid>`` namespace back to the
+# Supervisor's deterministic "<iteration>.<index>" subtask id.
+# --------------------------------------------------------------------------- #
+async def test_subtask_id_is_persisted_in_sub_checkpoint():
+    saver = _saver()
+    model = FakeModel([_ai_final("done")])
+    result = await run_subagent(
+        prompt="focused subtask",
+        tools=[_echo_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=saver,
+        thread_id="t-subtask-id",
+        emit=SpyEmit(),
+        subtask="1.2",
+    )
+    assert result.ok is True
+    # Namespace keys come from internal storage; content via the public list()
+    # API so serialization stays the saver's concern.
+    namespaces = list(saver.storage.get("t-subtask-id", {}))
+    sub_ns = [ns for ns in namespaces if ns.startswith("subagent:")]
+    assert sub_ns, f"no sub-agent namespace checkpointed; got {namespaces}"
+    found = False
+    for ns in sub_ns:
+        cfg = {"configurable": {"thread_id": "t-subtask-id", "checkpoint_ns": ns}}
+        for ckpt_tuple in saver.list(cfg):
+            values = (ckpt_tuple.checkpoint or {}).get("channel_values", {})
+            if values.get("subtask") == "1.2":
+                found = True
+    assert found, "subtask id missing from sub-checkpoint channel_values"
+
+
+async def test_subtask_omitted_leaves_channel_absent():
+    saver = _saver()
+    model = FakeModel([_ai_final("done")])
+    await run_subagent(
+        prompt="no id",
+        tools=[_echo_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=saver,
+        thread_id="t-no-subtask",
+        emit=SpyEmit(),
+    )
+    namespaces = list(saver.storage.get("t-no-subtask", {}))
+    for ns in namespaces:
+        if not ns.startswith("subagent:"):
+            continue
+        cfg = {"configurable": {"thread_id": "t-no-subtask", "checkpoint_ns": ns}}
+        for ckpt_tuple in saver.list(cfg):
+            values = (ckpt_tuple.checkpoint or {}).get("channel_values", {})
+            assert "subtask" not in values
+
+
+# --------------------------------------------------------------------------- #
+# 6b''. Transient LLM-error retry — one provider timeout must not forfeit the
+# sub-agent. Regression for task 0729e3a3 sub-agent 1.3: a single Bedrock
+# ReadTimeoutError on its FINAL model call (after 17 turns of completed
+# research) became a permanent failure because ``run_subagent`` swallows
+# exceptions into a failure marker, cutting the branch off from the task-level
+# retry+resume protection the main agent enjoys. Note: LangGraph's DEFAULT
+# RetryPolicy predicate refuses botocore's ReadTimeoutError (OSError is in its
+# MRO), so the policy must use the custom transient predicate.
+# --------------------------------------------------------------------------- #
+class _FlakyOnceModel(FakeModel):
+    """Raises the given exception on the FIRST ainvoke, then behaves normally."""
+
+    def __init__(self, scripted, exc: Exception):
+        super().__init__(scripted)
+        self._exc: Exception | None = exc
+
+    async def ainvoke(self, messages, *args, **kwargs):
+        if self._exc is not None:
+            exc, self._exc = self._exc, None
+            self.invocations += 1
+            raise exc
+        return await super().ainvoke(messages, *args, **kwargs)
+
+
+async def test_transient_llm_error_is_retried():
+    from botocore.exceptions import ReadTimeoutError
+
+    model = _FlakyOnceModel(
+        [_ai_final("recovered findings")],
+        ReadTimeoutError(endpoint_url="https://bedrock-runtime/converse"),
+    )
+    result = await run_subagent(
+        prompt="research",
+        tools=[_echo_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=_saver(),
+        thread_id="t-transient-retry",
+        emit=SpyEmit(),
+    )
+    assert result.ok is True, f"reason={result.reason} summary={result.summary}"
+    assert "recovered findings" in result.summary
+    assert model.invocations == 2  # first call raised, retry succeeded
+
+
+async def test_non_transient_llm_error_is_not_retried():
+    model = _FlakyOnceModel(
+        [_ai_final("never reached")],
+        ValueError("malformed tool schema — retrying cannot help"),
+    )
+    result = await run_subagent(
+        prompt="research",
+        tools=[_echo_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=_saver(),
+        thread_id="t-non-transient",
+        emit=SpyEmit(),
+    )
+    assert result.ok is False
+    assert result.reason == "error"
+    assert model.invocations == 1  # no retry on logic errors
+    # The typed cause is captured as the failure detail so the Console marker
+    # can show WHY (not just "error").
+    assert "ValueError" in result.summary
+    assert "malformed tool schema" in result.summary
+
+
+def test_transient_predicate_covers_observed_and_common_shapes():
+    from botocore.exceptions import ReadTimeoutError
+
+    from executor.retry_classification import is_retryable_error
+    from executor.subagents.fanout import _SUBAGENT_LLM_RETRY
+
+    # The per-turn RetryPolicy must gate on the SHARED classifier — the
+    # whole point of the extraction is that fanout and the task-level
+    # dead-letter decision can never drift apart again.
+    assert _SUBAGENT_LLM_RETRY.retry_on is is_retryable_error
+
+    # The exact exception that killed sub-agent 1.3 live.
+    assert is_retryable_error(ReadTimeoutError(endpoint_url="x")) is True
+    # Builtin transport errors.
+    assert is_retryable_error(ConnectionError("reset")) is True
+    assert is_retryable_error(TimeoutError("slow")) is True
+    # Logic errors must not retry.
+    assert is_retryable_error(ValueError("bad args")) is False
+    assert is_retryable_error(KeyError("missing")) is False
+
+
+# --------------------------------------------------------------------------- #
+# 6c. Tool-error containment — a raising tool yields an error ToolMessage,
+# it must NOT kill the whole sub-agent (ToolNode parity: the parent graph's
+# prebuilt ToolNode surfaces tool errors in-band for the LLM to route around).
+# --------------------------------------------------------------------------- #
+async def test_tool_exception_becomes_error_toolmessage():
+    def _raising_tool() -> StructuredTool:
+        async def boom(text: str) -> str:
+            raise RuntimeError("transient provider failure")
+
+        return StructuredTool.from_function(
+            coroutine=boom, name="boom", description="always raises"
+        )
+
+    model = FakeModel([
+        _ai_tool_call("c1", "boom", {"text": "x"}),
+        _ai_final("recovered after tool error"),
+    ])
+    result = await run_subagent(
+        prompt="try the flaky tool",
+        tools=[_echo_tool(), _raising_tool()],
+        ceiling=_ceiling(),
+        depth=0,
+        model=model,
+        checkpointer=_saver(),
+        thread_id="t-tool-error-contained",
+        emit=SpyEmit(),
+    )
+    assert result.ok is True, f"reason={result.reason} summary={result.summary}"
+    assert "recovered" in result.summary
+
+
+# --------------------------------------------------------------------------- #
 # 7. Heartbeat — span event only, no lease/heartbeat/task_events touch
 # --------------------------------------------------------------------------- #
 async def test_heartbeat_emitted_as_span_event(monkeypatch):
