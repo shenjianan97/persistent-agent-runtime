@@ -230,9 +230,123 @@ async def verify(report: str, findings: list[dict], *, model: Any) -> list[dict]
     return list(await asyncio.gather(*(_verify_one(fid) for fid in cited_ids)))
 
 
+# Broken-citation marker rendered in the prose for an unresolvable id (no
+# source_url). The Sources section pairs it with an explicit "source unavailable"
+# line — we NEVER fabricate a number or a URL for a dangling id (§A5).
+_BROKEN_MARKER = "?"
+# Warning glyph appended to a Sources line whose verify flag says the quote did
+# not clearly support the claim (``supported is False`` or an ``error``). It only
+# *flags*; the report is never gated on it (matching ``verify``'s contract).
+_UNSUPPORTED_MARKER = "⚠"
+
+
+def _is_unresolvable(entry: dict | None) -> bool:
+    """An id is unresolvable when its resolved/flag entry carries the render
+    error sentinel or otherwise has no usable ``source_url`` (§A5 — never invent
+    a source for such an id)."""
+    if not isinstance(entry, dict):
+        return True
+    if entry.get("error"):
+        return True
+    return not entry.get("source_url")
+
+
+def render_report(
+    report: str,
+    citations: list[dict],
+    verify_flags: list[dict],
+) -> str:
+    """Render the raw Writer report into a numbered-citation report. Deterministic; **no LLM**.
+
+    The Writer cites by raw ``[finding_id]`` (see :data:`_CITATION_RE`); this step
+    is the final, deterministic binding that turns those internal hashes into
+    reader-facing numbered sources, so the published report (and the Console
+    activity turn that mirrors the ``report`` channel verbatim) never leaks an
+    internal ``finding_id``.
+
+    Steps:
+
+    * Number each **distinct cited** ``finding_id`` by first appearance
+      (``extract_citations`` order) → 1, 2, 3 …
+    * Substitute each raw ``[finding_id]`` marker in the prose with ``[N]`` (or
+      ``[?]`` for an unresolvable id), via :data:`_CITATION_RE` — pure marker
+      substitution, the surrounding prose is **never reflowed** (style-agnostic:
+      works for formal prose and annotated bullets alike).
+    * Append a ``## Sources`` section: one line per ``[N]`` → its resolved
+      ``source_url`` (optionally prefixed with a short ``claim`` label). A source
+      whose matching ``verify_flags`` entry is unsupported / errored gets a
+      :data:`_UNSUPPORTED_MARKER`. An **unresolvable** id renders ``[?] (source
+      unavailable)`` — NEVER a fabricated source (§A5).
+
+    Inputs are never mutated and ``supporting_quote`` is never emitted into the
+    rendered report.
+    """
+    report = report or ""
+    citations_by_id = {
+        str(c.get("finding_id")): c for c in (citations or []) if isinstance(c, dict)
+    }
+    flags_by_id = {
+        str(f.get("finding_id")): f
+        for f in (verify_flags or [])
+        if isinstance(f, dict)
+    }
+
+    cited_ids = extract_citations(report)
+
+    # Assign a 1-based number to each distinct *resolvable* cited id, in
+    # first-appearance order; unresolvable ids render as a shared broken marker
+    # and never consume a source number.
+    number_by_id: dict[str, int] = {}
+    next_number = 1
+    for fid in cited_ids:
+        if _is_unresolvable(citations_by_id.get(fid)):
+            continue
+        number_by_id[fid] = next_number
+        next_number += 1
+
+    def _marker(fid: str) -> str:
+        n = number_by_id.get(fid)
+        return f"[{n}]" if n is not None else f"[{_BROKEN_MARKER}]"
+
+    # Substitute raw [finding_id] -> [N] / [?] in place (no reflow). cited_ids is
+    # derived from the same regex over the same report, so every matched id is
+    # accounted for; a stray bracket not in the cited set falls through to [?].
+    def _sub(match: "re.Match[str]") -> str:
+        return _marker(match.group(1))
+
+    rendered_body = _CITATION_RE.sub(_sub, report)
+
+    # Build the Sources section in source-number order, then a single broken line
+    # if any unresolvable id was cited.
+    source_lines: list[str] = []
+    ordered = sorted(number_by_id.items(), key=lambda kv: kv[1])
+    for fid, n in ordered:
+        cit = citations_by_id.get(fid, {})
+        url = cit.get("source_url", "")
+        claim = (cit.get("claim") or "").strip()
+        line = f"[{n}] {claim} — {url}" if claim else f"[{n}] {url}"
+        flag = flags_by_id.get(fid)
+        if flag is not None and (flag.get("supported") is False or flag.get("error")):
+            line = f"{line} {_UNSUPPORTED_MARKER}"
+        source_lines.append(line)
+
+    has_unresolvable = any(
+        _is_unresolvable(citations_by_id.get(fid)) for fid in cited_ids
+    )
+    if has_unresolvable:
+        source_lines.append(f"[{_BROKEN_MARKER}] (source unavailable)")
+
+    if not source_lines:
+        return rendered_body
+
+    body = rendered_body.rstrip()
+    return f"{body}\n\n## Sources\n" + "\n".join(source_lines)
+
+
 __all__ = [
     "RENDER_ERROR_FLAG",
     "resolve",
     "verify",
     "extract_citations",
+    "render_report",
 ]

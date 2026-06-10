@@ -42,6 +42,7 @@ from langchain_core.messages import AIMessage
 from executor.supervisor import citations
 from executor.supervisor.citations import (
     RENDER_ERROR_FLAG,
+    render_report,
     resolve,
     verify,
 )
@@ -253,6 +254,143 @@ async def test_verify_call_failure_degrades_gracefully():
 
 
 # --------------------------------------------------------------------------- #
+# render_report — deterministic numbered-source rendering, no LLM, no fabrication
+# --------------------------------------------------------------------------- #
+def _supported(fid: str) -> dict:
+    return {"finding_id": fid, "supported": True}
+
+
+def test_render_report_numbers_citations_first_appearance_and_lists_sources():
+    report = "The thing is real [f1]. It is large [f2]. And real again [f1]."
+    cits = [
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "q1", "claim": "real"},
+        {"finding_id": "f2", "source_url": "https://b", "supporting_quote": "q2", "claim": "large"},
+    ]
+    flags = [_supported("f1"), _supported("f2")]
+    out = render_report(report, cits, flags)
+
+    body = out.split("## Sources", 1)[0]
+    # Prose markers substituted [finding_id] -> [N] in first-appearance order.
+    assert "[1]" in body and "[2]" in body
+    # The repeated f1 reference also renders [1] (consistent numbering).
+    assert body.count("[1]") == 2
+    # No raw finding_id markers survive in the prose.
+    assert "[f1]" not in out and "[f2]" not in out
+    # Sources section appended with the resolved source_urls.
+    assert "## Sources" in out
+    assert "https://a" in out and "https://b" in out
+    # Source numbers match the prose numbers.
+    sources = out.split("## Sources", 1)[1]
+    assert "[1]" in sources and "[2]" in sources
+    # The [1] source line carries f1's url, [2] carries f2's.
+    lines = {
+        ln[: ln.index("]") + 1]: ln
+        for ln in sources.splitlines()
+        if ln.strip().startswith("[")
+    }
+    assert "https://a" in lines["[1]"]
+    assert "https://b" in lines["[2]"]
+
+
+def test_render_report_unresolvable_id_renders_broken_marker_no_fabrication():
+    report = "A dangling claim [f99]. A good one [f1]."
+    cits = [
+        {"finding_id": "f99", "error": RENDER_ERROR_FLAG},
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "q", "claim": "c"},
+    ]
+    flags = [
+        {"finding_id": "f99", "error": RENDER_ERROR_FLAG},
+        _supported("f1"),
+    ]
+    out = render_report(report, cits, flags)
+
+    # Unresolvable id renders as a broken marker, never a fabricated number/source.
+    assert "[?]" in out
+    assert "[f99]" not in out
+    # No fabricated url for the dangling id.
+    assert "(source unavailable)" in out
+    # The good citation still numbers + resolves.
+    assert "https://a" in out
+    # The unresolvable finding never invents a source_url.
+    assert "https://" not in out.split("(source unavailable)")[0].split("\n")[-1]
+
+
+def test_render_report_unsupported_verify_flag_marks_source_with_warning():
+    report = "Claim one [f1]. Claim two [f2]."
+    cits = [
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "q1", "claim": "c1"},
+        {"finding_id": "f2", "source_url": "https://b", "supporting_quote": "q2", "claim": "c2"},
+    ]
+    flags = [
+        {"finding_id": "f1", "supported": True},
+        {"finding_id": "f2", "supported": False},
+    ]
+    out = render_report(report, cits, flags)
+    sources = out.split("## Sources", 1)[1]
+    lines = {
+        ln[: ln.index("]") + 1]: ln
+        for ln in sources.splitlines()
+        if ln.strip().startswith("[")
+    }
+    # The unsupported source carries the warning marker; the supported one does not.
+    assert "⚠" in lines["[2]"]
+    assert "⚠" not in lines["[1]"]
+
+
+def test_render_report_does_not_mutate_inputs_and_preserves_quotes():
+    report = "Claim [f1]."
+    cits = [
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "‘immutable é’", "claim": "c"},
+    ]
+    flags = [_supported("f1")]
+    quote_before = cits[0]["supporting_quote"]
+    cits_snapshot = json.loads(json.dumps(cits))
+    flags_snapshot = json.loads(json.dumps(flags))
+
+    out = render_report(report, cits, flags)
+
+    # supporting_quote byte-identical; inputs untouched.
+    assert cits[0]["supporting_quote"] == quote_before
+    assert cits[0]["supporting_quote"].encode("utf-8") == quote_before.encode("utf-8")
+    assert cits == cits_snapshot
+    assert flags == flags_snapshot
+    # supporting_quote is never emitted into the rendered report.
+    assert "immutable é" not in out
+
+
+def test_render_report_is_deterministic():
+    report = "One [f1]. Two [f2]. One again [f1]."
+    cits = [
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "q1", "claim": "c1"},
+        {"finding_id": "f2", "source_url": "https://b", "supporting_quote": "q2", "claim": "c2"},
+    ]
+    flags = [_supported("f1"), _supported("f2")]
+    assert render_report(report, cits, flags) == render_report(report, cits, flags)
+
+
+def test_render_report_works_for_formal_and_bullet_styles():
+    cits = [
+        {"finding_id": "f1", "source_url": "https://a", "supporting_quote": "q1", "claim": "c1"},
+        {"finding_id": "f2", "source_url": "https://b", "supporting_quote": "q2", "claim": "c2"},
+    ]
+    flags = [_supported("f1"), _supported("f2")]
+
+    formal = "The market grew sharply [f1]. Losses narrowed [f2]."
+    bullets = "- Market grew sharply [f1]\n- Losses narrowed [f2]"
+
+    formal_out = render_report(formal, cits, flags)
+    bullets_out = render_report(bullets, cits, flags)
+
+    for out in (formal_out, bullets_out):
+        assert "[1]" in out and "[2]" in out
+        assert "[f1]" not in out and "[f2]" not in out
+        assert "## Sources" in out
+    # The bullet structure is preserved (prose not reflowed).
+    assert bullets_out.startswith("- Market grew sharply [1]")
+    assert "- Losses narrowed [2]" in bullets_out
+
+
+# --------------------------------------------------------------------------- #
 # reduce_findings — v1 hard cap, select/reorder only, IMMUTABLE quotes
 # --------------------------------------------------------------------------- #
 def test_reduce_findings_caps_and_logs_dropped(caplog):
@@ -321,12 +459,20 @@ async def test_writer_node_one_shot_cites_by_id_only():
         state, _writer_config(writer_model, writer_style="formal_report", verify_model=verify_model)
     )
     report = out["report"]
-    assert "[f1]" in report and "[f2]" in report
-    # No inline source URL leaked from the model output.
-    assert "https://a" not in report and "https://b" not in report
-    # Exactly ONE writer call (one-shot, not parallel section-writing).
+    # The returned report is now RENDERED: raw finding_id markers are replaced
+    # with numbered [N] citations and a Sources section is appended (S-citations).
+    assert "[f1]" not in report and "[f2]" not in report
+    assert "[1]" in report and "[2]" in report
+    assert "## Sources" in report
+    # The source_urls surface in the appended Sources section (deterministic
+    # binding), not inline in the prose body.
+    body = report.split("## Sources", 1)[0]
+    assert "https://a" not in body and "https://b" not in body
+    assert "https://a" in report and "https://b" in report
+    # Exactly ONE writer call (one-shot, not parallel section-writing) — rendering
+    # is deterministic, no extra LLM call.
     assert len(writer_model.calls) == 1
-    # verify flags + resolved citations attached for downstream render.
+    # verify flags + resolved citations STILL attached for downstream audit.
     assert "verify_flags" in out
     assert "citations" in out
     resolved = {c["finding_id"]: c for c in out["citations"]}

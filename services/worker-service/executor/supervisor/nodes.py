@@ -646,8 +646,15 @@ async def writer_node(state: SupervisorState, config: RunnableConfig) -> dict:
     step_usage = merge_step_usage(
         usage_from_message(writer_msg), verify_wrapped.usage
     )
+    # (5) Deterministic citation render — turn the raw ``[finding_id]`` markers
+    # into reader-facing numbered ``[N]`` citations + a ``## Sources`` section, so
+    # the published report (and the Console activity turn that mirrors the
+    # ``report`` channel verbatim) never leaks an internal finding_id. No LLM; must
+    # run LAST because ``verify`` / ``resolve`` above need the raw ``[finding_id]``
+    # form. ``citations`` / ``verify_flags`` are returned unchanged for audit.
+    rendered_report = citations.render_report(report, resolved, verify_flags)
     return {
-        "report": report,
+        "report": rendered_report,
         "citations": resolved,
         "verify_flags": verify_flags,
         "step_usage": step_usage,
