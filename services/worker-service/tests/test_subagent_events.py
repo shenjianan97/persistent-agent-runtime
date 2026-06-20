@@ -31,11 +31,13 @@ import pytest
 
 from core.subagent_events import (
     PROMPT_PREVIEW_MAX_CHARS,
+    SUBAGENT_COMPLETED_EVENT,
     SUBAGENT_FAILED_EVENT,
     SUBAGENT_FINDING_EVENT,
     SUBAGENT_STARTED_EVENT,
     SUPERVISOR_ITERATION_EVENT,
     build_task_event_sink,
+    emit_subagent_completed,
     emit_subagent_failed,
     emit_subagent_finding,
     emit_subagent_started,
@@ -55,6 +57,8 @@ NEW_EVENT_TYPES = [
     SUBAGENT_FINDING_EVENT,
     SUBAGENT_FAILED_EVENT,
     SUPERVISOR_ITERATION_EVENT,
+    # Migration 0026 — terminal success marker (counterpart to subagent_failed).
+    SUBAGENT_COMPLETED_EVENT,
 ]
 
 
@@ -188,7 +192,7 @@ class TestMigration0025CheckConstraint:
                 )
 
     @pytest.mark.asyncio
-    async def test_constraint_clause_contains_all_four(
+    async def test_constraint_clause_contains_all_subagent_markers(
         self, integration_pool: asyncpg.Pool
     ) -> None:
         async with integration_pool.acquire() as conn:
@@ -200,6 +204,8 @@ class TestMigration0025CheckConstraint:
         clause = row["check_clause"]
         for event_type in NEW_EVENT_TYPES:
             assert event_type in clause, f"{event_type} missing from {clause}"
+        # subagent_completed (migration 0026) is the terminal success marker.
+        assert SUBAGENT_COMPLETED_EVENT in clause
         assert "subagent_heartbeat" not in clause
         # Additive — a pre-existing value must survive.
         assert "memory_written" in clause
@@ -310,6 +316,24 @@ class TestEmitHelpersThroughRealSink:
             "subtask": "3.1",
             "reason": "timeout",
         }
+
+    @pytest.mark.asyncio
+    async def test_emit_subagent_completed(
+        self, integration_pool: asyncpg.Pool
+    ) -> None:
+        async with integration_pool.acquire() as conn:
+            task_id = await _new_task(conn)
+        sink = build_task_event_sink(
+            integration_pool, task_id=task_id, tenant_id=TENANT_ID, agent_id=AGENT_ID
+        )
+        await emit_subagent_completed(sink, iteration=2, subtask="2.0")
+        async with integration_pool.acquire() as conn:
+            ev = await _fetch_one_event(conn, task_id)
+        assert ev["event_type"] == SUBAGENT_COMPLETED_EVENT
+        assert ev["status_before"] is None and ev["status_after"] is None
+        # Minimal lifecycle payload — NO finding_count or other result (§A7).
+        assert ev["details"] == {"iteration": 2, "subtask": "2.0"}
+        assert "finding_count" not in ev["details"]
 
     @pytest.mark.asyncio
     async def test_emit_subagent_failed_carries_truncated_detail(

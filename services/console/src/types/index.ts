@@ -510,7 +510,8 @@ export type ActivityEventKind =
     | 'marker.supervisor.iteration'
     | 'marker.subagent.started'
     | 'marker.subagent.finding'
-    | 'marker.subagent.failed';
+    | 'marker.subagent.failed'
+    | 'marker.subagent.completed';
 
 export interface ActivityToolCall {
     id?: string;

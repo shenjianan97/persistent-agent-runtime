@@ -519,11 +519,12 @@ describe('ActivityPane', () => {
             renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
 
             await screen.findByTestId('activity-subagent-tree');
-            // The round-1 1.1 group is failed; the round-2 1.1 group is found and retried.
+            // The round-1 1.1 group is failed; the round-2 1.1 group produced a
+            // finding (=> terminal success 'done') and is retried.
             const statusChips = screen.getAllByTestId('activity-subagent-1.1-status');
             const chipTexts = statusChips.map((c) => c.textContent);
             expect(chipTexts).toContain('failed');
-            expect(chipTexts).toContain('finding');
+            expect(chipTexts).toContain('done');
             // Exactly one retry chip (on the round-2 group), pointing at round 1.
             const retry = screen.getByTestId('activity-subagent-1.1-retry');
             expect(retry).toHaveTextContent('retried from round 1');
@@ -543,6 +544,69 @@ describe('ActivityPane', () => {
             expect(screen.getByTestId('activity-row-0')).toHaveAttribute('data-kind', 'turn.user');
             expect(screen.getByText('Research the topic')).toBeInTheDocument();
             expect(screen.getByText('Here is the report.')).toBeInTheDocument();
+        });
+
+        it('shows a zero-finding successful sub-agent as done (not stuck running)', async () => {
+            // The core regression: a sub-agent that finishes successfully but
+            // emits NO finding marker. Its only terminal signal is
+            // subagent_completed — without it the badge is stranded on "running".
+            listActivityMock.mockResolvedValue({
+                events: [
+                    event({
+                        kind: 'marker.supervisor.iteration',
+                        timestamp: '2026-06-08T00:00:01+00:00',
+                        event_type: 'supervisor_iteration',
+                        iteration: 1,
+                        details: { iteration: 1, subtasks_emitted: 1, decision: 'stop', reason: 'done' },
+                    }),
+                    event({
+                        kind: 'marker.subagent.completed',
+                        timestamp: '2026-06-08T00:00:03+00:00',
+                        event_type: 'subagent_completed',
+                        iteration: 1,
+                        subtask: '1.0',
+                        details: { iteration: 1, subtask: '1.0' },
+                    }),
+                ],
+                next_cursor: null,
+            });
+            renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+            await screen.findByTestId('activity-subagent-tree');
+            const chip = screen.getByTestId('activity-subagent-1.0-status');
+            expect(chip).toHaveTextContent('done');
+            expect(chip).not.toHaveTextContent('running');
+            // The completion marker renders as its own "Completed" leaf.
+            expect(screen.getByTestId('activity-subagent-tree')).toHaveTextContent('Completed');
+        });
+
+        it('promotes a running sub-agent to done when subagent_completed arrives', async () => {
+            // started-only first (running), then a completed marker resolves it.
+            listActivityMock.mockResolvedValue({
+                events: [
+                    event({
+                        kind: 'marker.subagent.started',
+                        timestamp: '2026-06-08T00:00:01+00:00',
+                        event_type: 'subagent_started',
+                        iteration: 1,
+                        subtask: '1.0',
+                        details: { iteration: 1, subtask: '1.0', prompt_preview: 'go' },
+                    }),
+                    event({
+                        kind: 'marker.subagent.completed',
+                        timestamp: '2026-06-08T00:00:02+00:00',
+                        event_type: 'subagent_completed',
+                        iteration: 1,
+                        subtask: '1.0',
+                        details: { iteration: 1, subtask: '1.0' },
+                    }),
+                ],
+                next_cursor: null,
+            });
+            renderWithClient(<ActivityPane taskId="task-1" status="completed" />);
+
+            await screen.findByTestId('activity-subagent-tree');
+            expect(screen.getByTestId('activity-subagent-1.0-status')).toHaveTextContent('done');
         });
 
         it('tolerates an unknown marker kind (forward-compat)', async () => {

@@ -71,10 +71,15 @@ public class ActivityProjectionService {
             // S9 sub-agent fan-out observability — user-meaningful research progress:
             //   marker.subagent.finding    — a sub-agent emitted a structured finding
             //   marker.subagent.failed     — a sub-agent failed (customer sees failure)
+            //   marker.subagent.completed  — a sub-agent finished successfully (terminal;
+            //                                the ONLY signal for a zero-finding success —
+            //                                without it on the coarse view the Console badge
+            //                                is stranded on "running")
             //   marker.supervisor.iteration — supervisor closed a round (progress / stop)
             // Excluded: marker.subagent.started — lifecycle telemetry, detail-only
             "marker.subagent.finding",
             "marker.subagent.failed",
+            "marker.subagent.completed",
             "marker.supervisor.iteration"
     );
 
@@ -112,7 +117,14 @@ public class ActivityProjectionService {
 
     /** Event types subject to at-least-once dedup (includes first-wins types too). */
     private static final Set<String> SUBAGENT_DEDUP_TYPES = Set.of(
-            "subagent_started", "subagent_finding", "subagent_failed", "supervisor_iteration"
+            "subagent_started", "subagent_finding", "subagent_failed", "supervisor_iteration",
+            // subagent_completed is first-wins (NOT in SUBAGENT_LAST_WINS): its
+            // {iteration, subtask} payload is fixed, so every at-least-once duplicate
+            // row is byte-identical and first-wins keeps the EARLIEST created_at — the
+            // true completion timestamp. Pairs with subagent_started (also first-wins),
+            // its lifecycle-bracket sibling, rather than the last-wins result/reason
+            // markers (finding/failed/iteration) whose payload changes across re-emits.
+            "subagent_completed"
     );
 
     private final TaskRepository taskRepository;
@@ -191,8 +203,9 @@ public class ActivityProjectionService {
         // ordering. markerRows arrives in created_at ASC order from the DB.
         //
         // Resolution policy: first-wins for subagent_started (authoritative
-        // dispatch info); last-wins for subagent_finding / subagent_failed /
-        // supervisor_iteration (most-recent result/reason wins).
+        // dispatch info) and subagent_completed (fixed payload — earliest row is
+        // the true completion time); last-wins for subagent_finding /
+        // subagent_failed / supervisor_iteration (most-recent result/reason wins).
         //
         // Non-sub-agent markers are not subject to this dedup and flow through
         // unchanged (they already have unique event ids from the DB).
@@ -793,6 +806,7 @@ public class ActivityProjectionService {
             case "subagent_started" -> "marker.subagent.started";
             case "subagent_finding" -> "marker.subagent.finding";
             case "subagent_failed" -> "marker.subagent.failed";
+            case "subagent_completed" -> "marker.subagent.completed";
             case "supervisor_iteration" -> "marker.supervisor.iteration";
             // Forward-compat: unknown event_type written by a newer worker
             // against an older API is silently dropped (not errored).

@@ -67,19 +67,30 @@ SUBAGENT_FAILED_EVENT = "subagent_failed"
 """``task_events.event_type`` value for a sub-agent that exhausted its ceiling /
 timeout or errored (S6). Admitted by migration ``0025``."""
 
+SUBAGENT_COMPLETED_EVENT = "subagent_completed"
+"""``task_events.event_type`` value for a sub-agent that finished its work
+SUCCESSFULLY (the success-path counterpart to ``subagent_failed``). Emitted once
+per ``_fanout_node`` success branch so the Activity timeline has a terminal
+"this sub-agent finished" signal even when the sub-agent produced ZERO findings —
+otherwise its Console badge is stranded on "running" forever (no finding marker
+ever arrives). Forms the lifecycle bracket ``subagent_started`` →
+``subagent_completed`` | ``subagent_failed``. Admitted by migration ``0026``."""
+
 SINK_ADMITTED_EVENT_TYPES = frozenset({
     SUPERVISOR_ITERATION_EVENT,
     SUBAGENT_STARTED_EVENT,
     SUBAGENT_FINDING_EVENT,
     SUBAGENT_FAILED_EVENT,
+    SUBAGENT_COMPLETED_EVENT,
 })
 """The ONLY event_type values :func:`build_task_event_sink` writes to
-``task_events`` — exactly migration ``0025``'s four additions. The SAME injected
-``emit`` sink is also used by ``build_subagent_node`` for the
-``subagent.heartbeat`` SPAN event (``executor/subagents/fanout.py``); that
-heartbeat is a Langfuse span event and is DELIBERATELY NOT a ``task_events`` row
-(§A11-E4), so the sink drops any event_type outside this set rather than
-attempting an INSERT that the CHECK constraint would reject."""
+``task_events`` — migration ``0025``'s four additions plus ``subagent_completed``
+(migration ``0026``). The SAME injected ``emit`` sink is also used by
+``build_subagent_node`` for the ``subagent.heartbeat`` SPAN event
+(``executor/subagents/fanout.py``); that heartbeat is a Langfuse span event and
+is DELIBERATELY NOT a ``task_events`` row (§A11-E4), so the sink drops any
+event_type outside this set rather than attempting an INSERT that the CHECK
+constraint would reject."""
 
 PROMPT_PREVIEW_MAX_CHARS = 200
 """Cap on the ``prompt_preview`` carried in a ``subagent_started`` row's
@@ -260,6 +271,48 @@ async def emit_subagent_failed(
         logger.exception(
             "%s emit failed (non-fatal) details=%s",
             SUBAGENT_FAILED_EVENT,
+            details,
+        )
+
+
+async def emit_subagent_completed(
+    emit: EmitCallable | None,
+    *,
+    iteration: int,
+    subtask: str,
+) -> None:
+    """Emit a ``subagent_completed`` event with the canonical payload.
+
+    Payload: ``{iteration, subtask}`` — the same minimal lifecycle shape as
+    ``subagent_started``. DELIBERATELY carries no ``finding_count`` (or any other
+    result): findings already ride their own ``subagent_finding`` rows, and §A7's
+    row-size-minimalism principle keeps result data off lifecycle markers (a
+    consumer that wants a count sums the sibling ``subagent_finding`` rows). This
+    is the success-path terminal — the counterpart to :func:`emit_subagent_failed`
+    — emitted once per ``_fanout_node`` success branch so the Activity timeline
+    has a "this sub-agent finished" signal even on a ZERO-finding success (without
+    it the Console badge is stranded on "running").
+
+    User-meaningful (a customer should see a sub-agent finished, not just guess
+    from findings). ``emit`` is the injected sink; when ``None`` this degrades to
+    a structured log so the completion is still observable and never raises into
+    the graph. The ``(event_type, iteration, subtask)`` dedup key makes a
+    per-turn-resume re-emit idempotent for consumers (first-wins — every duplicate
+    row is byte-identical, so the earliest = true completion timestamp survives).
+    """
+    details = {
+        "iteration": iteration,
+        "subtask": subtask,
+    }
+    if emit is None:
+        logger.info("%s %s", SUBAGENT_COMPLETED_EVENT, details)
+        return
+    try:
+        await emit(SUBAGENT_COMPLETED_EVENT, details)
+    except Exception:  # noqa: BLE001 — observability must never sink the run.
+        logger.exception(
+            "%s emit failed (non-fatal) details=%s",
+            SUBAGENT_COMPLETED_EVENT,
             details,
         )
 

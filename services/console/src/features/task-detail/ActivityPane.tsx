@@ -13,6 +13,7 @@ import {
     ChevronDown,
     ChevronRight,
     AlertTriangle,
+    CheckCircle2,
     Activity as ActivityIcon,
 } from 'lucide-react';
 
@@ -127,7 +128,8 @@ function isSubagentMarker(kind: string): boolean {
         kind === 'marker.supervisor.iteration' ||
         kind === 'marker.subagent.started' ||
         kind === 'marker.subagent.finding' ||
-        kind === 'marker.subagent.failed'
+        kind === 'marker.subagent.failed' ||
+        kind === 'marker.subagent.completed'
     );
 }
 
@@ -900,7 +902,12 @@ interface SubagentGroup {
     // The sub-agent's own conversation turns (turn.user / turn.assistant /
     // turn.tool tagged with this subtask), collapsed by default.
     transcript: SubagentStep[];
-    status: 'found' | 'failed' | 'running';
+    // Terminal success ('done') is driven by EITHER a subagent_completed marker
+    // OR any subagent_finding (findings imply success — kept as a robustness
+    // fallback since the completed emit is best-effort and a lost one must not
+    // re-strand a sub-agent that did produce findings). 'failed' only when no
+    // terminal success was seen.
+    status: 'done' | 'failed' | 'running';
     // True when at least one S9 marker contributed — transcript-only groups
     // (historic tasks lacking marker correlation) suppress the status chip.
     hasMarkers: boolean;
@@ -977,9 +984,18 @@ function buildSubagentTree(
         const group = ensureGroup(round, subtask);
         group.steps.push(item);
         group.hasMarkers = true;
-        if (item.event.kind === 'marker.subagent.finding') {
-            group.status = 'found';
-        } else if (item.event.kind === 'marker.subagent.failed' && group.status !== 'found') {
+        // Terminal-state resolution. A subagent_completed marker is the explicit
+        // success terminal; a subagent_finding also implies success (fallback for
+        // a lost best-effort completed emit). 'failed' applies only if no success
+        // terminal was seen. This precedence is airtight because the worker emits
+        // EXACTLY ONE terminal (completed | failed) per (iteration, subtask) per
+        // round, and a retry carries a distinct <iteration> key (separate group).
+        if (
+            item.event.kind === 'marker.subagent.completed' ||
+            item.event.kind === 'marker.subagent.finding'
+        ) {
+            group.status = 'done';
+        } else if (item.event.kind === 'marker.subagent.failed' && group.status !== 'done') {
             group.status = 'failed';
         }
     }
@@ -1026,7 +1042,7 @@ function buildSubagentTree(
 }
 
 function statusChipLabel(status: SubagentGroup['status']): string {
-    if (status === 'found') return 'finding';
+    if (status === 'done') return 'done';
     if (status === 'failed') return 'failed';
     return 'running';
 }
@@ -1076,6 +1092,13 @@ function SubagentStepRow({ event, index }: SubagentStep) {
                 )}
             </span>
         );
+    } else if (event.kind === 'marker.subagent.completed') {
+        // Terminal success marker. The sub-agent's findings (if any) render as
+        // their own rows in this same group, so the completion row stays a plain
+        // "finished" signal — its whole purpose is to mark a sub-agent done even
+        // when it produced zero findings (the sole non-stuck signal in that case).
+        icon = <CheckCircle2 className="w-3 h-3 shrink-0 text-success" />;
+        line = <span className="flex-1 text-success">Completed</span>;
     } else {
         // marker.subagent.started — dispatch marker (detail-only on the server,
         // visible here only when "Show details" is on). Skeleton: prompt preview.
@@ -1154,7 +1177,7 @@ function SubagentTree({ rounds }: { rounds: RoundGroup[] }) {
                                             tone={
                                                 group.status === 'failed'
                                                     ? 'destructive'
-                                                    : group.status === 'found'
+                                                    : group.status === 'done'
                                                         ? 'success'
                                                         : 'muted'
                                             }

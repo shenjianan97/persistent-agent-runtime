@@ -711,6 +711,37 @@ class ActivityProjectionServiceTest {
     }
 
     @Test
+    void mapMarker_subagentCompleted_mapsToMarkerSubagentCompleted_userVisible() {
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse event = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "agent-1", "subagent_completed",
+                null, null, "worker-1", null, null,
+                Map.of("iteration", 2, "subtask", "2.0"),
+                OffsetDateTime.parse("2026-06-08T10:02:30+00:00"));
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(event));
+
+        // include_details=true
+        List<ActivityEventResponse> allEvents = service.getActivity(taskId, true).events();
+        assertEquals(1, allEvents.size());
+        ActivityEventResponse marker = allEvents.get(0);
+        assertEquals("marker.subagent.completed", marker.kind());
+        assertEquals(2, marker.iteration());
+        assertEquals("2.0", marker.subtask());
+
+        // include_details=false: marker.subagent.completed MUST be user-visible —
+        // it is the sole terminal signal for a zero-finding success, so the coarse
+        // view (the Console's default) has to carry it or the badge stays "running".
+        List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
+        assertEquals(1, userVisible.size());
+        assertEquals("marker.subagent.completed", userVisible.get(0).kind());
+    }
+
+    @Test
     void mapMarker_supervisorIteration_mapsToMarkerSupervisorIteration() {
         UUID taskId = UUID.randomUUID();
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
@@ -821,25 +852,33 @@ class ActivityProjectionServiceTest {
                 null, null, "w", null, null,
                 Map.of("iteration", 0, "subtasks_emitted", 2, "decision", "stop", "reason", "done"),
                 OffsetDateTime.parse("2026-06-08T10:03:00+00:00"));
+        TaskEventResponse completed = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_completed",
+                null, null, "w", null, null,
+                Map.of("iteration", 0, "subtask", "0.0"),
+                OffsetDateTime.parse("2026-06-08T10:04:00+00:00"));
 
         when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
-                .thenReturn(List.of(started, finding, failed, iteration));
+                .thenReturn(List.of(started, finding, failed, iteration, completed));
 
-        // include_details=true → all four visible
+        // include_details=true → all five visible
         List<ActivityEventResponse> all = service.getActivity(taskId, true).events();
         List<String> allKinds = all.stream().map(ActivityEventResponse::kind).toList();
         assertTrue(allKinds.contains("marker.subagent.started"));
         assertTrue(allKinds.contains("marker.subagent.finding"));
         assertTrue(allKinds.contains("marker.subagent.failed"));
+        assertTrue(allKinds.contains("marker.subagent.completed"));
         assertTrue(allKinds.contains("marker.supervisor.iteration"));
 
-        // include_details=false → started excluded, the other three visible
+        // include_details=false → started excluded, the other four visible
         List<ActivityEventResponse> userVisible = service.getActivity(taskId, false).events();
         List<String> userKinds = userVisible.stream().map(ActivityEventResponse::kind).toList();
         assertFalse(userKinds.contains("marker.subagent.started"),
                 "marker.subagent.started must be hidden when include_details=false");
         assertTrue(userKinds.contains("marker.subagent.finding"));
         assertTrue(userKinds.contains("marker.subagent.failed"));
+        assertTrue(userKinds.contains("marker.subagent.completed"),
+                "marker.subagent.completed must be user-visible (terminal success signal)");
         assertTrue(userKinds.contains("marker.supervisor.iteration"));
     }
 
@@ -882,6 +921,42 @@ class ActivityProjectionServiceTest {
         Map<String, Object> details = (Map<String, Object>) marker.details();
         assertEquals("FIRST", details.get("prompt_preview"),
                 "first-wins dedup: first row's prompt_preview must survive");
+    }
+
+    @Test
+    void getActivity_duplicateSubagentCompleted_firstWinsDedup() {
+        // At-least-once: a crashed-and-resumed success branch re-emits an
+        // identical subagent_completed. First-wins collapses the duplicate to one
+        // entry, keeping the EARLIEST created_at (the true completion time).
+        UUID taskId = UUID.randomUUID();
+        String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
+
+        when(taskRepository.getLatestRootCheckpoint(taskId, tenantId)).thenReturn(Optional.empty());
+
+        TaskEventResponse first = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_completed",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0"),
+                OffsetDateTime.parse("2026-06-08T10:00:00+00:00"));
+        TaskEventResponse duplicate = new TaskEventResponse(
+                UUID.randomUUID(), taskId, "a", "subagent_completed",
+                null, null, "w", null, null,
+                Map.of("iteration", 1, "subtask", "1.0"),
+                OffsetDateTime.parse("2026-06-08T10:00:05+00:00"));
+
+        when(taskEventRepository.listEvents(eq(taskId), eq(tenantId), anyInt()))
+                .thenReturn(List.of(first, duplicate));
+
+        List<ActivityEventResponse> events = service.getActivity(taskId, true).events();
+        assertEquals(1, events.size(),
+                "Duplicate subagent_completed rows with same (event_type, iteration, subtask) "
+                        + "must deduplicate to 1");
+        ActivityEventResponse marker = events.get(0);
+        assertEquals("marker.subagent.completed", marker.kind());
+        assertEquals(1, marker.iteration());
+        assertEquals("1.0", marker.subtask());
+        // first-wins keeps the earliest created_at.
+        assertEquals(OffsetDateTime.parse("2026-06-08T10:00:00+00:00"), marker.timestamp());
     }
 
     @Test

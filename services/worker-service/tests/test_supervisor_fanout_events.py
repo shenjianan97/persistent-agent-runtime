@@ -99,6 +99,19 @@ async def test_fanout_emits_n_distinct_subagent_started_under_one_iteration():
     assert subtasks == {f"1.{i}" for i in range(n)}
     # The marker carries the live round, not the static config 0.
     assert all(d["iteration"] == 1 for d in first_round)
+
+    # Every successful sub-agent also emits exactly one terminal subagent_completed
+    # (the success counterpart to subagent_failed) — the signal the Console needs to
+    # move a sub-agent off "running" even when it produced zero findings.
+    completed = [d for t, d in emit.events if t == "subagent_completed"]
+    first_round_done = [d for d in completed if str(d["subtask"]).startswith("1.")]
+    assert {d["subtask"] for d in first_round_done} == {f"1.{i}" for i in range(n)}
+    assert all(d["iteration"] == 1 for d in first_round_done)
+    # Minimal lifecycle payload — no finding_count or other result rides the marker.
+    assert all(set(d.keys()) == {"iteration", "subtask"} for d in first_round_done)
+    # All sub-agents succeeded here, so NONE emitted a failure marker (mutual
+    # exclusion of the two terminals per the if/else in _fanout_node).
+    assert not [d for t, d in emit.events if t == "subagent_failed"]
     assert out.get("report")
 
 
@@ -252,5 +265,16 @@ async def test_subagent_markers_carry_distinct_live_iteration_per_round():
     # The failed round-1 marker also carries the live round 1 (not 0).
     failed = [d for t, d in emit.events if t == "subagent_failed"]
     assert failed and all(d["subtask"] == "1.1" and d["iteration"] == 1 for d in failed)
+
+    # Terminal-marker mutual exclusion per (subtask, iteration): the success path
+    # emits subagent_completed, the failure path emits subagent_failed — never both
+    # for the same dispatch. 1.1 FAILED in round 1 → no completed for (1.1, 1); it
+    # succeeded on the round-2 retry → exactly one completed for (1.1, 2). 1.0
+    # succeeded in round 1.
+    completed = [d for t, d in emit.events if t == "subagent_completed"]
+    done_keys = {(d["subtask"], d["iteration"]) for d in completed}
+    assert ("1.1", 1) not in done_keys, "a failed sub-agent must NOT emit completed"
+    assert ("1.1", 2) in done_keys, "the round-2 retry succeeded → must emit completed"
+    assert ("1.0", 1) in done_keys
 
     assert out.get("report")

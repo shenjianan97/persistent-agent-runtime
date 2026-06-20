@@ -55,7 +55,11 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from core.subagent_events import emit_subagent_failed, emit_subagent_started
+from core.subagent_events import (
+    emit_subagent_completed,
+    emit_subagent_failed,
+    emit_subagent_started,
+)
 from executor.subagents import SubagentResult, run_subagent
 from executor.supervisor.nodes import (
     DECISION_CONTINUE,
@@ -302,6 +306,19 @@ async def _fanout_node(state: dict, config: RunnableConfig) -> dict:
             iteration=iteration,
             subtask=subtask,
             emit=emit,
+        )
+        # Terminal SUCCESS marker — the counterpart to ``subagent_failed`` below.
+        # Emitted unconditionally on the success path (even with zero findings) so
+        # the Activity timeline has a "this sub-agent finished" signal; without it
+        # a zero-finding success emits nothing after ``subagent_started`` and the
+        # Console badge is stranded on "running". This ``if result.ok: … else:``
+        # split guarantees EXACTLY ONE terminal (``completed`` | ``failed``) per
+        # (iteration, subtask) per invocation — the Console status precedence
+        # relies on that mutual exclusion.
+        await emit_subagent_completed(
+            emit,
+            iteration=iteration,
+            subtask=subtask,
         )
     else:
         # S9 observability — emit ``subagent_failed`` on a failure-marker result.
