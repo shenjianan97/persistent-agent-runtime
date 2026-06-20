@@ -224,15 +224,21 @@ Research brief (the north star — answer it):
 Findings (cite these by their id):
 {findings_block}
 
-Citation rules (STRICT):
-- Cite a finding by writing its id in square brackets immediately after the \
-sentence it supports, e.g. "The market grew 12% in 2024 [{example_id}]."
-- Cite by `finding_id` ONLY. Do NOT write source URLs, link text, or footnotes \
-in your output — the runtime resolves each id to its full citation at render.
+Citation rules (STRICT — follow exactly):
+- Cite by `finding_id` ONLY, in square brackets, placed inline IMMEDIATELY after \
+the sentence it supports, e.g. "The market grew 12% in 2024 [{example_id}]."
+- EVERY sentence that states a fact, figure, date, name, quote, or claim MUST \
+carry at least one inline finding id. A factual sentence with no citation is not \
+acceptable — if no finding supports it, do not write the sentence.
+- Put the citations IN THE BODY, next to the claims they support. Do NOT gather, \
+list, or repeat them at the end.
+- Do NOT write a "Sources", "References", "Bibliography", "Citations", "Primary \
+Sources", or any similar section, and do NOT write source URLs, link text, or \
+footnotes. The system appends the numbered source list automatically from your \
+inline ids — writing your own only duplicates it.
 - Only cite ids that appear in the findings list above. Do not invent ids.
-- Every substantive claim should be backed by at least one finding id.
 
-Write the final answer now."""
+Write the final answer now — inline citations only, no sources section."""
 
 
 def _render_findings_block(findings: list[dict]) -> str:
