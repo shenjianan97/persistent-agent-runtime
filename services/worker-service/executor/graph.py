@@ -713,6 +713,40 @@ def _reweave_messages(
     return out
 
 
+# Built-in WEB SOURCE tools the supervisor's ``source_allowlist`` governs — the
+# Console "Allowed Sources" checklist's base entries (SupervisorConfigSection
+# BASE_SOURCES: web_search / read_url). Only these are subject to the allowlist;
+# every other built-in tool (base platform tools a sub-agent needs to function)
+# is never filtered. Tool-server sources are not yet wired into sub-agents (v1).
+_SUPERVISOR_WEB_SOURCE_TOOLS = frozenset({"web_search", "read_url"})
+
+
+def _filter_subagent_source_tools(
+    allowed_tools: list[str], source_allowlist: list[str] | None
+) -> list[str]:
+    """Restrict the sub-agents' WEB SOURCE tools to ``source_allowlist``.
+
+    ``supervisor.source_allowlist`` (Console "Allowed Sources") restricts which
+    source tools fanned-out sub-agents may use. Semantics:
+
+    * ``None`` / empty → "all sources": no restriction, returned unchanged.
+    * non-empty → drop any web source tool (``web_search`` / ``read_url``) whose
+      name is NOT in the allowlist. Non-source tools (``plan_write``,
+      ``create_text_artifact``, …) always pass — the allowlist governs sources,
+      not the sub-agent's whole toolset.
+
+    Order-preserving; a no-op when nothing is restricted.
+    """
+    if not source_allowlist:
+        return list(allowed_tools)
+    allowed = set(source_allowlist)
+    return [
+        tool
+        for tool in allowed_tools
+        if tool not in _SUPERVISOR_WEB_SOURCE_TOOLS or tool in allowed
+    ]
+
+
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
@@ -3451,6 +3485,7 @@ class GraphExecutor:
                     task_id=task_id,
                     tenant_id=tenant_id,
                     agent_id=agent_id,
+                    cancel_event=cancel_event,
                 )
 
             async def run_astream():
@@ -4225,6 +4260,7 @@ class GraphExecutor:
         task_id: str,
         tenant_id: str,
         agent_id: str,
+        cancel_event: asyncio.Event,
     ) -> None:
         """Inject the Supervisor topology's dependency seams into ``config`` (S8).
 
@@ -4254,10 +4290,26 @@ class GraphExecutor:
         # The sub-agents' tool objects — the agent's own built-in tools (the
         # ``research`` preset seeds the web allowlist). The headless filter inside
         # ``run_subagent`` drops any interrupt-bearing tool before binding.
-        allowed_tools = agent_config.get("allowed_tools", [])
+        #
+        # supervisor.source_allowlist (when non-empty) restricts which WEB SOURCE
+        # tools the sub-agents may use — the Console "Allowed Sources" checklist
+        # (web_search / read_url + tool servers). Empty / absent = "all sources"
+        # (no restriction). Only source tools are governed: base platform tools the
+        # sub-agent needs (plan_write, create_text_artifact, …) are never filtered.
+        # v1 governs the built-in web source tools only — sub-agents do not yet
+        # receive tool-server tools, so a tool-server name in the allowlist has no
+        # built-in tool to gate (no effect, not an error).
+        allowed_tools = _filter_subagent_source_tools(
+            agent_config.get("allowed_tools", []),
+            (agent_config.get("supervisor") or {}).get("source_allowlist"),
+        )
+        # cancel_event is the task's REAL cancellation/lease-loss signal (threaded
+        # from execute_task), matching the ReAct path — so an in-flight sub-agent
+        # web/tool call aborts on cancel instead of running (and spending) until the
+        # next super-step boundary.
         sub_tools = self._get_tools(
             allowed_tools,
-            cancel_event=asyncio.Event(),
+            cancel_event=cancel_event,
             task_id=task_id,
             tenant_id=tenant_id,
             agent_id=agent_id,

@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from core.config import WorkerConfig
-from executor.graph import GraphExecutor
+from executor.graph import GraphExecutor, _filter_subagent_source_tools
 from executor.supervisor.graph import (
     GATHER_NODE_NAME,
     FANOUT_NODE_NAME,
@@ -113,6 +113,92 @@ async def test_supervisor_subagent_ceiling_is_research_sized():
             task_id="t",
             tenant_id="default",
             agent_id="a",
+            cancel_event=asyncio.Event(),
         )
     ceiling = config["configurable"]["supervisor_fanout_deps"]["ceiling"]
     assert ceiling.max_turns == MAX_SUBAGENT_TURN_BUDGET
+
+
+# ---------------------------------------------------------------------------
+# source_allowlist enforcement (pure helper) — Codex review P2.
+# ---------------------------------------------------------------------------
+
+
+def test_source_allowlist_none_or_empty_is_all_sources():
+    """None / empty allowlist = "all available sources": no restriction."""
+    tools = ["web_search", "read_url", "plan_write"]
+    assert _filter_subagent_source_tools(tools, None) == tools
+    assert _filter_subagent_source_tools(tools, []) == tools
+
+
+def test_source_allowlist_drops_unchecked_web_source_tool():
+    """A non-empty allowlist drops web source tools not named in it (the Codex
+    example: only web_search selected → read_url is removed)."""
+    result = _filter_subagent_source_tools(
+        ["web_search", "read_url", "plan_write"], ["web_search"]
+    )
+    assert result == ["web_search", "plan_write"]
+    assert "read_url" not in result
+
+
+def test_source_allowlist_never_filters_base_platform_tools():
+    """The allowlist governs SOURCE tools only — base platform tools the sub-agent
+    needs always pass even when not listed."""
+    result = _filter_subagent_source_tools(
+        ["web_search", "plan_write", "create_text_artifact"], ["web_search"]
+    )
+    assert "plan_write" in result
+    assert "create_text_artifact" in result
+
+
+async def test_supervisor_source_allowlist_filters_sub_tools():
+    """End-to-end through _inject: source_allowlist restricts the sub-agents'
+    _get_tools input to the allowed web sources (read_url dropped)."""
+    executor = _make_executor()
+    llm = MagicMock()
+    llm.bind_tools = MagicMock(return_value=llm)
+    config: dict = {"configurable": {}}
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)), \
+            patch.object(executor, "_get_tools", MagicMock(return_value=[])) as get_tools:
+        await executor._inject_supervisor_configurable(
+            config,
+            agent_config={
+                "model": "claude-haiku-4-5",
+                "allowed_tools": ["web_search", "read_url", "plan_write"],
+                "topology": "supervisor",
+                "supervisor": {"source_allowlist": ["web_search"]},
+            },
+            checkpointer=MagicMock(),
+            task_id="t",
+            tenant_id="default",
+            agent_id="a",
+            cancel_event=asyncio.Event(),
+        )
+    passed_allowed_tools = get_tools.call_args.args[0]
+    assert passed_allowed_tools == ["web_search", "plan_write"]
+
+
+async def test_supervisor_threads_real_cancel_event_into_sub_tools():
+    """The sub-agent tools are built with the task's REAL cancel_event (not a
+    throwaway), so an in-flight sub-agent tool call aborts on cancellation."""
+    executor = _make_executor()
+    llm = MagicMock()
+    llm.bind_tools = MagicMock(return_value=llm)
+    config: dict = {"configurable": {}}
+    sentinel = asyncio.Event()
+    with patch("executor.providers.create_llm", AsyncMock(return_value=llm)), \
+            patch.object(executor, "_get_tools", MagicMock(return_value=[])) as get_tools:
+        await executor._inject_supervisor_configurable(
+            config,
+            agent_config={
+                "model": "claude-haiku-4-5",
+                "allowed_tools": ["web_search"],
+                "topology": "supervisor",
+            },
+            checkpointer=MagicMock(),
+            task_id="t",
+            tenant_id="default",
+            agent_id="a",
+            cancel_event=sentinel,
+        )
+    assert get_tools.call_args.kwargs["cancel_event"] is sentinel
