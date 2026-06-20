@@ -1069,6 +1069,51 @@ class AgentServiceTest {
     }
 
     /**
+     * A Console update of a preset agent omits the preset-injected HIDDEN tools
+     * (e.g. {@code dispatch_subagent}, the coding sandbox extras) — the Console only
+     * echoes the user-facing allowlist back. canonicalizeConfig rebuilds
+     * allowed_tools from scratch and re-admits preset-injected names only when they
+     * appear in the request's allowed_tools, so without re-deriving them on update a
+     * coding/investigation agent silently LOSES dispatch_subagent on every edit even
+     * though the preset is preserved. The update path must re-derive the inherited
+     * preset's injected tools.
+     */
+    @Test
+    void updateAgent_codingPresetOmitsHiddenTools_preservesDispatchSubagent()
+            throws Exception {
+        // Console-shaped update: the user-facing allowlist only — dispatch_subagent
+        // (hidden, preset-injected) is NOT echoed back; preset/topology absent.
+        AgentConfigRequest config = new AgentConfigRequest(
+                "updated prompt", "openai", "gpt-4o", 0.7,
+                List.of("plan_write"), null, null, null, null,
+                null, null, null, null);
+        AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active",
+                null, null, null);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Map<String, Object> existingRow = buildAgentRowWithCodingPreset(
+                "test-agent", "Agent", "active");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "test-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("test-agent"), eq("Agent"),
+                jsonCaptor.capture(), eq("active"), eq(5), eq(500000L), eq(5000000L)))
+                .thenReturn(Optional.of(existingRow));
+
+        assertDoesNotThrow(() -> agentService.updateAgent("test-agent", request));
+
+        AgentConfigRequest parsed = objectMapper.readValue(jsonCaptor.getValue(),
+                AgentConfigRequest.class);
+        assertEquals("coding", parsed.preset(),
+                "preset must be preserved when the update omits it");
+        assertTrue(parsed.allowedTools().contains("dispatch_subagent"),
+                "the inherited coding preset's hidden dispatch_subagent must survive a "
+                        + "Console update that omits it: " + parsed.allowedTools());
+    }
+
+    /**
      * PUT that explicitly sends the same topology as the persisted row must succeed.
      */
     @Test
@@ -1279,6 +1324,26 @@ class AgentServiceTest {
         row.put("display_name", displayName);
         row.put("agent_config", "{\"system_prompt\":\"prompt\",\"provider\":\"openai\",\"model\":\"gpt-4o\","
                 + "\"temperature\":0.7,\"allowed_tools\":[],\"topology\":\"" + topology + "\"}");
+        row.put("status", status);
+        row.put("max_concurrent_tasks", 5);
+        row.put("budget_max_per_task", 500000L);
+        row.put("budget_max_per_hour", 5000000L);
+        row.put("created_at", Timestamp.from(Instant.now()));
+        row.put("updated_at", Timestamp.from(Instant.now()));
+        return row;
+    }
+
+    private Map<String, Object> buildAgentRowWithCodingPreset(
+            String agentId, String displayName, String status) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("agent_id", agentId);
+        row.put("display_name", displayName);
+        // A coding-preset agent as persisted after creation: dispatch_subagent (hidden,
+        // preset-injected) sits in allowed_tools alongside the user-facing tools.
+        row.put("agent_config", "{\"system_prompt\":\"prompt\",\"provider\":\"openai\","
+                + "\"model\":\"gpt-4o\",\"temperature\":0.7,"
+                + "\"allowed_tools\":[\"plan_write\",\"dispatch_subagent\"],"
+                + "\"topology\":\"react\",\"preset\":\"coding\"}");
         row.put("status", status);
         row.put("max_concurrent_tasks", 5);
         row.put("budget_max_per_task", 500000L);

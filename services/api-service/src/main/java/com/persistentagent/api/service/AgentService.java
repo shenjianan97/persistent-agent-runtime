@@ -426,12 +426,21 @@ public class AgentService {
         SupervisorConfigRequest supervisor = request.supervisor() != null
                 ? request.supervisor()
                 : readPersistedSupervisor(persistedConfigRaw);
+        // Re-derive the inherited preset's HIDDEN injected tools (dispatch_subagent, the
+        // coding sandbox extras). The Console echoes only the user-facing allowlist on
+        // update, so without this canonicalizeConfig — which re-admits preset-injected
+        // names only when they are present in allowed_tools — would silently drop them
+        // from a coding/investigation agent on every edit. mergeExtraTools dedups and is a
+        // no-op (returns the list unchanged) when the preset injects nothing.
+        List<String> allowedTools = PresetDefaults.mergeExtraTools(
+                request.allowedTools(),
+                PresetDefaults.injectedToolsForPreset(preset));
         return new AgentConfigRequest(
                 request.systemPrompt(),
                 request.provider(),
                 request.model(),
                 request.temperature(),
-                request.allowedTools(),
+                allowedTools,
                 request.toolServers(),
                 request.sandbox(),
                 request.memory(),

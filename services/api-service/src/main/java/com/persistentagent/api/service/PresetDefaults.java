@@ -536,6 +536,30 @@ public final class PresetDefaults {
     }
 
     /**
+     * The tool names a preset injects into {@code allowed_tools} at creation, keyed by
+     * preset name (empty for presets that seed no extra tools, or an unknown name).
+     *
+     * <p>Presets are applied at creation only ({@link #applyPreset}, never on PUT), so a
+     * Console update — which omits the HIDDEN preset-injected tools like
+     * {@code dispatch_subagent} (the UI only echoes the user-facing allowlist) — must
+     * re-derive these to keep them in the persisted config. {@code AgentService}'s update
+     * path merges this back into the request's {@code allowed_tools} for the inherited
+     * preset before canonicalisation re-admits them. Mirrors the per-preset
+     * {@code *_EXTRA_TOOLS} / {@code RESEARCH_TOOLS} the create path injects.
+     */
+    static List<String> injectedToolsForPreset(String preset) {
+        if (preset == null) {
+            return List.of();
+        }
+        return switch (preset) {
+            case "coding" -> CODING_EXTRA_TOOLS;
+            case "investigation" -> INVESTIGATION_EXTRA_TOOLS;
+            case "research" -> RESEARCH_TOOLS;
+            default -> List.of();
+        };
+    }
+
+    /**
      * Merges extra tools into the provided tools list, returning a new combined list.
      * Avoids duplicates: does not add a tool if it is already present.
      * If the existing list is null, returns a new list containing only the extra tools
