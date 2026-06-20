@@ -13,6 +13,7 @@ import {
     ChevronDown,
     ChevronRight,
     AlertTriangle,
+    CheckCircle2,
     Activity as ActivityIcon,
 } from 'lucide-react';
 
@@ -114,6 +115,21 @@ function isHitlResume(kind: string): boolean {
         kind === 'marker.hitl.rejected' ||
         kind === 'marker.hitl.input_received' ||
         kind === 'marker.hitl.resumed'
+    );
+}
+
+// Agent Modes — Supervisor Topology (S9). The four fan-out markers the server
+// projects from `task_events`. They render as an expandable tree grouped
+// round → sub-agent → step (NOT as flat rows). Each sub-agent group also
+// nests its full checkpointed transcript — `turn.*` events tagged with the
+// group's `subtask` id, projected from the `subagent:*` namespaces.
+function isSubagentMarker(kind: string): boolean {
+    return (
+        kind === 'marker.supervisor.iteration' ||
+        kind === 'marker.subagent.started' ||
+        kind === 'marker.subagent.finding' ||
+        kind === 'marker.subagent.failed' ||
+        kind === 'marker.subagent.completed'
     );
 }
 
@@ -868,6 +884,383 @@ function HitlResumeMarkerRow({ event, index }: RowProps) {
     );
 }
 
+// ─── Sub-agent fan-out tree (S9) ───────────────────────────────────
+//
+// The server projects four flat markers plus, per sub-agent, the full
+// checkpointed transcript as `turn.*` events tagged with the sub-agent's
+// `subtask` id. The Console groups both client-side into
+// round → sub-agent → (steps + collapsible transcript).
+
+interface SubagentStep {
+    event: ActivityEvent;
+    index: number; // original stream index (keeps DetailsAffordance testids stable)
+}
+
+interface SubagentGroup {
+    subtask: string;
+    steps: SubagentStep[];
+    // The sub-agent's own conversation turns (turn.user / turn.assistant /
+    // turn.tool tagged with this subtask), collapsed by default.
+    transcript: SubagentStep[];
+    // Terminal success ('done') is driven by EITHER a subagent_completed marker
+    // OR any subagent_finding (findings imply success — kept as a robustness
+    // fallback since the completed emit is best-effort and a lost one must not
+    // re-strand a sub-agent that did produce findings). 'failed' only when no
+    // terminal success was seen.
+    status: 'done' | 'failed' | 'running';
+    // True when at least one S9 marker contributed — transcript-only groups
+    // (historic tasks lacking marker correlation) suppress the status chip.
+    hasMarkers: boolean;
+    // Earlier round in which this same subtask id failed (retry linkage).
+    retriedFromRound: number | null;
+}
+
+interface RoundGroup {
+    iteration: number;
+    iterationEvent: ActivityEvent | null; // the supervisor.iteration summary, if present
+    subagents: SubagentGroup[];
+}
+
+/**
+ * Round a transcript turn belongs to. Turns carry no `iteration`; the
+ * Supervisor's deterministic subtask ids are "<iteration>.<index>", so the
+ * prefix recovers the round. Historic fallback ids (`sub-xxxx`, minted by the
+ * server for pre-seed checkpoints) land in round 0, which the tree labels
+ * "Sub-agents" instead of "Round 0".
+ */
+function transcriptIteration(subtask: string): number {
+    const match = /^(\d+)\./.exec(subtask);
+    return match ? Number(match[1]) : 0;
+}
+
+/**
+ * Partition the sub-agent markers (already filtered to `isSubagentMarker`)
+ * and transcript turns (turn.* tagged with a `subtask`) into
+ * round → sub-agent groups, preserving stream order. Retry linkage: a
+ * subtask id that carries a `failed` marker in an earlier round is flagged on
+ * its later-round group so the UI reads "subtask X · retried from round M".
+ */
+function buildSubagentTree(
+    items: SubagentStep[],
+    transcriptTurns: SubagentStep[],
+): RoundGroup[] {
+    const rounds = new Map<number, RoundGroup>();
+    const roundOrder: number[] = [];
+
+    const ensureRound = (iteration: number): RoundGroup => {
+        if (!rounds.has(iteration)) {
+            rounds.set(iteration, { iteration, iterationEvent: null, subagents: [] });
+            roundOrder.push(iteration);
+        }
+        return rounds.get(iteration)!;
+    };
+
+    const ensureGroup = (round: RoundGroup, subtask: string): SubagentGroup => {
+        let group = round.subagents.find((g) => g.subtask === subtask);
+        if (!group) {
+            group = {
+                subtask,
+                steps: [],
+                transcript: [],
+                status: 'running',
+                hasMarkers: false,
+                retriedFromRound: null,
+            };
+            round.subagents.push(group);
+        }
+        return group;
+    };
+
+    for (const item of items) {
+        const iteration = item.event.iteration ?? 0;
+        const round = ensureRound(iteration);
+
+        if (item.event.kind === 'marker.supervisor.iteration') {
+            round.iterationEvent = item.event;
+            continue;
+        }
+
+        const subtask = item.event.subtask ?? '(unknown)';
+        const group = ensureGroup(round, subtask);
+        group.steps.push(item);
+        group.hasMarkers = true;
+        // Terminal-state resolution. A subagent_completed marker is the explicit
+        // success terminal; a subagent_finding also implies success (fallback for
+        // a lost best-effort completed emit). 'failed' applies only if no success
+        // terminal was seen. This precedence is airtight because the worker emits
+        // EXACTLY ONE terminal (completed | failed) per (iteration, subtask) per
+        // round, and a retry carries a distinct <iteration> key (separate group).
+        if (
+            item.event.kind === 'marker.subagent.completed' ||
+            item.event.kind === 'marker.subagent.finding'
+        ) {
+            group.status = 'done';
+        } else if (item.event.kind === 'marker.subagent.failed' && group.status !== 'done') {
+            group.status = 'failed';
+        }
+    }
+
+    // Attach each transcript turn to its sub-agent group. Prefer a group that
+    // already exists from the markers (any round — the transcript spans the
+    // sub-agent's whole life); otherwise create one in the id-derived round.
+    for (const turn of transcriptTurns) {
+        const subtask = turn.event.subtask ?? '(unknown)';
+        let group: SubagentGroup | null = null;
+        for (const iteration of roundOrder) {
+            const candidate = rounds
+                .get(iteration)!
+                .subagents.find((g) => g.subtask === subtask);
+            if (candidate) {
+                group = candidate;
+                break;
+            }
+        }
+        if (!group) {
+            group = ensureGroup(ensureRound(transcriptIteration(subtask)), subtask);
+        }
+        group.transcript.push(turn);
+    }
+
+    // Retry linkage: walk rounds in ascending iteration order; if a subtask id
+    // failed in an earlier round, flag the later-round group with that round.
+    const failedAtRound = new Map<string, number>();
+    const sortedRounds = roundOrder.slice().sort((a, b) => a - b);
+    for (const iteration of sortedRounds) {
+        const round = rounds.get(iteration)!;
+        for (const group of round.subagents) {
+            const priorFail = failedAtRound.get(group.subtask);
+            if (priorFail != null && priorFail < iteration) {
+                group.retriedFromRound = priorFail;
+            }
+            if (group.status === 'failed') {
+                failedAtRound.set(group.subtask, iteration);
+            }
+        }
+    }
+
+    return roundOrder.map((it) => rounds.get(it)!);
+}
+
+function statusChipLabel(status: SubagentGroup['status']): string {
+    if (status === 'done') return 'done';
+    if (status === 'failed') return 'failed';
+    return 'running';
+}
+
+function SubagentStepRow({ event, index }: SubagentStep) {
+    let icon = <Sparkles className="w-3 h-3 shrink-0" />;
+    let line: React.ReactNode;
+    if (event.kind === 'marker.subagent.finding') {
+        const findingId = (event.details?.finding_id as string | undefined) ?? null;
+        const sourceUrl = (event.details?.source_url as string | undefined) ?? null;
+        icon = <Save className="w-3 h-3 shrink-0 text-success" />;
+        line = (
+            <span className="flex-1">
+                Finding{findingId ? ` ${findingId}` : ''}
+                {sourceUrl && (
+                    <>
+                        {' — '}
+                        <a
+                            href={sourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-primary hover:underline break-all"
+                        >
+                            {sourceUrl}
+                        </a>
+                    </>
+                )}
+            </span>
+        );
+    } else if (event.kind === 'marker.subagent.failed') {
+        const reason = (event.details?.reason as string | undefined) ?? 'failed';
+        // Human-readable cause (e.g. "ReadTimeoutError: …") carried by the
+        // worker since the marker-only "error" proved undiagnosable from the
+        // Console. Absent on historic rows.
+        const detail = (event.details?.detail as string | undefined) ?? null;
+        icon = <AlertTriangle className="w-3 h-3 shrink-0 text-destructive" />;
+        line = (
+            <span className="flex-1 text-destructive">
+                Failed — {reason}
+                {detail && (
+                    <span
+                        data-testid={`activity-subagent-failed-detail-${event.subtask ?? 'unknown'}`}
+                        className="block text-destructive/80 font-normal break-words"
+                    >
+                        {detail}
+                    </span>
+                )}
+            </span>
+        );
+    } else if (event.kind === 'marker.subagent.completed') {
+        // Terminal success marker. The sub-agent's findings (if any) render as
+        // their own rows in this same group, so the completion row stays a plain
+        // "finished" signal — its whole purpose is to mark a sub-agent done even
+        // when it produced zero findings (the sole non-stuck signal in that case).
+        icon = <CheckCircle2 className="w-3 h-3 shrink-0 text-success" />;
+        line = <span className="flex-1 text-success">Completed</span>;
+    } else {
+        // marker.subagent.started — dispatch marker (detail-only on the server,
+        // visible here only when "Show details" is on). Skeleton: prompt preview.
+        const preview = (event.details?.prompt_preview as string | undefined) ?? null;
+        line = (
+            <span className="flex-1 text-muted-foreground">
+                Dispatched{preview ? ` — ${truncate(preview, 200)}` : ''}
+            </span>
+        );
+    }
+    return (
+        <li
+            role="listitem"
+            data-testid={`activity-row-${index}`}
+            data-kind={event.kind}
+            className="list-none text-xs font-mono py-1"
+        >
+            <div className="flex items-center gap-2">
+                {icon}
+                {line}
+                {event.timestamp && (
+                    <span className="tabular-nums text-muted-foreground/70">
+                        {formatTime(event.timestamp)}
+                    </span>
+                )}
+            </div>
+            <div className="pl-5 pt-1">
+                <DetailsAffordance event={event} index={index} />
+            </div>
+        </li>
+    );
+}
+
+function SubagentTree({ rounds }: { rounds: RoundGroup[] }) {
+    return (
+        <li role="listitem" data-testid="activity-subagent-tree" className="list-none space-y-2">
+            {rounds.map((round) => {
+                const decision = (round.iterationEvent?.details?.decision as string | undefined) ?? null;
+                const emitted = (round.iterationEvent?.details?.subtasks_emitted as number | undefined) ?? null;
+                // Prefer the count of groups actually rendered: the round's
+                // supervisor.iteration marker is last-wins-deduped, so a
+                // closing "stop" decision (subtasks_emitted=0) would otherwise
+                // caption a round visibly full of sub-agents as "0 sub-agents".
+                const subagentCount = round.subagents.length > 0 ? round.subagents.length : emitted;
+                const summary = [
+                    // Round 0 holds transcript-only groups whose subtask id
+                    // carries no round (historic fallback ids) — "Round 0"
+                    // would be misleading there.
+                    round.iteration === 0 ? 'Sub-agents' : `Round ${round.iteration}`,
+                    subagentCount != null ? `${subagentCount} sub-agent${subagentCount === 1 ? '' : 's'}` : null,
+                    decision ? `decision: ${decision}` : null,
+                ]
+                    .filter(Boolean)
+                    .join(' · ');
+                return (
+                    <div key={round.iteration} data-round={round.iteration}>
+                        <Fold
+                            label={
+                                <span
+                                    data-testid={`activity-round-${round.iteration}-toggle`}
+                                    className="flex items-center gap-2"
+                                >
+                                    {summary}
+                                </span>
+                            }
+                            defaultOpen
+                        >
+                            <ul role="list" className="space-y-2">
+                                {round.subagents.map((group) => (
+                                    <li
+                                        role="listitem"
+                                        key={group.subtask}
+                                        className="list-none"
+                                    >
+                                        <Fold
+                                            tone={
+                                                group.status === 'failed'
+                                                    ? 'destructive'
+                                                    : group.status === 'done'
+                                                        ? 'success'
+                                                        : 'muted'
+                                            }
+                                            defaultOpen
+                                            label={
+                                                <span
+                                                    data-testid={`activity-subagent-${group.subtask}`}
+                                                    className="flex items-center gap-2"
+                                                >
+                                                    <span className="font-mono normal-case tracking-normal">
+                                                        Sub-agent {group.subtask}
+                                                    </span>
+                                                    {group.hasMarkers && (
+                                                        <span
+                                                            data-testid={`activity-subagent-${group.subtask}-status`}
+                                                            className="inline-flex items-center px-1.5 py-0.5 rounded-full border text-[9px] normal-case tracking-normal border-current/40"
+                                                        >
+                                                            {statusChipLabel(group.status)}
+                                                        </span>
+                                                    )}
+                                                    {group.retriedFromRound != null && (
+                                                        <span
+                                                            data-testid={`activity-subagent-${group.subtask}-retry`}
+                                                            className="inline-flex items-center px-1.5 py-0.5 rounded-full border border-amber-500/40 text-amber-300 text-[9px] normal-case tracking-normal"
+                                                        >
+                                                            retried from round {group.retriedFromRound}
+                                                        </span>
+                                                    )}
+                                                </span>
+                                            }
+                                        >
+                                            <ul role="list" className="space-y-1">
+                                                {group.steps.map((step) => (
+                                                    <SubagentStepRow
+                                                        key={step.index}
+                                                        event={step.event}
+                                                        index={step.index}
+                                                    />
+                                                ))}
+                                                {group.transcript.length > 0 && (
+                                                    <li role="listitem" className="list-none pt-1">
+                                                        <Fold
+                                                            label={
+                                                                <span
+                                                                    data-testid={`activity-subagent-${group.subtask}-transcript-toggle`}
+                                                                >
+                                                                    Transcript ·{' '}
+                                                                    {group.transcript.length}{' '}
+                                                                    {group.transcript.length === 1
+                                                                        ? 'turn'
+                                                                        : 'turns'}
+                                                                </span>
+                                                            }
+                                                        >
+                                                            <ul
+                                                                role="list"
+                                                                data-testid={`activity-subagent-${group.subtask}-transcript`}
+                                                                className="space-y-3"
+                                                            >
+                                                                {group.transcript.map((turn) => (
+                                                                    <ActivityRow
+                                                                        key={turn.index}
+                                                                        event={turn.event}
+                                                                        index={turn.index}
+                                                                    />
+                                                                ))}
+                                                            </ul>
+                                                        </Fold>
+                                                    </li>
+                                                )}
+                                            </ul>
+                                        </Fold>
+                                    </li>
+                                ))}
+                            </ul>
+                        </Fold>
+                    </div>
+                );
+            })}
+        </li>
+    );
+}
+
 function ActivityRow(props: RowProps) {
     const { event } = props;
     switch (event.kind) {
@@ -942,8 +1335,10 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
     const visibleCount = events.length;
     const isEmpty = !query.isLoading && visibleCount === 0;
 
+    // Main-conversation turns only — sub-agent transcript turns (tagged with
+    // a `subtask`) are counted inside their tree groups, not here.
     const turnCount = useMemo(
-        () => events.reduce((n, e) => (isTurn(e.kind) ? n + 1 : n), 0),
+        () => events.reduce((n, e) => (isTurn(e.kind) && !e.subtask ? n + 1 : n), 0),
         [events],
     );
 
@@ -971,6 +1366,46 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
             return null;
         });
     }, [events]);
+
+    // ─── Sub-agent fan-out tree (S9) ────────────────────────────────
+    // Collect the flat sub-agent / supervisor markers AND the sub-agent
+    // transcript turns (turn.* tagged with a `subtask`) out of the stream and
+    // group them round → sub-agent → (steps + transcript). The tree renders
+    // once, at the position of the FIRST such event; the rest are skipped in
+    // the flat render so they don't double-render as loose rows.
+    const subagentSteps = useMemo<SubagentStep[]>(() => {
+        return events
+            .map((event, index) => ({ event, index }))
+            .filter(({ event }) => isSubagentMarker(event.kind));
+    }, [events]);
+
+    const subagentTranscriptTurns = useMemo<SubagentStep[]>(() => {
+        return events
+            .map((event, index) => ({ event, index }))
+            .filter(({ event }) => isTurn(event.kind) && !!event.subtask);
+    }, [events]);
+
+    const subagentTree = useMemo<RoundGroup[]>(
+        () => buildSubagentTree(subagentSteps, subagentTranscriptTurns),
+        [subagentSteps, subagentTranscriptTurns],
+    );
+
+    const firstSubagentIndex = useMemo(() => {
+        const candidates = [
+            subagentSteps.length > 0 ? subagentSteps[0].index : -1,
+            subagentTranscriptTurns.length > 0 ? subagentTranscriptTurns[0].index : -1,
+        ].filter((i) => i >= 0);
+        return candidates.length > 0 ? Math.min(...candidates) : -1;
+    }, [subagentSteps, subagentTranscriptTurns]);
+
+    const subagentIndexSet = useMemo<Set<number>>(
+        () =>
+            new Set([
+                ...subagentSteps.map((s) => s.index),
+                ...subagentTranscriptTurns.map((s) => s.index),
+            ]),
+        [subagentSteps, subagentTranscriptTurns],
+    );
 
     const handoffByIndex = useMemo<(string | null)[]>(() => {
         return events.map((e, i) => {
@@ -1140,6 +1575,19 @@ export function ActivityPane({ taskId, status }: ActivityPaneProps) {
                     <ul role="list" className="space-y-3">
                         {events.map((event, index) => {
                             const handoff = handoffByIndex[index];
+                            // Sub-agent markers render inside the grouped tree,
+                            // not as flat rows. Render the tree once at the
+                            // first such marker; skip the rest entirely.
+                            if (subagentIndexSet.has(index)) {
+                                if (index === firstSubagentIndex) {
+                                    return (
+                                        <Fragment key={`subagent-tree-${index}`}>
+                                            <SubagentTree rounds={subagentTree} />
+                                        </Fragment>
+                                    );
+                                }
+                                return null;
+                            }
                             return (
                                 <Fragment
                                     key={`${event.kind}-${event.timestamp ?? 'null'}-${index}`}

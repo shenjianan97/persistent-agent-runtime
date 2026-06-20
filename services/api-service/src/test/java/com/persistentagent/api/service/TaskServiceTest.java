@@ -238,6 +238,86 @@ class TaskServiceTest {
                 eq("input"), eq(3), eq(100), eq(3600), isNull(), anyString());
     }
 
+    // --- submitTask: task_timeout_seconds fallback (S2 E7 wiring) ---
+
+    @Test
+    void submitTask_agentConfigHasTaskTimeoutSeconds_andRequestOmitsIt_usesAgentDefault() {
+        // A research-preset agent has agent_config.task_timeout_seconds=14400.
+        // A task submitted without an explicit timeout must get 14400, not 3600.
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent-research", "run deep research", null, null, null, null, null, null);
+
+        when(configValidationHelper.getAgentTaskTimeoutSeconds("default", "agent-research"))
+                .thenReturn(Optional.of(14400));
+
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Research Agent");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent-research"), eq("shared"),
+                eq("run deep research"), anyInt(), anyInt(), eq(14400), isNull(), anyString()))
+                .thenReturn(Optional.of(inserted));
+
+        TaskSubmissionResponse response = taskService.submitTask(request);
+
+        assertNotNull(response);
+        assertEquals(taskId, response.taskId());
+        // Verify 14400 was passed to the repository, not the platform default 3600.
+        verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent-research"), eq("shared"),
+                eq("run deep research"), anyInt(), anyInt(), eq(14400), isNull(), anyString());
+    }
+
+    @Test
+    void submitTask_explicitTimeoutWinsOverAgentDefault() {
+        // An explicit task_timeout_seconds on the request must override the agent-level default.
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent-research", "run deep research", null, null, 7200, null, null, null);
+
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Research Agent");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent-research"), eq("shared"),
+                eq("run deep research"), anyInt(), anyInt(), eq(7200), isNull(), anyString()))
+                .thenReturn(Optional.of(inserted));
+
+        taskService.submitTask(request);
+
+        // Explicit 7200 wins; the agent-config fallback must not even be consulted.
+        verify(configValidationHelper, never()).getAgentTaskTimeoutSeconds(anyString(), anyString());
+        verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent-research"), eq("shared"),
+                eq("run deep research"), anyInt(), anyInt(), eq(7200), isNull(), anyString());
+    }
+
+    @Test
+    void submitTask_agentHasNoTaskTimeoutSeconds_fallsBackToPlatformDefault() {
+        // An agent whose agent_config has no task_timeout_seconds key must still get 3600.
+        TaskSubmissionRequest request = new TaskSubmissionRequest(
+                null, "agent1", "input", null, null, null, null, null, null);
+
+        when(configValidationHelper.getAgentTaskTimeoutSeconds("default", "agent1"))
+                .thenReturn(Optional.empty());
+
+        UUID taskId = UUID.randomUUID();
+        Timestamp now = Timestamp.from(Instant.now());
+        Map<String, Object> inserted = new LinkedHashMap<>();
+        inserted.put("task_id", taskId);
+        inserted.put("agent_display_name_snapshot", "Agent One");
+        inserted.put("created_at", now);
+        when(taskRepository.insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), eq(3600), isNull(), anyString()))
+                .thenReturn(Optional.of(inserted));
+
+        taskService.submitTask(request);
+
+        verify(taskRepository).insertTaskFromAgent(eq("default"), eq("agent1"), eq("shared"),
+                eq("input"), anyInt(), anyInt(), eq(3600), isNull(), anyString());
+    }
+
     // --- submitTask: attached_memory_ids + memory_mode ---
 
     @Test

@@ -540,10 +540,84 @@ class ConfigValidationHelperTest {
         ContextManagementConfigRequest cm = new ContextManagementConfigRequest("bad-cm-model", null, null, null, null);
         com.persistentagent.api.model.request.AgentConfigRequest config =
                 new com.persistentagent.api.model.request.AgentConfigRequest(
-                        "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm);
+                        "prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, cm, null, null, null, null);
 
         assertThrows(ValidationException.class, () -> helper.validateAgentConfig(config),
                 "validateAgentConfig must propagate context_management validation errors");
+    }
+
+    // --- getAgentTaskTimeoutSeconds (S2 E7 fallback) ---
+
+    @Test
+    void getAgentTaskTimeoutSeconds_agentNotFound_returnsEmpty() {
+        when(agentRepository.findByIdAndTenant("tenant", "missing-agent"))
+                .thenReturn(Optional.empty());
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "missing-agent");
+
+        assertTrue(result.isEmpty(), "Unknown agent must return empty");
+    }
+
+    @Test
+    void getAgentTaskTimeoutSeconds_agentHasTaskTimeout_returnsValue() {
+        when(agentRepository.findByIdAndTenant("tenant", "research-agent"))
+                .thenReturn(Optional.of(Map.of("agent_config",
+                        "{\"task_timeout_seconds\":14400,\"memory\":{\"enabled\":false}}")));
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "research-agent");
+
+        assertTrue(result.isPresent(), "research preset agent should return a value");
+        assertEquals(14400, result.get());
+    }
+
+    @Test
+    void getAgentTaskTimeoutSeconds_agentConfigLacksField_returnsEmpty() {
+        when(agentRepository.findByIdAndTenant("tenant", "plain-agent"))
+                .thenReturn(Optional.of(Map.of("agent_config",
+                        "{\"memory\":{\"enabled\":false}}")));
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "plain-agent");
+
+        assertTrue(result.isEmpty(), "Config without task_timeout_seconds must return empty");
+    }
+
+    @Test
+    void getAgentTaskTimeoutSeconds_nullAgentConfigJson_returnsEmpty() {
+        Map<String, Object> row = new HashMap<>();
+        row.put("agent_config", null);
+        when(agentRepository.findByIdAndTenant("tenant", "null-config-agent"))
+                .thenReturn(Optional.of(row));
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "null-config-agent");
+
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    void getAgentTaskTimeoutSeconds_malformedJson_returnsEmpty() {
+        when(agentRepository.findByIdAndTenant("tenant", "bad-json-agent"))
+                .thenReturn(Optional.of(Map.of("agent_config", "{not-valid")));
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "bad-json-agent");
+
+        assertTrue(result.isEmpty(), "Malformed JSON must return empty — never throw");
+    }
+
+    @Test
+    void getAgentTaskTimeoutSeconds_pgobjectConfig_returnsValue() throws Exception {
+        // JDBC hands jsonb columns back as PGobject in production.
+        PGobject pg = new PGobject();
+        pg.setType("jsonb");
+        pg.setValue("{\"task_timeout_seconds\":7200}");
+        Map<String, Object> row = new HashMap<>();
+        row.put("agent_config", pg);
+        when(agentRepository.findByIdAndTenant("tenant", "pg-agent"))
+                .thenReturn(Optional.of(row));
+
+        Optional<Integer> result = helper.getAgentTaskTimeoutSeconds("tenant", "pg-agent");
+
+        assertTrue(result.isPresent());
+        assertEquals(7200, result.get());
     }
 
     // --- plan_write allowed tool (Planning Primitive P3) ---

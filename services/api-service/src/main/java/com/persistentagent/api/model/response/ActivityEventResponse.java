@@ -25,6 +25,11 @@ import java.util.Map;
  *       {@code marker.offload_emitted} / {@code marker.system_note} /
  *       {@code marker.lifecycle} / {@code marker.hitl.*} — sourced from
  *       {@code task_events}. Ordering key: {@code created_at}.</li>
+ *   <li>{@code marker.subagent.started} / {@code marker.subagent.finding} /
+ *       {@code marker.subagent.failed} / {@code marker.supervisor.iteration} —
+ *       sub-agent fan-out observability markers (S9). Carry {@code iteration}
+ *       and {@code subtask} (where applicable) so the Console can group by
+ *       round then sub-agent. Sourced from {@code task_events}.</li>
  * </ul>
  *
  * <p>Fields not applicable to a given kind are omitted from the JSON via
@@ -64,7 +69,18 @@ public record ActivityEventResponse(
         @JsonProperty("worker_id") String workerId,
         // Pre-truncation byte count on `turn.tool` events when the worker
         // truncated a large tool output. Null on other kinds / untruncated.
-        @JsonProperty("orig_bytes") Long origBytes
+        @JsonProperty("orig_bytes") Long origBytes,
+        // Sub-agent fan-out observability (S9): iteration round (1-based; supervisor_iteration
+        // cap/no-op events may carry 0) and
+        // stable logical sub-agent id. iteration is present only on
+        // marker.subagent.* / marker.supervisor.iteration kinds. subtask is
+        // additionally set on turn.* events projected from a sub-agent's
+        // checkpointed transcript (subagent:* namespaces) so the Console can
+        // nest those turns under the matching sub-agent group. Null elsewhere.
+        // @JsonInclude(NON_NULL) on the record ensures existing kinds serialise
+        // byte-identically (these fields are absent, not null-valued in JSON).
+        @JsonProperty("iteration") Integer iteration,
+        @JsonProperty("subtask") String subtask
 ) {
 
     /** Inline tool-call descriptor on an assistant turn. */

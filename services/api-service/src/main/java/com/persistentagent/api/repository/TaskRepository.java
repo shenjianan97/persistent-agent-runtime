@@ -189,6 +189,30 @@ public class TaskRepository {
     }
 
     /**
+     * Gets sub-agent-namespace checkpoints ({@code checkpoint_ns} starting
+     * with {@code subagent:}) ordered by namespace then creation time, so a
+     * caller can group rows per sub-agent and walk each transcript in order.
+     * Each sub-agent's inner ReAct turns are checkpointed under its own
+     * namespace (S3 fan-out helper); the transcript lives in the
+     * {@code sub_messages} channel of the namespace's latest checkpoint.
+     * Returns an empty list for tasks without fan-out (ReAct topology).
+     */
+    public List<Map<String, Object>> getSubagentCheckpoints(UUID taskId, String tenantId) {
+        String checkSql = "SELECT 1 FROM tasks WHERE task_id = ? AND tenant_id = ?";
+        if (jdbcTemplate.queryForList(checkSql, taskId, tenantId).isEmpty()) {
+            return List.of();
+        }
+        String sql = """
+                SELECT checkpoint_ns, checkpoint_id, worker_id, cost_microdollars,
+                       checkpoint_payload, created_at
+                FROM checkpoints
+                WHERE task_id = ? AND checkpoint_ns LIKE 'subagent:%'
+                ORDER BY checkpoint_ns ASC, created_at ASC
+                """;
+        return jdbcTemplate.queryForList(sql, taskId);
+    }
+
+    /**
      * Result of a state-transition operation that distinguishes
      * "task not found" from "task found but in wrong state."
      */

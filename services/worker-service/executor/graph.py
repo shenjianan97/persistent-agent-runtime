@@ -29,7 +29,7 @@ from langfuse.langchain import CallbackHandler
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.errors import GraphRecursionError, GraphInterrupt
-from langgraph.types import Command
+from langgraph.types import Command, Send
 
 from checkpointer.postgres import PostgresDurableCheckpointer, LeaseRevokedException
 from core.config import WorkerConfig
@@ -137,6 +137,21 @@ from tools.memory_tools import (
     build_memory_tools,
 )
 from tools.plan_tools import build_plan_write_tool
+from core.subagent_events import build_task_event_sink
+from tools.subagent_tools import (
+    DISPATCH_SUBAGENT_TOOL_NAME,
+    MAX_SUBAGENT_TURN_BUDGET,
+    budget_to_ceiling,
+    build_dispatch_subagent_tool,
+)
+from executor.grounding import today_line
+from executor.retry_classification import is_retryable_error
+from executor.subagents import run_subagent
+from executor.supervisor.graph import (
+    FANOUT_NODE_NAME as SUPERVISOR_FANOUT_NODE_NAME,
+    GATHER_NODE_NAME as SUPERVISOR_GATHER_NODE_NAME,
+    build_supervisor_graph,
+)
 from executor.mcp_session import McpToolCallError
 from executor.compaction.defaults import OFFLOAD_THRESHOLD_BYTES
 from executor.compaction.ingestion import (
@@ -240,6 +255,22 @@ def _message_content_to_text(message: BaseMessage) -> str:
     if isinstance(raw, list):
         return _extract_message_text(raw, separator="\n\n")
     return raw if isinstance(raw, str) else str(raw)
+
+
+def _terminal_output_content(values: dict) -> Any:
+    """Terminal ``output.result`` content from the final graph state.
+
+    Supervisor topology: the user-visible deliverable is the Writer's
+    ``report`` channel — there the ``messages`` channel carries only the task
+    input, so the generic last-message extraction would echo the user's
+    prompt back as the Output card (observed live: task 0729e3a3). ReAct
+    state has no ``report`` channel and falls through to the last-message
+    flatten.
+    """
+    report = values.get("report")
+    if isinstance(report, str) and report.strip():
+        return report
+    return _finalize_output_content(values.get("messages", []))
 
 
 def _looks_like_future_work_promise(message: BaseMessage) -> bool:
@@ -682,6 +713,40 @@ def _reweave_messages(
     return out
 
 
+# Built-in WEB SOURCE tools the supervisor's ``source_allowlist`` governs — the
+# Console "Allowed Sources" checklist's base entries (SupervisorConfigSection
+# BASE_SOURCES: web_search / read_url). Only these are subject to the allowlist;
+# every other built-in tool (base platform tools a sub-agent needs to function)
+# is never filtered. Tool-server sources are not yet wired into sub-agents (v1).
+_SUPERVISOR_WEB_SOURCE_TOOLS = frozenset({"web_search", "read_url"})
+
+
+def _filter_subagent_source_tools(
+    allowed_tools: list[str], source_allowlist: list[str] | None
+) -> list[str]:
+    """Restrict the sub-agents' WEB SOURCE tools to ``source_allowlist``.
+
+    ``supervisor.source_allowlist`` (Console "Allowed Sources") restricts which
+    source tools fanned-out sub-agents may use. Semantics:
+
+    * ``None`` / empty → "all sources": no restriction, returned unchanged.
+    * non-empty → drop any web source tool (``web_search`` / ``read_url``) whose
+      name is NOT in the allowlist. Non-source tools (``plan_write``,
+      ``create_text_artifact``, …) always pass — the allowlist governs sources,
+      not the sub-agent's whole toolset.
+
+    Order-preserving; a no-op when nothing is restricted.
+    """
+    if not source_allowlist:
+        return list(allowed_tools)
+    allowed = set(source_allowlist)
+    return [
+        tool
+        for tool in allowed_tools
+        if tool not in _SUPERVISOR_WEB_SOURCE_TOOLS or tool in allowed
+    ]
+
+
 class GraphExecutor:
     """Orchestrates LangGraph execution for a claimed task."""
 
@@ -1078,6 +1143,17 @@ class GraphExecutor:
         if "plan_write" in allowed_tools:
             tools.append(build_plan_write_tool())
 
+        # Supervisor Topology (Task S4) — ``dispatch_subagent`` delegation tool.
+        # Gated: only registered when "dispatch_subagent" is in the allowlist
+        # (the ``coding`` / ``investigation`` presets seed it; S2 owns that —
+        # we gate purely on the resolved allowlist, never on preset names).
+        # This registers the LLM-facing SCHEMA only. The actual delegation is a
+        # post-agent routing edge in ``_build_graph`` that intercepts the call
+        # and ``Send``s it to the shared subagent node (S3) — it is NOT executed
+        # inside the ToolNode. Counts against MAX_TOOLS_PER_AGENT like any tool.
+        if DISPATCH_SUBAGENT_TOOL_NAME in allowed_tools:
+            tools.append(build_dispatch_subagent_tool())
+
         return tools
 
     async def _build_graph(
@@ -1097,7 +1173,36 @@ class GraphExecutor:
         checkpointer: PostgresDurableCheckpointer | None = None,
         model_context_window: int = 128_000,
     ) -> StateGraph:
-        """Assembles the LangGraph state machine and binds MCP tools."""
+        """Assembles the LangGraph state machine and binds MCP tools.
+
+        Supervisor Topology (Task S8) — the single graph-construction entry
+        branches on ``agent_config.topology`` (the source-of-truth graph-shape
+        selector; §A5/§A9):
+
+        * ``"react"`` / absent → the existing ReAct build below, byte-for-byte
+          unchanged (existing agents have no ``topology`` key);
+        * ``"supervisor"`` → the compiled-shape Supervisor ("Deep Research")
+          graph from ``executor/supervisor/graph.py`` (Scope → Supervisor ⇄
+          fan-out → Writer);
+        * any other value → fail the build defensively (the API validates
+          topology at creation — S1 — so an unknown value here is an integrity
+          bug, NOT a silent ReAct fallback).
+
+        Both branches return an UNCOMPILED ``StateGraph``; ``execute_task``
+        compiles it once with the shared Postgres checkpointer + invokes with
+        ``durability="sync"`` (so the Supervisor run is one durable task on the
+        parent ``thread_id`` — Pattern A).
+        """
+        topology = agent_config.get("topology", "react")
+        if topology == "supervisor":
+            return build_supervisor_graph()
+        if topology != "react":
+            raise ValueError(
+                f"unknown agent_config.topology {topology!r}: expected 'react' "
+                "or 'supervisor' (the API validates this at creation; an "
+                "unexpected value here is an integrity bug, not a ReAct fallback)"
+            )
+
         provider = agent_config.get("provider", "anthropic")
         model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
         temperature = agent_config.get("temperature", 0.7)
@@ -1643,16 +1748,45 @@ class GraphExecutor:
             workflow.add_node(MEMORY_WRITE_NODE_NAME, memory_write_graph_node)
             workflow.add_edge(MEMORY_WRITE_NODE_NAME, END)
 
+        # Supervisor Topology (Task S4) — whether the LLM may emit
+        # ``dispatch_subagent``. When enabled, the post-agent routing edge
+        # below splits a turn's tool calls: each ``dispatch_subagent`` call is
+        # ``Send``-routed to the shared subagent node (S3) — NOT executed in
+        # the ToolNode — while every other tool call still goes to the ToolNode,
+        # in the same super-step. The subagent node threads its summary back as
+        # a ``ToolMessage`` keyed to the original ``tool_call_id``, so every
+        # emitted ``tool_call_id`` receives exactly one ``ToolMessage`` before
+        # the next agent-node call (an unanswered tool call → provider error).
+        _dispatch_enabled = DISPATCH_SUBAGENT_TOOL_NAME in allowed_tools
+
+        SUBAGENT_NODE_NAME = "subagent"
+
+        def _partition_tool_calls(last: Any) -> tuple[list[dict], bool]:
+            """Split the last AIMessage's tool calls into (dispatch, has_other).
+
+            Returns the list of ``dispatch_subagent`` tool-call dicts and whether
+            any non-dispatch (ToolNode-bound) tool call is present.
+            """
+            dispatch_calls: list[dict] = []
+            has_other = False
+            for call in getattr(last, "tool_calls", None) or []:
+                if call.get("name") == DISPATCH_SUBAGENT_TOOL_NAME:
+                    dispatch_calls.append(call)
+                else:
+                    has_other = True
+            return dispatch_calls, has_other
+
         # Phase 2 Track 5 Task 12 — unified routing function out of the
         # agent node. Replaces the pre-Task-12 ``tools_condition``-based
         # wiring so the decision tree is explicit:
         #
         # 1. Pending tool calls on the last AIMessage → ``tools`` (same as
-        #    stock ``tools_condition``).
+        #    stock ``tools_condition``); a ``dispatch_subagent`` call in the
+        #    turn is split out and ``Send``-routed to the subagent node (S4).
         # 2. ``auto_write`` OR the ``memory_opt_in`` state flag is True →
         #    ``memory_write`` (terminal memory branch).
         # 3. Otherwise → ``END`` (silent no-op in agent_decides-no-opt).
-        def route_after_agent(state: Any) -> str:
+        def route_after_agent(state: Any) -> Any:
             messages = state.get("messages") if isinstance(state, dict) else None
             if not messages:
                 messages = getattr(state, "messages", None)
@@ -1663,8 +1797,44 @@ class GraphExecutor:
                 if isinstance(state, dict)
                 else getattr(state, "memory_opt_in", False)
             )
+
             if pending:
-                decision = "tools"
+                # Split dispatch_subagent calls (→ Send to the subagent node)
+                # from normal tool calls (→ ToolNode), in one super-step. Depth
+                # is sourced from graph state (default 0 for a top-level ReAct
+                # agent) and incremented by one — never read from the LLM args,
+                # so a crafted call cannot escalate past MAX_SUBAGENT_DEPTH.
+                dispatch_calls, has_other = (
+                    _partition_tool_calls(last) if _dispatch_enabled else ([], True)
+                )
+                if dispatch_calls:
+                    parent_depth = int(
+                        state.get("depth", 0)
+                        if isinstance(state, dict)
+                        else getattr(state, "depth", 0) or 0
+                    )
+                    sends: list[Any] = [
+                        Send(
+                            SUBAGENT_NODE_NAME,
+                            {
+                                "tool_call_id": call.get("id"),
+                                "prompt": (call.get("args") or {}).get("prompt", ""),
+                                "tools": (call.get("args") or {}).get("tools", []),
+                                "budget": (call.get("args") or {}).get("budget"),
+                                "depth": parent_depth + 1,
+                            },
+                        )
+                        for call in dispatch_calls
+                    ]
+                    if has_other:
+                        sends.append("tools")
+                    logger.info(
+                        "subagent.route_after_agent task_id=%s dispatch_calls=%d "
+                        "has_other_tools=%s parent_depth=%d",
+                        task_id, len(dispatch_calls), has_other, parent_depth,
+                    )
+                    return sends
+                decision: Any = "tools"
             elif stack_enabled and (auto_write or opt_in):
                 decision = MEMORY_WRITE_NODE_NAME
             else:
@@ -1690,6 +1860,148 @@ class GraphExecutor:
             "task_id": task_id,
         }
 
+        # Supervisor Topology (Task S4) — the shared subagent node, reached only
+        # via ``Send`` from the post-agent routing edge above (NEVER from the
+        # ToolNode). It is a thin DRIVER over S3's ``run_subagent`` — it does not
+        # fork a second ReAct subgraph; ``run_subagent`` owns the subgraph node,
+        # the ceiling/timeout/depth enforcement, and the headless filter. The
+        # node's job is purely transport: map the LLM-supplied ``tools`` arg to
+        # the parent's own tool objects (so a sub-agent can never use a tool the
+        # parent lacks), translate ``budget`` → ``SubagentCeiling``, call
+        # ``run_subagent`` with the state-sourced (incremented) ``depth``, and
+        # thread the outcome back as a single ``ToolMessage`` keyed to the
+        # original ``tool_call_id``. Failure markers become a descriptive
+        # ``ToolMessage`` — never a raised graph error (the parent loop reacts).
+        _tools_by_name = {getattr(t, "name", None): t for t in tools}
+
+        def _strip_dispatch_tool_calls(state: Any) -> Any:
+            """Return a state view whose last AIMessage drops dispatch calls.
+
+            The ToolNode answers every tool call on the last AIMessage; a
+            ``dispatch_subagent`` call is answered by the subagent node instead,
+            so it must be removed from the message the ToolNode sees (otherwise
+            the id is answered twice — once with the unreachable-stub error,
+            once with the real summary — corrupting the message journal). When
+            the turn has no dispatch calls this is a passthrough.
+            """
+            messages = (
+                state.get("messages") if isinstance(state, dict)
+                else getattr(state, "messages", None)
+            )
+            if not messages:
+                return state
+            last = messages[-1]
+            calls = getattr(last, "tool_calls", None) or []
+            kept = [c for c in calls if c.get("name") != DISPATCH_SUBAGENT_TOOL_NAME]
+            if len(kept) == len(calls):
+                return state  # no dispatch calls — nothing to strip
+            trimmed = last.model_copy(update={"tool_calls": kept})
+            new_messages = list(messages[:-1]) + [trimmed]
+            if isinstance(state, dict):
+                return {**state, "messages": new_messages}
+            # RuntimeState is a TypedDict (dict at runtime); the dict branch
+            # covers it. Fall back to a dict view for any object-shaped state.
+            return {"messages": new_messages}
+
+        async def _subagent_emit(event_name, payload=None):
+            # S3's wedged-branch liveness signal is a span event ONLY. Full
+            # Langfuse span emission is wired with the rest of sub-agent
+            # observability (a later task); here it is a structured log line so
+            # the heartbeat is still observable and S3's ``emit`` contract is
+            # honoured. NEVER a task_events row, NEVER a lease touch.
+            logger.debug(
+                "subagent.emit task_id=%s event=%s payload=%s",
+                task_id, event_name, payload,
+            )
+
+        async def subagent_node(state: dict, config: RunnableConfig):
+            # ``state`` is the ``Send`` payload assembled by route_after_agent —
+            # the sub-agent's ENTIRE input. The parent's ``messages`` are NOT
+            # passed in (isolation holds at entry), and the sub-agent's internal
+            # working turns live on ``run_subagent``'s separate channel — only
+            # the summary ToolMessage written here crosses back.
+            tool_call_id = state.get("tool_call_id")
+            if not tool_call_id:
+                # Unreachable via real LLMs (they always populate tool call ids),
+                # but the "never raises" node contract is absolute — constructing
+                # ToolMessage(tool_call_id=None) would raise a pydantic
+                # ValidationError. Skip gracefully so the parent loop can continue.
+                logger.warning(
+                    "subagent.missing_tool_call_id task_id=%s — skipping node",
+                    task_id,
+                )
+                return {"messages": []}
+            prompt = state.get("prompt", "") or ""
+            requested = state.get("tools", []) or []
+            depth = int(state.get("depth", 1))
+
+            # Bound the sub-agent's tools to the subset of the PARENT's tools the
+            # LLM named — it can never be granted a tool the parent itself lacks.
+            # ``dispatch_subagent`` itself is never delegated (no nested tool
+            # surface needed; S3's headless filter independently drops any
+            # interrupt-bearing tool by name).
+            delegated_tools = [
+                _tools_by_name[name]
+                for name in requested
+                if name in _tools_by_name
+                and name != DISPATCH_SUBAGENT_TOOL_NAME
+            ]
+
+            # Derive a sub-thread off the parent's thread_id so the sub-agent's
+            # inner super-steps are checkpointed under their own namespace while
+            # sharing the parent checkpointer (per-inner-turn crash resume).
+            parent_thread = ""
+            try:
+                parent_thread = (
+                    (config.get("configurable") or {}).get("thread_id", "")
+                    if isinstance(config, dict)
+                    else ""
+                )
+            except Exception:
+                parent_thread = ""
+            # Share the parent task's UUID thread_id; isolate the sub-agent's
+            # sub-checkpoint by namespace (the PostgresDurableCheckpointer maps
+            # thread_id → task_id::uuid and lease-gates writes against that row,
+            # so a derived non-UUID thread id fails Postgres coercion).
+            sub_checkpoint_ns = f"subagent:{tool_call_id}"
+
+            # Current-date grounding: the sub-agent runs with no platform
+            # SystemMessage, so without this line it anchors relative
+            # timeframes on its training cutoff (see executor/grounding.py).
+            result = await run_subagent(
+                f"{today_line()}\n\n{prompt}",
+                delegated_tools,
+                ceiling=budget_to_ceiling(state.get("budget")),
+                depth=depth,
+                model=llm,
+                checkpointer=checkpointer,
+                thread_id=parent_thread,
+                checkpoint_ns=sub_checkpoint_ns,
+                emit=_subagent_emit,
+            )
+
+            if result.ok:
+                content = result.summary or "(sub-agent returned no summary)"
+            else:
+                reason = result.reason or "error"
+                detail = f": {result.summary}" if result.summary else ""
+                content = (
+                    f"sub-agent did not complete (reason: {reason}){detail}. "
+                    f"You may retry with a narrower prompt or smaller budget, "
+                    f"proceed without it, or stop."
+                )
+            logger.info(
+                "subagent.completed task_id=%s tool_call_id=%s ok=%s reason=%s "
+                "depth=%d delegated_tools=%d",
+                task_id, tool_call_id, result.ok, result.reason, depth,
+                len(delegated_tools),
+            )
+            return {
+                "messages": [
+                    ToolMessage(content=content, tool_call_id=tool_call_id)
+                ]
+            }
+
         if tools:
             _raw_tool_node = ToolNode(tools, handle_tool_errors=_handle_tool_error)
 
@@ -1714,7 +2026,18 @@ class GraphExecutor:
                 recall-pointer rewrite and the projection stub rule can
                 recognise it later.
                 """
-                out = await _raw_tool_node.ainvoke(state, config)
+                # Supervisor Topology (Task S4) — a mixed turn routes
+                # ``dispatch_subagent`` calls to the subagent node (via Send)
+                # AND the normal calls here, in the same super-step. The
+                # ToolNode must NOT also answer the dispatch calls — the
+                # subagent node owns those ``tool_call_id``s. Hide them from the
+                # ToolNode so each id is answered exactly once.
+                _tn_input = (
+                    _strip_dispatch_tool_calls(state)
+                    if _dispatch_enabled
+                    else state
+                )
+                out = await _raw_tool_node.ainvoke(_tn_input, config)
                 if not _offload_enabled or _offload_store is None:
                     # When the flag is off, still tag recall-tool outputs so
                     # the compaction hook's projection stub + recall-pointer
@@ -1779,15 +2102,34 @@ class GraphExecutor:
 
             workflow.add_node("tools", tool_node)
             workflow.add_edge("tools", "agent")
-            if stack_enabled:
+            # Supervisor Topology (Task S4) — register the shared subagent node
+            # and its return edge. It is reached ONLY via ``Send`` from
+            # route_after_agent (a dispatch_subagent call), in the same
+            # super-step as any sibling ToolNode call, and returns to the agent
+            # node so the parent loop continues with the summary ToolMessage.
+            if _dispatch_enabled:
+                workflow.add_node(SUBAGENT_NODE_NAME, subagent_node)
+                workflow.add_edge(SUBAGENT_NODE_NAME, "agent")
+            if stack_enabled or _dispatch_enabled:
+                # ``route_after_agent`` owns the split (dispatch → Send to the
+                # subagent node, others → ToolNode). The path map must name
+                # every reachable target; ``SUBAGENT_NODE_NAME`` is added when
+                # dispatch is enabled so a returned ``Send(SUBAGENT_NODE_NAME)``
+                # resolves.
+                _route_map: dict[Any, Any] = {
+                    "tools": "tools",
+                    END: END,
+                }
+                # The memory_write target only exists when the stack is enabled
+                # (that node is added in the ``stack_enabled`` block above).
+                if stack_enabled:
+                    _route_map[MEMORY_WRITE_NODE_NAME] = MEMORY_WRITE_NODE_NAME
+                if _dispatch_enabled:
+                    _route_map[SUBAGENT_NODE_NAME] = SUBAGENT_NODE_NAME
                 workflow.add_conditional_edges(
                     "agent",
                     route_after_agent,
-                    {
-                        "tools": "tools",
-                        MEMORY_WRITE_NODE_NAME: MEMORY_WRITE_NODE_NAME,
-                        END: END,
-                    },
+                    _route_map,
                 )
             else:
                 workflow.add_conditional_edges("agent", tools_condition)
@@ -2017,6 +2359,173 @@ class GraphExecutor:
         )
 
         return (int(cumulative_task_cost), int(hourly_cost or 0))
+
+    async def _record_supervisor_step_cost(
+        self, conn, task_id: str, tenant_id: str, agent_id: str,
+        checkpoint_id: str, cost_microdollars: int,
+        execution_metadata: dict | None = None,
+        *,
+        worker_id: str,
+    ) -> tuple:
+        """ADDITIVE per-checkpoint cost write for the Supervisor topology (§A11-E1).
+
+        Mirrors :meth:`_record_step_cost` but uses
+        :func:`add_cost_and_preserve_metadata` (COALESCE-preserving, never
+        overwrite) for the per-checkpoint ``checkpoints.cost_microdollars`` write.
+        Several Supervisor super-steps (and several fan-out ``Send`` branches in
+        one super-step) attribute spend to the SAME parent ``checkpoint_id``
+        before a new checkpoint is emitted, so an overwrite would silently drop
+        all-but-the-last write's spend (the exact E1 gap). The
+        ``agent_cost_ledger`` row + hourly-window increment are append/increment
+        and stay correct under the additive path. Pattern A: NO ``sub_agent_id``
+        column, NO per-sub-agent rows — the spend is the parent task's.
+
+        Lease-gated identically (raises ``LeaseRevokedException`` if the worker no
+        longer owns the task). Must run inside an active transaction on ``conn``.
+        """
+        lease_ok = await conn.fetchval(
+            '''SELECT 1 FROM tasks
+               WHERE task_id = $1::uuid
+                 AND tenant_id = $2
+                 AND status = 'running'
+                 AND lease_owner = $3
+               FOR UPDATE''',
+            task_id, tenant_id, worker_id,
+        )
+        if lease_ok is None:
+            raise LeaseRevokedException(
+                f"Lease revoked before supervisor cost write for task {task_id}"
+            )
+
+        await add_cost_and_preserve_metadata(
+            conn,
+            checkpoint_id=checkpoint_id,
+            task_id=task_id,
+            delta_microdollars=cost_microdollars,
+            execution_metadata=execution_metadata if execution_metadata else None,
+        )
+        await insert_cost_row(
+            conn,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            checkpoint_id=checkpoint_id,
+            cost_microdollars=cost_microdollars,
+        )
+        await increment_hour_window_cost(
+            conn, tenant_id, agent_id, cost_microdollars
+        )
+        cumulative_task_cost = await sum_task_cost(conn, task_id)
+        hourly_cost = await conn.fetchval(
+            '''SELECT hour_window_cost_microdollars
+               FROM agent_runtime_state
+               WHERE tenant_id = $1 AND agent_id = $2''',
+            tenant_id, agent_id,
+        )
+        return (int(cumulative_task_cost), int(hourly_cost or 0))
+
+    async def _attribute_supervisor_event_cost(
+        self,
+        event: dict,
+        *,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        model_name: str,
+        provider: str,
+        worker_id: str,
+        task_data: dict,
+    ) -> bool:
+        """Bill one Supervisor astream ``updates`` event's spend (Task S8, §A11-E1).
+
+        Reads ``step_usage`` off each node payload in the event and writes it
+        ADDITIVELY to the parent's latest super-step ``checkpoint_id``. Returns
+        ``True`` iff a budget pause fired (so the caller runs the pause teardown
+        + ``return``s). The ReAct ``"agent"`` gate never matches a Supervisor
+        super-step, so this branch is the ONLY thing that meters scope /
+        supervisor / fan-out / writer / verify spend — without it a Deep Research
+        run records ~$0 and never trips the pause.
+
+        Budget pause is evaluated at the FAN-OUT SUPER-STEP BOUNDARY, not
+        mid-``Send`` (§A11-E2). Spend is recorded on EVERY node carrying
+        ``step_usage`` (additive — billed exactly once), including each
+        ``supervisor_fanout`` branch. But the pause is evaluated ONLY at a
+        super-step boundary: the ``supervisor_gather`` node (which runs strictly
+        after the whole fan-out round merges — the true boundary) or a single-node
+        scope/supervisor/writer super-step. It is NEVER evaluated on a
+        ``supervisor_fanout`` event, because the fan-out super-step yields one
+        ``{supervisor_fanout: …}`` event per branch as branches complete — pausing
+        on one would strand the still-in-flight siblings. We accept the
+        design-budgeted ``max_fanout × ceiling`` overshoot (§A8/D3 — finer
+        in-flight metering deferred). The carve-out skips are NOT widened.
+
+        Note the gather node carries no ``step_usage`` (it does no LLM work), so
+        the pause check reads the LIVE cumulative ``sum_task_cost`` after the
+        round's spend is recorded — not a per-event delta.
+        """
+        # (1) Record spend for every node carrying step_usage (additive). Track
+        # whether THIS event reached a super-step boundary worth a pause check.
+        at_boundary = SUPERVISOR_GATHER_NODE_NAME in event
+        for node_key, payload in event.items():
+            if not isinstance(payload, dict):
+                continue
+            # A non-fan-out LLM node (scope/supervisor/writer) is its own
+            # single-node super-step boundary; the gather node is the fan-out
+            # round boundary. A supervisor_fanout event is NEVER a boundary.
+            if node_key != SUPERVISOR_FANOUT_NODE_NAME:
+                at_boundary = True
+            step_usage = payload.get("step_usage")
+            if not step_usage:
+                continue
+            try:
+                resp_meta = {"usage_metadata": dict(step_usage)}
+                step_cost, execution_metadata = await self._calculate_step_cost(
+                    resp_meta, model_name, provider=provider,
+                )
+                if step_cost <= 0:
+                    continue
+                async with self.pool.acquire() as cost_conn:
+                    checkpoint_id = await fetch_latest_checkpoint_id(cost_conn, task_id)
+                    if not checkpoint_id:
+                        continue
+                    async with cost_conn.transaction():
+                        cumulative_task_cost, hourly_cost = await self._record_supervisor_step_cost(
+                            cost_conn, task_id, tenant_id, agent_id, checkpoint_id, step_cost,
+                            execution_metadata=execution_metadata,
+                            worker_id=worker_id,
+                        )
+                    logger.debug(
+                        "Task %s supervisor step cost: %d microdollars node=%s (cumulative: %d, hourly: %d)",
+                        task_id, step_cost, node_key, cumulative_task_cost, hourly_cost,
+                    )
+            except LeaseRevokedException:
+                raise
+            except Exception:
+                logger.warning(
+                    "Supervisor per-step cost tracking failed for task %s node=%s",
+                    task_id, node_key, exc_info=True,
+                )
+
+        # (2) Pause check ONLY at a super-step boundary (§A11-E2), against the
+        # live cumulative ledger total (the gather node carries no per-event
+        # delta of its own).
+        if not at_boundary:
+            return False
+        try:
+            async with self.pool.acquire() as cost_conn:
+                cumulative_task_cost = await sum_task_cost(cost_conn, task_id)
+                if cumulative_task_cost > 0 and await self._check_budget_and_pause(
+                    cost_conn, task_data, cumulative_task_cost, worker_id
+                ):
+                    return True
+        except LeaseRevokedException:
+            raise
+        except Exception:
+            logger.warning(
+                "Supervisor boundary budget check failed for task %s", task_id,
+                exc_info=True,
+            )
+        return False
 
     async def _calculate_step_cost(
         self,
@@ -2566,7 +3075,7 @@ class GraphExecutor:
         """
         sections = []
 
-        sections.append(f"Today's date is {datetime.now(timezone.utc).strftime('%Y-%m-%d')}.")
+        sections.append(today_line())
 
         if "request_human_input" in allowed_tools:
             sections.append(
@@ -2961,6 +3470,24 @@ class GraphExecutor:
                 langfuse_credentials=langfuse_credentials,
             )
 
+            # Supervisor Topology (Task S8) — inject every dep the Supervisor
+            # nodes read from ``config["configurable"]`` (scope/supervisor/writer
+            # /verify models, the loaded agent_config snapshot, the event sink,
+            # and the fan-out deps the per-subtask node hands to ``run_subagent``).
+            # ReAct tasks skip this entirely. Pattern A: the fan-out shares the
+            # parent's checkpointer + thread_id (one durable task).
+            _is_supervisor = agent_config.get("topology", "react") == "supervisor"
+            if _is_supervisor:
+                await self._inject_supervisor_configurable(
+                    config,
+                    agent_config=agent_config,
+                    checkpointer=checkpointer,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    agent_id=agent_id,
+                    cancel_event=cancel_event,
+                )
+
             async def run_astream():
                 nonlocal session_manager, per_task_langfuse_client, sandbox
                 # For first run, inject HumanMessage based on initial input.
@@ -3177,6 +3704,49 @@ class GraphExecutor:
                 # Track cumulative costs for Task 4 budget enforcement (added later)
                 cumulative_task_cost = 0
                 hourly_cost = 0
+                # Supervisor Topology (Task S8) — gate the new cost+pause branch.
+                _is_supervisor_run = (
+                    agent_config.get("topology", "react") == "supervisor"
+                )
+
+                async def _handle_budget_pause_side_effects() -> None:
+                    """Shared budget-pause teardown (ReAct + Supervisor, §A11-E2).
+
+                    Closes MCP sessions, records + pauses the sandbox, then leaves
+                    the lease for manual/auto resume. The caller ``return``s after
+                    calling this. Extracted so the Supervisor super-step-boundary
+                    pause reuses the EXACT ReAct teardown rather than a parallel
+                    copy.
+                    """
+                    nonlocal session_manager, sandbox
+                    if session_manager is not None:
+                        await session_manager.close("paused")
+                        session_manager = None
+                    if sandbox is not None and sandbox_start_time is not None:
+                        elapsed = time.monotonic() - sandbox_start_time
+                        pause_sandbox_cost = int(
+                            elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
+                        )
+                        if pause_sandbox_cost > 0:
+                            try:
+                                async with self.pool.acquire() as sc_conn:
+                                    await insert_cost_row(
+                                        sc_conn,
+                                        tenant_id=tenant_id,
+                                        agent_id=agent_id,
+                                        task_id=task_id,
+                                        checkpoint_id='sandbox',
+                                        cost_microdollars=pause_sandbox_cost,
+                                    )
+                            except Exception:
+                                logger.warning(
+                                    "sandbox_cost_recording_failed_on_budget_pause",
+                                    extra={"task_id": task_id},
+                                    exc_info=True,
+                                )
+                    if sandbox is not None and provisioner is not None:
+                        await provisioner.pause(sandbox)
+                        sandbox = None
 
                 # Executing super-steps via astream
                 # durability="sync" ensures checkpoints are committed before astream
@@ -3294,37 +3864,11 @@ class GraphExecutor:
                                                     cost_conn, task_data, cumulative_task_cost, worker_id
                                                 )
                                                 if was_paused:
-                                                    # Close MCP sessions before releasing lease on budget pause
-                                                    if session_manager is not None:
-                                                        await session_manager.close("paused")
-                                                        session_manager = None  # Prevent double-close in finally
-                                                    # Record sandbox cost before pausing
-                                                    if sandbox is not None and sandbox_start_time is not None:
-                                                        elapsed = time.monotonic() - sandbox_start_time
-                                                        pause_sandbox_cost = int(
-                                                            elapsed * sandbox_config.get("vcpu", 2) * 50000 / 3600
-                                                        )
-                                                        if pause_sandbox_cost > 0:
-                                                            try:
-                                                                async with self.pool.acquire() as sc_conn:
-                                                                    await insert_cost_row(
-                                                                        sc_conn,
-                                                                        tenant_id=tenant_id,
-                                                                        agent_id=agent_id,
-                                                                        task_id=task_id,
-                                                                        checkpoint_id='sandbox',
-                                                                        cost_microdollars=pause_sandbox_cost,
-                                                                    )
-                                                            except Exception:
-                                                                logger.warning(
-                                                                    "sandbox_cost_recording_failed_on_budget_pause",
-                                                                    extra={"task_id": task_id},
-                                                                    exc_info=True,
-                                                                )
-                                                    # Pause sandbox before releasing lease on budget pause
-                                                    if sandbox is not None and provisioner is not None:
-                                                        await provisioner.pause(sandbox)
-                                                        sandbox = None  # Prevent double-destroy in finally
+                                                    # Shared teardown (close MCP
+                                                    # sessions → record + pause
+                                                    # sandbox), identical to the
+                                                    # Supervisor pause path.
+                                                    await _handle_budget_pause_side_effects()
                                                     return  # Stop execution — task is now paused
                                 except LeaseRevokedException:
                                     # Propagate to the outer astream handler so the evicted worker
@@ -3333,6 +3877,51 @@ class GraphExecutor:
                                     raise
                                 except Exception:
                                     logger.warning("Per-step cost tracking failed for task %s", task_id, exc_info=True)
+
+                    # Supervisor Topology cost-attribution mechanism (Task S8,
+                    # §A11-E1). The ReAct ``"agent"`` gate above NEVER matches a
+                    # Supervisor super-step (its LLM nodes emit under
+                    # scope/supervisor/supervisor_fanout/writer keys), so without
+                    # this branch a Deep Research run records ~$0 and never trips
+                    # the budget pause. Every LLM-bearing Supervisor node (and the
+                    # fan-out sub-agents, via ``run_subagent``'s surfaced usage)
+                    # accumulates its ``usage_metadata`` into the ``step_usage``
+                    # channel it returns; each astream ``updates`` event carries
+                    # its node's ``step_usage`` delta. We bill it ADDITIVELY to the
+                    # parent's super-step ``checkpoint_id`` (``add_cost_and_preserve
+                    # _metadata`` — never overwrite). Pattern A: the parent task's
+                    # cost, no ``sub_agent_id`` column, no per-sub-agent rows.
+                    #
+                    # ⚠ The cost mechanism is needed because the outer
+                    # ``astream(subgraphs=True)`` does NOT descend into the nested
+                    # ``run_subagent`` ``ainvoke`` (verified, langgraph==1.0.5), so
+                    # the spec's option (b) — helper-accumulated usage through state
+                    # — is the working approach, not ``subgraphs=True``.
+                    #
+                    # Budget pause is evaluated at the FAN-OUT SUPER-STEP BOUNDARY,
+                    # not mid-``Send`` (§A11-E2): spend is recorded on every event
+                    # (additive — billed once), but the pause is evaluated only on
+                    # NON-fan-out events (scope/supervisor/supervisor_gather/writer
+                    # — the boundary; ``supervisor_gather`` is exactly the fan-out
+                    # round boundary). Pausing on a ``supervisor_fanout`` event would
+                    # strand the still-in-flight sibling branches. We accept the
+                    # design-budgeted ``max_fanout × ceiling`` overshoot (§A8/D3 —
+                    # finer in-flight metering deferred). The ``:3160`` carve-out
+                    # skips are NOT widened for fan-out.
+                    elif _is_supervisor_run:
+                        was_paused = await self._attribute_supervisor_event_cost(
+                            event,
+                            task_id=task_id,
+                            tenant_id=tenant_id,
+                            agent_id=agent_id,
+                            model_name=model_name,
+                            provider=provider,
+                            worker_id=worker_id,
+                            task_data=task_data,
+                        )
+                        if was_paused:
+                            await _handle_budget_pause_side_effects()
+                            return  # Stop execution — task is now paused
 
                 if cancel_event.is_set():
                     return
@@ -3402,8 +3991,9 @@ class GraphExecutor:
                 # Anthropic multi-block, Gemini, etc.) to plain text so the
                 # Console can render markdown without provider-aware branching.
                 # Checkpoint persistence is unchanged — this normalizes only
-                # the terminal output.result artifact.
-                output_content = _finalize_output_content(messages)
+                # the terminal output.result artifact. Supervisor topology
+                # surfaces the Writer's ``report`` channel instead.
+                output_content = _terminal_output_content(final_state.values)
                 last_message = messages[-1] if messages else None
                 if last_message is not None and _looks_like_future_work_promise(last_message):
                     logger.warning(
@@ -3661,6 +4251,109 @@ class GraphExecutor:
                 except Exception:
                     logger.warning("Sandbox pause failed for task %s in finally block", task_id, exc_info=True)
 
+    async def _inject_supervisor_configurable(
+        self,
+        config: dict[str, Any],
+        *,
+        agent_config: dict[str, Any],
+        checkpointer: PostgresDurableCheckpointer,
+        task_id: str,
+        tenant_id: str,
+        agent_id: str,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        """Inject the Supervisor topology's dependency seams into ``config`` (S8).
+
+        Every LLM-bearing Supervisor node (scope/supervisor/writer/verify) and the
+        fan-out node read their deps from ``config["configurable"]`` (the
+        dependency-injection convention the nodes established — see
+        ``executor/supervisor/nodes.py``). S8 binds them here at task-execution
+        time so the nodes never re-fetch from the API and so the fan-out shares
+        the parent's checkpointer + thread_id (Pattern A).
+
+        v1 model resolution: all four supervisor phases use the agent's
+        configured ``provider``/``model``. Per-phase model overrides are a
+        deferred refinement (the config carries no per-phase model field today).
+        The fan-out sub-agents reuse the same model + the agent's own tool
+        objects (a sub-agent can never use a tool the parent agent lacks). The
+        per-sub-agent ceiling is the platform MAX turn budget (no supervisor
+        sub-field configures it yet) — it bounds the per-task fan-out
+        overshoot to ``max_fanout × ceiling`` (§A5/§A8/D3).
+        """
+        provider = agent_config.get("provider", "anthropic")
+        model_name = agent_config.get("model", "claude-3-5-sonnet-latest")
+        temperature = agent_config.get("temperature", 0.7)
+        model = await providers.create_llm(
+            self.pool, provider, model_name, temperature
+        )
+
+        # The sub-agents' tool objects — the agent's own built-in tools (the
+        # ``research`` preset seeds the web allowlist). The headless filter inside
+        # ``run_subagent`` drops any interrupt-bearing tool before binding.
+        #
+        # supervisor.source_allowlist (when non-empty) restricts which WEB SOURCE
+        # tools the sub-agents may use — the Console "Allowed Sources" checklist
+        # (web_search / read_url + tool servers). Empty / absent = "all sources"
+        # (no restriction). Only source tools are governed: base platform tools the
+        # sub-agent needs (plan_write, create_text_artifact, …) are never filtered.
+        # v1 governs the built-in web source tools only — sub-agents do not yet
+        # receive tool-server tools, so a tool-server name in the allowlist has no
+        # built-in tool to gate (no effect, not an error).
+        allowed_tools = _filter_subagent_source_tools(
+            agent_config.get("allowed_tools", []),
+            (agent_config.get("supervisor") or {}).get("source_allowlist"),
+        )
+        # cancel_event is the task's REAL cancellation/lease-loss signal (threaded
+        # from execute_task), matching the ReAct path — so an in-flight sub-agent
+        # web/tool call aborts on cancel instead of running (and spending) until the
+        # next super-step boundary.
+        sub_tools = self._get_tools(
+            allowed_tools,
+            cancel_event=cancel_event,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+
+        # S9: the REAL sink. Per emit it acquires its OWN short-lived connection
+        # from the pool and writes a task_events row via _insert_task_event —
+        # at-least-once, NOT atomic with the checkpoint write (the checkpointer
+        # owns its own connections; checkpointer/postgres.py). A crashed-and-
+        # resumed inner step re-emits, so the (event_type, iteration, subtask)
+        # dedup key is the contract and the projection is duplicate-tolerant. The
+        # sink drops the subagent.heartbeat SPAN event (§A11-E4 — Langfuse only,
+        # never an admitted task_events type). NEVER a lease touch, NEVER a
+        # checkpoint write. Migration 0025 admits the four event_type values this
+        # sink writes (§A6 deploy order: 0025 must reach prod first).
+        _supervisor_emit = build_task_event_sink(
+            self.pool,
+            task_id=task_id,
+            tenant_id=tenant_id,
+            agent_id=agent_id,
+        )
+
+        cfg = config["configurable"]
+        cfg["scope_model"] = model
+        cfg["supervisor_model"] = model
+        cfg["writer_model"] = model
+        cfg["verify_model"] = model
+        cfg["agent_config"] = agent_config
+        cfg["supervisor_emit"] = _supervisor_emit
+        cfg["iteration"] = 0
+        # S6 fail-fasts if these two are missing — wire them correctly.
+        cfg["supervisor_fanout_deps"] = {
+            "model": model,
+            "checkpointer": checkpointer,
+            # Research-sized: the 8-turn dispatch default ceilings out mid-
+            # search on real research sub-tasks (paywalled/dead URLs burn
+            # turns) and a ceiling stop discards all partial work — observed
+            # live as an all-failed round-1 dead-letter. Per-task overshoot
+            # stays bounded by max_fanout × ceiling (§A5/§A8/D3).
+            "ceiling": budget_to_ceiling(MAX_SUBAGENT_TURN_BUDGET),
+            "tools": sub_tools,
+            "emit": _supervisor_emit,
+        }
+
     def _build_runnable_config(
         self,
         *,
@@ -3804,58 +4497,13 @@ class GraphExecutor:
         return False
 
     def _is_retryable_error(self, e: Exception) -> bool:
-        """Determines if the exception should trigger a retry or immediate dead letter."""
-        # Check exception type first (most reliable signal).
-        # ``ToolTransportError`` is intentionally absent: its only raisers
-        # (tools/read_url.py, tools/providers/search.py) execute inside the
-        # ToolNode, whose ``handle_tool_errors=_handle_tool_error`` converts
-        # it to an agent-visible error ToolMessage instead of re-raising —
-        # so the type can no longer reach this classifier, and keeping a
-        # "retryable" entry for it would contradict those agent-correctable
-        # semantics for any future raiser.
-        if isinstance(e, McpToolCallError):
-            return True
-        if isinstance(e, (ConnectionError, TimeoutError)):
-            return True
-        # botocore timeouts: botocore.exceptions.ReadTimeoutError /
-        # ConnectTimeoutError do NOT inherit from Python's builtin
-        # TimeoutError (urllib3 defines its own same-named base). Import
-        # lazily to avoid coupling the generic classifier to a specific
-        # provider SDK at module-load time.
-        try:
-            from botocore.exceptions import ReadTimeoutError as _BotoReadTimeoutError
-            from botocore.exceptions import ConnectTimeoutError as _BotoConnectTimeoutError
+        """Determines if the exception should trigger a retry or immediate dead letter.
 
-            if isinstance(e, (_BotoReadTimeoutError, _BotoConnectTimeoutError)):
-                return True
-        except ImportError:
-            pass
-
-        # Use HTTP status code from the provider exception if available
-        status = self._extract_status_code(e)
-        if status is not None:
-            return status in self._RETRYABLE_STATUS_CODES
-
-        # Fallback: string heuristics for errors without a status code
-        error_str = str(e).lower()
-
-        if "429" in error_str or "rate limit" in error_str or "rate exceeded" in error_str:
-            return True
-        if re.search(r'\b50[0234]\b', error_str):
-            return True
-        # Network-timeout phrasing produced by botocore / httpx / urllib3
-        # when no HTTP status was received. Matches the exact prefixes
-        # "Read timeout" and "Connect timeout" to avoid overmatching
-        # unrelated error strings that happen to contain the word "timeout".
-        if "read timeout" in error_str or "connect timeout" in error_str:
-            return True
-        if "validation" in error_str or "invalid" in error_str or "unsupported" in error_str or "pydantic" in error_str:
-            return False
-        if re.search(r'\b40[0-4]\b', error_str):
-            return False
-
-        # Default unknown exceptions to non-retryable
-        return False
+        Delegates to the shared classifier (``executor/retry_classification``)
+        so the task-level dead-letter decision and the sub-agent per-turn
+        ``RetryPolicy`` (fanout) can never drift apart.
+        """
+        return is_retryable_error(e)
 
     async def _check_budget_and_pause(
         self,

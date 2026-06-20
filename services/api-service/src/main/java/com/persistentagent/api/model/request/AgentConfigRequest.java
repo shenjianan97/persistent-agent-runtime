@@ -34,5 +34,35 @@ public record AgentConfigRequest(
                 // defaults written to the row — same pattern as memory above).
                 @JsonInclude(JsonInclude.Include.NON_NULL)
                 @JsonProperty("context_management")
-                ContextManagementConfigRequest contextManagement) {
+                ContextManagementConfigRequest contextManagement,
+
+                // Agent Modes — Supervisor Topology (S1). The internal graph-shape
+                // selector. Enum {react, supervisor}; absent → treated as "react" at
+                // read time. Immutable after agent creation (enforced in updateAgent).
+                // No silent default is written into the persisted row.
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("topology")
+                String topology,
+
+                // The customer-facing preset selector. S1 only accepts/round-trips it
+                // verbatim; the preset→defaults mapping and unknown-preset 400 are S2's job.
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("preset")
+                String preset,
+
+                // Deep Research tuning sub-object. Optional; partial payloads accepted.
+                // When absent, the persisted JSON omits the key entirely.
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("supervisor")
+                SupervisorConfigRequest supervisor,
+
+                // Agent Modes — Supervisor Topology (S2). Agent-level default for
+                // task_timeout_seconds, seeded by the research preset (14400 s = 4 h).
+                // Stored in agent_config JSONB (not a DB column). When present, TaskService
+                // uses this value as the fallback when the task submission omits
+                // task_timeout_seconds (request value → agent config default → DEFAULT_TASK_TIMEOUT_SECONDS).
+                // Absent means: use the platform default at submission time.
+                @JsonInclude(JsonInclude.Include.NON_NULL)
+                @JsonProperty("task_timeout_seconds")
+                Integer taskTimeoutSeconds) {
 }

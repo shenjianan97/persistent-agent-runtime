@@ -9,6 +9,7 @@ import com.persistentagent.api.model.request.AgentConfigRequest;
 import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
+import com.persistentagent.api.model.request.SupervisorConfigRequest;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.repository.ModelRepository;
 import com.persistentagent.api.repository.ToolServerRepository;
@@ -311,6 +312,70 @@ public class ConfigValidationHelper {
         // value passes this validator.
     }
 
+    /**
+     * Validates the optional {@code supervisor} sub-object on
+     * {@link AgentConfigRequest}. Absence is always valid.
+     *
+     * <ul>
+     *   <li>{@code maxFanoutPerIteration}, when non-null: must be in [1, 20].</li>
+     *   <li>{@code maxIterations}, when non-null: must be in [1, 10].</li>
+     *   <li>{@code sourceAllowlist}, when non-null: at most 50 entries. Entry
+     *       contents are NOT validated — customers may name tools / stores not yet wired.</li>
+     *   <li>{@code writerStyle}, when non-null: must be one of
+     *       {@code {formal_report, annotated_bullets}}.</li>
+     *   <li>{@code scopeClarificationEnabled}: pure boolean toggle — no further validation.</li>
+     *   <li>No cross-field validation with {@code topology} — a {@code supervisor}
+     *       sub-object on a {@code react} agent is accepted but inert.</li>
+     * </ul>
+     *
+     * @param s supervisor sub-object (may be {@code null})
+     */
+    public void validateSupervisorConfig(SupervisorConfigRequest s) {
+        if (s == null) {
+            return; // Absent supervisor sub-object is valid.
+        }
+
+        if (s.maxFanoutPerIteration() != null) {
+            int val = s.maxFanoutPerIteration();
+            if (val < ValidationConstants.SUPERVISOR_MAX_FANOUT_MIN
+                    || val > ValidationConstants.SUPERVISOR_MAX_FANOUT_MAX) {
+                throw new ValidationException(
+                        "supervisor.max_fanout_per_iteration must be between "
+                                + ValidationConstants.SUPERVISOR_MAX_FANOUT_MIN + " and "
+                                + ValidationConstants.SUPERVISOR_MAX_FANOUT_MAX);
+            }
+        }
+
+        if (s.maxIterations() != null) {
+            int val = s.maxIterations();
+            if (val < ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MIN
+                    || val > ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MAX) {
+                throw new ValidationException(
+                        "supervisor.max_iterations must be between "
+                                + ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MIN + " and "
+                                + ValidationConstants.SUPERVISOR_MAX_ITERATIONS_MAX);
+            }
+        }
+
+        if (s.sourceAllowlist() != null
+                && s.sourceAllowlist().size() > ValidationConstants.SUPERVISOR_SOURCE_ALLOWLIST_MAX) {
+            throw new ValidationException(
+                    "supervisor.source_allowlist must not exceed "
+                            + ValidationConstants.SUPERVISOR_SOURCE_ALLOWLIST_MAX + " entries "
+                            + "(got " + s.sourceAllowlist().size() + ")");
+        }
+
+        if (s.writerStyle() != null
+                && !ValidationConstants.VALID_WRITER_STYLES.contains(s.writerStyle())) {
+            throw new ValidationException(
+                    "Invalid supervisor.writer_style: '" + s.writerStyle()
+                            + "'. Valid values: " + ValidationConstants.VALID_WRITER_STYLES);
+        }
+
+        // scopeClarificationEnabled: pure boolean toggle — record typing enforces it;
+        // no further validation needed.
+    }
+
     public void validateAgentConfig(AgentConfigRequest config) {
         validateModel(config.provider(), config.model());
         validateAllowedTools(config.allowedTools());
@@ -318,6 +383,48 @@ public class ConfigValidationHelper {
         validateSandboxConfig(config.sandbox());
         validateMemoryConfig(config.memory(), config.provider());
         validateContextManagementConfig(config.contextManagement(), config.provider(), config.model());
+
+        // Agent Modes — Supervisor Topology (S1): topology enum + supervisor sub-object.
+        if (config.topology() != null
+                && !ValidationConstants.VALID_TOPOLOGIES.contains(config.topology())) {
+            throw new ValidationException(
+                    "Invalid topology: '" + config.topology()
+                            + "'. Valid values: " + ValidationConstants.VALID_TOPOLOGIES);
+        }
+        validateSupervisorConfig(config.supervisor());
+
+        // Agent Modes — Supervisor Topology (S2): preset validation.
+        // Unknown preset → 400 naming the valid presets.
+        // Topology-vs-preset contradiction → 400 (explicit topology that conflicts with
+        // the preset's seeded topology).
+        validatePreset(config.preset(), config.topology());
+    }
+
+    /**
+     * Validates the optional {@code preset} field and the topology-vs-preset consistency.
+     *
+     * <ul>
+     *   <li>A {@code null} / absent preset is always valid (direct topology config).</li>
+     *   <li>An unrecognised preset name → 400 naming the valid presets.</li>
+     *   <li>A preset combined with an explicit {@code topology} that contradicts the
+     *       preset's seeded topology → 400 (documented decision in
+     *       {@link PresetDefaults#validatePresetTopologyConsistency}).</li>
+     * </ul>
+     *
+     * @param preset   the preset value from the request (may be null)
+     * @param topology the topology value from the request (may be null)
+     */
+    public void validatePreset(String preset, String topology) {
+        if (preset == null) {
+            return; // No preset — no seeding. Valid.
+        }
+        if (!PresetDefaults.KNOWN_PRESETS.contains(preset)) {
+            throw new ValidationException(
+                    "Unknown preset: '" + preset
+                            + "'. Valid presets: " + PresetDefaults.KNOWN_PRESETS);
+        }
+        // Topology-vs-preset contradiction check.
+        PresetDefaults.validatePresetTopologyConsistency(preset, topology);
     }
 
     /**
@@ -370,6 +477,59 @@ public class ConfigValidationHelper {
             return Optional.of(false);
         }
         return Optional.of(readMemoryEnabled(agentConfigJson));
+    }
+
+    /**
+     * Looks up {@code agent_config.task_timeout_seconds} for the agent. Returns
+     * {@link Optional#empty()} when the agent cannot be resolved or when the
+     * field is absent / malformed — callers should fall through to
+     * {@link ValidationConstants#DEFAULT_TASK_TIMEOUT_SECONDS} in those cases.
+     *
+     * <p>Used by {@link com.persistentagent.api.service.TaskService} to apply
+     * the agent-level timeout default when the task-submission request omits
+     * {@code task_timeout_seconds} (resolution order: explicit request value →
+     * agent config default → platform default 3600).
+     *
+     * <p>A malformed or out-of-range value in the stored JSON is treated as
+     * absent — this method never throws, so an unexpected config state does not
+     * break task submission.
+     */
+    public Optional<Integer> getAgentTaskTimeoutSeconds(String tenantId, String agentId) {
+        Optional<Map<String, Object>> agentRow = agentRepository.findByIdAndTenant(tenantId, agentId);
+        if (agentRow.isEmpty()) {
+            return Optional.empty();
+        }
+        String agentConfigJson = extractAgentConfigJson(agentRow.get().get("agent_config"));
+        if (agentConfigJson == null || agentConfigJson.isBlank()) {
+            return Optional.empty();
+        }
+        return readTaskTimeoutSeconds(agentConfigJson);
+    }
+
+    /**
+     * Parses {@code agent_config.task_timeout_seconds} out of the stored JSON.
+     * Returns {@link Optional#empty()} when the key is absent, null, non-integer,
+     * or out of the legal range — never throws.
+     */
+    private Optional<Integer> readTaskTimeoutSeconds(String agentConfigJson) {
+        try {
+            JsonNode root = objectMapper.readTree(agentConfigJson);
+            if (root == null) {
+                return Optional.empty();
+            }
+            JsonNode node = root.get("task_timeout_seconds");
+            if (node == null || node.isNull() || !node.isInt()) {
+                return Optional.empty();
+            }
+            int value = node.intValue();
+            // Sanity-check: must be within the same range enforced at submission time.
+            if (value < 1 || value > 86400) {
+                return Optional.empty();
+            }
+            return Optional.of(value);
+        } catch (Exception e) {
+            return Optional.empty();
+        }
     }
 
     private static String extractAgentConfigJson(Object rawAgentConfig) {

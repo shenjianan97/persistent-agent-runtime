@@ -13,6 +13,7 @@ import { useToolServers } from '../tool-servers/useToolServers';
 import { MemoryTab } from './memory/MemoryTab';
 import { ContextManagementSection } from './ContextManagementSection';
 import type { ContextManagementConfig } from './ContextManagementSection';
+import { SupervisorConfigSection } from './SupervisorConfigSection';
 
 import {
     Form, FormControl, FormField, FormItem, FormLabel, FormMessage,
@@ -27,6 +28,24 @@ import { Bot, Pencil, X } from 'lucide-react';
 
 const MEMORY_MAX_ENTRIES_PLATFORM_DEFAULT = 10_000;
 const MEMORY_SUMMARIZER_PLATFORM_DEFAULT = 'Platform default (runtime-configured; fallback: claude-haiku-4-5)';
+
+// Two-layer naming: `topology` is immutable after agent creation (invariant #2).
+// The customer-facing label never uses the internal word "Supervisor".
+const PRESET_LABELS: Record<string, string> = {
+    chat: 'Chat',
+    coding: 'Coding',
+    investigation: 'Investigation',
+    research: 'Deep Research',
+};
+
+function topologyLabel(topology: string | undefined): string {
+    return topology === 'supervisor' ? 'Deep Research' : 'ReAct';
+}
+
+function presetLabel(preset: string | undefined): string {
+    if (!preset) return '—';
+    return PRESET_LABELS[preset] ?? preset;
+}
 
 const agentDetailSchema = z.object({
     display_name: z.string().min(1, 'Agent name is required').max(200),
@@ -286,6 +305,14 @@ export function AgentDetailPage() {
         .filter(t => !AUTO_MANAGED_TOOLS.has(t))
         .map(id => ALL_TOOL_LABELS[id] ?? id);
 
+    // Agent Modes — Supervisor Topology. Topology + preset are immutable after
+    // creation (invariant #2): rendered read-only in BOTH view and edit modes,
+    // never as an editable control. The Deep Research sub-object is shown
+    // read-only when the agent is a supervisor agent.
+    const agentTopology = agent.agent_config.topology ?? 'react';
+    const isSupervisorAgent = agentTopology === 'supervisor';
+    const agentPreset = agent.agent_config.preset;
+
     const readOnlyField = (label: string, value: React.ReactNode) => (
         <div>
             <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">{label}</span>
@@ -371,7 +398,43 @@ export function AgentDetailPage() {
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {readOnlyField('Agent Name', agent.display_name)}
                                 {readOnlyField('Model', `${agent.agent_config.provider} / ${agent.agent_config.model}`)}
+                                <div>
+                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">
+                                        Preset
+                                    </span>
+                                    <span
+                                        data-testid="agent-config-preset"
+                                        className="text-foreground text-sm font-mono"
+                                    >
+                                        {presetLabel(agentPreset)}
+                                    </span>
+                                </div>
+                                <div>
+                                    <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">
+                                        Mode
+                                    </span>
+                                    <span
+                                        data-testid="agent-config-topology"
+                                        className="text-foreground text-sm font-mono"
+                                    >
+                                        {topologyLabel(agentTopology)}
+                                    </span>
+                                </div>
                             </div>
+                            <p className="text-xs text-muted-foreground/70">
+                                Mode is fixed at agent creation; create a new agent to change it.
+                            </p>
+                            {isSupervisorAgent && (
+                                <div className="pt-4 border-t border-white/8">
+                                    <SupervisorConfigSection
+                                        value={agent.agent_config.supervisor}
+                                        onChange={() => {}}
+                                        applicable
+                                        disabled
+                                        toolServers={toolServers}
+                                    />
+                                </div>
+                            )}
                             <div>
                                 <span className="text-muted-foreground block mb-1 uppercase tracking-widest text-[10px]">System Prompt</span>
                                 <span className="text-foreground/80 text-sm font-mono whitespace-pre-wrap">{agent.agent_config.system_prompt}</span>
@@ -552,6 +615,26 @@ export function AgentDetailPage() {
                                             );
                                         }}
                                     />
+                                    {/* Preset + topology are immutable after creation (invariant
+                                        #2): rendered read-only on the edit form too — plain text,
+                                        no editable control and no change handler. A <span> can't be
+                                        edited, which makes the invariant obviously correct.
+                                        Changing the mode means creating a new agent. */}
+                                    <div>
+                                        <span className="block uppercase tracking-widest text-muted-foreground text-xs">Preset</span>
+                                        <span
+                                            data-testid="agent-config-preset"
+                                            className="mt-2 block text-foreground text-sm font-mono"
+                                        >
+                                            {presetLabel(agentPreset)}
+                                        </span>
+                                        <p
+                                            data-testid="agent-config-topology"
+                                            className="text-xs text-muted-foreground/70 mt-1"
+                                        >
+                                            Mode: {topologyLabel(agentTopology)} — fixed at agent creation; create a new agent to change it.
+                                        </p>
+                                    </div>
                                 </div>
 
                                 <FormField
@@ -851,6 +934,19 @@ export function AgentDetailPage() {
                                     availableSummarizerModels={models}
                                     onChange={handleCtxMgmtChange}
                                 />
+
+                                {/* Deep Research sub-object — read-only on edit
+                                    (conservative; invariant #2 + no S1 contract
+                                    for mutating these knobs post-creation). */}
+                                {isSupervisorAgent && (
+                                    <SupervisorConfigSection
+                                        value={agent.agent_config.supervisor}
+                                        onChange={() => {}}
+                                        applicable
+                                        disabled
+                                        toolServers={toolServers}
+                                    />
+                                )}
                             </CardContent>
                         </Card>
 

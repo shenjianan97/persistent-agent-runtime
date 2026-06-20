@@ -135,6 +135,24 @@ const MOCK_AGENT_WITH_CONTEXT_MANAGEMENT = {
     },
 };
 
+// Supervisor topology ("Deep Research") agent — exercises the S10 read-only
+// preset/topology rendering + the read-only Deep Research config section.
+const MOCK_AGENT_SUPERVISOR = {
+    ...MOCK_AGENT,
+    agent_config: {
+        ...MOCK_AGENT.agent_config,
+        topology: 'supervisor' as const,
+        preset: 'research',
+        supervisor: {
+            max_fanout_per_iteration: 7,
+            max_iterations: 4,
+            source_allowlist: ['web_search', 'internal_docs'],
+            writer_style: 'annotated_bullets' as const,
+            scope_clarification_enabled: true,
+        },
+    },
+};
+
 describe('AgentDetailPage', () => {
     it('shows sandbox info in read-only mode when sandbox is enabled', async () => {
         agentMock.mockReturnValue({ data: MOCK_AGENT_WITH_SANDBOX, isLoading: false, error: null });
@@ -358,5 +376,101 @@ describe('AgentDetailPage', () => {
 
         expect(screen.getAllByText('disabled')).not.toHaveLength(0);
         expect(screen.getByText('Disabled agents cannot be used for new task submissions.')).toBeInTheDocument();
+    });
+
+    describe('Supervisor topology — Deep Research read-only rendering (S10, invariant #2)', () => {
+        it('shows preset + topology + Deep Research config read-only in the view mode', async () => {
+            agentMock.mockReturnValue({ data: MOCK_AGENT_SUPERVISOR, isLoading: false, error: null });
+
+            render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+            expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+            // Customer-facing preset + derived topology, both read-only (not <select>).
+            const preset = screen.getByTestId('agent-config-preset');
+            expect(preset).toHaveTextContent('Deep Research');
+            expect(preset.tagName).not.toBe('SELECT');
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent('Deep Research');
+            expect(
+                screen.getByText(/fixed at agent creation; create a new agent to change it/i)
+            ).toBeInTheDocument();
+
+            // Deep Research config section renders with persisted values, disabled.
+            const fanout = screen.getByTestId('supervisor-config-max-fanout') as HTMLInputElement;
+            expect(fanout.value).toBe('7');
+            expect(fanout).toBeDisabled();
+            expect(screen.getByTestId('supervisor-config-max-iterations')).toBeDisabled();
+            expect(screen.getByTestId('supervisor-config-writer-style')).toBeDisabled();
+            expect(screen.getByTestId('supervisor-config-scope-clarification')).toBeDisabled();
+            // Allowed-Sources renders as a read-only checklist: persisted sources
+            // are shown checked + disabled. "web_search" is a base source ("Web
+            // search"); "internal_docs" is a persisted custom source.
+            const webSearch = screen.getByLabelText('Web search') as HTMLInputElement;
+            expect(webSearch).toBeChecked();
+            expect(webSearch).toBeDisabled();
+            const internalDocs = screen.getByLabelText('internal_docs') as HTMLInputElement;
+            expect(internalDocs).toBeChecked();
+            expect(internalDocs).toBeDisabled();
+            // "All available sources" is unchecked since specific sources are set.
+            expect(screen.getByLabelText('All available sources')).not.toBeChecked();
+            // Read-only: no chip add-input.
+            expect(screen.queryByPlaceholderText(/add source name/i)).not.toBeInTheDocument();
+        });
+
+        it('keeps preset/topology non-editable in EDIT mode (invariant #2 — no editable control)', async () => {
+            agentMock.mockReturnValue({ data: MOCK_AGENT_SUPERVISOR, isLoading: false, error: null });
+
+            render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+            expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+            fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+            expect(screen.getByRole('button', { name: /save changes/i })).toBeInTheDocument();
+
+            // Preset/topology render as plain text, NOT an editable control.
+            const preset = screen.getByTestId('agent-config-preset');
+            expect(preset.tagName).not.toBe('SELECT');
+            expect(preset.tagName).not.toBe('INPUT');
+            expect(preset).toHaveTextContent('Deep Research');
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent('Deep Research');
+            expect(
+                screen.getByText(/fixed at agent creation; create a new agent to change it/i)
+            ).toBeInTheDocument();
+
+            // The Deep Research config section stays disabled on the edit form too.
+            expect(screen.getByTestId('supervisor-config-max-fanout')).toBeDisabled();
+            expect(screen.getByTestId('supervisor-config-writer-style')).toBeDisabled();
+        });
+
+        it('does not include topology/preset/supervisor in the update payload (immutable — not re-sent)', async () => {
+            agentMock.mockReturnValue({ data: MOCK_AGENT_SUPERVISOR, isLoading: false, error: null });
+
+            render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+            expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+            fireEvent.click(screen.getByRole('button', { name: /edit/i }));
+            fireEvent.click(screen.getByRole('button', { name: /save changes/i }));
+
+            await waitFor(() => expect(updateMock).toHaveBeenCalled());
+
+            const payload = updateMock.mock.calls[0][0];
+            expect(payload.request.agent_config.topology).toBeUndefined();
+            expect(payload.request.agent_config.preset).toBeUndefined();
+            expect(payload.request.agent_config.supervisor).toBeUndefined();
+        });
+
+        it('does not render the Deep Research config section for a react (non-supervisor) agent', async () => {
+            agentMock.mockReturnValue({ data: MOCK_AGENT, isLoading: false, error: null });
+
+            render(<AgentDetailPage />, { wrapper: createWrapper() });
+
+            expect(await screen.findByRole('heading', { name: 'Research Agent' })).toBeInTheDocument();
+
+            expect(screen.queryByText('Deep Research Configuration')).not.toBeInTheDocument();
+            expect(screen.queryByTestId('supervisor-config-max-fanout')).not.toBeInTheDocument();
+            // The preset/topology fields still render read-only, showing the react defaults.
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent('ReAct');
+        });
     });
 });

@@ -1,6 +1,7 @@
 package com.persistentagent.api.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.persistentagent.api.config.ValidationConstants;
 import com.persistentagent.api.exception.AgentNotFoundException;
@@ -11,11 +12,13 @@ import com.persistentagent.api.model.request.AgentUpdateRequest;
 import com.persistentagent.api.model.request.ContextManagementConfigRequest;
 import com.persistentagent.api.model.request.MemoryConfigRequest;
 import com.persistentagent.api.model.request.SandboxConfigRequest;
+import com.persistentagent.api.model.request.SupervisorConfigRequest;
 import com.persistentagent.api.model.response.AgentResponse;
 import com.persistentagent.api.model.response.AgentSummaryResponse;
 import com.persistentagent.api.repository.AgentRepository;
 import com.persistentagent.api.util.DateTimeUtil;
 import com.persistentagent.api.util.JsonParseUtil;
+import org.postgresql.util.PGobject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -49,20 +52,38 @@ public class AgentService {
 
     @Transactional
     public AgentResponse createAgent(AgentCreateRequest request) {
+        // S1 validation: topology/supervisor bounds + enum.
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
-        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
+        // Agent Modes — S2: apply preset defaults AFTER S1 validation, BEFORE canonicalize.
+        // Unknown-preset 400 is checked in validateAgentConfig (ConfigValidationHelper).
+        // Topology-vs-preset contradiction is also checked there.
+        //
+        // ORDERING IS DELIBERATE: applyPreset runs AFTER validateAllowedTools (inside
+        // validateAgentConfig). Preset-injected tools (e.g. dispatch_subagent) are NOT in
+        // ValidationConstants.ALLOWED_TOOLS yet (Track-7 precedent: seeded ahead of S4
+        // runtime), so they intentionally bypass the closed validation allowlist by being
+        // injected post-validation. This means a customer who lists "dispatch_subagent"
+        // themselves still gets a 400 (it isn't in ALLOWED_TOOLS), while the preset may seed
+        // it — the asymmetry is on purpose, not a bug to "fix". canonicalizeConfig re-admits
+        // these names via PresetDefaults.PRESET_INJECTED_TOOLS.
+        AgentCreateRequest seeded = PresetDefaults.applyPreset(request);
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(seeded.agentConfig());
         String agentConfigJson = serializeConfig(canonicalized);
 
         String tenantId = ValidationConstants.DEFAULT_TENANT_ID;
         String agentId = UUID.randomUUID().toString();
 
-        int maxConcurrentTasks = request.maxConcurrentTasks() != null
-                ? request.maxConcurrentTasks() : DEFAULT_MAX_CONCURRENT_TASKS;
-        long budgetMaxPerTask = request.budgetMaxPerTask() != null
-                ? request.budgetMaxPerTask() : DEFAULT_BUDGET_MAX_PER_TASK;
-        long budgetMaxPerHour = request.budgetMaxPerHour() != null
-                ? request.budgetMaxPerHour() : DEFAULT_BUDGET_MAX_PER_HOUR;
+        // Preset seeding inserts the preset value as the fallback between "request explicit"
+        // and DEFAULT_*. Since applyPreset already applied the preset fallbacks into the
+        // seeded request, we use DEFAULT_* here only as the final backstop.
+        int maxConcurrentTasks = seeded.maxConcurrentTasks() != null
+                ? seeded.maxConcurrentTasks() : DEFAULT_MAX_CONCURRENT_TASKS;
+        long budgetMaxPerTask = seeded.budgetMaxPerTask() != null
+                ? seeded.budgetMaxPerTask() : DEFAULT_BUDGET_MAX_PER_TASK;
+        long budgetMaxPerHour = seeded.budgetMaxPerHour() != null
+                ? seeded.budgetMaxPerHour() : DEFAULT_BUDGET_MAX_PER_HOUR;
 
         Map<String, Object> result = agentRepository.insert(
                 tenantId, agentId, request.displayName(), agentConfigJson,
@@ -138,12 +159,37 @@ public class AgentService {
 
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
-        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
-        String agentConfigJson = serializeConfig(canonicalized);
-
-        // For update, we need current values as defaults if not provided
+        // For update, we need the current row both for the topology-immutability gate
+        // and to inherit the immutable / read-only fields the Console omits.
         Map<String, Object> existing = agentRepository.findByIdAndTenant(tenantId, agentId)
                 .orElseThrow(() -> new AgentNotFoundException(agentId));
+        Object persistedConfigRaw = existing.get("agent_config");
+
+        // Topology immutability gate (Agent Modes — S1).
+        // Only an EXPLICIT topology in the request can be a change. The Console omits
+        // topology on update (it is immutable), so an absent topology means "unchanged"
+        // and must NOT be canonicalised to "react" and compared — doing so rejected
+        // every edit (even a budget-only change) to a supervisor agent, because absent
+        // → "react" never equals the persisted "supervisor". See
+        // updateAgent_topologyOmittedOnSupervisorAgent_*.
+        String persistedTopology = readPersistedTopology(persistedConfigRaw);
+        String requestedTopology = request.agentConfig().topology();
+        if (requestedTopology != null
+                && !canonicalizeTopology(requestedTopology).equals(persistedTopology)) {
+            throw new ValidationException("topology is immutable after agent creation");
+        }
+
+        // Inherit the immutable / read-only fields (topology, preset, supervisor) from
+        // the persisted row when the request omits them, so the Console's normal update
+        // (which never re-sends them) PRESERVES them instead of wiping agent_config down
+        // to a react agent. Every other field comes from the request verbatim — memory /
+        // context_management / sandbox keep their replace-on-absent semantics; ONLY these
+        // three immutable fields inherit-on-absent.
+        AgentConfigRequest effectiveConfig = inheritImmutableFields(
+                request.agentConfig(), persistedConfigRaw);
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(effectiveConfig);
+        String agentConfigJson = serializeConfig(canonicalized);
 
         int maxConcurrentTasks = request.maxConcurrentTasks() != null
                 ? request.maxConcurrentTasks()
@@ -213,6 +259,42 @@ public class AgentService {
         // worker (Task 3) per Phase 2 Track 7 design.
         ContextManagementConfigRequest canonicalizedContextManagement = config.contextManagement();
 
+        // Agent Modes — Supervisor Topology (S1): round-trip topology, preset, and
+        // supervisor verbatim. Absent keys stay absent — the "react" default for
+        // absent topology is a read-time convention only, never written into the row.
+        String canonicalizedTopology = config.topology();
+        String canonicalizedPreset = config.preset();
+        SupervisorConfigRequest canonicalizedSupervisor = config.supervisor();
+
+        // Agent Modes — Supervisor Topology (S2): carry preset-injected tool names through
+        // canonicalisation. Two guards keep the no-preset path byte-for-byte identical to
+        // pre-S2 (e61337d):
+        //   1. The whole block is gated on config.preset() != null — with no preset the loop
+        //      never runs, so canonicalizeConfig rebuilds allowed_tools purely from config
+        //      flags (BASE + SANDBOX-if-enabled + DEV-if-enabled) and drops everything else,
+        //      exactly as before. (Pre-S2 the closed validation allowlist guaranteed only
+        //      known platform tools reached allowed_tools, and tool-server/BYOT tools travel
+        //      through the separate tool_servers field — they never appear here.)
+        //   2. Even WITH a preset, only names in PresetDefaults.PRESET_INJECTED_TOOLS are
+        //      admitted — not arbitrary allowed_tools entries — so an unrelated tool a caller
+        //      smuggled past validation on a preset request still can't survive.
+        // PresetDefaults injects its extra names AFTER validation (Track-7 precedent:
+        // dispatch_subagent is not yet in ALLOWED_TOOLS), so they must be re-admitted here;
+        // the coding preset's sandbox tools are also injected directly (rather than via
+        // sandbox.enabled) and are re-admitted the same way.
+        if (config.preset() != null && config.allowedTools() != null) {
+            for (String tool : config.allowedTools()) {
+                if (PresetDefaults.PRESET_INJECTED_TOOLS.contains(tool)
+                        && !canonicalizedTools.contains(tool)) {
+                    canonicalizedTools.add(tool);
+                }
+            }
+        }
+
+        // Agent Modes — Supervisor Topology (S2): task_timeout_seconds as agent-level JSONB
+        // default. Absent stays absent (platform default applied at submission time).
+        Integer canonicalizedTaskTimeoutSeconds = config.taskTimeoutSeconds();
+
         return new AgentConfigRequest(
                 config.systemPrompt(),
                 config.provider(),
@@ -226,7 +308,11 @@ public class AgentService {
                         : List.of(),
                 canonicalizedSandbox,
                 canonicalizedMemory,
-                canonicalizedContextManagement);
+                canonicalizedContextManagement,
+                canonicalizedTopology,
+                canonicalizedPreset,
+                canonicalizedSupervisor,
+                canonicalizedTaskTimeoutSeconds);
     }
 
     private String serializeConfig(AgentConfigRequest config) {
@@ -235,6 +321,134 @@ public class AgentService {
         } catch (JsonProcessingException e) {
             throw new ValidationException("Failed to serialize agent_config: " + e.getMessage());
         }
+    }
+
+    /**
+     * Returns the canonical topology string for a given raw value.
+     * {@code null} → {@code "react"} (read-time default; never written to the row).
+     */
+    static String canonicalizeTopology(String topology) {
+        return topology != null ? topology : "react";
+    }
+
+    /**
+     * Reads the {@code topology} key out of the persisted {@code agent_config} JSONB,
+     * canonicalising absent / null / unreadable values to {@code "react"}.
+     *
+     * @param rawAgentConfig the raw value from the DB row (may be {@code String},
+     *                       {@code PGobject}, or some other wrapper)
+     */
+    private String readPersistedTopology(Object rawAgentConfig) {
+        String raw = readPersistedTopologyRaw(rawAgentConfig);
+        return raw != null ? raw : "react";
+    }
+
+    /**
+     * Parses the persisted {@code agent_config} JSONB into a {@link JsonNode},
+     * tolerating the various raw wrappers the DB row may carry ({@code String},
+     * {@code PGobject}, …). Returns {@code null} on absent / blank / unparseable.
+     */
+    private JsonNode parsePersistedConfig(Object rawAgentConfig) {
+        if (rawAgentConfig == null) {
+            return null;
+        }
+        String json;
+        if (rawAgentConfig instanceof String s) {
+            json = s;
+        } else if (rawAgentConfig instanceof PGobject pg) {
+            json = pg.getValue();
+        } else {
+            json = rawAgentConfig.toString();
+        }
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readTree(json);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Reads the RAW {@code topology} value from the persisted {@code agent_config}
+     * JSONB — {@code null} when absent (NOT canonicalised to "react"). Used for the
+     * inherit-on-absent update path, so a react agent's config stays byte-for-byte
+     * unchanged (topology never written) while a supervisor agent inherits
+     * "supervisor". Use {@link #readPersistedTopology} for the canonical form.
+     */
+    private String readPersistedTopologyRaw(Object rawAgentConfig) {
+        return readPersistedString(rawAgentConfig, "topology");
+    }
+
+    /** Reads a top-level string key from the persisted agent_config; null when absent. */
+    private String readPersistedString(Object rawAgentConfig, String key) {
+        JsonNode root = parsePersistedConfig(rawAgentConfig);
+        JsonNode node = root == null ? null : root.get(key);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        return node.asText(null);
+    }
+
+    /**
+     * Reads the persisted {@code supervisor} sub-object back into a
+     * {@link SupervisorConfigRequest}; {@code null} when absent or unparseable.
+     */
+    private SupervisorConfigRequest readPersistedSupervisor(Object rawAgentConfig) {
+        JsonNode root = parsePersistedConfig(rawAgentConfig);
+        JsonNode node = root == null ? null : root.get("supervisor");
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        try {
+            return objectMapper.treeToValue(node, SupervisorConfigRequest.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Builds the effective update config: the {@code topology}, {@code preset}, and
+     * {@code supervisor} fields are immutable / read-only post-creation and are NOT
+     * re-sent by the Console on update, so they inherit from the persisted row when
+     * the request omits them (preserving them instead of wiping agent_config). Every
+     * other field comes from the request verbatim.
+     */
+    private AgentConfigRequest inheritImmutableFields(
+            AgentConfigRequest request, Object persistedConfigRaw) {
+        String topology = request.topology() != null
+                ? request.topology()
+                : readPersistedTopologyRaw(persistedConfigRaw);
+        String preset = request.preset() != null
+                ? request.preset()
+                : readPersistedString(persistedConfigRaw, "preset");
+        SupervisorConfigRequest supervisor = request.supervisor() != null
+                ? request.supervisor()
+                : readPersistedSupervisor(persistedConfigRaw);
+        // Re-derive the inherited preset's HIDDEN injected tools (dispatch_subagent, the
+        // coding sandbox extras). The Console echoes only the user-facing allowlist on
+        // update, so without this canonicalizeConfig — which re-admits preset-injected
+        // names only when they are present in allowed_tools — would silently drop them
+        // from a coding/investigation agent on every edit. mergeExtraTools dedups and is a
+        // no-op (returns the list unchanged) when the preset injects nothing.
+        List<String> allowedTools = PresetDefaults.mergeExtraTools(
+                request.allowedTools(),
+                PresetDefaults.injectedToolsForPreset(preset));
+        return new AgentConfigRequest(
+                request.systemPrompt(),
+                request.provider(),
+                request.model(),
+                request.temperature(),
+                allowedTools,
+                request.toolServers(),
+                request.sandbox(),
+                request.memory(),
+                request.contextManagement(),
+                topology,
+                preset,
+                supervisor,
+                request.taskTimeoutSeconds());
     }
 
     // --- Conversion helpers ---

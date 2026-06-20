@@ -188,4 +188,108 @@ describe('CreateAgentDialog', () => {
             expect.any(Object),
         );
     });
+
+    describe('mode cards + Deep Research (supervisor) section', () => {
+        /** Click a mode card by its visible title. */
+        function selectMode(title: string) {
+            fireEvent.click(screen.getByText(title));
+        }
+
+        it('renders four self-describing mode cards with descriptions, defaulting to Chat (ReAct)', () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            const group = screen.getByTestId('agent-config-preset');
+            expect(group).toBeInTheDocument();
+            // It is no longer a native <select>.
+            expect(group.tagName).not.toBe('SELECT');
+            // Four card titles.
+            expect(screen.getByText('Chat')).toBeInTheDocument();
+            expect(screen.getByText('Coding')).toBeInTheDocument();
+            expect(screen.getByText('Investigation')).toBeInTheDocument();
+            expect(screen.getByText('Deep Research')).toBeInTheDocument();
+            // Descriptions present.
+            expect(screen.getByText(/Quick Q&A\. Base tools only\./i)).toBeInTheDocument();
+            expect(screen.getByText(/Writes & runs code in a sandbox/i)).toBeInTheDocument();
+            expect(screen.getByText(/Multi-step research; can delegate/i)).toBeInTheDocument();
+            expect(screen.getByText(/Autonomous multi-round research/i)).toBeInTheDocument();
+            // Default is chat → ReAct, supervisor section hidden.
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent(/ReAct/i);
+            expect(screen.queryByText('Deep Research Configuration')).not.toBeInTheDocument();
+        });
+
+        it('hides the supervisor section and derives ReAct mode for the chat preset', () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            expect(screen.queryByText('Deep Research Configuration')).not.toBeInTheDocument();
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent(/ReAct/i);
+        });
+
+        it('reveals the supervisor section and shows Deep Research mode when the Deep Research card is clicked', () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            selectMode('Deep Research');
+            // Section header appears; its inner config is collapsed behind Customize.
+            expect(screen.getByText('Deep Research Configuration')).toBeInTheDocument();
+            expect(screen.getByText(/using smart defaults/i)).toBeInTheDocument();
+            expect(screen.queryByTestId('supervisor-config-max-fanout')).not.toBeInTheDocument();
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent(/Deep Research/i);
+            // Expanding Customize reveals the fields.
+            fireEvent.click(screen.getByRole('button', { name: /customize/i }));
+            expect(screen.getByTestId('supervisor-config-max-fanout')).toBeInTheDocument();
+            expect(screen.getByTestId('supervisor-config-writer-style')).toBeInTheDocument();
+        });
+
+        it('hides the supervisor section again when switching back to a non-research card', () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            selectMode('Deep Research');
+            expect(screen.getByText('Deep Research Configuration')).toBeInTheDocument();
+            selectMode('Coding');
+            expect(screen.queryByText('Deep Research Configuration')).not.toBeInTheDocument();
+            expect(screen.getByTestId('agent-config-topology')).toHaveTextContent(/ReAct/i);
+        });
+
+        it('emits preset and supervisor sub-object in the payload when research fields are set', async () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Research Agent' } });
+            selectMode('Deep Research');
+            fireEvent.click(screen.getByRole('button', { name: /customize/i }));
+            fireEvent.change(screen.getByTestId('supervisor-config-max-fanout'), { target: { value: '5' } });
+            fireEvent.change(screen.getByTestId('supervisor-config-writer-style'), {
+                target: { value: 'annotated_bullets' },
+            });
+
+            fireEvent.click(screen.getByRole('button', { name: /create/i }));
+            await waitFor(() => expect(createMock).toHaveBeenCalled());
+
+            const payload = createMock.mock.calls[0][0];
+            expect(payload.agent_config.preset).toBe('research');
+            expect(payload.agent_config.supervisor).toEqual({
+                max_fanout_per_iteration: 5,
+                writer_style: 'annotated_bullets',
+            });
+            // The client sends preset, not a synthesized topology field (S1 derives it).
+            expect(payload.agent_config.topology).toBeUndefined();
+        });
+
+        it('omits the supervisor sub-object for non-research presets (only-send-what-was-set)', async () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Chat Agent' } });
+            fireEvent.click(screen.getByRole('button', { name: /create/i }));
+            await waitFor(() => expect(createMock).toHaveBeenCalled());
+
+            const payload = createMock.mock.calls[0][0];
+            expect(payload.agent_config.preset).toBe('chat');
+            expect(payload.agent_config.supervisor).toBeUndefined();
+        });
+
+        it('omits the supervisor sub-object when research is selected but no field is touched (zero-edit create)', async () => {
+            render(<CreateAgentDialog open onOpenChange={() => {}} />, { wrapper: createWrapper() });
+            fireEvent.change(screen.getByLabelText(/agent name/i), { target: { value: 'Bare Research Agent' } });
+            selectMode('Deep Research');
+            // No Customize, no field touched — creatable as-is.
+            fireEvent.click(screen.getByRole('button', { name: /create/i }));
+            await waitFor(() => expect(createMock).toHaveBeenCalled());
+
+            const payload = createMock.mock.calls[0][0];
+            expect(payload.agent_config.preset).toBe('research');
+            expect(payload.agent_config.supervisor).toBeUndefined();
+        });
+    });
 });

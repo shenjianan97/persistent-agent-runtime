@@ -105,9 +105,10 @@ def test_graph_completion_path_uses_finalize_helper():
     assert "def _finalize_output_content" in src, (
         "helper definition missing from graph.py"
     )
-    assert "output_content = _finalize_output_content(messages)" in src, (
+    assert "output_content = _terminal_output_content(final_state.values)" in src, (
         "graph.py completion path no longer routes through "
-        "_finalize_output_content; output.result normalization regressed"
+        "_terminal_output_content; supervisor report / output.result "
+        "normalization regressed"
     )
     # Inverse assertion: the pre-fix idiom must NOT reappear near the
     # completion path.
@@ -115,3 +116,38 @@ def test_graph_completion_path_uses_finalize_helper():
         "graph.py regressed to the pre-fix direct-access pattern; "
         "provider-shaped block lists will leak back into output.result"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Supervisor topology — output.result must be the Writer's report
+# --------------------------------------------------------------------------- #
+def test_terminal_output_prefers_supervisor_report():
+    """Regression for task 0729e3a3: in the supervisor topology the
+    ``messages`` channel carries only the task input (the deliverable lives
+    in the ``report`` channel), so the generic last-message extraction echoed
+    the user's prompt back as ``output.result`` on the Console Output card.
+    """
+    from executor.graph import _terminal_output_content
+
+    values = {
+        "messages": [HumanMessage(content="research Trump news")],
+        "report": "## Report\n\nFindings with citations.",
+    }
+    assert _terminal_output_content(values) == "## Report\n\nFindings with citations."
+
+
+def test_terminal_output_falls_back_to_messages_for_react():
+    from executor.graph import _terminal_output_content
+
+    values = {"messages": [AIMessage(content="final prose")]}
+    assert _terminal_output_content(values) == "final prose"
+
+
+def test_terminal_output_ignores_blank_report():
+    from executor.graph import _terminal_output_content
+
+    values = {
+        "messages": [AIMessage(content="final prose")],
+        "report": "   ",
+    }
+    assert _terminal_output_content(values) == "final prose"

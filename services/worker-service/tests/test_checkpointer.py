@@ -267,6 +267,61 @@ class TestPostgresDurableCheckpointer:
             ("writer-task", "custom", {"value": 1})
         ]
 
+    async def test_send_in_pregel_tasks_channel_round_trips(self) -> None:
+        """A pending ``Send`` (the LangGraph ``__pregel_tasks`` channel value
+        produced by a fan-out routing edge) must survive a checkpoint write +
+        read. ``langchain_dumps``/``langchain_loads`` cannot serialise a
+        ``Send`` (it emits a ``not_implemented`` marker that raises on load),
+        so the checkpointer must route the TASKS channel through its
+        ``JsonPlusSerializer`` serde. Regression guard for the S3 sub-agent
+        fan-out durability path (the Supervisor topology Sends N sub-agents)."""
+        from langgraph.constants import TASKS
+        from langgraph.types import Send
+
+        checkpoint = _sample_checkpoint("checkpoint-send")
+        checkpoint["channel_values"] = {
+            "messages": ["hi"],
+            TASKS: [Send("subagent", {"subtask": "alpha"})],
+        }
+
+        write_conn = _FakeConnection(fetchval_result=1)
+        saver = PostgresDurableCheckpointer(
+            _FakePool(write_conn), worker_id="worker-123", tenant_id="default"
+        )
+        await saver.aput(
+            _sample_config(), checkpoint, {"source": "loop", "step": 1}, {"messages": "1"}
+        )
+        # The UPSERT bound a serialised payload string at index 6.
+        upsert_call = next(c for c in write_conn.calls if c[0] == "execute"
+                           and UPSERT_CHECKPOINT_QUERY.strip() in c[1])
+        serialised_payload = upsert_call[2][6]
+        assert isinstance(serialised_payload, str)
+
+        # Reading it back must revive the Send (not raise NotImplementedError).
+        read_conn = _FakeConnection(
+            fetchrow_result={
+                "task_id": "00000000-0000-0000-0000-000000000123",
+                "checkpoint_ns": "",
+                "checkpoint_id": "checkpoint-send",
+                "parent_checkpoint_id": None,
+                "thread_ts": "2026-03-07T10:00:01.123456+00:00",
+                "parent_ts": None,
+                "checkpoint_payload": serialised_payload,
+                "metadata_payload": {"source": "loop", "step": 1},
+            },
+            pending_writes=[],
+        )
+        read_saver = PostgresDurableCheckpointer(
+            _FakePool(read_conn), worker_id="worker-123", tenant_id="default"
+        )
+        tup = await read_saver.aget_tuple(_sample_config(checkpoint_id="checkpoint-send"))
+        assert tup is not None
+        revived = tup.checkpoint["channel_values"][TASKS]
+        assert len(revived) == 1
+        assert isinstance(revived[0], Send)
+        assert revived[0].node == "subagent"
+        assert revived[0].arg == {"subtask": "alpha"}
+
     async def test_alist_applies_before_limit_and_filter(self) -> None:
         conn = _FakeConnection(
             fetch_results=[
