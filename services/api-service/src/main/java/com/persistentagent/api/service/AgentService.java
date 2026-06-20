@@ -159,22 +159,37 @@ public class AgentService {
 
         configValidationHelper.validateAgentConfig(request.agentConfig());
 
-        AgentConfigRequest canonicalized = canonicalizeConfig(request.agentConfig());
-        String agentConfigJson = serializeConfig(canonicalized);
-
-        // For update, we need current values as defaults if not provided
+        // For update, we need the current row both for the topology-immutability gate
+        // and to inherit the immutable / read-only fields the Console omits.
         Map<String, Object> existing = agentRepository.findByIdAndTenant(tenantId, agentId)
                 .orElseThrow(() -> new AgentNotFoundException(agentId));
+        Object persistedConfigRaw = existing.get("agent_config");
 
         // Topology immutability gate (Agent Modes — S1).
-        // Compare the canonicalised topology of the incoming request against the
-        // canonicalised topology of the current persisted row. "react" is the
-        // read-time default for absent topology (it is never written into the row).
-        String incomingTopology = canonicalizeTopology(request.agentConfig().topology());
-        String persistedTopology = readPersistedTopology(existing.get("agent_config"));
-        if (!incomingTopology.equals(persistedTopology)) {
+        // Only an EXPLICIT topology in the request can be a change. The Console omits
+        // topology on update (it is immutable), so an absent topology means "unchanged"
+        // and must NOT be canonicalised to "react" and compared — doing so rejected
+        // every edit (even a budget-only change) to a supervisor agent, because absent
+        // → "react" never equals the persisted "supervisor". See
+        // updateAgent_topologyOmittedOnSupervisorAgent_*.
+        String persistedTopology = readPersistedTopology(persistedConfigRaw);
+        String requestedTopology = request.agentConfig().topology();
+        if (requestedTopology != null
+                && !canonicalizeTopology(requestedTopology).equals(persistedTopology)) {
             throw new ValidationException("topology is immutable after agent creation");
         }
+
+        // Inherit the immutable / read-only fields (topology, preset, supervisor) from
+        // the persisted row when the request omits them, so the Console's normal update
+        // (which never re-sends them) PRESERVES them instead of wiping agent_config down
+        // to a react agent. Every other field comes from the request verbatim — memory /
+        // context_management / sandbox keep their replace-on-absent semantics; ONLY these
+        // three immutable fields inherit-on-absent.
+        AgentConfigRequest effectiveConfig = inheritImmutableFields(
+                request.agentConfig(), persistedConfigRaw);
+
+        AgentConfigRequest canonicalized = canonicalizeConfig(effectiveConfig);
+        String agentConfigJson = serializeConfig(canonicalized);
 
         int maxConcurrentTasks = request.maxConcurrentTasks() != null
                 ? request.maxConcurrentTasks()
@@ -324,8 +339,18 @@ public class AgentService {
      *                       {@code PGobject}, or some other wrapper)
      */
     private String readPersistedTopology(Object rawAgentConfig) {
+        String raw = readPersistedTopologyRaw(rawAgentConfig);
+        return raw != null ? raw : "react";
+    }
+
+    /**
+     * Parses the persisted {@code agent_config} JSONB into a {@link JsonNode},
+     * tolerating the various raw wrappers the DB row may carry ({@code String},
+     * {@code PGobject}, …). Returns {@code null} on absent / blank / unparseable.
+     */
+    private JsonNode parsePersistedConfig(Object rawAgentConfig) {
         if (rawAgentConfig == null) {
-            return "react";
+            return null;
         }
         String json;
         if (rawAgentConfig instanceof String s) {
@@ -336,19 +361,85 @@ public class AgentService {
             json = rawAgentConfig.toString();
         }
         if (json == null || json.isBlank()) {
-            return "react";
+            return null;
         }
         try {
-            JsonNode root = objectMapper.readTree(json);
-            JsonNode topologyNode = root == null ? null : root.get("topology");
-            if (topologyNode == null || topologyNode.isNull()) {
-                return "react";
-            }
-            String val = topologyNode.asText(null);
-            return val != null ? val : "react";
+            return objectMapper.readTree(json);
         } catch (Exception e) {
-            return "react";
+            return null;
         }
+    }
+
+    /**
+     * Reads the RAW {@code topology} value from the persisted {@code agent_config}
+     * JSONB — {@code null} when absent (NOT canonicalised to "react"). Used for the
+     * inherit-on-absent update path, so a react agent's config stays byte-for-byte
+     * unchanged (topology never written) while a supervisor agent inherits
+     * "supervisor". Use {@link #readPersistedTopology} for the canonical form.
+     */
+    private String readPersistedTopologyRaw(Object rawAgentConfig) {
+        return readPersistedString(rawAgentConfig, "topology");
+    }
+
+    /** Reads a top-level string key from the persisted agent_config; null when absent. */
+    private String readPersistedString(Object rawAgentConfig, String key) {
+        JsonNode root = parsePersistedConfig(rawAgentConfig);
+        JsonNode node = root == null ? null : root.get(key);
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        return node.asText(null);
+    }
+
+    /**
+     * Reads the persisted {@code supervisor} sub-object back into a
+     * {@link SupervisorConfigRequest}; {@code null} when absent or unparseable.
+     */
+    private SupervisorConfigRequest readPersistedSupervisor(Object rawAgentConfig) {
+        JsonNode root = parsePersistedConfig(rawAgentConfig);
+        JsonNode node = root == null ? null : root.get("supervisor");
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        try {
+            return objectMapper.treeToValue(node, SupervisorConfigRequest.class);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Builds the effective update config: the {@code topology}, {@code preset}, and
+     * {@code supervisor} fields are immutable / read-only post-creation and are NOT
+     * re-sent by the Console on update, so they inherit from the persisted row when
+     * the request omits them (preserving them instead of wiping agent_config). Every
+     * other field comes from the request verbatim.
+     */
+    private AgentConfigRequest inheritImmutableFields(
+            AgentConfigRequest request, Object persistedConfigRaw) {
+        String topology = request.topology() != null
+                ? request.topology()
+                : readPersistedTopologyRaw(persistedConfigRaw);
+        String preset = request.preset() != null
+                ? request.preset()
+                : readPersistedString(persistedConfigRaw, "preset");
+        SupervisorConfigRequest supervisor = request.supervisor() != null
+                ? request.supervisor()
+                : readPersistedSupervisor(persistedConfigRaw);
+        return new AgentConfigRequest(
+                request.systemPrompt(),
+                request.provider(),
+                request.model(),
+                request.temperature(),
+                request.allowedTools(),
+                request.toolServers(),
+                request.sandbox(),
+                request.memory(),
+                request.contextManagement(),
+                topology,
+                preset,
+                supervisor,
+                request.taskTimeoutSeconds());
     }
 
     // --- Conversion helpers ---

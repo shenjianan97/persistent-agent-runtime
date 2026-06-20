@@ -1015,6 +1015,60 @@ class AgentServiceTest {
     }
 
     /**
+     * REGRESSION (user-reported): a PUT that OMITS topology against a SUPERVISOR
+     * (Deep Research) agent — the Console's normal update path, which never re-sends
+     * the immutable topology/preset/supervisor fields — must SUCCEED (omission is not
+     * a topology change) AND must PRESERVE topology/preset/supervisor in the persisted
+     * agent_config rather than wiping them.
+     *
+     * <p>Before the fix the gate canonicalised the absent topology to "react",
+     * mismatched the persisted "supervisor", and rejected EVERY edit (including a
+     * budget-only change) with "topology is immutable after agent creation".
+     */
+    @Test
+    void updateAgent_topologyOmittedOnSupervisorAgent_succeedsAndPreservesImmutableConfig()
+            throws Exception {
+        // Console-shaped update: mutable fields only; topology/preset/supervisor absent.
+        AgentConfigRequest config = new AgentConfigRequest(
+                "updated prompt", "openai", "gpt-4o", 0.7, List.of(), null, null, null, null,
+                null, null, null, null);
+        // Budget-only-style edit (distinct budget numbers to prove they flow through).
+        AgentUpdateRequest request = new AgentUpdateRequest("Agent", config, "active",
+                3, 900000L, 9000000L);
+
+        doNothing().when(configValidationHelper).validateAgentConfig(any());
+
+        Map<String, Object> existingRow = buildAgentRowWithSupervisorConfig(
+                "test-agent", "Agent", "active");
+        when(agentRepository.findByIdAndTenant(TENANT_ID, "test-agent"))
+                .thenReturn(Optional.of(existingRow));
+
+        Map<String, Object> updatedRow = buildAgentRowWithSupervisorConfig(
+                "test-agent", "Agent", "active");
+        ArgumentCaptor<String> jsonCaptor = ArgumentCaptor.forClass(String.class);
+        when(agentRepository.update(eq(TENANT_ID), eq("test-agent"), eq("Agent"),
+                jsonCaptor.capture(), eq("active"), eq(3), eq(900000L), eq(9000000L)))
+                .thenReturn(Optional.of(updatedRow));
+
+        // 1. Must NOT throw — omitting topology is not a topology change.
+        assertDoesNotThrow(() -> agentService.updateAgent("test-agent", request));
+
+        // 2. The immutable / read-only fields must survive the round-trip (not be wiped).
+        AgentConfigRequest parsed = objectMapper.readValue(jsonCaptor.getValue(),
+                AgentConfigRequest.class);
+        assertEquals("supervisor", parsed.topology(),
+                "topology must be preserved when the update omits it");
+        assertEquals("research", parsed.preset(),
+                "preset must be preserved when the update omits it");
+        assertNotNull(parsed.supervisor(),
+                "supervisor sub-object must be preserved when the update omits it");
+        assertEquals(Integer.valueOf(5), parsed.supervisor().maxFanoutPerIteration());
+        assertEquals("formal_report", parsed.supervisor().writerStyle());
+        // The mutable field the user actually edited still lands.
+        assertEquals("updated prompt", parsed.systemPrompt());
+    }
+
+    /**
      * PUT that explicitly sends the same topology as the persisted row must succeed.
      */
     @Test
@@ -1225,6 +1279,26 @@ class AgentServiceTest {
         row.put("display_name", displayName);
         row.put("agent_config", "{\"system_prompt\":\"prompt\",\"provider\":\"openai\",\"model\":\"gpt-4o\","
                 + "\"temperature\":0.7,\"allowed_tools\":[],\"topology\":\"" + topology + "\"}");
+        row.put("status", status);
+        row.put("max_concurrent_tasks", 5);
+        row.put("budget_max_per_task", 500000L);
+        row.put("budget_max_per_hour", 5000000L);
+        row.put("created_at", Timestamp.from(Instant.now()));
+        row.put("updated_at", Timestamp.from(Instant.now()));
+        return row;
+    }
+
+    private Map<String, Object> buildAgentRowWithSupervisorConfig(
+            String agentId, String displayName, String status) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("agent_id", agentId);
+        row.put("display_name", displayName);
+        // A research-preset supervisor agent as it sits persisted after creation.
+        row.put("agent_config", "{\"system_prompt\":\"prompt\",\"provider\":\"openai\","
+                + "\"model\":\"gpt-4o\",\"temperature\":0.7,"
+                + "\"allowed_tools\":[\"web_search\",\"read_url\"],"
+                + "\"topology\":\"supervisor\",\"preset\":\"research\","
+                + "\"supervisor\":{\"max_fanout_per_iteration\":5,\"writer_style\":\"formal_report\"}}");
         row.put("status", status);
         row.put("max_concurrent_tasks", 5);
         row.put("budget_max_per_task", 500000L);
