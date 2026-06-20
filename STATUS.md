@@ -28,16 +28,16 @@ Tracks 9 (Planning Primitive) and 10 (Deep Research Mode) were removed on 2026-0
 |------------|--------|--------|
 | Langfuse Customer Integration | Complete | [plan](docs/exec-plans/completed/langfuse/plan.md) |
 | Agent Capabilities (sandbox, artifacts, file input, coding primitives) | Tracks 1 & 2 complete; Track 3 proposed | [design](docs/design-docs/agent-capabilities/design.md) |
-| Agent Modes (topologies, delegation tools, Workflow resource, presets) | Framing approved (2026-05-22); Track 2 (Planning Primitive) done & merged; Track 1 (Supervisor Topology) implemented & verified on its branch — see below | [design](docs/design-docs/agent-modes/design.md) · [tracks](docs/exec-plans/active/agent-modes/README.md) |
+| Agent Modes (topologies, delegation tools, Workflow resource, presets) | Framing approved (2026-05-22); both implementation tracks (Planning Primitive #115, Supervisor Topology #119) **done, merged & archived**. Workflow resource + additional presets remain Phase-3 | [design](docs/design-docs/agent-modes/design.md) · [tracks](docs/exec-plans/active/agent-modes/README.md) |
 
 #### Agent Modes Tracks
 
 | Track | Name | Status | Plan | Progress |
 |-------|------|--------|------|----------|
-| 1 | Supervisor Topology (Deep Research) | **Implemented & verified on branch `agent-modes/supervisor-topology-v1` (S1–S11 done, 2026-06-09)** — §A12 ledger fully dispositioned (D1–D3 all **Closed** with metrics, [§A12](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md#a12-deferred-decisions-ledger-definition-of-done-gate)); browser gates passed (Scenario 21 incl. transcript fold + report turn, 2026-06-09/10); post-S11 live-run hardening committed. Remaining: merge to `main`, then archive the track | [plan](docs/exec-plans/active/agent-modes/supervisor-topology/plan.md) | [progress](docs/exec-plans/active/agent-modes/supervisor-topology/progress.md) |
+| 1 | Supervisor Topology (Deep Research) | **✅ Done, merged (#119, 2026-06-20) & archived** — S1–S11 + post-S11 hardening (subagent_completed terminal marker + migration 0026, Writer inline-citation contract, Console immutable-field/preset-tool preservation, supervisor.source_allowlist enforcement, cancel_event propagation). §A12 ledger fully dispositioned (D1–D3 all **Closed** with metrics, [§A12](docs/exec-plans/completed/agent-modes/supervisor-topology/plan.md#a12-deferred-decisions-ledger-definition-of-done-gate)); browser gates passed (Scenario 21 incl. transcript fold + report turn + zero-finding "done"). | [plan](docs/exec-plans/completed/agent-modes/supervisor-topology/plan.md) | [progress](docs/exec-plans/completed/agent-modes/supervisor-topology/progress.md) |
 | 2 | Planning Primitive | **✅ Done & merged (#115, 2026-06-08); archived** — P1–P5 shipped, two-stage reviewed, browser gate passed. `plan_write` ships as a **base platform tool** for all agents (product decision superseded the opt-in design). Outstanding follow-ups (non-blocking, in the track's progress.md): prompt-cache scan dedup; API-wide 405 hygiene | [plan](docs/exec-plans/completed/agent-modes/planning-primitive/plan.md) | [progress](docs/exec-plans/completed/agent-modes/planning-primitive/progress.md) |
 
-Workflow resource and additional presets remain Phase-3 / deferred. The two planned tracks are independent and separately archivable. See the [tracks index](docs/exec-plans/active/agent-modes/README.md).
+Both tracks are now complete and archived under `completed/agent-modes/`. Workflow resource and additional presets remain Phase-3 / deferred. See the [tracks index](docs/exec-plans/active/agent-modes/README.md).
 
 #### Agent Capabilities Tracks
 

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 >
-> **One of two tracks under [Agent Modes](../../../active/agent-modes/README.md).** Sibling track: [Supervisor Topology](../../../active/agent-modes/supervisor-topology/plan.md) (independent; shares only `RuntimeState`, the worker tool registry, and the Console Activity pane — see *Cross-track coordination* in §A3).
+> **One of two tracks under [Agent Modes](../../../active/agent-modes/README.md).** Sibling track: [Supervisor Topology](../supervisor-topology/plan.md) (independent; shares only `RuntimeState`, the worker tool registry, and the Console Activity pane — see *Cross-track coordination* in §A3).
 
 **Goal:** Ship the **Planning Primitive** — a ReAct agent's own to-do-list "scratchpad": a `plan` field on the runtime state written by a `plan_write` tool, injected back into the prompt **after** Track-7 compaction so it survives, exposed read-only at `GET /v1/tasks/{id}/plan`, and rendered as a checklist on the Console task-detail Activity pane. Governing design: [Agent Modes design](../../../../design-docs/agent-modes/design.md) → *How Planning Primitive composes*.
 
@@ -66,7 +66,7 @@
 - **P2 ∥ P3** after P1 — P2 is worker (`graph.py`), P3 is Java API, zero overlap.
 - **P3 (Java) ∥ P1/P2 (Python)** — P3 only needs the plan item *shape*, which is fixed by P1's contract; it can start as soon as that shape is agreed.
 
-**Cross-track coordination (with the [Supervisor Topology](../../../active/agent-modes/supervisor-topology/plan.md) track):** the two tracks are independent but touch four shared files — `executor/compaction/state.py` (both add a `RuntimeState` field), `executor/graph.py::_get_tools` (both register a built-in tool), `services/console/src/features/task-detail/ActivityPane.tsx`, and `types/index.ts`. **If both tracks run concurrently, any agent editing one of these MUST use `isolation: "worktree"`** and merge after. No Planning task depends on a Supervisor task or vice versa.
+**Cross-track coordination (with the [Supervisor Topology](../supervisor-topology/plan.md) track):** the two tracks are independent but touch four shared files — `executor/compaction/state.py` (both add a `RuntimeState` field), `executor/graph.py::_get_tools` (both register a built-in tool), `services/console/src/features/task-detail/ActivityPane.tsx`, and `types/index.ts`. **If both tracks run concurrently, any agent editing one of these MUST use `isolation: "worktree"`** and merge after. No Planning task depends on a Supervisor task or vice versa.
 
 **Console gate (AGENTS.md):** P4 subagent ships code + `make console-test` + scenario text only; the **orchestrator** runs Playwright once, serially, after merge. Read `docs/CONSOLE_TASK_CHECKLIST.md` before P4.
 

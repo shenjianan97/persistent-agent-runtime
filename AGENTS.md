@@ -65,7 +65,17 @@ When a plan **ships a safe v1 default and defers the better choice** to "later, 
 - Record every deferral in a **Deferred Decisions Ledger** in the track plan: *v1 behavior (ships now) · observable trigger · review gate · disposition*. The trigger is the v1 instrumentation (a logged metric), not a calendar date.
 - **Tie it to the track's definition-of-done.** A track is **not "complete"/archivable until every ledger row is dispositioned** — either **Closed** (with the metric as evidence that v1 sufficed) or **spun into a named follow-up task**. Never a silent third option.
 - Force the look at a real checkpoint: the integration/acceptance task's criteria must **report the deferred-item metrics and disposition each**. Surface outstanding rows in `STATUS.md`.
-- Hold the line on language: **"v1 shipped" ≠ "fully optimized."** When v1 tasks merge, claim "v1 implemented and verified," not "done," while ledger rows remain open. (Worked example: `exec-plans/active/agent-modes/supervisor-topology/` §A12.)
+- Hold the line on language: **"v1 shipped" ≠ "fully optimized."** When v1 tasks merge, claim "v1 implemented and verified," not "done," while ledger rows remain open. (Worked example: `exec-plans/completed/agent-modes/supervisor-topology/` §A12.)
+
+### Status docs move with the code that changes them
+
+`STATUS.md` and the per-track `progress.md` are **state assertions, not changelogs** — a reader trusts them as the current truth. So **the commit/PR that changes the state must update the doc in the same change set**, never as a follow-up:
+
+- A change that **flips a status** (track/phase `Not started → Done`, a deferred-ledger row `Open → Closed`, "implemented" → "merged") edits `STATUS.md` / `progress.md` **in the same PR**. If the status flip can't happen until merge (e.g. "merged to main", "archived"), do it as the **immediate next commit on `main`** the moment the merge lands — not "later".
+- **Archival is part of done, not after it.** When a track meets its definition-of-done, the same change set that closes it moves `exec-plans/active/<track>/` → `completed/<track>/` and flips the `STATUS.md` row. A merged-but-not-archived track is a stale-status bug. (See #117 archiving the Planning Primitive track as a worked example.)
+- **Never leave a doc asserting a future intent the code already satisfied.** A `STATUS.md` line reading "Remaining: merge to main" after the branch is merged is a drift defect — fix it with the merge, not in a separate pass.
+
+The test: if someone reads `STATUS.md` at the commit you just made, is every assertion in it true *at that commit*? If not, the doc edit belonged in this change.
 
 ## Agent Skills (Superpowers)
 
@@ -104,6 +114,7 @@ Applies to research, design docs, task specs, PR descriptions, code review comme
 **Always:**
 - Invoke relevant superpowers skills (§Agent Skills (Superpowers))
 - Use `isolation: "worktree"` when parallel subagents could touch overlapping files (§Parallel Subagent Safety)
+- Update `STATUS.md` / `progress.md` in the same change set that flips the state they assert — including archiving a completed track (§Status docs move with the code that changes them)
 
 **Prefer:**
 - Do PR work in a **git worktree** when it may run alongside other agents (or when the user is fanning out several tasks). This repo is built for it — the test infra is per-worktree isolated (#112) and the worker venv / `.env.localdev` fall back to the primary checkout (#111), so there's no bootstrap penalty. Reserve the **primary checkout** for single-stream work and CI-parity runs (which need the fixed `par-e2e-postgres` / 55433 / 8081). Not required for a lone serial task. (§Local Validation Notes)
