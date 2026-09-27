@@ -15,6 +15,7 @@ from executor.graph import GraphExecutor
 import executor.providers
 from langchain_core.messages import AIMessage, ToolCall
 import pytest_asyncio
+from tests.task_wait import wait_for_terminal_task
 
 DB_DSN = os.getenv(
     "E2E_DB_DSN",
@@ -288,8 +289,7 @@ async def test_worker_mcp_tool_execution_integration():
             # We setup a task allowing the 'web_search' tool
             t1 = await setup_test_task(pool)
             
-            # Allow time for polling, graph building, tool execution via MCP, and DB commits
-            await asyncio.sleep(4)
+            await wait_for_terminal_task(pool, t1)
             
             async with pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT * FROM tasks WHERE task_id=$1", t1)
